@@ -17,7 +17,9 @@ type LevelDB struct {
 }
 
 func OpenLevelDB(path string) (*LevelDB, error) {
-	db, err := leveldb.OpenFile(path, &opt.Options{Filter: filter.NewBloomFilter(10000)})
+	db, err := leveldb.OpenFile(path, &opt.Options{
+		Filter:      filter.NewBloomFilter(10000),
+		WriteBuffer: 25 * 1000 * 1000})
 
 	if err != nil {
 		return nil, err
