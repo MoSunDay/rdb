@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	types "rdb/internal/rtypes"
-	"strconv"
 	"strings"
 )
 
@@ -15,6 +14,7 @@ func clusterHandler(c types.CommandContext) {
 		"help":  clusterHelp,
 		"info":  clusterInfo,
 		"nodes": clusterNodes,
+		"test":  clusterTest,
 	}
 	if len(args) == 0 {
 		clusterHelp(c)
@@ -51,7 +51,7 @@ func clusterInfo(c types.CommandContext) {
 
 func clusterHelp(c types.CommandContext) {
 	conn := c.Conn
-	conn.WriteString("CLUSTER [ help | NODES | SLOTS | INIT ]")
+	conn.WriteString("CLUSTER [ help | nodes | test ]")
 }
 
 func clusterNodes(c types.CommandContext) {
@@ -62,15 +62,7 @@ func clusterNodes(c types.CommandContext) {
 	for _, addr := range addrs {
 		addrSlice := strings.Split(addr, ":")
 		portStr := addrSlice[1]
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			conn.WriteError("cluster slots verification failed")
-			return
-		}
-		portStr = strconv.Itoa(port + 200)
-		addr = addrSlice[0] + ":" + portStr
 		uuid := make([]byte, 40)
-
 		for i := 0; i < 40; i++ {
 			if i < len(addr) {
 				if addr[i] != '.' && addr[i] != ':' {
@@ -106,7 +98,6 @@ func getNodeSlots() map[string]string {
 			start += 1
 		}
 	}
-	fmt.Println(nodeSlots)
 	return nodeSlots
 }
 
@@ -121,6 +112,7 @@ func getNodeSlots() map[string]string {
 // 	c.WriteBulkString("356a192b7913b04c54574d18c28d46e6395428ab")
 // }
 
-// func clusterTest(c types.CommandContext) {
-// 	c.WriteString("-MOVED 0 0.0.0.0:6666")
-// }
+func clusterTest(c types.CommandContext) {
+	conn := c.Conn
+	conn.WriteError("MOVED 5465 127.0.0.1:32681")
+}

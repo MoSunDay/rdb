@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"rdb/internal/command"
 	types "rdb/internal/rtypes"
@@ -15,11 +16,22 @@ import (
 )
 
 var confLogger = utils.GetLogger("server")
-var addr = ":32680"
 
 func NewServer() *redcon.Server {
 	confLogger.Println("start leveldb")
-	db, err := store.OpenLevelDB(filepath.Join("/tmp", "leveldb"))
+	addr := utils.GetEnvDefault("RDB_ADDR", ":32680")
+	db, err := store.OpenLevelDB(filepath.Join("/tmp", addr, "leveldb"))
+
+	go func() {
+		t := time.NewTicker(20 * time.Millisecond)
+		for {
+			select {
+			case <-t.C:
+				db.GC()
+			}
+		}
+	}()
+
 	if err != nil {
 		confLogger.Println("start leveldb failed", err)
 	}
@@ -40,13 +52,17 @@ func NewServer() *redcon.Server {
 			if _, ok := command.Whitelist[firstCmd]; !ok {
 				slotNumber := int(utils.GetSlotNumber(cmd.Args[1]))
 				for index, addr := range addrs {
-					if slotNumber <= (index+1)*perNodeslots && addr != host {
-						conn.WriteString("-MOVED 0 " + addr)
-						return
+					if slotNumber <= (index+1)*perNodeslots {
+						if addr == host {
+							break
+						} else {
+							conn.WriteError(fmt.Sprintf("MOVED %d %s", slotNumber, addr))
+							return
+						}
 					}
 				}
-
 			}
+
 			if fn, ok := command.CommandHander[firstCmd]; ok {
 				cmdArgsList := cmd.Args[1:]
 				fn(types.CommandContext{
