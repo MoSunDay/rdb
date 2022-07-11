@@ -1,6 +1,6 @@
-# Compatible with Redis Cluster protocol and use Raft protocol to synchronize slots and support persistent database
+### 支持 Redis Cluster 协议的可持久化存储
 
-## TodoList
+#### TodoList
 1. - [x] 单节点支持 `LevelDB`
 2. - [x] `set/mset/get/mget` 常用命令支持
 3. - [x] 支持 `redis cluster` 通过 `redis-benchmark` && `redis-py-cluster` 的测试
