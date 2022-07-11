@@ -66,3 +66,4 @@ $ free -m
 内存：       15889        1489        5928         109        8470       13956
 交换：           0           0           0
 ```
+[友情链接 sdb 基于 rpc 的 KV 持久化存储](https://github.com/yemingfeng/sdb)
