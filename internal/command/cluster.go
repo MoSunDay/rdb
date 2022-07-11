@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	types "rdb/internal/rtypes"
+	"strconv"
 	"strings"
 )
 
@@ -13,7 +14,11 @@ func clusterHandler(c types.CommandContext) {
 	subCommand := map[string]func(c types.CommandContext){
 		"help":  clusterHelp,
 		"info":  clusterInfo,
+		"INFO":  clusterInfo,
 		"nodes": clusterNodes,
+		"NODES": clusterNodes,
+		"slots": clusterSlots,
+		"SLOTS": clusterSlots,
 		"test":  clusterTest,
 	}
 	if len(args) == 0 {
@@ -51,7 +56,7 @@ func clusterInfo(c types.CommandContext) {
 
 func clusterHelp(c types.CommandContext) {
 	conn := c.Conn
-	conn.WriteString("CLUSTER [ help | nodes | test ]")
+	conn.WriteString("CLUSTER [ help | nodes | slots | test ]")
 }
 
 func clusterNodes(c types.CommandContext) {
@@ -74,8 +79,13 @@ func clusterNodes(c types.CommandContext) {
 				uuid[i] = 'b'
 			}
 		}
-
-		nodeInfo := fmt.Sprintf("%s %s@%s myself,master - 0 0 connected %s\r\n", string(uuid), addr, portStr, nodeSlots[addr])
+		var flag string
+		if addr == os.Args[1] {
+			flag = "myself,"
+		} else {
+			flag = ""
+		}
+		nodeInfo := fmt.Sprintf("%s %s@%s %smaster - 0 0 1 connected %s\r\n", string(uuid), addr, portStr, flag, nodeSlots[addr])
 		response = append(response, nodeInfo)
 	}
 	conn.WriteBulkString(strings.Join(response, ""))
@@ -101,16 +111,39 @@ func getNodeSlots() map[string]string {
 	return nodeSlots
 }
 
-// func clusterSlots(c types.CommandContext) {
-// 	c.WriteArray(1)
-// 	c.WriteArray(3)
-// 	c.WriteInt64(0)
-// 	c.WriteInt64(16383)
-// 	c.WriteArray(3)
-// 	c.WriteBulkString("0.0.0.0")
-// 	c.WriteInt64(6666)
-// 	c.WriteBulkString("356a192b7913b04c54574d18c28d46e6395428ab")
-// }
+func clusterSlots(c types.CommandContext) {
+	conn := c.Conn
+	addrs := strings.Split(os.Args[2], ",")
+	nodeSlots := getNodeSlots()
+	conn.WriteArray(len(addrs))
+	for _, addr := range addrs {
+		conn.WriteArray(3)
+		addrSlice := strings.Split(addr, ":")
+		slotRange := strings.Split(nodeSlots[addr], "-")
+		uuid := make([]byte, 40)
+		for i := 0; i < 40; i++ {
+			if i < len(addr) {
+				if addr[i] != '.' && addr[i] != ':' {
+					uuid[i] = addr[i]
+				} else {
+					uuid[i] = 'a'
+				}
+			} else {
+				uuid[i] = 'b'
+			}
+		}
+		startSlot, _ := strconv.ParseInt(slotRange[0], 10, 64)
+		endSlot, _ := strconv.ParseInt(slotRange[1], 10, 64)
+		port, _ := strconv.ParseInt(addrSlice[1], 10, 64)
+		conn.WriteInt64(startSlot)
+		conn.WriteInt64(endSlot)
+		conn.WriteArray(4)
+		conn.WriteBulkString(addrSlice[0])
+		conn.WriteInt64(port)
+		conn.WriteBulkString(string(uuid))
+		conn.WriteArray(0)
+	}
+}
 
 func clusterTest(c types.CommandContext) {
 	conn := c.Conn

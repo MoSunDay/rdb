@@ -13,6 +13,8 @@ var CommandHander = map[string]func(types.CommandContext){
 	"mget":    mgetHandler,
 	"mset":    msetHandler,
 	"keys":    keysHandler,
+	"gc":      gcHandler,
+	"config":  configHandler,
 	"cluster": clusterHandler,
 }
 
@@ -20,5 +22,7 @@ var Whitelist = map[string]bool{
 	"ping":    true,
 	"quit":    true,
 	"keys":    true,
+	"gc":      true,
+	"config":  true,
 	"cluster": true,
 }
