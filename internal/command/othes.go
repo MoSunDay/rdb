@@ -14,11 +14,11 @@ func quitHandler(c types.CommandContext) {
 	conn.Close()
 }
 
-func gcHandler(c types.CommandContext) {
-	conn, db := c.Conn, c.DB
-	db.GC()
-	conn.WriteString("OK")
-}
+// func gcHandler(c types.CommandContext) {
+// 	conn, db := c.Conn, c.DB
+// 	db.GC()
+// 	conn.WriteString("OK")
+// }
 
 func configHandler(c types.CommandContext) {
 	conn := c.Conn

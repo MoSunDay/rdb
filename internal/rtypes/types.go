@@ -7,12 +7,13 @@ import (
 )
 
 type RDBServer struct {
-	DB     *store.LevelDB
+	DB     *store.Pebble
 	Server *redcon.Server
 }
 
 type CommandContext struct {
-	Conn redcon.Conn
-	DB   *store.LevelDB
-	Args [][]byte
+	Conn      redcon.Conn
+	DB        *store.Pebble
+	PrefixKey []byte
+	Args      [][]byte
 }
