@@ -13,7 +13,6 @@ var CommandHander = map[string]func(types.CommandContext){
 	"mget":    mgetHandler,
 	"mset":    msetHandler,
 	"keys":    keysHandler,
-	"gc":      gcHandler,
 	"config":  configHandler,
 	"cluster": clusterHandler,
 }

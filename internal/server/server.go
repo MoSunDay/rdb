@@ -1,12 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"rdb/internal/command"
+	"rdb/internal/conf"
 	types "rdb/internal/rtypes"
 	"rdb/internal/store"
 	"rdb/internal/utils"
@@ -17,29 +18,45 @@ import (
 var confLogger = utils.GetLogger("server")
 
 func NewServer() *redcon.Server {
-	confLogger.Println("start leveldb")
-	addr := utils.GetEnvDefault("RDB_ADDR", ":32680")
-	db, err := store.OpenLevelDB(filepath.Join("/tmp", addr, "leveldb"))
+	confLogger.Println("start pebble")
+	host, addrs := conf.Content.Bind, conf.Content.Instances
+	db, err := store.OpenPebble(filepath.Join(conf.Content.StorePath, host))
 
 	if err != nil {
 		confLogger.Println("start leveldb failed", err)
 	}
-	confLogger.Println("start server bind:", addr)
-	host, addrs := os.Args[1], strings.Split(os.Args[2], ",")
+
+	confLogger.Println("start server bind:", host)
 	perNodeslots := 16384 / len(addrs)
 
 	Server := redcon.NewServer(
-		addr,
+		host,
 		func(conn redcon.Conn, cmd redcon.Command) {
 			defer (func() {
 				if err := recover(); err != nil {
 					conn.WriteError(fmt.Sprintf("fatal error: %s", (err.(error)).Error()))
 				}
 			})()
+
 			firstCmd := strings.ToLower(string(cmd.Args[0]))
+			var prefixKey []byte
+
 			if fn, ok := command.CommandHander[firstCmd]; ok {
 				if _, ok := command.Whitelist[firstCmd]; !ok {
-					slotNumber := int(utils.GetSlotNumber(cmd.Args[1]))
+					var start, end, slotNumber int
+
+					key := cmd.Args[1]
+					start = bytes.Index(key, []byte("{"))
+					if start != -1 {
+						start += 1
+						end = bytes.Index(key[start:], []byte("}"))
+					}
+
+					if start != -1 && end != -1 {
+						slotNumber, prefixKey = utils.GetSlotNumberWithPrefixKey(key[start : start+end])
+					} else {
+						slotNumber, prefixKey = utils.GetSlotNumberWithPrefixKey(cmd.Args[1])
+					}
 					for index, addr := range addrs {
 						if slotNumber <= (index+1)*perNodeslots {
 							if addr == host {
@@ -53,9 +70,10 @@ func NewServer() *redcon.Server {
 				}
 				cmdArgsList := cmd.Args[1:]
 				fn(types.CommandContext{
-					Conn: conn,
-					DB:   db,
-					Args: cmdArgsList,
+					Conn:      conn,
+					DB:        db,
+					PrefixKey: prefixKey,
+					Args:      cmdArgsList,
 				})
 			} else {
 				conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")

@@ -2,10 +2,12 @@ package command
 
 import (
 	"fmt"
-	"os"
+	"rdb/internal/conf"
 	types "rdb/internal/rtypes"
+	"rdb/internal/utils"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func clusterHandler(c types.CommandContext) {
@@ -35,7 +37,7 @@ func clusterHandler(c types.CommandContext) {
 func clusterInfo(c types.CommandContext) {
 	conn := c.Conn
 	clusterStatus := "ok"
-	addrs := strings.Split(os.Args[2], ",")
+	addrs := conf.Content.Instances
 	size := len(addrs)
 	epoch := "1"
 	conn.WriteBulkString(fmt.Sprintf(""+
@@ -61,31 +63,23 @@ func clusterHelp(c types.CommandContext) {
 
 func clusterNodes(c types.CommandContext) {
 	conn := c.Conn
-	addrs := strings.Split(os.Args[2], ",")
+	addrs := conf.Content.Instances
 	nodeSlots := getNodeSlots()
 	response := make([]string, len(addrs))
+
 	for _, addr := range addrs {
 		addrSlice := strings.Split(addr, ":")
 		portStr := addrSlice[1]
-		uuid := make([]byte, 40)
-		for i := 0; i < 40; i++ {
-			if i < len(addr) {
-				if addr[i] != '.' && addr[i] != ':' {
-					uuid[i] = addr[i]
-				} else {
-					uuid[i] = 'a'
-				}
-			} else {
-				uuid[i] = 'b'
-			}
-		}
+		uuid := utils.MD5With40(addr)
 		var flag string
-		if addr == os.Args[1] {
+		if addr == conf.Content.Bind {
 			flag = "myself,"
 		} else {
 			flag = ""
 		}
-		nodeInfo := fmt.Sprintf("%s %s@%s %smaster - 0 0 1 connected %s\r\n", string(uuid), addr, portStr, flag, nodeSlots[addr])
+		timestamp := time.Now().UnixMilli()
+
+		nodeInfo := fmt.Sprintf("%s %s@%s %smaster - 0 %d 1 connected %s\r\n", uuid, addr, portStr, flag, timestamp, nodeSlots[addr])
 		response = append(response, nodeInfo)
 	}
 	conn.WriteBulkString(strings.Join(response, ""))
@@ -93,7 +87,7 @@ func clusterNodes(c types.CommandContext) {
 
 func getNodeSlots() map[string]string {
 	nodeSlots := make(map[string]string)
-	addrs := strings.Split(os.Args[2], ",")
+	addrs := conf.Content.Instances
 	slotNumber := 16384
 	perNodeslots := slotNumber / len(addrs)
 
@@ -113,25 +107,14 @@ func getNodeSlots() map[string]string {
 
 func clusterSlots(c types.CommandContext) {
 	conn := c.Conn
-	addrs := strings.Split(os.Args[2], ",")
+	addrs := conf.Content.Instances
 	nodeSlots := getNodeSlots()
 	conn.WriteArray(len(addrs))
 	for _, addr := range addrs {
 		conn.WriteArray(3)
 		addrSlice := strings.Split(addr, ":")
 		slotRange := strings.Split(nodeSlots[addr], "-")
-		uuid := make([]byte, 40)
-		for i := 0; i < 40; i++ {
-			if i < len(addr) {
-				if addr[i] != '.' && addr[i] != ':' {
-					uuid[i] = addr[i]
-				} else {
-					uuid[i] = 'a'
-				}
-			} else {
-				uuid[i] = 'b'
-			}
-		}
+		uuid := utils.MD5With40(addr)
 		startSlot, _ := strconv.ParseInt(slotRange[0], 10, 64)
 		endSlot, _ := strconv.ParseInt(slotRange[1], 10, 64)
 		port, _ := strconv.ParseInt(addrSlice[1], 10, 64)
@@ -140,7 +123,7 @@ func clusterSlots(c types.CommandContext) {
 		conn.WriteArray(4)
 		conn.WriteBulkString(addrSlice[0])
 		conn.WriteInt64(port)
-		conn.WriteBulkString(string(uuid))
+		conn.WriteBulkString(uuid)
 		conn.WriteArray(0)
 	}
 }
