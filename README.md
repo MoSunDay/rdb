@@ -12,6 +12,16 @@
 #### Benchmark
 `3` 个 `rdb` 实例组成的集群以及压力发生器「redis-benchmark」在同一台服务器上运行，机器为 `DELL XPS`
 ```
+redis-benchmark -h 127.0.0.1 -p 32680 -t set,get -n 1000000 -c 500 -q -r 100000000000000 -d 50 --cluster
+Cluster has 3 master nodes:
+
+Master 0: 5bfc2c013b2b43876d7d0d9bf8cbc732f8cbc732 127.0.0.1:32680
+Master 1: 844806f0817b51006e8b41d51e1e67621e1e6762 127.0.0.1:32681
+Master 2: c45e0865c53ab2941536e073ef100675ef100675 127.0.0.1:32682
+
+SET: 53087.01 requests per second, p50=5.975 msec
+GET: 54144.79 requests per second, p50=3.271 msec
+
 top - 23:56:37 up 2 days, 11:31,  5 users,  load average: 11.65, 5.75, 2.32
 任务: 266 total,   3 running, 263 sleeping,   0 stopped,   0 zombie
 %Cpu(s):  6.6 us, 25.6 sy, 47.6 ni,  7.0 id,  5.9 wa,  0.0 hi,  7.2 si,  0.0 st
