@@ -55,5 +55,5 @@ func GetSlotNumberWithPrefixKey(key []byte) (int, []byte) {
 	slot := crc16sum(key) % 16384
 	bs := []byte(strconv.Itoa(int(slot)))
 	bs = append(bs, '/')
-	return int(slot), BytesCombine(bs, key)
+	return int(slot), bs
 }
