@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"rdb/internal/utils"
 
 	"github.com/cockroachdb/pebble"
