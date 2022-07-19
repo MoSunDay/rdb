@@ -69,9 +69,7 @@ func (pdb *Pebble) Set(prefix, k, v []byte) error {
 }
 
 func (pdb *Pebble) get(k []byte) ([]byte, error) {
-	item, _, err := pdb.db.Get(k)
-	slotIndex := bytes.Index(item, []byte("/"))
-	val := item[slotIndex+1:]
+	val, _, err := pdb.db.Get(k)
 	if err != nil {
 		return nil, err
 	}
