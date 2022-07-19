@@ -33,7 +33,6 @@ func (pdb *Pebble) Size() int {
 }
 
 func (pdb *Pebble) MSet(prefix []byte, data [][]byte) error {
-	prefix = append(prefix, '/')
 	batch := pdb.db.NewIndexedBatch()
 	for i := 0; i < len(data); i += 2 {
 		item := utils.BytesCombine(prefix, data[i])
@@ -44,7 +43,6 @@ func (pdb *Pebble) MSet(prefix []byte, data [][]byte) error {
 
 func (pdb *Pebble) MGet(prefix []byte, data [][]byte) (resp [][]byte) {
 	null := []byte{}
-	prefix = append(prefix, '/')
 	for _, key := range data {
 		item := utils.BytesCombine(prefix, key)
 		val, err := pdb.get(item)
@@ -62,7 +60,6 @@ func (pdb *Pebble) set(k, v []byte) error {
 }
 
 func (pdb *Pebble) Set(prefix, k, v []byte) error {
-	prefix = append(prefix, '/')
 	item := utils.BytesCombine(prefix, k)
 	return pdb.set(item, v)
 }
@@ -76,13 +73,11 @@ func (pdb *Pebble) get(k []byte) ([]byte, error) {
 }
 
 func (pdb *Pebble) Get(prefix, k []byte) ([]byte, error) {
-	prefix = append(prefix, '/')
 	item := utils.BytesCombine(prefix, k)
 	return pdb.get(item)
 }
 
 func (pdb *Pebble) Del(prefix, key []byte) error {
-	prefix = append(prefix, '/')
 	item := utils.BytesCombine(prefix, key)
 	pdb.db.Delete(item, pebble.Sync)
 	return nil
