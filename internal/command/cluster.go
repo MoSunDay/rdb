@@ -98,7 +98,7 @@ func getNodeSlots() map[string]string {
 		} else {
 			end = perNodeslots * (index + 1)
 			nodeSlots[addr] = fmt.Sprintf("%d-%d", start, end)
-			start += end
+			start = end
 			start += 1
 		}
 	}
