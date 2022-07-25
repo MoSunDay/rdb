@@ -16,7 +16,7 @@ func main() {
 	confLogger.Println("Bind:", conf.Content.Bind)
 	confLogger.Println("Instances:", conf.Content.Instances)
 	confLogger.Println("Path:", conf.Content.StorePath)
-	err := server.NewServer().ListenAndServe()
+	err := server.NewRDB().KVServer.ListenAndServe()
 	if err != nil {
 		confLogger.Println(err)
 	}
