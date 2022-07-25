@@ -9,9 +9,13 @@ import (
 )
 
 type Config struct {
-	StorePath string   `yaml:"store_path"`
-	Bind      string   `yaml:"bind"`
-	Instances []string `yaml:"instances"`
+	StorePath      string   `yaml:"store_path"`
+	Bind           string   `yaml:"bind"`
+	Instances      []string `yaml:"instances"`
+	JoinAddress    string   `yaml:"raft_join_address"`
+	RaftTCPAddress string   `yaml:"raft_bind_address"`
+	Bootstrap      bool     `yaml:"raft_bootstrap"`
+	HttpAddress    string   `yaml:"raft_http_bind_address"`
 }
 
 var confLogger = utils.GetLogger("conf")
