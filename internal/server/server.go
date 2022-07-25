@@ -3,11 +3,14 @@ package server
 import (
 	"bytes"
 	"fmt"
+	"net"
+	"net/http"
 	"path/filepath"
 	"strings"
 
 	"rdb/internal/command"
 	"rdb/internal/conf"
+	"rdb/internal/rcache"
 	types "rdb/internal/rtypes"
 	"rdb/internal/store"
 	"rdb/internal/utils"
@@ -17,7 +20,12 @@ import (
 
 var confLogger = utils.GetLogger("server")
 
-func NewServer() *redcon.Server {
+type RDB struct {
+	KVServer *redcon.Server
+	RCache   *rcache.Cached
+}
+
+func newServer(RCache *rcache.Cached) *redcon.Server {
 	confLogger.Println("start pebble")
 	host, addrs := conf.Content.Bind, conf.Content.Instances
 	db, err := store.OpenPebble(filepath.Join(conf.Content.StorePath, host))
@@ -57,6 +65,7 @@ func NewServer() *redcon.Server {
 					} else {
 						slotNumber, prefixKey = utils.GetSlotNumberWithPrefixKey(cmd.Args[1])
 					}
+
 					for index, addr := range addrs {
 						if slotNumber <= (index+1)*perNodeslots {
 							if addr == host {
@@ -90,4 +99,70 @@ func NewServer() *redcon.Server {
 		},
 	)
 	return Server
+}
+
+func newRcache() *rcache.Cached {
+	opts := rcache.NewOptions()
+	opts.DataDir = conf.Content.StorePath + "/raft"
+	opts.HttpAddress = conf.Content.HttpAddress
+	opts.Bootstrap = conf.Content.Bootstrap
+	opts.RaftTCPAddress = conf.Content.RaftTCPAddress
+	opts.JoinAddress = conf.Content.JoinAddress
+
+	SlotCache := &rcache.Cached{
+		Opts: opts,
+		Log:  confLogger,
+		CM:   rcache.NewCacheManager(),
+	}
+	ctx := &rcache.CachedContext{SlotCache}
+
+	raft, err := rcache.NewRaftNode(SlotCache.Opts, ctx)
+	if err != nil {
+		SlotCache.Log.Fatal(fmt.Sprintf("new raft node failed:%v", err))
+	}
+	SlotCache.Raft = raft
+
+	if SlotCache.Opts.JoinAddress != "" {
+		err = rcache.JoinRaftCluster(SlotCache.Opts)
+		if err != nil {
+			SlotCache.Log.Fatal(fmt.Sprintf("join raft cluster failed:%v", err))
+		}
+	}
+
+	httpServer := rcache.NewHttpServer(ctx, confLogger)
+	SlotCache.HttpServer = httpServer
+
+	go func() {
+		for {
+			select {
+			case leader := <-SlotCache.Raft.LeaderNotifyCh:
+				if leader {
+					SlotCache.Log.Println("become leader, enable write api")
+					SlotCache.HttpServer.SetWriteFlag(true)
+				} else {
+					SlotCache.Log.Println("become follower, close write api")
+					SlotCache.HttpServer.SetWriteFlag(false)
+				}
+			}
+		}
+	}()
+
+	go func() {
+		var l net.Listener
+		var err error
+		l, err = net.Listen("tcp", SlotCache.Opts.HttpAddress)
+		if err != nil {
+			confLogger.Fatal(fmt.Sprintf("listen %s failed: %s", SlotCache.Opts.HttpAddress, err))
+		}
+		confLogger.Printf("http server listen:%s", l.Addr())
+		http.Serve(l, httpServer.Mux)
+	}()
+
+	return SlotCache
+}
+
+func NewRDB() *RDB {
+	RCache := newRcache()
+	KVServer := newServer(RCache)
+	return &RDB{RCache: RCache, KVServer: KVServer}
 }

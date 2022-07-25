@@ -1,6 +1,8 @@
 bind: 127.0.0.1:32680
-store_path: /data/rdb
+store_path: /tmp/
 instances: 
 - 127.0.0.1:32680
-- 127.0.0.1:32681
-- 127.0.0.1:32682
+raft_bootstrap: true
+raft_http_bind_address: 127.0.0.1:12680
+raft_bind_address: 127.0.0.1:22680
+raft_join_address: ""
