@@ -3,19 +3,26 @@ package conf
 import (
 	"flag"
 	"io/ioutil"
+	"rdb/internal/rcache"
+	"rdb/internal/rtypes"
 	"rdb/internal/utils"
 
 	"gopkg.in/yaml.v2"
 )
 
 type Config struct {
-	StorePath      string   `yaml:"store_path"`
-	Bind           string   `yaml:"bind"`
-	Instances      []string `yaml:"instances"`
-	JoinAddress    string   `yaml:"raft_join_address"`
-	RaftTCPAddress string   `yaml:"raft_bind_address"`
-	Bootstrap      bool     `yaml:"raft_bootstrap"`
-	HttpAddress    string   `yaml:"raft_http_bind_address"`
+	StorePath      string `yaml:"store_path"`
+	Bind           string `yaml:"bind"`
+	JoinAddress    string `yaml:"raft_join_address"`
+	RaftTCPAddress string `yaml:"raft_bind_address"`
+	Bootstrap      bool   `yaml:"raft_bootstrap"`
+	HttpAddress    string `yaml:"raft_http_bind_address"`
+	ClusterReady   bool
+	Sentinel       rtypes.Sentinel
+	MigrateTask    rtypes.MigrateTask
+	CRaft          *rcache.Cached
+	StableAddrs    []string
+	PerNodeslots   int
 }
 
 var confLogger = utils.GetLogger("conf")
@@ -34,5 +41,6 @@ func init() {
 	if err != nil {
 		confLogger.Fatalf("unmarshal: %+v", err)
 	}
+
 	confLogger.Printf("conf: %+v", Content)
 }

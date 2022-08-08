@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"rdb/internal/command"
 	"rdb/internal/conf"
@@ -25,9 +26,9 @@ type RDB struct {
 	RCache   *rcache.Cached
 }
 
-func newServer(RCache *rcache.Cached) *redcon.Server {
+func newServer() *redcon.Server {
 	confLogger.Println("start pebble")
-	host, addrs := conf.Content.Bind, conf.Content.Instances
+	host := conf.Content.Bind
 	db, err := store.OpenPebble(filepath.Join(conf.Content.StorePath, host))
 
 	if err != nil {
@@ -35,7 +36,6 @@ func newServer(RCache *rcache.Cached) *redcon.Server {
 	}
 
 	confLogger.Println("start server bind:", host)
-	perNodeslots := 16384 / len(addrs)
 
 	Server := redcon.NewServer(
 		host,
@@ -66,6 +66,8 @@ func newServer(RCache *rcache.Cached) *redcon.Server {
 						slotNumber, prefixKey = utils.GetSlotNumberWithPrefixKey(cmd.Args[1])
 					}
 
+					addrs := conf.Content.StableAddrs
+					perNodeslots := conf.Content.PerNodeslots
 					for index, addr := range addrs {
 						if slotNumber <= (index+1)*perNodeslots {
 							if addr == host {
@@ -163,6 +165,39 @@ func newRcache() *rcache.Cached {
 
 func NewRDB() *RDB {
 	RCache := newRcache()
-	KVServer := newServer(RCache)
+	instances := RCache.CM.Get("cluster_slots_stable_instances")
+	if instances != "" || len(instances)%2 != 0 {
+		conf.Content.ClusterReady = true
+	} else {
+		conf.Content.ClusterReady = false
+	}
+	conf.Content.CRaft = RCache
+
+	KVServer := newServer()
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		for range ticker.C {
+			conf.Content.Sentinel.RTime += 5
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			instances := RCache.CM.Get("cluster_slots_stable_instances")
+			addrs := strings.Split(instances, ",")
+			if instances != "" || len(addrs)%2 != 0 {
+				conf.Content.ClusterReady = true
+				conf.Content.StableAddrs = addrs
+				conf.Content.PerNodeslots = 16384 / len(addrs)
+			} else {
+				conf.Content.ClusterReady = false
+			}
+		}
+	}()
+
 	return &RDB{RCache: RCache, KVServer: KVServer}
 }

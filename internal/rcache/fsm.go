@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"rdb/internal/rtypes"
 
 	"github.com/hashicorp/raft"
 )
@@ -13,13 +14,8 @@ type FSM struct {
 	log *log.Logger
 }
 
-type logEntryData struct {
-	Key   string
-	Value string
-}
-
 func (f *FSM) Apply(logEntry *raft.Log) interface{} {
-	e := logEntryData{}
+	e := rtypes.RaftLogEntryData{}
 	if err := json.Unmarshal(logEntry.Data, &e); err != nil {
 		panic("Failed unmarshaling Raft log entry. This is a bug.")
 	}
