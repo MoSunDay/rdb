@@ -17,3 +17,22 @@ type CommandContext struct {
 	PrefixKey []byte
 	Args      [][]byte
 }
+
+type MigrateTask struct {
+	StartNode  string
+	TargetNode string
+	EndNode    string
+	Enable     bool
+	StartSlot  int64
+	CurSlot    int64
+	EndSlot    int64
+}
+
+type Sentinel struct {
+	RTime int64
+}
+
+type RaftLogEntryData struct {
+	Key   string
+	Value string
+}

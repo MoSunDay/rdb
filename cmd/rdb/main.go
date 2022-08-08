@@ -14,7 +14,6 @@ func main() {
 	flag.Parse()
 	confLogger.Println("Start..")
 	confLogger.Println("Bind:", conf.Content.Bind)
-	confLogger.Println("Instances:", conf.Content.Instances)
 	confLogger.Println("Path:", conf.Content.StorePath)
 	err := server.NewRDB().KVServer.ListenAndServe()
 	if err != nil {

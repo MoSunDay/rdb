@@ -1,8 +1,10 @@
 package command
 
 import (
+	"encoding/json"
 	"fmt"
 	"rdb/internal/conf"
+	"rdb/internal/rtypes"
 	types "rdb/internal/rtypes"
 	"rdb/internal/utils"
 	"strconv"
@@ -15,6 +17,8 @@ func clusterHandler(c types.CommandContext) {
 	args := c.Args
 	subCommand := map[string]func(c types.CommandContext){
 		"help":  clusterHelp,
+		"INIT":  clusterInit,
+		"init":  clusterInit,
 		"info":  clusterInfo,
 		"INFO":  clusterInfo,
 		"nodes": clusterNodes,
@@ -36,8 +40,8 @@ func clusterHandler(c types.CommandContext) {
 
 func clusterInfo(c types.CommandContext) {
 	conn := c.Conn
-	clusterStatus := "ok"
-	addrs := conf.Content.Instances
+	clusterStatus := strconv.FormatBool(conf.Content.ClusterReady)
+	addrs := conf.Content.StableAddrs
 	size := len(addrs)
 	epoch := "1"
 	conn.WriteBulkString(fmt.Sprintf(""+
@@ -63,7 +67,7 @@ func clusterHelp(c types.CommandContext) {
 
 func clusterNodes(c types.CommandContext) {
 	conn := c.Conn
-	addrs := conf.Content.Instances
+	addrs := conf.Content.StableAddrs
 	nodeSlots := getNodeSlots()
 	response := make([]string, len(addrs))
 
@@ -87,7 +91,7 @@ func clusterNodes(c types.CommandContext) {
 
 func getNodeSlots() map[string]string {
 	nodeSlots := make(map[string]string)
-	addrs := conf.Content.Instances
+	addrs := conf.Content.StableAddrs
 	slotNumber := 16384
 	perNodeslots := slotNumber / len(addrs)
 
@@ -107,8 +111,9 @@ func getNodeSlots() map[string]string {
 
 func clusterSlots(c types.CommandContext) {
 	conn := c.Conn
-	addrs := conf.Content.Instances
+	addrs := conf.Content.StableAddrs
 	nodeSlots := getNodeSlots()
+
 	conn.WriteArray(len(addrs))
 	for _, addr := range addrs {
 		conn.WriteArray(3)
@@ -131,4 +136,28 @@ func clusterSlots(c types.CommandContext) {
 func clusterTest(c types.CommandContext) {
 	conn := c.Conn
 	conn.WriteError("MOVED 5465 127.0.0.1:32681")
+}
+
+func clusterInit(c types.CommandContext) {
+	conn, args := c.Conn, c.Args
+	if len(args) < 2 {
+		conn.WriteError("cluster init [instances]")
+	}
+	key := "cluster_slots_stable_instances"
+	value := args[1]
+
+	event := rtypes.RaftLogEntryData{Key: key, Value: string(value)}
+	eventBytes, err := json.Marshal(event)
+	if err != nil {
+		conn.WriteError("Raft internal error")
+		return
+	}
+
+	applyFuture := conf.Content.CRaft.Raft.Raft.Apply(eventBytes, 5*time.Second)
+	if err := applyFuture.Error(); err != nil {
+		conn.WriteError("Raft Apply failed")
+		return
+	}
+
+	conn.WriteString("done")
 }
