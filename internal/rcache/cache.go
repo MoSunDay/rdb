@@ -25,7 +25,6 @@ func (c *cacheManager) Get(key string) (ret string) {
 		ret = value.(string)
 	} else {
 		ret = ""
-		confLogger.Printf("cacheManager get key: %s failed\n", key)
 	}
 	return ret
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"rdb/internal/rtypes"
 	"rdb/internal/utils"
 	"sync/atomic"
 	"time"
@@ -84,7 +85,7 @@ func (h *HttpServer) doSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event := logEntryData{Key: key, Value: value}
+	event := rtypes.RaftLogEntryData{Key: key, Value: value}
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
 		h.Log.Printf("json.Marshal failed, err:%v", err)
