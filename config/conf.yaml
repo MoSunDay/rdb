@@ -5,6 +5,5 @@ raft_http_bind_address: 127.0.0.1:12680
 raft_bind_address: 127.0.0.1:22680
 raft_join_address: ""
 
-
 # cluster_slots_stable_instances: xxx,xxx,xxx,xx
 # cluster_migrate_instances: xxx,xxx,xxx:src1_slot:cur_slot:src2_slot
