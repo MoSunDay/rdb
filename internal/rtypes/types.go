@@ -2,6 +2,7 @@ package rtypes
 
 import (
 	"rdb/internal/store"
+	"rdb/internal/utils"
 
 	"github.com/MoSunDay/redcon"
 )
@@ -35,4 +36,9 @@ type Sentinel struct {
 type RaftLogEntryData struct {
 	Key   string
 	Value string
+}
+
+type Helper struct {
+	CLock utils.CLock
+	DB    *store.Pebble
 }
