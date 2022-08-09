@@ -2,3 +2,5 @@ cmd/rdb/main
 cmd/rdb/rdb
 main
 test.go
+rdb
+rdb_debug
