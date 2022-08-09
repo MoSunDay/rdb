@@ -105,11 +105,22 @@ func newServer() *redcon.Server {
 
 func newRcache() *rcache.Cached {
 	opts := rcache.NewOptions()
-	opts.DataDir = conf.Content.StorePath + "/raft"
+	opts.DataDir = conf.Content.StorePath + "/" + conf.Content.Bind + "/raft"
 	opts.HttpAddress = conf.Content.HttpAddress
-	opts.Bootstrap = conf.Content.Bootstrap
+
+	if opts.JoinAddress != "" {
+		opts.Bootstrap = false
+	} else {
+		opts.Bootstrap = true
+	}
+
+	if !utils.Exists(opts.DataDir) {
+		opts.JoinAddress = conf.Content.JoinAddress
+	} else {
+		opts.JoinAddress = ""
+	}
+
 	opts.RaftTCPAddress = conf.Content.RaftTCPAddress
-	opts.JoinAddress = conf.Content.JoinAddress
 
 	SlotCache := &rcache.Cached{
 		Opts: opts,
@@ -189,7 +200,7 @@ func NewRDB() *RDB {
 		for range ticker.C {
 			instances := RCache.CM.Get("cluster_slots_stable_instances")
 			addrs := strings.Split(instances, ",")
-			if instances != "" || len(addrs)%2 != 0 {
+			if instances != "" || (len(addrs)%2 != 0 && addrs[0] != "") {
 				conf.Content.ClusterReady = true
 				conf.Content.StableAddrs = addrs
 				conf.Content.PerNodeslots = 16384 / len(addrs)

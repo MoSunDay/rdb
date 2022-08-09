@@ -1,6 +1,5 @@
 bind: 127.0.0.1:32682
-store_path: /tmp
-instances: 
-- 127.0.0.1:32681
-- 127.0.0.1:32682
-- 127.0.0.1:32683
+store_path: /tmp/
+raft_http_bind_address: 127.0.0.1:12682
+raft_bind_address: 127.0.0.1:22682
+raft_join_address: 127.0.0.1:12681

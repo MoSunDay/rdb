@@ -20,3 +20,14 @@ func MD5With40(str string) string {
 	result := hex.EncodeToString(h.Sum(nil))
 	return result + result[24:]
 }
+
+func Exists(path string) bool {
+	_, err := os.Stat(path)
+	if err != nil {
+		if os.IsExist(err) {
+			return true
+		}
+		return false
+	}
+	return true
+}
