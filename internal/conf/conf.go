@@ -23,6 +23,7 @@ type Config struct {
 	CRaft          *rcache.Cached
 	StableAddrs    []string
 	PerNodeslots   int
+	Helper         rtypes.Helper
 }
 
 var confLogger = utils.GetLogger("conf")
