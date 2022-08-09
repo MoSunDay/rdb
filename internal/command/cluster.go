@@ -13,8 +13,12 @@ import (
 )
 
 func clusterHandler(c types.CommandContext) {
-	// conn, db, args := c.Conn, c.DB, c.Args
-	args := c.Args
+	conn, args := c.Conn, c.Args
+	fmt.Println(string(args[0]))
+	if !conf.Content.ClusterReady && (len(args) >= 1 && (string(args[0]) != "init" && string(args[0]) != "INIT")) {
+		conn.WriteError("cluster not ready, initialize the cluster with this command (cluster init [instanes01,instanes02,instance03])")
+		return
+	}
 	subCommand := map[string]func(c types.CommandContext){
 		"help":  clusterHelp,
 		"INIT":  clusterInit,
