@@ -42,6 +42,4 @@ func init() {
 	if err != nil {
 		confLogger.Fatalf("unmarshal: %+v", err)
 	}
-
-	confLogger.Printf("conf: %+v", Content)
 }

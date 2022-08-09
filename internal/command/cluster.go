@@ -14,7 +14,6 @@ import (
 
 func clusterHandler(c types.CommandContext) {
 	conn, args := c.Conn, c.Args
-	fmt.Println(string(args[0]))
 	if !conf.Content.ClusterReady && (len(args) >= 1 && (string(args[0]) != "init" && string(args[0]) != "INIT")) {
 		conn.WriteError("cluster not ready, initialize the cluster with this command (cluster init [instanes01,instanes02,instance03])")
 		return
@@ -147,6 +146,14 @@ func clusterInit(c types.CommandContext) {
 	if len(args) < 2 {
 		conn.WriteError("cluster init [instances]")
 	}
+
+	RaftLeaderAddr, _ := conf.Content.CRaft.Raft.Raft.LeaderWithID()
+	RaftLeaderAddrStr := string(RaftLeaderAddr)
+	if conf.Content.RaftTCPAddress != RaftLeaderAddrStr {
+		conn.WriteError("Leader addr: " + RaftLeaderAddrStr)
+		return
+	}
+
 	key := "cluster_slots_stable_instances"
 	value := args[1]
 
