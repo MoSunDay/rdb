@@ -1,4 +1,6 @@
 ### 支持 Redis Cluster 协议的可持久化存储
+### 一些思考
+[传送门](https://blog.mself.top/post/kv/)
 
 #### TodoList
 1. - [x] 单节点支持 `pebble`
