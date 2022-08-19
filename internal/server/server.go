@@ -188,6 +188,7 @@ func NewRDB() *RDB {
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
 		for range ticker.C {
 			conf.Content.Sentinel.RTime += 5
 		}
