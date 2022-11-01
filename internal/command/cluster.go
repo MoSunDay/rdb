@@ -128,11 +128,12 @@ func clusterSlots(c types.CommandContext) {
 		port, _ := strconv.ParseInt(addrSlice[1], 10, 64)
 		conn.WriteInt64(startSlot)
 		conn.WriteInt64(endSlot)
-		conn.WriteArray(4)
+		// conn.WriteArray(4)
+		conn.WriteArray(3)
 		conn.WriteBulkString(addrSlice[0])
 		conn.WriteInt64(port)
 		conn.WriteBulkString(uuid)
-		conn.WriteArray(0)
+		// conn.WriteArray(0)
 	}
 }
 
