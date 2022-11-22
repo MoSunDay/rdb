@@ -13,15 +13,16 @@ import (
 type Config struct {
 	StorePath      string `yaml:"store_path"`
 	Bind           string `yaml:"bind"`
-	JoinAddress    string `yaml:"raft_join_address"`
 	RaftTCPAddress string `yaml:"raft_bind_address"`
-	Bootstrap      bool   `yaml:"raft_bootstrap"`
 	HttpAddress    string `yaml:"raft_http_bind_address"`
+	RaftToken      string `yaml:"raft_token"`
+	MonitorAddr    string `yaml:"monitor_addr"`
 	ClusterReady   bool
 	Sentinel       rtypes.Sentinel
 	MigrateTask    rtypes.MigrateTask
 	CRaft          *rcache.Cached
 	StableAddrs    []string
+	BackupAddrs    []string
 	PerNodeslots   int
 	Helper         rtypes.Helper
 }

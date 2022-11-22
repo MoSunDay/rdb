@@ -92,7 +92,7 @@ func NewRaftNode(opts *options, ctx *CachedContext) (*RaftNodeInfo, error) {
 		return nil, err
 	}
 	address := transport.LocalAddr()
-	if opts.Bootstrap {
+	if os.Getenv("RAFT_BOOTSTRAP") == "true" {
 		configuration := raft.Configuration{
 			Servers: []raft.Server{
 				{
@@ -108,9 +108,10 @@ func NewRaftNode(opts *options, ctx *CachedContext) (*RaftNodeInfo, error) {
 }
 
 func JoinRaftCluster(opts *options) error {
-	url := fmt.Sprintf("http://%s/join?peerAddress=%s", opts.JoinAddress, opts.RaftTCPAddress)
+	url := fmt.Sprintf("http://%s/join?peerAddress=%s&raft-token=%s", opts.JoinAddress, opts.RaftTCPAddress, opts.RaftToken)
 
 	resp, err := http.Get(url)
+	log.Println(resp)
 	if err != nil {
 		return err
 	}
