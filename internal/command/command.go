@@ -15,6 +15,7 @@ var CommandHander = map[string]func(types.CommandContext){
 	"keys":    keysHandler,
 	"config":  configHandler,
 	"cluster": clusterHandler,
+	"raft":    raftHandler,
 }
 
 var Whitelist = map[string]bool{
@@ -24,4 +25,5 @@ var Whitelist = map[string]bool{
 	"gc":      true,
 	"config":  true,
 	"cluster": true,
+	"raft":    true,
 }

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"rdb/internal/command"
 	"rdb/internal/conf"
+	"rdb/internal/monitor"
 	"rdb/internal/rcache"
 	types "rdb/internal/rtypes"
 	"rdb/internal/store"
@@ -45,7 +47,7 @@ func newServer() *redcon.Server {
 					conn.WriteError(fmt.Sprintf("fatal error: %s", (err.(error)).Error()))
 				}
 			})()
-
+			startTime := conf.Content.Sentinel.RTime
 			firstCmd := strings.ToLower(string(cmd.Args[0]))
 			var prefixKey []byte
 
@@ -89,6 +91,8 @@ func newServer() *redcon.Server {
 			} else {
 				conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
 			}
+			endTime := conf.Content.Sentinel.RTime
+			monitor.Collector.Latency.WithLabelValues(firstCmd).Observe(float64(endTime - startTime))
 		},
 		func(conn redcon.Conn) bool {
 			// Use this function to accept or deny the connection.
@@ -108,20 +112,14 @@ func newRcache() *rcache.Cached {
 	opts.DataDir = conf.Content.StorePath + "/" + conf.Content.Bind + "/raft"
 	opts.HttpAddress = conf.Content.HttpAddress
 
-	if opts.JoinAddress != "" {
-		opts.Bootstrap = false
-	} else {
-		opts.Bootstrap = true
-	}
-
 	if !utils.Exists(opts.DataDir) {
-		opts.JoinAddress = conf.Content.JoinAddress
+		opts.JoinAddress = os.Getenv("RAFT_JOIN_ADDR")
 	} else {
 		opts.JoinAddress = ""
 	}
 
 	opts.RaftTCPAddress = conf.Content.RaftTCPAddress
-
+	opts.RaftToken = conf.Content.RaftToken
 	SlotCache := &rcache.Cached{
 		Opts: opts,
 		Log:  confLogger,
@@ -183,7 +181,6 @@ func NewRDB() *RDB {
 		conf.Content.ClusterReady = false
 	}
 	conf.Content.CRaft = RCache
-
 	KVServer := newServer()
 
 	go func() {
@@ -195,7 +192,7 @@ func NewRDB() *RDB {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {
@@ -207,6 +204,20 @@ func NewRDB() *RDB {
 				conf.Content.PerNodeslots = 16384 / len(addrs)
 			} else {
 				conf.Content.ClusterReady = false
+			}
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			instances := RCache.CM.Get("cluster_slots_backup_instances")
+			addrs := strings.Split(instances, ",")
+			if instances != "" {
+				conf.Content.ClusterReady = true
+				conf.Content.BackupAddrs = addrs
 			}
 		}
 	}()

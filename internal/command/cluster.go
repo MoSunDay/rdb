@@ -46,7 +46,9 @@ func clusterInfo(c types.CommandContext) {
 	clusterStatus := strconv.FormatBool(conf.Content.ClusterReady)
 	addrs := conf.Content.StableAddrs
 	size := len(addrs)
-	epoch := "1"
+
+	stats := conf.Content.CRaft.Raft.Raft.Stats()
+	epoch := stats["term"]
 	conn.WriteBulkString(fmt.Sprintf(""+
 		"cluster_state:%s\n"+
 		"cluster_slots_assigned:16384\n"+
@@ -65,7 +67,7 @@ func clusterInfo(c types.CommandContext) {
 
 func clusterHelp(c types.CommandContext) {
 	conn := c.Conn
-	conn.WriteString("CLUSTER [ help | nodes | slots | test ]")
+	conn.WriteString("cluster [ help | nodes | slots | test ]")
 }
 
 func clusterNodes(c types.CommandContext) {
@@ -116,7 +118,6 @@ func clusterSlots(c types.CommandContext) {
 	conn := c.Conn
 	addrs := conf.Content.StableAddrs
 	nodeSlots := getNodeSlots()
-
 	conn.WriteArray(len(addrs))
 	for _, addr := range addrs {
 		conn.WriteArray(3)
