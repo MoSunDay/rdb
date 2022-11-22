@@ -1,5 +1,12 @@
 bind: 127.0.0.1:32683
 store_path: /tmp/
+# raft_bootstrap: true
 raft_http_bind_address: 127.0.0.1:12683
+raft_token: "6Mwqjg7TF9jcnF8PRxrq7jK3pG3DZ28fy5guk3Hm264smyftmuhUGtz5mssHfG7Ztg23j4FMb5qmpxdhBusfpevkveyR93eNfx6uv5YEZYyczfdYn4rpKxcRxiXhirik"
 raft_bind_address: 127.0.0.1:22683
-raft_join_address: 127.0.0.1:12681
+# raft_join_address: ""
+monitor_addr: 127.0.0.1:42683
+
+# cluster_slots_stable_instances: xxx,xxx,xxx,xx
+# cluster_migrate_instances: xxx,xxx,xxx:src1_slot:cur_slot:src2_slot
+# cluster_slots_version: 1
