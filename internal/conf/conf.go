@@ -3,28 +3,35 @@ package conf
 import (
 	"flag"
 	"io/ioutil"
+	"rdb/internal/monitor"
 	"rdb/internal/rcache"
 	"rdb/internal/rtypes"
 	"rdb/internal/utils"
+	"time"
 
 	"gopkg.in/yaml.v2"
 )
 
 type Config struct {
-	StorePath      string `yaml:"store_path"`
-	Bind           string `yaml:"bind"`
-	RaftTCPAddress string `yaml:"raft_bind_address"`
-	HttpAddress    string `yaml:"raft_http_bind_address"`
-	RaftToken      string `yaml:"raft_token"`
-	MonitorAddr    string `yaml:"monitor_addr"`
-	ClusterReady   bool
-	Sentinel       rtypes.Sentinel
-	MigrateTask    rtypes.MigrateTask
-	CRaft          *rcache.Cached
-	StableAddrs    []string
-	BackupAddrs    []string
-	PerNodeslots   int
-	Helper         rtypes.Helper
+	StorePath         string `yaml:"store_path"`
+	Bind              string `yaml:"bind"`
+	MonitorAddr       string `yaml:"monitor_addr"`
+	RaftTCPAddress    string `yaml:"raft_bind_address"`
+	HttpAddress       string `yaml:"raft_http_bind_address"`
+	RaftToken         string `yaml:"raft_token"`
+	BackupStorePath   string `yaml:"backup_store_path"`
+	BackupBind        string `yaml:"backup_bind"`
+	BackupMonitorAddr string `yaml:"backup_monitor_addr"`
+	BackupTarget      string `yaml:"backup_target"`
+	Monitor           *monitor.CustomCollector
+	ClusterReady      bool
+	Sentinel          rtypes.Sentinel
+	MigrateTask       rtypes.MigrateTask
+	CRaft             *rcache.Cached
+	StableAddrs       []string
+	BackupAddrs       []string
+	PerNodeslots      int
+	Helper            rtypes.Helper
 }
 
 var confLogger = utils.GetLogger("conf")
@@ -43,4 +50,12 @@ func init() {
 	if err != nil {
 		confLogger.Fatalf("unmarshal: %+v", err)
 	}
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			Content.Sentinel.RTime += 5
+		}
+	}()
 }

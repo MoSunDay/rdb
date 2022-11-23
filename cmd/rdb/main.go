@@ -16,9 +16,20 @@ func main() {
 	confLogger.Println("Start..")
 	confLogger.Println("Bind:", conf.Content.Bind)
 	confLogger.Println("Path:", conf.Content.StorePath)
-	monitor.Setup()
-	err := server.NewRDB().KVServer.ListenAndServe()
+	conf.Content.Monitor = monitor.NewCustomCollector(conf.Content.MonitorAddr)
+	rdb := server.NewRDB()
+
+	if conf.Content.BackupTarget != "" {
+		go func() {
+			err := rdb.BackupServer.KV.ListenAndServe()
+			if err != nil {
+				confLogger.Fatal(err)
+			}
+		}()
+	}
+
+	err := rdb.Server.KV.ListenAndServe()
 	if err != nil {
-		confLogger.Println(err)
+		confLogger.Fatal(err)
 	}
 }
