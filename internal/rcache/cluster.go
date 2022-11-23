@@ -31,6 +31,8 @@ type CachedContext struct {
 type RaftNodeInfo struct {
 	Raft           *raft.Raft
 	Fsm            *FSM
+	Observer       *raft.Observer
+	ObserverChan   chan raft.Observation
 	LeaderNotifyCh chan bool
 }
 
@@ -72,6 +74,7 @@ func NewRaftNode(opts *options, ctx *CachedContext) (*RaftNodeInfo, error) {
 		ctx: ctx,
 		log: log.New(os.Stderr, "FSM: ", log.Ldate|log.Ltime),
 	}
+
 	snapshotStore, err := raft.NewFileSnapshotStore(opts.DataDir, 1, os.Stderr)
 	if err != nil {
 		return nil, err
@@ -104,7 +107,22 @@ func NewRaftNode(opts *options, ctx *CachedContext) (*RaftNodeInfo, error) {
 		RaftNode.BootstrapCluster(configuration)
 	}
 
-	return &RaftNodeInfo{Raft: RaftNode, Fsm: Fsm, LeaderNotifyCh: LeaderNotifyCh}, nil
+	obsChan := make(chan raft.Observation)
+	observer := raft.NewObserver(obsChan, true, func(o *raft.Observation) bool {
+		data := o.Data
+		switch data.(type) {
+		case raft.FailedHeartbeatObservation:
+			return true
+		case raft.ResumedHeartbeatObservation:
+			return true
+		case raft.PeerObservation:
+			return true
+		default:
+			return false
+		}
+	})
+	RaftNode.RegisterObserver(observer)
+	return &RaftNodeInfo{Raft: RaftNode, Fsm: Fsm, LeaderNotifyCh: LeaderNotifyCh, Observer: observer, ObserverChan: obsChan}, nil
 }
 
 func JoinRaftCluster(opts *options) error {

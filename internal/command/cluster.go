@@ -48,7 +48,7 @@ func clusterInfo(c types.CommandContext) {
 	size := len(addrs)
 
 	stats := conf.Content.CRaft.Raft.Raft.Stats()
-	epoch := stats["term"]
+	epoch := stats["term"] + stats["commit_index"]
 	conn.WriteBulkString(fmt.Sprintf(""+
 		"cluster_state:%s\n"+
 		"cluster_slots_assigned:16384\n"+
@@ -147,6 +147,7 @@ func clusterInit(c types.CommandContext) {
 	conn, args := c.Conn, c.Args
 	if len(args) < 2 {
 		conn.WriteError("cluster init [instances]")
+		return
 	}
 
 	RaftLeaderAddr, _ := conf.Content.CRaft.Raft.Raft.LeaderWithID()
@@ -158,7 +159,6 @@ func clusterInit(c types.CommandContext) {
 
 	key := "cluster_slots_stable_instances"
 	value := args[1]
-
 	event := rtypes.RaftLogEntryData{Key: key, Value: string(value)}
 	eventBytes, err := json.Marshal(event)
 	if err != nil {

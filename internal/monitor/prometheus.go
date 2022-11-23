@@ -22,11 +22,11 @@ func newCollector() *CustomCollector {
 			Name:    "rdb_command_latency",
 			Help:    "rdb command latency(millisecond)",
 			Buckets: prometheus.LinearBuckets(5, 25, 8),
-		}, []string{"type"}),
+		}, []string{"type", "mode", "ack"}),
 		RaftStatus: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "raft_stats",
 			Help: "raft stats",
-		}, []string{"type"}),
+		}, []string{"status"}),
 	}
 
 	return c

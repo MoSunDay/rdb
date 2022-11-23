@@ -12,7 +12,7 @@ var CommandHander = map[string]func(types.CommandContext){
 	"del":     delHandler,
 	"mget":    mgetHandler,
 	"mset":    msetHandler,
-	"keys":    keysHandler,
+	"size":    sizeHandler,
 	"config":  configHandler,
 	"cluster": clusterHandler,
 	"raft":    raftHandler,
@@ -21,8 +21,7 @@ var CommandHander = map[string]func(types.CommandContext){
 var Whitelist = map[string]bool{
 	"ping":    true,
 	"quit":    true,
-	"keys":    true,
-	"gc":      true,
+	"size":    true,
 	"config":  true,
 	"cluster": true,
 	"raft":    true,
