@@ -12,7 +12,6 @@ import (
 
 	"rdb/internal/command"
 	"rdb/internal/conf"
-	"rdb/internal/monitor"
 	"rdb/internal/rcache"
 	types "rdb/internal/rtypes"
 	"rdb/internal/store"
@@ -23,23 +22,27 @@ import (
 
 var confLogger = utils.GetLogger("server")
 
-type RDB struct {
-	KVServer *redcon.Server
-	RCache   *rcache.Cached
+type DB struct {
+	KV *redcon.Server
 }
 
-func newServer() *redcon.Server {
+type RDB struct {
+	Server       *DB
+	BackupServer *DB
+	RCache       *rcache.Cached
+}
+
+func newDB(bind, storePath, monitorAddr, mode string) *DB {
 	confLogger.Println("start pebble")
-	host := conf.Content.Bind
-	db, err := store.OpenPebble(filepath.Join(conf.Content.StorePath, host))
+	host := bind
+	db, err := store.OpenPebble(filepath.Join(storePath, host))
 
 	if err != nil {
 		confLogger.Println("start leveldb failed", err)
 	}
 
 	confLogger.Println("start server bind:", host)
-
-	Server := redcon.NewServer(
+	KV := redcon.NewServer(
 		host,
 		func(conn redcon.Conn, cmd redcon.Command) {
 			defer (func() {
@@ -92,7 +95,7 @@ func newServer() *redcon.Server {
 				conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
 			}
 			endTime := conf.Content.Sentinel.RTime
-			monitor.Collector.Latency.WithLabelValues(firstCmd).Observe(float64(endTime - startTime))
+			conf.Content.Monitor.Latency.WithLabelValues(mode, firstCmd).Observe(float64(endTime - startTime))
 		},
 		func(conn redcon.Conn) bool {
 			// Use this function to accept or deny the connection.
@@ -104,7 +107,7 @@ func newServer() *redcon.Server {
 			// log.Printf("closed: %s, err: %v", conn.RemoteAddr(), err)
 		},
 	)
-	return Server
+	return &DB{KV: KV}
 }
 
 func newRcache() *rcache.Cached {
@@ -181,15 +184,12 @@ func NewRDB() *RDB {
 		conf.Content.ClusterReady = false
 	}
 	conf.Content.CRaft = RCache
-	KVServer := newServer()
 
-	go func() {
-		ticker := time.NewTicker(5 * time.Millisecond)
-		defer ticker.Stop()
-		for range ticker.C {
-			conf.Content.Sentinel.RTime += 5
-		}
-	}()
+	Server := newDB(conf.Content.Bind, conf.Content.StorePath, conf.Content.MonitorAddr, "normal")
+	var BackupServer *DB
+	if conf.Content.BackupTarget != "" {
+		BackupServer = newDB(conf.Content.BackupBind, conf.Content.BackupStorePath, conf.Content.BackupMonitorAddr, "backup")
+	}
 
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
@@ -208,19 +208,18 @@ func NewRDB() *RDB {
 		}
 	}()
 
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
+	// go func() {
+	// 	ticker := time.NewTicker(3 * time.Second)
+	// 	defer ticker.Stop()
 
-		for range ticker.C {
-			instances := RCache.CM.Get("cluster_slots_backup_instances")
-			addrs := strings.Split(instances, ",")
-			if instances != "" {
-				conf.Content.ClusterReady = true
-				conf.Content.BackupAddrs = addrs
-			}
-		}
-	}()
-
-	return &RDB{RCache: RCache, KVServer: KVServer}
+	// 	for range ticker.C {
+	// 		instances := RCache.CM.Get("cluster_slots_backup_instances")
+	// 		addrs := strings.Split(instances, ",")
+	// 		if instances != "" {
+	// 			conf.Content.ClusterReady = true
+	// 			conf.Content.BackupAddrs = addrs
+	// 		}
+	// 	}
+	// }()
+	return &RDB{RCache: RCache, Server: Server, BackupServer: BackupServer}
 }
