@@ -1,13 +1,24 @@
 bind: 127.0.0.1:32681
 store_path: /tmp/
-backup_target: 127.0.0.1:32683
-backup_bind: 127.0.0.1:32683
+backup_bind: 127.0.0.1:32682
 backup_store_path: /tmp/backup
-backup_monitor_addr: 127.0.0.1:42683
 raft_http_bind_address: 127.0.0.1:12681
 raft_token: "6Mwqjg7TF9jcnF8PRxrq7jK3pG3DZ28fy5guk3Hm264smyftmuhUGtz5mssHfG7Ztg23j4FMb5qmpxdhBusfpevkveyR93eNfx6uv5YEZYyczfdYn4rpKxcRxiXhirik"
 raft_bind_address: 127.0.0.1:22681
 monitor_addr: 127.0.0.1:42681
-# cluster_slots_stable_instances: xxx,xxx,xxx,xx
-# cluster_migrate_instances: xxx,xxx,xxx:src1_slot:cur_slot:src2_slot
-# cluster_slots_version: 1
+
+
+# only leader
+allow_ip_list:
+  - 127.0.0.1
+# only leader
+backup_target_map:
+  127.0.0.1:22681:
+    src: 127.0.0.1:32681
+    target: 127.0.0.1:32684
+  127.0.0.1:22683:
+    src: 127.0.0.1:32683
+    target: 127.0.0.1:32686
+  127.0.0.1:22685:
+    src: 127.0.0.1:32685
+    target: 127.0.0.1:32682

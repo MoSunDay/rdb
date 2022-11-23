@@ -19,7 +19,7 @@ func main() {
 	conf.Content.Monitor = monitor.NewCustomCollector(conf.Content.MonitorAddr)
 	rdb := server.NewRDB()
 
-	if conf.Content.BackupTarget != "" {
+	if conf.Content.BackupBind != "" {
 		go func() {
 			err := rdb.BackupServer.KV.ListenAndServe()
 			if err != nil {

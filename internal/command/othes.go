@@ -1,6 +1,9 @@
 package command
 
-import types "rdb/internal/rtypes"
+import (
+	types "rdb/internal/rtypes"
+	"strconv"
+)
 
 func pingHandler(c types.CommandContext) {
 	conn := c.Conn
@@ -14,11 +17,10 @@ func quitHandler(c types.CommandContext) {
 	conn.Close()
 }
 
-// func gcHandler(c types.CommandContext) {
-// 	conn, db := c.Conn, c.DB
-// 	db.GC()
-// 	conn.WriteString("OK")
-// }
+func sizeHandler(c types.CommandContext) {
+	conn, db := c.Conn, c.DB
+	conn.WriteString(strconv.Itoa(int(db.Size())))
+}
 
 func configHandler(c types.CommandContext) {
 	conn := c.Conn
