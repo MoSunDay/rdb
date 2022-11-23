@@ -8,8 +8,12 @@
 3. - [x] 支持 `redis cluster` 通过 `redis-benchmark` && `redis-py-cluster` 的测试
 4. - [x] 引入配置管理
 6. - [x] `cluster` 数据交给 `Raft` 管理
-7. - [] 支持数据迁移
-8. - [] 进一步的性能优化
+7. - [x] 接入 `Prometheus metrics`
+8. - [x] 支持简单的 `HA`
+9. - [x] 支持简单的数据迁移
+10. - [x] 支持无损数据迁移
+11. - [x] 支持 `Raft` 与 `Redis Client` 的身份验证
+12. - [] 进一步的性能优化
 
 #### Benchmark
 `3` 个 `rdb` 实例组成的集群以及压力发生器「redis-benchmark」在同一台服务器上运行，机器为 `DELL XPS`
