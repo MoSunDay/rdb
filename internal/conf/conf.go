@@ -13,16 +13,17 @@ import (
 )
 
 type Config struct {
-	StorePath         string `yaml:"store_path"`
-	Bind              string `yaml:"bind"`
-	MonitorAddr       string `yaml:"monitor_addr"`
-	RaftTCPAddress    string `yaml:"raft_bind_address"`
-	HttpAddress       string `yaml:"raft_http_bind_address"`
-	RaftToken         string `yaml:"raft_token"`
-	BackupStorePath   string `yaml:"backup_store_path"`
-	BackupBind        string `yaml:"backup_bind"`
-	BackupMonitorAddr string `yaml:"backup_monitor_addr"`
-	BackupTarget      string `yaml:"backup_target"`
+	StorePath         string                       `yaml:"store_path"`
+	Bind              string                       `yaml:"bind"`
+	MonitorAddr       string                       `yaml:"monitor_addr"`
+	RaftTCPAddress    string                       `yaml:"raft_bind_address"`
+	HttpAddress       string                       `yaml:"raft_http_bind_address"`
+	RaftToken         string                       `yaml:"raft_token"`
+	BackupStorePath   string                       `yaml:"backup_store_path"`
+	BackupBind        string                       `yaml:"backup_bind"`
+	BackupMonitorAddr string                       `yaml:"backup_monitor_addr"`
+	BackupTargetMap   map[string]map[string]string `yaml:"backup_target_map"`
+	IPList            []string                     `yaml:"allow_ip_list"`
 	Monitor           *monitor.CustomCollector
 	ClusterReady      bool
 	Sentinel          rtypes.Sentinel
@@ -30,6 +31,7 @@ type Config struct {
 	CRaft             *rcache.Cached
 	StableAddrs       []string
 	BackupAddrs       []string
+	AllowIPs          []string
 	PerNodeslots      int
 	Helper            rtypes.Helper
 }

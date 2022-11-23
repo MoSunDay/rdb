@@ -2,22 +2,26 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
 	"rdb/internal/command"
 	"rdb/internal/conf"
 	"rdb/internal/rcache"
+	"rdb/internal/rtypes"
 	types "rdb/internal/rtypes"
 	"rdb/internal/store"
 	"rdb/internal/utils"
 
 	"github.com/MoSunDay/redcon"
+	"github.com/hashicorp/raft"
 )
 
 var confLogger = utils.GetLogger("server")
@@ -51,6 +55,7 @@ func newDB(bind, storePath, monitorAddr, mode string) *DB {
 				}
 			})()
 			startTime := conf.Content.Sentinel.RTime
+			isMoved := "false"
 			firstCmd := strings.ToLower(string(cmd.Args[0]))
 			var prefixKey []byte
 
@@ -78,6 +83,7 @@ func newDB(bind, storePath, monitorAddr, mode string) *DB {
 							if addr == host {
 								break
 							} else {
+								isMoved = "true"
 								conn.WriteError(fmt.Sprintf("MOVED %d %s", slotNumber, addr))
 								return
 							}
@@ -91,20 +97,51 @@ func newDB(bind, storePath, monitorAddr, mode string) *DB {
 					PrefixKey: prefixKey,
 					Args:      cmdArgsList,
 				})
+				endTime := conf.Content.Sentinel.RTime
+				conf.Content.Monitor.Latency.WithLabelValues(mode, firstCmd, isMoved).Observe(float64(endTime - startTime))
 			} else {
 				conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
 			}
-			endTime := conf.Content.Sentinel.RTime
-			conf.Content.Monitor.Latency.WithLabelValues(mode, firstCmd).Observe(float64(endTime - startTime))
+
 		},
 		func(conn redcon.Conn) bool {
-			// Use this function to accept or deny the connection.
-			// log.Printf("accept: %s", conn.RemoteAddr())
-			return true
+			addr := conn.RemoteAddr()
+			confLogger.Printf("accept: %s", addr)
+
+			portIndex := strings.Index(addr, ":")
+			confLogger.Println("allow_ip_" + addr[0:portIndex])
+			val := conf.Content.CRaft.CM.Get("allow_ip_" + addr[0:portIndex])
+			if val != "" {
+				return true
+			}
+
+			reader := redcon.NewReader(conn.NetConn())
+			writer := redcon.NewWriter(conn.NetConn())
+
+			command, err := reader.ReadCommand()
+			if err != nil {
+				confLogger.Println("reader.ReadCommand() err:", err)
+				writer.WriteError("ERR NOAUTH")
+				writer.Flush()
+				return false
+			}
+			if len(command.Args) < 1 {
+				confLogger.Println("len(command.Args) < 1")
+				writer.WriteError("ERR NOAUTH")
+				writer.Flush()
+				return false
+			}
+			if utils.BytesToString(command.Args[0]) == "AUTH" && utils.BytesToString(command.Args[1]) == conf.Content.RaftToken {
+				writer.WriteString("OK")
+				writer.Flush()
+				return true
+			}
+			writer.WriteError("ERR NOAUTH")
+			writer.Flush()
+			return false
 		},
 		func(conn redcon.Conn, err error) {
-			// This is called when the connection has been closed
-			// log.Printf("closed: %s, err: %v", conn.RemoteAddr(), err)
+			confLogger.Printf("closed: %s, err: %v", conn.RemoteAddr(), err)
 		},
 	)
 	return &DB{KV: KV}
@@ -128,13 +165,13 @@ func newRcache() *rcache.Cached {
 		Log:  confLogger,
 		CM:   rcache.NewCacheManager(),
 	}
-	ctx := &rcache.CachedContext{SlotCache}
 
-	raft, err := rcache.NewRaftNode(SlotCache.Opts, ctx)
+	ctx := &rcache.CachedContext{SlotCache}
+	raftInstance, err := rcache.NewRaftNode(SlotCache.Opts, ctx)
 	if err != nil {
 		SlotCache.Log.Fatal(fmt.Sprintf("new raft node failed:%v", err))
 	}
-	SlotCache.Raft = raft
+	SlotCache.Raft = raftInstance
 
 	if SlotCache.Opts.JoinAddress != "" {
 		err = rcache.JoinRaftCluster(SlotCache.Opts)
@@ -147,6 +184,58 @@ func newRcache() *rcache.Cached {
 	SlotCache.HttpServer = httpServer
 
 	go func() {
+		getServerID := func(unknown interface{}) (retType, ServerID string) {
+			confLogger.Println("######################", reflect.TypeOf(unknown))
+			switch unknown := unknown.(type) {
+			case raft.FailedHeartbeatObservation:
+				return "FailedHeartbeatObservation", string(unknown.PeerID)
+			case raft.ResumedHeartbeatObservation:
+				return "ResumedHeartbeatObservation", string(unknown.PeerID)
+			case raft.PeerObservation:
+				return "PeerObservation", string(unknown.Peer.ID)
+			default:
+				return "unknown", ""
+			}
+		}
+
+		handlerObserver := func(retType, serverID string) {
+			if retType != "ResumedHeartbeatObservation" && retType != "FailedHeartbeatObservation" && retType != "PeerObservation" {
+				return
+			}
+			key := "cluster_slots_stable_instances"
+			val := SlotCache.CM.Get("backup_target_map_" + serverID)
+			failedNodeBackupMap := strings.Split(val, ",")
+			if len(failedNodeBackupMap) != 2 {
+				confLogger.Println("failedNodeBackupMap error:", failedNodeBackupMap)
+				return
+			}
+			val = SlotCache.CM.Get(key)
+			stableInstances := strings.Split(val, ",")
+
+			if retType == "FailedHeartbeatObservation" {
+				stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[0], failedNodeBackupMap[1])
+			} else {
+				stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[1], failedNodeBackupMap[0])
+			}
+
+			clusterInstaces := strings.Join(stableInstances, ",")
+			if val == clusterInstaces {
+				confLogger.Printf("%s %s don't need update", retType, serverID)
+				return
+			}
+			event := rtypes.RaftLogEntryData{Key: key, Value: clusterInstaces}
+			eventBytes, err := json.Marshal(event)
+			if err != nil {
+				confLogger.Printf("json.Marshal failed, err:%v", err)
+				return
+			}
+			applyFuture := SlotCache.Raft.Raft.Apply(eventBytes, 5*time.Second)
+			if err := applyFuture.Error(); err != nil {
+				confLogger.Printf("raft.Apply failed:%v", err)
+			}
+			confLogger.Printf("%s %s done", retType, serverID)
+		}
+
 		for {
 			select {
 			case leader := <-SlotCache.Raft.LeaderNotifyCh:
@@ -157,6 +246,9 @@ func newRcache() *rcache.Cached {
 					SlotCache.Log.Println("become follower, close write api")
 					SlotCache.HttpServer.SetWriteFlag(false)
 				}
+			case observer := <-SlotCache.Raft.ObserverChan:
+				retType, serverID := getServerID(observer.Data)
+				handlerObserver(retType, serverID)
 			}
 		}
 	}()
@@ -187,39 +279,67 @@ func NewRDB() *RDB {
 
 	Server := newDB(conf.Content.Bind, conf.Content.StorePath, conf.Content.MonitorAddr, "normal")
 	var BackupServer *DB
-	if conf.Content.BackupTarget != "" {
+	if conf.Content.BackupBind != "" {
 		BackupServer = newDB(conf.Content.BackupBind, conf.Content.BackupStorePath, conf.Content.BackupMonitorAddr, "backup")
 	}
+
+	go func() {
+		raftApply := func(key, value string) {
+			event := rtypes.RaftLogEntryData{Key: key, Value: value}
+			eventBytes, err := json.Marshal(event)
+			if err != nil {
+				confLogger.Fatalln("raft Write backup_target_map failed")
+			}
+			applyFuture := RCache.Raft.Raft.Apply(eventBytes, 5*time.Second)
+			if err := applyFuture.Error(); err != nil {
+				confLogger.Fatalf("raft.Apply backup_target_map failed:%v\n", err)
+			}
+		}
+		for {
+			backupMap := RCache.CM.Get("backup_target_map_init")
+			allowIPs := RCache.CM.Get("allow_ip_list_init")
+			if conf.Content.BackupTargetMap != nil && RCache.Raft.Raft.Leader() == raft.ServerAddress(conf.Content.RaftTCPAddress) {
+				if backupMap == "" {
+					for k, vMap := range conf.Content.BackupTargetMap {
+						raftApply("backup_target_map_"+k, vMap["src"]+","+vMap["target"])
+					}
+					raftApply("backup_target_map_init", "done")
+				}
+				if allowIPs == "" {
+					for _, item := range conf.Content.IPList {
+						raftApply("allow_ip_"+item, "on")
+					}
+					raftApply("allow_ip_list_init", "done")
+				}
+			}
+			if backupMap != "" && allowIPs != "" {
+				confLogger.Println("init backup_target_map && allowIPs done.")
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}()
 
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
+		stableIntances := ""
 		for range ticker.C {
-			instances := RCache.CM.Get("cluster_slots_stable_instances")
-			addrs := strings.Split(instances, ",")
-			if instances != "" || (len(addrs)%2 != 0 && addrs[0] != "") {
-				conf.Content.ClusterReady = true
-				conf.Content.StableAddrs = addrs
-				conf.Content.PerNodeslots = 16384 / len(addrs)
-			} else {
-				conf.Content.ClusterReady = false
+			instances = RCache.CM.Get("cluster_slots_stable_instances")
+			if stableIntances != instances {
+				addrs := strings.Split(instances, ",")
+				stableIntances = instances
+				if instances != "" || (len(addrs)%2 != 0 && addrs[0] != "") {
+					conf.Content.ClusterReady = true
+					conf.Content.StableAddrs = addrs
+					conf.Content.PerNodeslots = 16384 / len(addrs)
+				} else {
+					conf.Content.ClusterReady = false
+				}
 			}
 		}
 	}()
 
-	// go func() {
-	// 	ticker := time.NewTicker(3 * time.Second)
-	// 	defer ticker.Stop()
-
-	// 	for range ticker.C {
-	// 		instances := RCache.CM.Get("cluster_slots_backup_instances")
-	// 		addrs := strings.Split(instances, ",")
-	// 		if instances != "" {
-	// 			conf.Content.ClusterReady = true
-	// 			conf.Content.BackupAddrs = addrs
-	// 		}
-	// 	}
-	// }()
 	return &RDB{RCache: RCache, Server: Server, BackupServer: BackupServer}
 }

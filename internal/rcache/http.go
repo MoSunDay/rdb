@@ -37,7 +37,7 @@ func NewHttpServer(ctx *CachedContext, log *log.Logger) *HttpServer {
 	}
 
 	// Mux.HandleFunc("/set", s.doSet)
-	// Mux.HandleFunc("/get", s.doGet)
+	Mux.HandleFunc("/get", s.doGet)
 	Mux.HandleFunc("/join", s.doJoin)
 	Mux.HandleFunc("/depart", s.doDepart)
 	// Mux.HandleFunc("/info", s.doInfo)
@@ -59,7 +59,7 @@ func (h *HttpServer) SetWriteFlag(flag bool) {
 
 func (h *HttpServer) doGet(w http.ResponseWriter, r *http.Request) {
 	vars := r.URL.Query()
-
+	ret := ""
 	key := vars.Get("key")
 	if key == "" {
 		h.Log.Println("doGet() error, get nil key")
@@ -67,7 +67,10 @@ func (h *HttpServer) doGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ret := h.Ctx.Cache.CM.Get(key)
+	if r.URL.Query().Get("raft-token") == h.Ctx.Cache.Opts.RaftToken {
+		ret = h.Ctx.Cache.CM.Get(key)
+	}
+
 	fmt.Fprintf(w, "%s\n", ret)
 }
 
