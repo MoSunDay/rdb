@@ -11,8 +11,8 @@
 7. - [x] 接入 `Prometheus metrics`
 8. - [x] 支持简单的 `HA`
 9. - [x] 支持简单的数据迁移
-10. - [x] 支持无损数据迁移
-11. - [x] 支持 `Raft` 与 `Redis Client` 的身份验证
+10. - [x] 支持 `Raft` 与 `Redis Client` 的身份验证
+11. - [] 支持无损数据迁移
 12. - [] 进一步的性能优化
 
 #### Benchmark
