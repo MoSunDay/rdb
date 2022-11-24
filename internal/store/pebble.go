@@ -4,6 +4,8 @@ import (
 	"rdb/internal/utils"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/sstable"
 )
 
 type Pebble struct {
@@ -11,7 +13,14 @@ type Pebble struct {
 }
 
 func OpenPebble(path string) (*Pebble, error) {
-	db, err := pebble.Open(path, &pebble.Options{})
+
+	option := &pebble.Options{}
+	option.EnsureDefaults()
+	for i := range option.Levels {
+		option.Levels[i].Compression = sstable.NoCompression
+		option.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+	}
+	db, err := pebble.Open(path, option)
 
 	if err != nil {
 		return nil, err
