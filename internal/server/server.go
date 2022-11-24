@@ -86,6 +86,8 @@ func newDB(bind, storePath, mode string) *DB {
 							} else {
 								isMoved = "true"
 								conn.WriteError(fmt.Sprintf("MOVED %d %s", slotNumber, addr))
+								endTime := conf.Content.Sentinel.RTime
+								conf.Content.Monitor.Latency.WithLabelValues(mode, firstCmd, isMoved).Observe(float64(endTime - startTime))
 								return
 							}
 						}
