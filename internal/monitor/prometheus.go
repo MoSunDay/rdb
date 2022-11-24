@@ -42,7 +42,7 @@ func (c *CustomCollector) ListenAndServe(bind string) {
 	go func() {
 		confLogger.Println("init monitor...")
 		prometheus.MustRegister(c.Latency)
-		// prometheus.MustRegister(c.RaftStatus)
+		prometheus.MustRegister(c.RaftStatus)
 
 		http.Handle("/metrics", promhttp.Handler())
 		log.Fatal(http.ListenAndServe(bind, nil))

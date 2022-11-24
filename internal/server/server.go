@@ -36,7 +36,7 @@ type RDB struct {
 	RCache       *rcache.Cached
 }
 
-func newDB(bind, storePath, monitorAddr, mode string) *DB {
+func newDB(bind, storePath, mode string) *DB {
 	confLogger.Println("start pebble")
 	host := bind
 	db, err := store.OpenPebble(filepath.Join(storePath, host))
@@ -48,6 +48,7 @@ func newDB(bind, storePath, monitorAddr, mode string) *DB {
 	confLogger.Println("start server bind:", host)
 	KV := redcon.NewServer(
 		host,
+		conf.Content.RaftToken,
 		func(conn redcon.Conn, cmd redcon.Command) {
 			defer (func() {
 				if err := recover(); err != nil {
@@ -56,7 +57,7 @@ func newDB(bind, storePath, monitorAddr, mode string) *DB {
 			})()
 			startTime := conf.Content.Sentinel.RTime
 			isMoved := "false"
-			firstCmd := strings.ToLower(string(cmd.Args[0]))
+			firstCmd := strings.ToLower(utils.BytesToString(cmd.Args[0]))
 			var prefixKey []byte
 
 			if fn, ok := command.CommandHander[firstCmd]; ok {
@@ -97,51 +98,17 @@ func newDB(bind, storePath, monitorAddr, mode string) *DB {
 					PrefixKey: prefixKey,
 					Args:      cmdArgsList,
 				})
+
 				endTime := conf.Content.Sentinel.RTime
 				conf.Content.Monitor.Latency.WithLabelValues(mode, firstCmd, isMoved).Observe(float64(endTime - startTime))
 			} else {
 				conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
 			}
-
 		},
 		func(conn redcon.Conn) bool {
-			addr := conn.RemoteAddr()
-			confLogger.Printf("accept: %s", addr)
-
-			portIndex := strings.Index(addr, ":")
-			confLogger.Println("allow_ip_" + addr[0:portIndex])
-			val := conf.Content.CRaft.CM.Get("allow_ip_" + addr[0:portIndex])
-			if val != "" {
-				return true
-			}
-
-			reader := redcon.NewReader(conn.NetConn())
-			writer := redcon.NewWriter(conn.NetConn())
-
-			command, err := reader.ReadCommand()
-			if err != nil {
-				confLogger.Println("reader.ReadCommand() err:", err)
-				writer.WriteError("ERR NOAUTH")
-				writer.Flush()
-				return false
-			}
-			if len(command.Args) < 1 {
-				confLogger.Println("len(command.Args) < 1")
-				writer.WriteError("ERR NOAUTH")
-				writer.Flush()
-				return false
-			}
-			if utils.BytesToString(command.Args[0]) == "AUTH" && utils.BytesToString(command.Args[1]) == conf.Content.RaftToken {
-				writer.WriteString("OK")
-				writer.Flush()
-				return true
-			}
-			writer.WriteError("ERR NOAUTH")
-			writer.Flush()
-			return false
+			return true
 		},
 		func(conn redcon.Conn, err error) {
-			confLogger.Printf("closed: %s, err: %v", conn.RemoteAddr(), err)
 		},
 	)
 	return &DB{KV: KV}
@@ -277,10 +244,10 @@ func NewRDB() *RDB {
 	}
 	conf.Content.CRaft = RCache
 
-	Server := newDB(conf.Content.Bind, conf.Content.StorePath, conf.Content.MonitorAddr, "normal")
+	Server := newDB(conf.Content.Bind, conf.Content.StorePath, "normal")
 	var BackupServer *DB
 	if conf.Content.BackupBind != "" {
-		BackupServer = newDB(conf.Content.BackupBind, conf.Content.BackupStorePath, conf.Content.BackupMonitorAddr, "backup")
+		BackupServer = newDB(conf.Content.BackupBind, conf.Content.BackupStorePath, "backup")
 	}
 
 	go func() {
