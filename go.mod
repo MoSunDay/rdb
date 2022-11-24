@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/MoSunDay/concurrent-map v0.0.0-20191203013645-5995e9c56ca5
-	github.com/MoSunDay/redcon v1.2.4
+	github.com/MoSunDay/redcon v1.2.6
 	github.com/cockroachdb/pebble v0.0.0-20220708173837-d3484a60444e
 	github.com/hashicorp/go-hclog v1.2.1
 	github.com/hashicorp/raft v1.3.9
