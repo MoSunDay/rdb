@@ -1,5 +1,9 @@
 #!/bin/sh
-kill $(pidof rdb_debug)
+
+set -e
+
+kill $(pidof rdb_debug) || echo $?
+
 go build -o rdb_debug cmd/rdb/main.go 
 export RAFT_BOOTSTRAP=true;
 ./rdb_debug -config config/conf_32681.yaml &

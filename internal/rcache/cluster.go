@@ -57,7 +57,7 @@ func NewRaftNode(opts *options, ctx *CachedContext) (*RaftNodeInfo, error) {
 		TimeFormat: `2006/01/02 15:04:05`,
 	})
 	RaftConfig.SnapshotInterval = 30 * time.Second
-	RaftConfig.SnapshotThreshold = 2
+	RaftConfig.SnapshotThreshold = 1
 	LeaderNotifyCh := make(chan bool, 1)
 	RaftConfig.NotifyCh = LeaderNotifyCh
 
