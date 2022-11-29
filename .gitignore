@@ -4,3 +4,5 @@ main
 test.go
 rdb
 rdb_debug
+scrtips/auto_config/output
+scrtips/auto_install.sh

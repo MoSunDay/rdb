@@ -34,6 +34,7 @@ type RaftNodeInfo struct {
 	Observer       *raft.Observer
 	ObserverChan   chan raft.Observation
 	LeaderNotifyCh chan bool
+	Transport      *raft.NetworkTransport
 }
 
 func newRaftTransport(opts *options) (*raft.NetworkTransport, error) {
@@ -113,16 +114,12 @@ func NewRaftNode(opts *options, ctx *CachedContext) (*RaftNodeInfo, error) {
 		switch data.(type) {
 		case raft.FailedHeartbeatObservation:
 			return true
-		case raft.ResumedHeartbeatObservation:
-			return true
-		case raft.PeerObservation:
-			return true
 		default:
 			return false
 		}
 	})
 	RaftNode.RegisterObserver(observer)
-	return &RaftNodeInfo{Raft: RaftNode, Fsm: Fsm, LeaderNotifyCh: LeaderNotifyCh, Observer: observer, ObserverChan: obsChan}, nil
+	return &RaftNodeInfo{Raft: RaftNode, Fsm: Fsm, LeaderNotifyCh: LeaderNotifyCh, Observer: observer, ObserverChan: obsChan, Transport: transport}, nil
 }
 
 func JoinRaftCluster(opts *options) error {
