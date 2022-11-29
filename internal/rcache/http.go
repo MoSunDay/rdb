@@ -1,14 +1,10 @@
 package rcache
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"rdb/internal/rtypes"
-	"rdb/internal/utils"
 	"sync/atomic"
-	"time"
 
 	"github.com/hashicorp/raft"
 )
@@ -74,39 +70,6 @@ func (h *HttpServer) doGet(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s\n", ret)
 }
 
-func (h *HttpServer) doSet(w http.ResponseWriter, r *http.Request) {
-	if !h.checkWritePermission() {
-		fmt.Fprint(w, "write method not allowed\n")
-		return
-	}
-	vars := r.URL.Query()
-
-	key := vars.Get("key")
-	value := vars.Get("value")
-	if key == "" || value == "" {
-		h.Log.Println("doSet() error, get nil key or nil value")
-		fmt.Fprint(w, "param error\n")
-		return
-	}
-
-	event := rtypes.RaftLogEntryData{Key: key, Value: value}
-	eventBytes, err := json.Marshal(event)
-	if err != nil {
-		h.Log.Printf("json.Marshal failed, err:%v", err)
-		fmt.Fprint(w, "internal error\n")
-		return
-	}
-
-	applyFuture := h.Ctx.Cache.Raft.Raft.Apply(eventBytes, 5*time.Second)
-	if err := applyFuture.Error(); err != nil {
-		h.Log.Printf("raft.Apply failed:%v", err)
-		fmt.Fprint(w, "internal error\n")
-		return
-	}
-
-	fmt.Fprintf(w, "ok\n")
-}
-
 func (h *HttpServer) doJoin(w http.ResponseWriter, r *http.Request) {
 	vars := r.URL.Query()
 
@@ -149,21 +112,4 @@ func (h *HttpServer) doDepart(w http.ResponseWriter, r *http.Request) {
 		log.Println("join cluster failed")
 	}
 	fmt.Fprint(w, "ok")
-}
-
-func (h *HttpServer) doInfo(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "%+v\nlast_index: %d\n", h.Ctx.Cache.Raft.Raft.Stats(), h.Ctx.Cache.Raft.Raft.LastIndex())
-}
-
-func (h *HttpServer) doHash(w http.ResponseWriter, r *http.Request) {
-	vars := r.URL.Query()
-
-	key := vars.Get("key")
-	if key == "" {
-		h.Log.Println("doHash() error, get nil key")
-		fmt.Fprint(w, "")
-		return
-	}
-
-	fmt.Fprintf(w, "key: %s, slot: %d\n", key, utils.GetSlotNumber([]byte(key)))
 }
