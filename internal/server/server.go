@@ -158,6 +158,7 @@ func newRCache() *rcache.Cached {
 		}
 		key := "cluster_slots_stable_instances"
 		val := RCache.CM.Get("backup_target_map_" + serverID)
+
 		failedNodeBackupMap := strings.Split(val, ",")
 		if len(failedNodeBackupMap) != 2 {
 			confLogger.Println("failedNodeBackupMap error:", failedNodeBackupMap)
@@ -173,7 +174,6 @@ func newRCache() *rcache.Cached {
 		}
 
 		clusterInstances := strings.Join(stableInstances, ",")
-		confLogger.Println(clusterInstances, val)
 		if val == clusterInstances {
 			confLogger.Printf("%s %s don't need update", retType, serverID)
 			return
