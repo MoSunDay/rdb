@@ -165,11 +165,16 @@ func newRCache() *rcache.Cached {
 			return
 		}
 		val = RCache.CM.Get(key)
-		stableInstances := strings.Split(val, ",")
 
+		var stableInstances []string
 		if retType == "FailedHeartbeatObservation" {
+			stableInstances = strings.Split(val, ",")
 			stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[0], failedNodeBackupMap[1])
 		} else {
+			if strings.Contains(val, failedNodeBackupMap[0]) {
+				return
+			}
+			stableInstances = strings.Split(val, ",")
 			stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[1], failedNodeBackupMap[0])
 		}
 

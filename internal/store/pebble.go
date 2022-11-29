@@ -91,3 +91,27 @@ func (pdb *Pebble) Del(prefix, key []byte) error {
 	pdb.db.Delete(item, pebble.Sync)
 	return nil
 }
+
+func (pdb *Pebble) Iter(prefix []byte) *pebble.Iterator {
+	keyUpperBound := func(b []byte) []byte {
+		end := make([]byte, len(b))
+		copy(end, b)
+		for i := len(end) - 1; i >= 0; i-- {
+			end[i] = end[i] + 1
+			if end[i] != 0 {
+				return end[:i+1]
+			}
+		}
+		return nil // no upper-bound
+	}
+	prefixIterOptions := func(prefix []byte) *pebble.IterOptions {
+		return &pebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: keyUpperBound(prefix),
+		}
+	}
+	return pdb.db.NewIter(prefixIterOptions(prefix))
+	// for iter.First(); iter.Valid(); iter.Next() {
+	// 	log.Printf("%s\n", iter.Key())
+	// }
+}
