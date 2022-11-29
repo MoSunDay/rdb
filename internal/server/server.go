@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,7 +117,7 @@ func newDB(bind, storePath, mode string) *DB {
 	return &DB{KV: KV}
 }
 
-func newRcache() *rcache.Cached {
+func newRCache() *rcache.Cached {
 	opts := rcache.NewOptions()
 	opts.DataDir = conf.Content.StorePath + "/" + conf.Content.Bind + "/raft"
 	opts.HttpAddress = conf.Content.HttpAddress
@@ -129,28 +130,114 @@ func newRcache() *rcache.Cached {
 
 	opts.RaftTCPAddress = conf.Content.RaftTCPAddress
 	opts.RaftToken = conf.Content.RaftToken
-	SlotCache := &rcache.Cached{
+	RCache := &rcache.Cached{
 		Opts: opts,
 		Log:  confLogger,
 		CM:   rcache.NewCacheManager(),
 	}
 
-	ctx := &rcache.CachedContext{SlotCache}
-	raftInstance, err := rcache.NewRaftNode(SlotCache.Opts, ctx)
+	ctx := &rcache.CachedContext{RCache}
+	raftInstance, err := rcache.NewRaftNode(RCache.Opts, ctx)
 	if err != nil {
-		SlotCache.Log.Fatal(fmt.Sprintf("new raft node failed:%v", err))
+		RCache.Log.Fatal(fmt.Sprintf("new raft node failed:%v", err))
 	}
-	SlotCache.Raft = raftInstance
+	RCache.Raft = raftInstance
 
-	if SlotCache.Opts.JoinAddress != "" {
-		err = rcache.JoinRaftCluster(SlotCache.Opts)
+	if RCache.Opts.JoinAddress != "" {
+		err = rcache.JoinRaftCluster(RCache.Opts)
 		if err != nil {
-			SlotCache.Log.Fatal(fmt.Sprintf("join raft cluster failed:%v", err))
+			RCache.Log.Fatal(fmt.Sprintf("join raft cluster failed:%v", err))
 		}
 	}
 
 	httpServer := rcache.NewHttpServer(ctx, confLogger)
-	SlotCache.HttpServer = httpServer
+	RCache.HttpServer = httpServer
+	handlerObserver := func(retType, serverID string) {
+		if retType != "ResumedHeartbeatObservation" && retType != "FailedHeartbeatObservation" {
+			return
+		}
+		key := "cluster_slots_stable_instances"
+		val := RCache.CM.Get("backup_target_map_" + serverID)
+		failedNodeBackupMap := strings.Split(val, ",")
+		if len(failedNodeBackupMap) != 2 {
+			confLogger.Println("failedNodeBackupMap error:", failedNodeBackupMap)
+			return
+		}
+		val = RCache.CM.Get(key)
+		stableInstances := strings.Split(val, ",")
+
+		if retType == "FailedHeartbeatObservation" {
+			stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[0], failedNodeBackupMap[1])
+		} else {
+			stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[1], failedNodeBackupMap[0])
+		}
+
+		clusterInstances := strings.Join(stableInstances, ",")
+		confLogger.Println(clusterInstances, val)
+		if val == clusterInstances {
+			confLogger.Printf("%s %s don't need update", retType, serverID)
+			return
+		}
+		event := rtypes.RaftLogEntryData{Key: key, Value: clusterInstances}
+		eventBytes, err := json.Marshal(event)
+		if err != nil {
+			confLogger.Printf("json.Marshal failed, err:%v", err)
+			return
+		}
+		applyFuture := RCache.Raft.Raft.Apply(eventBytes, 5*time.Second)
+		if err := applyFuture.Error(); err != nil {
+			confLogger.Printf("raft.Apply failed:%v", err)
+		}
+		confLogger.Printf("%s %s done", retType, serverID)
+	}
+
+	go func() {
+		Raft := raftInstance.Raft
+		addr := raft.ServerAddress(conf.Content.RaftTCPAddress)
+		transport := raftInstance.Transport
+
+		for {
+			time.Sleep(5 * time.Second)
+			if !conf.Content.ClusterReady {
+				continue
+			}
+			leader := Raft.Leader()
+			if conf.Content.ClusterReady && leader == addr {
+				feature := Raft.VerifyLeader()
+				if err := feature.Error(); err != nil {
+					confLogger.Fatalf("Raft.VerifyLeader() err:%v\n", err)
+					continue
+				}
+				term, err := strconv.ParseUint(Raft.Stats()["term"], 10, 64)
+				if err != nil {
+					confLogger.Println("term, err := strconv.Atoi(Raft.Stats()[term]), err:", err)
+					continue
+				}
+				serverID, serverAddress := raft.ServerID(leader), raft.ServerAddress(leader)
+				config := Raft.GetConfiguration()
+				for _, peer := range config.Configuration().Servers {
+					if peer.ID == raft.ServerID(addr) {
+						continue
+					}
+					req := raft.AppendEntriesRequest{
+						RPCHeader: raft.RPCHeader{
+							ProtocolVersion: raft.DefaultConfig().ProtocolVersion,
+							ID:              []byte(leader),
+							Addr:            transport.EncodePeer(serverID, serverAddress),
+						},
+						Term:   term,
+						Leader: transport.EncodePeer(serverID, serverAddress),
+					}
+					var resp raft.AppendEntriesResponse
+					if err := transport.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
+						confLogger.Println("rcache heartbeat failed err:", err)
+					} else {
+						handlerObserver("ResumedHeartbeatObservation", string(peer.ID))
+					}
+				}
+			}
+		}
+	}()
 
 	go func() {
 		getServerID := func(unknown interface{}) (retType, ServerID string) {
@@ -158,64 +245,21 @@ func newRcache() *rcache.Cached {
 			switch unknown := unknown.(type) {
 			case raft.FailedHeartbeatObservation:
 				return "FailedHeartbeatObservation", string(unknown.PeerID)
-			case raft.ResumedHeartbeatObservation:
-				return "ResumedHeartbeatObservation", string(unknown.PeerID)
-			case raft.PeerObservation:
-				return "PeerObservation", string(unknown.Peer.ID)
 			default:
 				return "unknown", ""
 			}
 		}
-
-		handlerObserver := func(retType, serverID string) {
-			if retType != "ResumedHeartbeatObservation" && retType != "FailedHeartbeatObservation" && retType != "PeerObservation" {
-				return
-			}
-			key := "cluster_slots_stable_instances"
-			val := SlotCache.CM.Get("backup_target_map_" + serverID)
-			failedNodeBackupMap := strings.Split(val, ",")
-			if len(failedNodeBackupMap) != 2 {
-				confLogger.Println("failedNodeBackupMap error:", failedNodeBackupMap)
-				return
-			}
-			val = SlotCache.CM.Get(key)
-			stableInstances := strings.Split(val, ",")
-
-			if retType == "FailedHeartbeatObservation" {
-				stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[0], failedNodeBackupMap[1])
-			} else {
-				stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[1], failedNodeBackupMap[0])
-			}
-
-			clusterInstaces := strings.Join(stableInstances, ",")
-			if val == clusterInstaces {
-				confLogger.Printf("%s %s don't need update", retType, serverID)
-				return
-			}
-			event := rtypes.RaftLogEntryData{Key: key, Value: clusterInstaces}
-			eventBytes, err := json.Marshal(event)
-			if err != nil {
-				confLogger.Printf("json.Marshal failed, err:%v", err)
-				return
-			}
-			applyFuture := SlotCache.Raft.Raft.Apply(eventBytes, 5*time.Second)
-			if err := applyFuture.Error(); err != nil {
-				confLogger.Printf("raft.Apply failed:%v", err)
-			}
-			confLogger.Printf("%s %s done", retType, serverID)
-		}
-
 		for {
 			select {
-			case leader := <-SlotCache.Raft.LeaderNotifyCh:
+			case leader := <-RCache.Raft.LeaderNotifyCh:
 				if leader {
-					SlotCache.Log.Println("become leader, enable write api")
-					SlotCache.HttpServer.SetWriteFlag(true)
+					RCache.Log.Println("become leader, enable write api")
+					RCache.HttpServer.SetWriteFlag(true)
 				} else {
-					SlotCache.Log.Println("become follower, close write api")
-					SlotCache.HttpServer.SetWriteFlag(false)
+					RCache.Log.Println("become follower, close write api")
+					RCache.HttpServer.SetWriteFlag(false)
 				}
-			case observer := <-SlotCache.Raft.ObserverChan:
+			case observer := <-RCache.Raft.ObserverChan:
 				retType, serverID := getServerID(observer.Data)
 				handlerObserver(retType, serverID)
 			}
@@ -225,19 +269,19 @@ func newRcache() *rcache.Cached {
 	go func() {
 		var l net.Listener
 		var err error
-		l, err = net.Listen("tcp", SlotCache.Opts.HttpAddress)
+		l, err = net.Listen("tcp", RCache.Opts.HttpAddress)
 		if err != nil {
-			confLogger.Fatal(fmt.Sprintf("listen %s failed: %s", SlotCache.Opts.HttpAddress, err))
+			confLogger.Fatal(fmt.Sprintf("listen %s failed: %s", RCache.Opts.HttpAddress, err))
 		}
 		confLogger.Printf("http server listen:%s", l.Addr())
 		http.Serve(l, httpServer.Mux)
 	}()
 
-	return SlotCache
+	return RCache
 }
 
 func NewRDB() *RDB {
-	RCache := newRcache()
+	RCache := newRCache()
 	instances := RCache.CM.Get("cluster_slots_stable_instances")
 	if instances != "" || len(instances)%2 != 0 {
 		conf.Content.ClusterReady = true
@@ -266,7 +310,6 @@ func NewRDB() *RDB {
 		}
 		for {
 			backupMap := RCache.CM.Get("backup_target_map_init")
-			allowIPs := RCache.CM.Get("allow_ip_list_init")
 			if conf.Content.BackupTargetMap != nil && RCache.Raft.Raft.Leader() == raft.ServerAddress(conf.Content.RaftTCPAddress) {
 				if backupMap == "" {
 					for k, vMap := range conf.Content.BackupTargetMap {
@@ -274,15 +317,9 @@ func NewRDB() *RDB {
 					}
 					raftApply("backup_target_map_init", "done")
 				}
-				if allowIPs == "" {
-					for _, item := range conf.Content.IPList {
-						raftApply("allow_ip_"+item, "on")
-					}
-					raftApply("allow_ip_list_init", "done")
-				}
 			}
-			if backupMap != "" && allowIPs != "" {
-				confLogger.Println("init backup_target_map && allowIPs done.")
+			if backupMap != "" {
+				confLogger.Println("init backup_target_map done.")
 				return
 			}
 			time.Sleep(1 * time.Second)
@@ -293,12 +330,12 @@ func NewRDB() *RDB {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
-		stableIntances := ""
+		stableInstances := ""
 		for range ticker.C {
 			instances = RCache.CM.Get("cluster_slots_stable_instances")
-			if stableIntances != instances {
+			if stableInstances != instances {
 				addrs := strings.Split(instances, ",")
-				stableIntances = instances
+				stableInstances = instances
 				if instances != "" || (len(addrs)%2 != 0 && addrs[0] != "") {
 					conf.Content.ClusterReady = true
 					conf.Content.StableAddrs = addrs
