@@ -17,7 +17,6 @@ func OpenPebble(path string) (*Pebble, error) {
 	option := &pebble.Options{}
 	option.EnsureDefaults()
 	for i := range option.Levels {
-		option.Levels[i].Compression = sstable.NoCompression
 		option.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
 	}
 	db, err := pebble.Open(path, option)
