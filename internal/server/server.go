@@ -207,12 +207,14 @@ func newRCache() *rcache.Cached {
 				continue
 			}
 			leader := Raft.Leader()
-			if conf.Content.ClusterReady && leader == addr {
-				feature := Raft.VerifyLeader()
-				if err := feature.Error(); err != nil {
-					confLogger.Fatalf("Raft.VerifyLeader() err:%v\n", err)
-					continue
-				}
+			if leader != addr {
+				continue
+			}
+			feature := Raft.VerifyLeader()
+			if err := feature.Error(); err != nil {
+				confLogger.Println("Raft.VerifyLeader() err:", err)
+				continue
+			} else {
 				term, err := strconv.ParseUint(Raft.Stats()["term"], 10, 64)
 				if err != nil {
 					confLogger.Println("term, err := strconv.Atoi(Raft.Stats()[term]), err:", err)
@@ -243,7 +245,6 @@ func newRCache() *rcache.Cached {
 			}
 		}
 	}()
-
 	go func() {
 		getServerID := func(unknown interface{}) (retType, ServerID string) {
 			confLogger.Println("######################", reflect.TypeOf(unknown))
