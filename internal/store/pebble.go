@@ -14,7 +14,13 @@ type Pebble struct {
 
 func OpenPebble(path string) (*Pebble, error) {
 
-	db, err := pebble.Open(path, &pebble.Options{})
+
+	option := &pebble.Options{}
+	option.EnsureDefaults()
+	for i := range option.Levels {
+		option.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+	}
+	db, err := pebble.Open(path, option)
 
 	if err != nil {
 		return nil, err
