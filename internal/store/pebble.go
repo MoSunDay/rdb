@@ -5,7 +5,6 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
-	"github.com/cockroachdb/pebble/sstable"
 )
 
 type Pebble struct {
