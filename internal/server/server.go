@@ -152,34 +152,10 @@ func newRCache() *rcache.Cached {
 
 	httpServer := rcache.NewHttpServer(ctx, confLogger)
 	RCache.HttpServer = httpServer
-	handlerObserver := func(retType, serverID string) {
-		if retType != "ResumedHeartbeatObservation" && retType != "FailedHeartbeatObservation" {
-			return
-		}
+
+	updateClusterStableSlots := func(clusterInstances, currentInstances, retType, serverID string) {
 		key := "cluster_slots_stable_instances"
-		val := RCache.CM.Get("backup_target_map_" + serverID)
-
-		failedNodeBackupMap := strings.Split(val, ",")
-		if len(failedNodeBackupMap) != 2 {
-			confLogger.Println("failedNodeBackupMap error:", failedNodeBackupMap)
-			return
-		}
-		val = RCache.CM.Get(key)
-
-		var stableInstances []string
-		if retType == "FailedHeartbeatObservation" {
-			stableInstances = strings.Split(val, ",")
-			stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[0], failedNodeBackupMap[1])
-		} else {
-			if strings.Contains(val, failedNodeBackupMap[0]) {
-				return
-			}
-			stableInstances = strings.Split(val, ",")
-			stableInstances = utils.StringSliceReplaceItem(stableInstances, failedNodeBackupMap[1], failedNodeBackupMap[0])
-		}
-
-		clusterInstances := strings.Join(stableInstances, ",")
-		if val == clusterInstances {
+		if currentInstances == clusterInstances {
 			confLogger.Printf("%s %s don't need update", retType, serverID)
 			return
 		}
@@ -194,6 +170,32 @@ func newRCache() *rcache.Cached {
 			confLogger.Printf("raft.Apply failed:%v", err)
 		}
 		confLogger.Printf("%s %s done", retType, serverID)
+
+	}
+
+	handlerObserver := func(retType, serverID string) {
+		if retType != "ResumedHeartbeatObservation" && retType != "FailedHeartbeatObservation" {
+			return
+		}
+		key := "cluster_slots_stable_instances"
+		val := RCache.CM.Get("backup_target_map_" + serverID)
+
+		failedNodeBackupMap := strings.Split(val, ",")
+		if len(failedNodeBackupMap) != 2 {
+			confLogger.Println("failedNodeBackupMap error:", failedNodeBackupMap)
+			return
+		}
+		val = RCache.CM.Get(key)
+		var clusterInstances string
+		if retType == "FailedHeartbeatObservation" {
+			clusterInstances = strings.ReplaceAll(val, failedNodeBackupMap[0], failedNodeBackupMap[1])
+		} else {
+			if strings.Contains(val, failedNodeBackupMap[0]) {
+				return
+			}
+			clusterInstances = strings.ReplaceAll(val, failedNodeBackupMap[1], failedNodeBackupMap[0])
+		}
+		updateClusterStableSlots(clusterInstances, val, retType, serverID)
 	}
 
 	go func() {
@@ -215,6 +217,15 @@ func newRCache() *rcache.Cached {
 				confLogger.Println("Raft.VerifyLeader() err:", err)
 				continue
 			} else {
+				val := RCache.CM.Get("backup_target_map_" + string(leader))
+				failedNodeBackupMap := strings.Split(val, ",")
+				key := "cluster_slots_stable_instances"
+				val = RCache.CM.Get(key)
+				if strings.Contains(val, failedNodeBackupMap[1]) {
+					clusterInstances := strings.ReplaceAll(val, failedNodeBackupMap[1], failedNodeBackupMap[0])
+					updateClusterStableSlots(clusterInstances, val, "ResumedHeartbeatObservation", failedNodeBackupMap[0])
+				}
+
 				term, err := strconv.ParseUint(Raft.Stats()["term"], 10, 64)
 				if err != nil {
 					confLogger.Println("term, err := strconv.Atoi(Raft.Stats()[term]), err:", err)
