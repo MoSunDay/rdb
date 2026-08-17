@@ -18,7 +18,7 @@ P0/P1（[2026-08-18/rust-import-ds-p0-p1.md](../2026-08-18/rust-import-ds-p0-p1.
 - `zset_remops.rs`：ZREMRANGEBYRANK/SCORE/LEX；`zset_scan.rs`：ZSCAN(±WITHSCORES)；`zsetops_cmd.rs`：ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE（WEIGHTS/AGGREGATE）；`zset_block.rs`：BZPOPMIN/BZPOPMAX（`*3` 应答、超时 `*-1`）。
 
 ### 测试
-- 单测（经注册表 arm 分发，arity/WRONGTYPE/边界）：list 20、zset 31、ds 纯数学 10。
+- 单测（经注册表 arm 分发，arity/WRONGTYPE/边界）：list 20、zset 31、ds 纯数学 9、wait 并发 1（register_shared）。
 - e2e：`tests/list_e2e.rs` 8 用例——生命周期、LREM compaction 正确性、TTL 惰性清理、CROSSSLOT、BLPOP 丢失唤醒回归（`blpop_got_does_not_swallow_next_notify`）、真实进程跨连接唤醒；`tests/zset_e2e.rs` 8 用例——生命周期、边界、代数、TTL、ZSCAN 游标、BZPOPMIN 跨连接唤醒。
 
 ## 验证
