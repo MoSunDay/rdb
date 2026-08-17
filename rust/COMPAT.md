@@ -110,6 +110,31 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     auto-picks a queue.
   - Physical slot prefix is derived from the PARENT topic name (CRC16), so all queues of a
     topic family co-locate and any node serves the family (all Lite verbs route-local).
+- **JSON (P3, json.* verbs)**: single-record storage — one kind-0x10 record per key holds the
+  whole document (LEB128 expire envelope + compact serde_json body, `preserve_order` keeps
+  object key insertion order like Redis). Every mutation deserializes, mutates and re-serializes
+  the full document; there is no sub-document addressing at the storage layer.
+  - Only the legacy RedisJSON v1 deterministic path grammar is supported: root `.` or `$`,
+    `.field`, `['field']`, `[index]` (composable, e.g. `.a[0].b` or `['odd.key'][2]`). Wildcards
+    (`$..`, `[*]`), filters and recursive descent are rejected as `ERR wrong static path`.
+    Legacy paths address exactly one node: reads/mutations on a missing path are `nil`/`0`,
+    never "no match in multi-match" semantics.
+  - `JSON.SET` on a missing key with a non-root path fails like RedisJSON v1 (there is no
+    document to descend into); intermediate object fields are auto-created, but descending
+    through a scalar is `ERR wrong type of path value`. `JSON.SET` at a non-existing *path*
+    inside an existing doc reports `ERR path <path> does not exist` (path embedded, matching
+    RedisJSON v1).
+  - `JSON.GET` with multiple paths returns a flat RESP array of per-path serializations
+    (Redis wraps them in a single synthetic object with legacy paths).
+  - `JSON.ARRPOP` with an out-of-range index errors (`ERR index out of range`) instead of
+    Redis' silent nil; `-1` pops the last element.
+  - `JSON.NUMINCRBY` re-serializes numbers with serde_json's shortest-roundtrip formatting
+    (e.g. `3.5`, `1e20` for overflow magnitudes); integral results below 2^53 are stored as
+    i64, larger or fractional ones as f64. `JSON.TYPE` reports `integer`/`number` accordingly.
+  - `JSON.MGET` aborts the whole command with WRONGTYPE if any key holds a foreign kind
+    (Redis skips such keys).
+  - `JSON.DEL`/`JSON.FORGET` are aliases; a root path drops the kind-0x10 record through the
+    shared expire machinery (TTL index maintained), a sub-path splices the document.
 
 ## Runtime verification (this tree)
 
