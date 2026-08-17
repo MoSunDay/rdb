@@ -1,0 +1,7 @@
+[package]
+name = "rdb-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time", "macros", "io-util"] }
