@@ -11,12 +11,26 @@ pub mod hash_scan;
 pub mod keys;
 pub mod keys_core;
 pub mod keys_scan;
+pub mod list_block;
+pub mod list_cmd;
+pub mod list_move;
+pub mod list_ops;
+pub mod list_rewrite;
 pub mod migrate;
 pub mod raft_cmd;
 pub mod set_cmd;
 pub mod set_scan;
 pub mod setops_cmd;
 pub mod string;
+pub mod zset_block;
+pub mod zset_cmd;
+pub mod zset_pop;
+pub mod zset_range;
+pub mod zset_read;
+pub mod zset_remops;
+pub mod zset_scan;
+pub mod zset_util;
+pub mod zsetops_cmd;
 
 use crate::state;
 
@@ -114,6 +128,61 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "xgroup" => Some(|ctx| Box::pin(crate::lite::group::xgroup(ctx))),
         "xinfo" => Some(|ctx| Box::pin(crate::lite::info::xinfo(ctx))),
         "xpick" => Some(|ctx| Box::pin(crate::lite::info::xpick(ctx))),
+        // List family: blocking pops (list_block), moves + LINSERT/LPOS
+        // (list_move), reads/writes (list_cmd), pops (list_ops) and
+        // LREM/LTRIM rewrites (list_rewrite).
+        "blpop" => Some(|ctx| Box::pin(list_block::blpop(ctx))),
+        "blmove" => Some(|ctx| Box::pin(list_block::blmove(ctx))),
+        "brpop" => Some(|ctx| Box::pin(list_block::brpop(ctx))),
+        "brpoplpush" => Some(|ctx| Box::pin(list_block::brpoplpush(ctx))),
+        "lindex" => Some(|ctx| Box::pin(list_cmd::lindex(ctx))),
+        "linsert" => Some(|ctx| Box::pin(list_move::linsert(ctx))),
+        "llen" => Some(|ctx| Box::pin(list_cmd::llen(ctx))),
+        "lmove" => Some(|ctx| Box::pin(list_move::lmove(ctx))),
+        "lpop" => Some(|ctx| Box::pin(list_ops::lpop(ctx))),
+        "lpos" => Some(|ctx| Box::pin(list_move::lpos(ctx))),
+        "lpush" => Some(|ctx| Box::pin(list_cmd::lpush(ctx))),
+        "lpushx" => Some(|ctx| Box::pin(list_cmd::lpushx(ctx))),
+        "lrange" => Some(|ctx| Box::pin(list_cmd::lrange(ctx))),
+        "lrem" => Some(|ctx| Box::pin(list_rewrite::lrem(ctx))),
+        "lset" => Some(|ctx| Box::pin(list_cmd::lset(ctx))),
+        "ltrim" => Some(|ctx| Box::pin(list_rewrite::ltrim(ctx))),
+        "rpop" => Some(|ctx| Box::pin(list_ops::rpop(ctx))),
+        "rpoplpush" => Some(|ctx| Box::pin(list_move::rpoplpush(ctx))),
+        "rpush" => Some(|ctx| Box::pin(list_cmd::rpush(ctx))),
+        "rpushx" => Some(|ctx| Box::pin(list_cmd::rpushx(ctx))),
+        // Sorted-set family: writes + shared state helpers (zset_cmd),
+        // point reads (zset_read), removals/pops (zset_pop) and the
+        // ZRANGE family (zset_range).
+        "zadd" => Some(|ctx| Box::pin(zset_cmd::zadd(ctx))),
+        "zincrby" => Some(|ctx| Box::pin(zset_cmd::zincrby(ctx))),
+        "zcard" => Some(|ctx| Box::pin(zset_read::zcard(ctx))),
+        "zscore" => Some(|ctx| Box::pin(zset_read::zscore(ctx))),
+        "zmscore" => Some(|ctx| Box::pin(zset_read::zmscore(ctx))),
+        "zcount" => Some(|ctx| Box::pin(zset_read::zcount(ctx))),
+        "zrank" => Some(|ctx| Box::pin(zset_read::zrank(ctx))),
+        "zrevrank" => Some(|ctx| Box::pin(zset_read::zrevrank(ctx))),
+        "zrandmember" => Some(|ctx| Box::pin(zset_read::zrandmember(ctx))),
+        "zrem" => Some(|ctx| Box::pin(zset_pop::zrem(ctx))),
+        "zpopmin" => Some(|ctx| Box::pin(zset_pop::zpopmin(ctx))),
+        "zpopmax" => Some(|ctx| Box::pin(zset_pop::zpopmax(ctx))),
+        "zrange" => Some(|ctx| Box::pin(zset_range::zrange(ctx))),
+        "zrangebyscore" => Some(|ctx| Box::pin(zset_range::zrangebyscore(ctx))),
+        "zrevrangebyscore" => Some(|ctx| Box::pin(zset_range::zrevrangebyscore(ctx))),
+        "zrangebylex" => Some(|ctx| Box::pin(zset_range::zrangebylex(ctx))),
+        "zrevrangebylex" => Some(|ctx| Box::pin(zset_range::zrevrangebylex(ctx))),
+        "zlexcount" => Some(|ctx| Box::pin(zset_range::zlexcount(ctx))),
+        // Range removals (zset_remops), cursor iteration (zset_scan),
+        // multi-key algebra (zsetops_cmd) and blocking pops (zset_block).
+        "zremrangebyrank" => Some(|ctx| Box::pin(zset_remops::zremrangebyrank(ctx))),
+        "zremrangebyscore" => Some(|ctx| Box::pin(zset_remops::zremrangebyscore(ctx))),
+        "zremrangebylex" => Some(|ctx| Box::pin(zset_remops::zremrangebylex(ctx))),
+        "zscan" => Some(|ctx| Box::pin(zset_scan::zscan(ctx))),
+        "zunionstore" => Some(|ctx| Box::pin(zsetops_cmd::zunionstore(ctx))),
+        "zinterstore" => Some(|ctx| Box::pin(zsetops_cmd::zinterstore(ctx))),
+        "zdiffstore" => Some(|ctx| Box::pin(zsetops_cmd::zdiffstore(ctx))),
+        "bzpopmin" => Some(|ctx| Box::pin(zset_block::bzpopmin(ctx))),
+        "bzpopmax" => Some(|ctx| Box::pin(zset_block::bzpopmax(ctx))),
         _ => None,
     }
 }

@@ -12,9 +12,11 @@ pub mod codec;
 pub mod expire;
 pub mod hash_ds;
 pub mod latch;
+pub mod list_ds;
 pub mod set_ds;
 pub mod setops;
 pub mod wait;
+pub mod zset_ds;
 
 pub use codec::{
     family_of, is_user_key_kind, meta_kinds, CodecFamily, HASH_FAMILY, JSON_FAMILY,
@@ -83,3 +85,11 @@ mod tests {
 #[cfg(test)]
 #[path = "codec_tests.rs"]
 mod codec_tests;
+
+#[cfg(test)]
+#[path = "list_ds_tests.rs"]
+mod list_ds_tests;
+
+#[cfg(test)]
+#[path = "zset_ds_tests.rs"]
+mod zset_ds_tests;
