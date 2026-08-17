@@ -3,7 +3,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 
 ## 职责
 - Rust 版 rdb 的完整实现，位于 `rust/`：独立 cargo workspace（`rust/Cargo.toml`，成员 `rust/rdb` 与 `rust/bench`），服务二进制与库同名 `rdb`，压测工具 `rdb-bench`。
-- 数据面：tokio TCP + RESP2 编解码（与 Go 的 redcon fork 字节对齐），命令分发、slot 路由与 `MOVED` 重定向；已支持 string/keys 族/Hash/Set 命令与全类型统一 TTL（`ds/` 基座，七类结构分阶段推进）。
+- 数据面：tokio TCP + RESP2 编解码（与 Go 的 redcon fork 字节对齐），命令分发、slot 路由与 `MOVED` 重定向；已支持 string/keys 族/Hash/Set/List/ZSet 命令（含 BLPOP/BZPOPMIN 等阻塞命令族，经 `ds/wait.rs` WaitHub 唤醒）与全类型统一 TTL（`ds/` 基座，七类结构分阶段推进）。
 - 控制面：openraft 0.9.25 复制集群元数据（实例列表、备份映射、迁移任务），对外提供 HTTP join/depart/get。
 - 存储：RocksDB 持久化，物理 key 带 `<slot>/` 十进制前缀（如 `5465/`，见 `store::slot_prefix`）。
 - 与 Go 实现功能对齐：RESP 数据面与 Raft HTTP API 字节兼容；Raft TCP 线协议不同（openraft JSON 帧 vs hashicorp msgpack），兼容性细节与偏差清单见 `rust/COMPAT.md`。
@@ -80,7 +80,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `raft_cluster_e2e.rs`：bootstrap + HTTP join/depart 的两节点集群；
   - `raft_transport.rs`：双节点复制，覆盖 install-snapshot 路径；
   - `ha_failover.rs`：`backup_target_map` 故障切换与恢复；
-  - `ds_e2e.rs` / `expire_e2e.rs` / `hash_set_e2e.rs`：数据结构 e2e——信封 roundtrip、主动过期采样、EXPIRE 族/TTL 持久化、Hash/Set 全命令生命周期与 CROSSSLOT；
+  - `ds_e2e.rs` / `expire_e2e.rs` / `hash_set_e2e.rs`：数据结构 e2e——信封 roundtrip、主动过期采样、EXPIRE 族/TTL 持久化、Hash/Set 全命令生命周期与 CROSSSLOT；`list_e2e.rs` / `zset_e2e.rs`：List/ZSet 全命令生命周期、LREM compaction、TTL 惰性清理、ZSCAN 游标、BLPOP/BZPOPMIN 跨连接唤醒与超时（含丢失唤醒回归用例）；
   - `lite_e2e.rs`：流命令 e2e；
   - `process_cluster_e2e.rs` / `process_failover_e2e.rs`：进程级 e2e——`CARGO_BIN_EXE_rdb` 拉起真实二进制 + 临时 yaml 组 3 节点集群，断言协议应答原文（`-ERR: NOAUTH`、`-MOVED <slot> <addr>`、kill -9 后新 leader 选主、RocksDB 重启回读），公共工具在 `tests/common/mod.rs`。
 - 集成测试统一用 `tempfile` 临时目录与临时端口（端口 0），无固定端口依赖。
