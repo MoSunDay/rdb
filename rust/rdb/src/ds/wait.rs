@@ -65,6 +65,19 @@ pub fn register(hub: &WaitHub, key: &[u8]) -> Arc<Waiter> {
     waiter
 }
 
+/// Register an EXISTING waiter under `key` — lets one blocking command
+/// park on several keys at once (BLPOP key1..keyN). Same FIFO semantics
+/// as [`register`], which creates and registers in one step.
+pub fn register_shared(hub: &WaitHub, key: &[u8], waiter: &Arc<Waiter>) {
+    let mut map = hub
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.entry(key.to_vec())
+        .or_default()
+        .push_back(Arc::clone(waiter));
+}
+
 /// Signal ONE waiter (the oldest) for `key` and pop it from the queue.
 /// A key with no waiters is a no-op. Returns whether anyone was woken.
 pub fn notify(hub: &WaitHub, key: &[u8]) -> bool {
@@ -141,6 +154,29 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
+
+    #[test]
+    fn shared_waiter_wakes_from_either_registered_key() {
+        let hub = WaitHub::new();
+        let waiter = Arc::new(new_waiter());
+        register_shared(&hub, b"70/k1", &waiter);
+        register_shared(&hub, b"70/k2", &waiter);
+        // notify on EITHER key pops and signals the same waiter
+        assert!(notify(&hub, b"70/k2"));
+        assert_eq!(
+            wait(&waiter, Duration::from_millis(0)),
+            WaitOutcome::Signaled
+        );
+        // idempotent wake: the other key still holds the shared waiter
+        assert!(notify(&hub, b"70/k1"));
+        assert_eq!(
+            wait(&waiter, Duration::from_millis(0)),
+            WaitOutcome::Signaled
+        );
+        // both queues are now drained
+        assert!(!notify(&hub, b"70/k1"));
+        assert!(!notify(&hub, b"70/k2"));
+    }
 
     #[test]
     fn wait_times_out_when_nobody_notifies() {
