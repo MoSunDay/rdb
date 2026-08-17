@@ -1,0 +1,6 @@
+# tokio_unstable enables Builder::disable_lifo_slot, which we MUST call:
+# the multi-thread scheduler's LIFO slot loses task wakeups on this host
+# (all workers park while runnable tasks sit queued; freezes 6s+).
+# See COMPAT.md "tokio LIFO slot freeze" for the full root cause.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

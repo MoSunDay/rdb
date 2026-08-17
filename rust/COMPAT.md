@@ -1,0 +1,102 @@
+# COMPAT.md — Rust `rdb` vs Go `rdb` compatibility notes
+
+The Rust implementation is byte-compatible with the Go implementation on the **RESP data plane**
+and the Raft **HTTP API**. The Raft **TCP wire protocol is intentionally different** (openraft
+JSON framing vs hashicorp msgpack), so Go and Rust nodes cannot join the same raft cluster.
+
+## Critical build requirement (tokio LIFO-slot freeze)
+
+`rust/.cargo/config.toml` sets `rustflags = ["--cfg", "tokio_unstable"]` so that
+`tokio::runtime::Builder::disable_lifo_slot()` in `rdb/src/main.rs` compiles and takes effect.
+
+Why this exists: with the tokio multi_thread runtime's default LIFO slot, this workload suffers
+lost-wakeup freezes (~6s stalls, and multiples thereof) — tokio-rs/tokio#4941 family. Reproduced
+on a fully idle 3-node cluster (followers freeze too), so it is inherent to openraft + LIFO slot
+scheduling, not to write load. Evidence:
+- current_thread runtime: zero freezes over 8+ minutes of hammering.
+- multi_thread + `disable_lifo_slot()`: 2000+ raft writes, 937-write/145s soak, zero slow
+  responses (>1s), zero errors, zero 1s-beacon gaps on any node.
+- HA drill: kill -9 leader → follower elected in ~6s, writes OK, restarted node rejoins and
+  catches up.
+
+If you build the binary without `rust/.cargo/config.toml` in scope (e.g. building from outside
+the `rust/` directory), set `RUSTFLAGS='--cfg tokio_unstable'`. Without the cfg, the code falls
+back to a multi_thread runtime WITH the LIFO slot (freezes return); the escape hatch
+`RDB_CURRENT_THREAD=1` switches to the current_thread runtime, which is freeze-free but
+single-threaded. `RDB_WORKER_THREADS=N` tunes the worker pool size (default: Go's NumCPU
+parity).
+
+## Intentional fixes of Go bugs (byte-incompatible by design)
+
+1. **MSET odd arg count**: Go silently ignored the trailing key; Rust returns an error and
+   stops applying the pair list.
+2. **DEL return value**: Go always returned `:1`; Rust returns the real count (0/1 per key).
+3. **ClusterReady semantics**: Go checks `len(joined_string) > 2`; Rust checks "parsed stable
+   instances list non-empty". Diverges only for a single 1-char instance name (not realistic);
+   otherwise equivalent.
+4. **DBSIZE/Size**: Go counted store entries directly; Rust reads the RocksDB
+   `rocksdb.estimate-num-keys` property (approximate, O(1)).
+
+## Preserved Go quirks (byte-compatible)
+
+- `MGET`/`MSET` route by the **first key only** (all keys go to the first key's node).
+- `cluster test` returns the hardcoded literal `-MOVED 5465 127.0.0.1:32681`.
+- Empty hash tag `{}` hashes to slot 0 (Go `FindHashTag` behavior).
+- Slot range routing uses inclusive upper bound: `slot <= (i+1)*per`, `per = 16384/len`.
+- Single-instance `cluster nodes` reports the full `1-16383` range.
+- `migrate task` overwrites `migrate_task` unconditionally.
+- `/join` with a **wrong** raft token still replies `ok` (token not enforced; parity with Go).
+- `epoch = term + commit_index` concatenated as strings.
+- Cluster-not-ready error text contains the Go typo: `instanes01`.
+- Unknown command reply: `ERR unknown command '<raw-arg-bytes>'` (first arg verbatim).
+- `AUTH` accepts exactly 2 args (`AUTH <token>`), reply `+OK` / `ERR: NOAUTH`.
+- `MOVED <slot> <addr>` redirect format; cross-node requests redirect on the first-key slot.
+- HA peer probe: plain TCP connect with 5s timeout, every 5s; self-recovery guarded by
+  `len(dead)==2`; probe-only (no auto failover writes beyond backup_target_map semantics).
+- Node description format: `<RaftTCPAddress> [<State>]`.
+
+## Intentional deviations (documented, not byte-compatible)
+
+- **Raft wire protocol**: openraft JSON frames with u32 big-endian length prefix over TCP,
+  replacing hashicorp msgpack. Go↔Rust clusters cannot mix; data plane unaffected.
+- **Node IDs**: openraft requires numeric IDs; Rust derives a deterministic u64 from the node
+  address (md5-based, first 16 hex chars). The address remains the human-visible identity in
+  `raft nodes`, membership display, and all logs.
+- **Timers**: heartbeat 500ms / election 1000–2000ms as in Go config; openraft tick granularity
+  is `heartbeat * 3 / 2` = 750ms internally.
+- **Apply wait**: `raft_apply` blocks the caller (std mpsc + 6s timeout) for Go WaitGroup
+  parity; openraft applies asynchronously, typical latency ~ms.
+- **ForwardToLeader mapping**: follower `raft set` maps openraft's `ForwardToLeader` error to
+  the Go string `internal error err: not leader` (variant match, not string sniffing).
+- **Join ordering**: Rust binds RESP + HTTP *before* issuing the join request (so peers can
+  reach this node immediately); Go joins first. Join response must be exactly `ok`, else the
+  process exits (fail-fast, same as Go). Stagger joins (start nodes
+  one at a time, ~3-5s apart): two simultaneous `change_membership` calls race
+  in openraft and one gets `internal error`, exiting that node (retryable). Bootstrap/`RAFT_JOIN_ADDR` semantics are identical,
+  including the silent skip when `RAFT_JOIN_ADDR` is unset on a fresh data dir.
+- **Storage fsync**: RocksDB WAL defaults vs Go pebble/bolt fsync-per-commit — durability
+  windows are comparable but not bit-identical.
+- **Monitor**: Prometheus text format and metric/label names match Go's collector.
+- **Lite Mode (RocketMQ-style, rdb extension)**: parent topics with dynamic per-group queues
+  exposed through Streams-verb commands (XADD/XLEN/XRANGE/XTRIM/XDEL/XIDLE/XREAD/XREADGROUP/
+  XACK/XGROUP/XINFO/XPICK). This is not a Redis Streams emulator:
+  - XREAD/XREADGROUP accept exactly ONE stream (multi-stream syntax is an error).
+  - No PEL: XACK persists the group's committed watermark synchronously (kind-0x0E record,
+    delivered := committed), so a kill -9 restart resumes from the watermark and redelivers
+    only post-watermark entries — at-least-once semantics, not exactly-once.
+  - XIDLE sets a per-stream idle TTL reusing the uniform expire envelope; expiry reaps the
+    whole stream (entries + group state).
+  - XPICK and XINFO TOPICS / XINFO LITE are rdb extensions; a bare parent name in XADD
+    auto-picks a queue.
+  - Physical slot prefix is derived from the PARENT topic name (CRC16), so all queues of a
+    topic family co-locate and any node serves the family (all Lite verbs route-local).
+
+## Runtime verification (this tree)
+
+- Full RESP drill (gate text, cluster init/nodes, MOVED format+routing, hash-tag co-location,
+  set/get/del, raft set/get cross-node, follower write error, unknown command, NOAUTH): all pass.
+- Soak: 937 writes / 145s and 742 writes bursts — 0 slow (>1s), 0 errors, 0 beacon gaps.
+- HA: leader kill -9 → new leader in ~6s → writes commit → node restart rejoins as follower
+  and catches up (verified both pre- and post-failover keys).
+- `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test
+  --workspace` green (123 tests).
