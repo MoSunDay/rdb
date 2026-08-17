@@ -8,6 +8,11 @@ pub mod cluster;
 pub mod hash_cmd;
 pub mod hash_incr;
 pub mod hash_scan;
+pub mod json_arr;
+pub mod json_cmd;
+pub mod json_obj;
+pub mod json_path;
+pub mod json_str;
 pub mod keys;
 pub mod keys_core;
 pub mod keys_scan;
@@ -183,6 +188,24 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "zdiffstore" => Some(|ctx| Box::pin(zsetops_cmd::zdiffstore(ctx))),
         "bzpopmin" => Some(|ctx| Box::pin(zset_block::bzpopmin(ctx))),
         "bzpopmax" => Some(|ctx| Box::pin(zset_block::bzpopmax(ctx))),
+        // JSON documents (json_cmd/json_str/json_arr/json_obj).
+        "json.set" => Some(|ctx| Box::pin(json_cmd::json_set(ctx))),
+        "json.get" => Some(|ctx| Box::pin(json_cmd::json_get(ctx))),
+        "json.del" => Some(|ctx| Box::pin(json_cmd::json_del(ctx))),
+        "json.forget" => Some(|ctx| Box::pin(json_cmd::json_forget(ctx))),
+        "json.type" => Some(|ctx| Box::pin(json_cmd::json_type(ctx))),
+        "json.mget" => Some(|ctx| Box::pin(json_cmd::json_mget(ctx))),
+        "json.strappend" => Some(|ctx| Box::pin(json_str::json_strappend(ctx))),
+        "json.strlen" => Some(|ctx| Box::pin(json_str::json_strlen(ctx))),
+        "json.numincrby" => Some(|ctx| Box::pin(json_str::json_numincrby(ctx))),
+        "json.arrappend" => Some(|ctx| Box::pin(json_arr::json_arrappend(ctx))),
+        "json.arrpop" => Some(|ctx| Box::pin(json_arr::json_arrpop(ctx))),
+        "json.arrindex" => Some(|ctx| Box::pin(json_arr::json_arrindex(ctx))),
+        "json.arrinsert" => Some(|ctx| Box::pin(json_arr::json_arrinsert(ctx))),
+        "json.arrlen" => Some(|ctx| Box::pin(json_arr::json_arrlen(ctx))),
+        "json.arrtrim" => Some(|ctx| Box::pin(json_arr::json_arrtrim(ctx))),
+        "json.objkeys" => Some(|ctx| Box::pin(json_obj::json_objkeys(ctx))),
+        "json.objlen" => Some(|ctx| Box::pin(json_obj::json_objlen(ctx))),
         _ => None,
     }
 }
@@ -210,3 +233,10 @@ mod hash_tests;
 #[cfg(test)]
 #[path = "set_tests.rs"]
 mod set_tests;
+
+#[cfg(test)]
+#[path = "json_arr_tests.rs"]
+mod json_arr_tests;
+#[cfg(test)]
+#[path = "json_tests.rs"]
+mod json_tests;

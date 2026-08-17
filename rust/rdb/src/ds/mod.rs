@@ -11,6 +11,7 @@
 pub mod codec;
 pub mod expire;
 pub mod hash_ds;
+pub mod json_ds;
 pub mod latch;
 pub mod list_ds;
 pub mod set_ds;
