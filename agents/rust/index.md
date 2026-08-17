@@ -37,7 +37,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `set_*.rs`：Set 全命令——`set_cmd.rs`、`set_scan.rs` SSCAN/SRANDMEMBER、`setops_cmd.rs` SDIFF/SINTER/SUNION（±STORE）；
   - `mod.rs` 注册表为 async（`Handler -> HandlerFuture`），多 key 命令做 CROSSSLOT 校验。
   - `lite/`（crate 根 `src/lite/`）：流命令 XADD/XLEN/XRANGE/XTRIM/XDEL/XIDLE/XREAD/XREADGROUP/XACK/XGROUP/XINFO/XPICK。
-- `lite/`：Lite Mode（RocketMQ 风格父主题 + 动态队列）。`mod.rs` 运行时与装配、`model.rs` 主题名/物理布局（slot 前缀取父主题名）、`select.rs` 队列挑选（round_robin/hash/least_backlog）、`append.rs` xadd/xrange/xtrim/xdel/xidle、`read.rs` xlen/xread/xreadgroup（单流）、`ack.rs` xack（同步持久化组水位）、`entries.rs` 条目扫描公共件、`group.rs` xgroup、`offset.rs` 组水位内存缓存 + 200ms 刷盘（kind-0x0E）、`info.rs` xinfo/xpick；空闲 TTL 复用统一过期信封，到期整流回收；无 PEL，重启自已提交水位 at-least-once 恢复。
+- `lite/`：Lite Mode（RocketMQ 风格父主题 + 动态队列）。`mod.rs` 运行时与装配、`model.rs` 主题名/物理布局（slot 前缀取父主题名）、`select.rs` 队列挑选（round_robin/hash/least_backlog）、`append.rs` xadd/xrange/xtrim/xdel/xidle、`read.rs` xlen/xread/xreadgroup（单流）、`ack.rs` xack（同步持久化组水位）、`entries.rs` 条目扫描公共件、`group.rs` xgroup、`offset.rs` 组水位内存缓存 + 200ms 刷盘（kind-0x0E）、`info.rs` xinfo/xpick；空闲 TTL 复用统一过期信封，到期整流回收；无 PEL，重启自已提交水位 at-least-once 恢复。stream 类即由此定形：不做 Redis Streams 全仿真，语义模型为 RocketMQ 主题/队列；`ds/codec.rs` 的 `KIND_STREAM_PEND 0x0F` 是为将来完整 PEL 预留的 kind，Lite 实现不落盘该 kind（组已提交水位落在 kind-0x0E 记录）。
 - `rcache/`：openraft 控制面。
   - `mod.rs`：TypeConfig、`raft_config()`（heartbeat 500ms、election 1000–2000ms、快照策略 LogsSinceLast(8192)）、`new_raft_node` 与 RAFT_BOOTSTRAP 初始化；
   - `store.rs` + `store_snapshot.rs`：RocksDB 日志/快照存储，快照仅保留 1 份；

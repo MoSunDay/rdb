@@ -55,6 +55,26 @@ parity).
   `len(dead)==2`; probe-only (no auto failover writes beyond backup_target_map semantics).
 - Node description format: `<RaftTCPAddress> [<State>]`.
 
+## Typed record physical encoding (Rust data plane)
+
+The Rust tree stores every non-string type under a derived-key scheme the Go implementation does
+not share (Go keeps only raw pebble keys + `slot/` prefix; on-disk stores are NOT interchangeable):
+
+```text
+data key   = <slot_prefix> ++ <kind:u8> ++ <key_len:u32 BE> ++ <user_key> [++ elem suffix]
+value      = LEB128 varuint expire_ms (0 = no TTL) ++ payload
+expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind on>
+```
+
+- Kind registry lives in `rdb/src/ds/codec.rs` (0x00 raw string .. 0x12 vectorset elem).
+- EXCEPTION: kind 0x00 raw STRING keeps the legacy `<prefix> ++ <key>` bare layout (no envelope),
+  so pre-TTL databases keep working; the first EXPIRE migrates the record to kind 0x01.
+- Classification rule during scans: a physical key whose first post-prefix byte is `<= 0x12` or
+  `== 0xFD` reads as typed; a legacy raw string starting with such a byte is misread (accepted
+  collision, raw strings written after this change start with an ordinary byte).
+- Family deletes use ONE RANGE PER KIND (`family_delete_ranges`) -- a single family-wide span
+  would swallow other keys' records because the kind byte sorts first.
+
 ## Intentional deviations (documented, not byte-compatible)
 
 - **Raft wire protocol**: openraft JSON frames with u32 big-endian length prefix over TCP,
