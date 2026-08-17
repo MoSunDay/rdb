@@ -2,7 +2,8 @@ cmd/rdb/main
 cmd/rdb/rdb
 main
 test.go
-rdb
+/rdb
 rdb_debug
 scrtips/auto_config/output
 scrtips/auto_install.sh
+rust/target/
