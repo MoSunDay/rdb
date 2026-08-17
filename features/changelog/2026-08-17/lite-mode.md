@@ -36,15 +36,16 @@ Streams 模拟器，差异见 [COMPAT.md](../../../rust/COMPAT.md)。
 | group_lifecycle_and_catchup | 组创建/消费/水位推进/重建组从 0 追平 | `rust/rdb/tests/lite_e2e.rs:61` |
 | restart_resumes_from_committed_watermark | 进程内重启自已提交水位恢复，不重投已 ACK 条目 | `rust/rdb/tests/lite_e2e.rs:153` |
 | idle_ttl_reaps_whole_stream | XIDLE 到期整流回收（条目+组状态），XADD 续活 | `rust/rdb/tests/lite_e2e.rs:208` |
-| block_wakes_on_xadd_over_wire | XREAD BLOCK 跨连接被 XADD 唤醒（tokio 双连接） | `rust/rdb/tests/lite_e2e.rs:252` |
-| lite_metrics_series_exposed | /metrics 暴露三条 Lite 序列 | `rust/rdb/tests/lite_e2e.rs:339` |
+| block_wakes_on_xadd_over_wire | XREAD BLOCK 跨连接被 XADD 唤醒（tokio 双连接） | `rust/rdb/tests/lite_e2e.rs:261` |
+| lite_metrics_series_exposed | /metrics 暴露三条 Lite 序列 | `rust/rdb/tests/lite_e2e.rs:348` |
+| xrange_bounds_count_xtrim_and_xdel | XRANGE 全程/- 与 `(` 排他、COUNT 截断、missing 空数组；XTRIM MAXLEN/`~` 裁剪后 XLEN；XDEL 命中/missing/非法 id | `rust/rdb/tests/lite_streams_e2e.rs:10` |
 | process_kill9_restart_resumes | kill -9 后重启自已提交水位恢复（进程级） | `rust/rdb/tests/lite_proc_e2e.rs:11` |
 | select 单测 ×3 | 策略解析/轮转回绕/空默认/hash 稳定 | `rust/rdb/src/lite/select.rs:128` |
 | offset 单测 ×2 | ACK 计数与钳制/位置设置与移除 | `rust/rdb/src/lite/offset.rs:198` |
 
-- 全量回归：`cargo test --workspace` → 239 passed / 0 failed（0 ignored）。
+- 全量回归：`cargo test --workspace` → 240 passed / 0 failed（0 ignored）。
 - clippy：`cargo clippy --workspace --all-targets -- -D warnings` → 零警告；`cargo fmt --check` 通过。
-- 行数：新增文件均 ≤400（最大 `append.rs` 374、`lite_e2e.rs` 362）；迭代文件均 ≤800
+- 行数：新增文件均 ≤400（最大 `append.rs` 374、`lite_e2e.rs` 371、`lite_streams_e2e.rs` 89）；迭代文件均 ≤800
   （最大 `tests/common/mod.rs` 401）。
 
 ## Impact Surface

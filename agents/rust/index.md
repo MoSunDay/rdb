@@ -76,7 +76,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 ## 测试
 - 单元测试内联于各模块 `#[cfg(test)]`；集成测试位于 `rust/rdb/tests/`：
   - `resp_e2e.rs`：RESP 层 e2e（AUTH 门、字符串命令、MOVED、协议错误）；
-  - `lite_e2e.rs` / `lite_proc_e2e.rs`：Lite Mode e2e——父主题自动选队列、XPICK、XINFO、组生命周期与补读、重启自已提交水位恢复、空闲 TTL 整流回收、BLOCK 跨连接唤醒、指标暴露；进程级 kill -9 重启恢复；公共工具 `tests/common/lite.rs`；
+  - `lite_e2e.rs` / `lite_streams_e2e.rs` / `lite_proc_e2e.rs`：Lite Mode e2e——父主题自动选队列、XPICK、XINFO、组生命周期与补读、重启自已提交水位恢复、空闲 TTL 整流回收、BLOCK 跨连接唤醒、指标暴露；XRANGE 边界/COUNT、XTRIM MAXLEN 裁剪、XDEL 命中与 missing；进程级 kill -9 重启恢复；公共工具 `tests/common/lite.rs`；
   - `raft_cluster_e2e.rs`：bootstrap + HTTP join/depart 的两节点集群；
   - `raft_transport.rs`：双节点复制，覆盖 install-snapshot 路径；
   - `ha_failover.rs`：`backup_target_map` 故障切换与恢复；
