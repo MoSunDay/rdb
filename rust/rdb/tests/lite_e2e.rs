@@ -216,7 +216,16 @@ fn idle_ttl_reaps_whole_stream() {
         text(&call(&shared, "xidle", &[b"orders/q0"])).starts_with(":1"),
         "about 1s left"
     );
-    std::thread::sleep(Duration::from_millis(1300));
+    // Poll for the ~1s TTL instead of a fixed-margin sleep (upper-bounded:
+    // slow CI must not flake on a 300ms margin over a 1s TTL).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while call(&shared, "xidle", &[b"orders/q0"]) != b":-2\r\n".to_vec() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle TTL did not fire within 5s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         call(&shared, "xlen", &[b"orders/q0"]),
         b":0\r\n".to_vec(),
