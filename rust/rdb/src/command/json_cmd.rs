@@ -132,7 +132,8 @@ pub async fn json_set(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let (expire_ms, mut doc) = match json_state(ctx, &key) {
         JsonState::WrongType => {
             append_error(ctx.out, WRONGTYPE);
@@ -249,7 +250,8 @@ pub async fn json_del(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     match json_state(ctx, &key) {
         JsonState::WrongType => append_error(ctx.out, WRONGTYPE),
         JsonState::Missing => append_int(ctx.out, 0),

@@ -106,10 +106,11 @@ async fn store_variant(ctx: &mut Ctx<'_>, cmd: &str, op: Op) {
         .collect();
     latches.sort();
     latches.dedup();
-    let _guards: Vec<_> = latches
-        .iter()
-        .map(|k| latch::lock(&ctx.shared.latch, k))
-        .collect();
+    let mut guards = Vec::with_capacity(latches.len());
+    for k in &latches {
+        guards.push(latch::lock(&ctx.shared.latch, k).await);
+    }
+    let _guards = guards;
 
     let dst = ctx.args[0].clone();
     let sources = ctx.args[1..].to_vec();

@@ -223,10 +223,11 @@ async fn store_variant(ctx: &mut Ctx<'_>, cmd: &str, op: Op) {
         .collect();
     latches.sort();
     latches.dedup();
-    let _guards: Vec<_> = latches
-        .iter()
-        .map(|k| latch::lock(&ctx.shared.latch, k))
-        .collect();
+    let mut guards = Vec::with_capacity(latches.len());
+    for k in &latches {
+        guards.push(latch::lock(&ctx.shared.latch, k).await);
+    }
+    let _guards = guards;
 
     let now = expire::now_ms();
     let mut maps: Vec<HashMap<Vec<u8>, f64>> = Vec::with_capacity(opts.keys.len());

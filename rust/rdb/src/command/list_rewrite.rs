@@ -106,7 +106,8 @@ pub async fn lrem(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let (expire_ms, meta) =
         match list_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
             ListState::List { expire_ms, meta } => (expire_ms, meta),
@@ -199,7 +200,8 @@ pub async fn ltrim(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let (expire_ms, meta) =
         match list_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
             ListState::List { expire_ms, meta } => (expire_ms, meta),

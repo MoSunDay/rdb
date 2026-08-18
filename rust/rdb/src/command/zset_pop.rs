@@ -31,7 +31,8 @@ pub async fn zrem(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
@@ -97,7 +98,8 @@ async fn pop(ctx: &mut Ctx<'_>, max: bool, cmd: &str) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let (expire_ms, base) =
         match zset_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
             ZSetState::ZSet { expire_ms, count } => (expire_ms, count),

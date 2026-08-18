@@ -18,7 +18,7 @@ pub async fn handle(ctx: &mut Ctx<'_>) {
         b"stats" | b"STATS" => raft_stats(ctx),
         b"leader" | b"LEADER" => raft_leader(ctx),
         b"NODES" | b"nodes" => raft_nodes(ctx),
-        b"set" | b"SET" => raft_set(ctx),
+        b"set" | b"SET" => raft_set(ctx).await,
         b"get" | b"GET" => raft_get_cmd(ctx),
         _ => raft_help(ctx),
     }
@@ -47,7 +47,7 @@ fn raft_nodes(ctx: &mut Ctx<'_>) {
     append_string(ctx.out, &format!("{}, nodes: {}", raft.node_desc, latest));
 }
 
-fn raft_set(ctx: &mut Ctx<'_>) {
+async fn raft_set(ctx: &mut Ctx<'_>) {
     if ctx.args.len() != 3 {
         append_error(ctx.out, "ERR wrong number of arguments for set command");
         return;
@@ -56,10 +56,19 @@ fn raft_set(ctx: &mut Ctx<'_>) {
         key: String::from_utf8_lossy(&ctx.args[1]).into_owned(),
         value: String::from_utf8_lossy(&ctx.args[2]).into_owned(),
     };
-    let mut raft = ctx.shared.raft.write().unwrap();
     // Go applies with a 5s timeout; the apply loop enforces it (the stub
-    // applies synchronously).
-    match state::raft_apply(&mut raft, &entry) {
+    // applies synchronously). The write guard covers only the non-blocking
+    // start and is DROPPED before the await so `shared.raft` stays
+    // readable while the apply is in flight.
+    let started = {
+        let mut raft = ctx.shared.raft.write().unwrap();
+        state::raft_apply_start(&mut raft, &entry)
+    };
+    let result = match started {
+        Ok(ticket) => state::raft_apply_await(ticket).await,
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(()) => append_string(ctx.out, "OK"),
         Err(e) => append_error(ctx.out, &format!("internal error err: {e}")),
     }

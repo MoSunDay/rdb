@@ -143,7 +143,7 @@ pub async fn delete_records(
             kind, expire_ms, ..
         } => {
             let family = codec::family_of(kind).unwrap_or(codec::STRING_FAMILY);
-            let _guard = latch::lock(&shared.latch, &latch_key(prefix, key));
+            let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
             let mut batch = WriteBatch::default();
             expire::family_delete_entries(&mut batch, prefix, family, key, expire_ms);
             ops::batch_write_async(Arc::clone(&shared.store), batch)
@@ -164,7 +164,7 @@ pub async fn apply_ttl(
     flag: TtlFlag,
     now: u64,
 ) -> Result<bool, String> {
-    let _guard = latch::lock(&shared.latch, &latch_key(prefix, key));
+    let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
     let state = resolve(&shared.store, prefix, key, now);
     if !state.is_present() {
         return Ok(false);
@@ -205,7 +205,7 @@ pub async fn persist_key(
     key: &[u8],
     now: u64,
 ) -> Result<bool, String> {
-    let _guard = latch::lock(&shared.latch, &latch_key(prefix, key));
+    let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
     let state = resolve(&shared.store, prefix, key, now);
     match state {
         KeyState::Missing | KeyState::RawString { .. } => Ok(false),
@@ -296,8 +296,8 @@ pub async fn rename_key(
             (kb, ka)
         }
     };
-    let _ga = latch::lock(&shared.latch, &ka);
-    let _gb = latch::lock(&shared.latch, &kb);
+    let _ga = latch::lock(&shared.latch, &ka).await;
+    let _gb = latch::lock(&shared.latch, &kb).await;
     let src_state = resolve(&shared.store, prefix, src, now);
     if !src_state.is_present() {
         return Ok(RenameOutcome::SrcMissing);

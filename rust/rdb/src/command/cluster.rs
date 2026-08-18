@@ -39,7 +39,7 @@ pub async fn handle(ctx: &mut Ctx<'_>) {
     };
     match first.as_slice() {
         b"help" => cluster_help(ctx),
-        b"INIT" | b"init" => cluster_init(ctx),
+        b"INIT" | b"init" => cluster_init(ctx).await,
         b"info" | b"INFO" => cluster_info(ctx),
         b"nodes" | b"NODES" => cluster_nodes(ctx),
         b"slots" | b"SLOTS" => cluster_slots(ctx),
@@ -142,7 +142,7 @@ fn cluster_test(ctx: &mut Ctx<'_>) {
     append_error(ctx.out, "MOVED 5465 127.0.0.1:32681");
 }
 
-fn cluster_init(ctx: &mut Ctx<'_>) {
+async fn cluster_init(ctx: &mut Ctx<'_>) {
     if ctx.args.len() < 2 {
         append_error(ctx.out, "cluster init [instances]");
         return;
@@ -160,9 +160,18 @@ fn cluster_init(ctx: &mut Ctx<'_>) {
         key: "cluster_slots_stable_instances".to_string(),
         value: String::from_utf8_lossy(&ctx.args[1]).into_owned(),
     };
-    let mut raft = ctx.shared.raft.write().unwrap();
-    // Go applies with a 5s timeout; the stub applies synchronously.
-    match state::raft_apply(&mut raft, &entry) {
+    // Go applies with a 5s timeout; the stub applies synchronously. The
+    // write guard covers only the non-blocking start and is DROPPED
+    // before the await (see raft_set).
+    let started = {
+        let mut raft = ctx.shared.raft.write().unwrap();
+        state::raft_apply_start(&mut raft, &entry)
+    };
+    let result = match started {
+        Ok(ticket) => state::raft_apply_await(ticket).await,
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(()) => append_string(ctx.out, "done"),
         Err(_) => append_error(ctx.out, "Raft Apply failed"),
     }

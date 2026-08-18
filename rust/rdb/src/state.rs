@@ -47,10 +47,17 @@ pub fn mode_label(mode: Mode) -> &'static str {
 pub const APPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One queued apply (Go raft.Apply future): the entry plus the channel
-/// the blocking caller waits on.
+/// the awaiting caller is woken on.
 pub struct ApplyReq {
     pub entry: rtypes::RaftLogEntryData,
-    pub reply: std::sync::mpsc::Sender<Result<(), String>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+/// Pending-apply handle returned by [`raft_apply_start`]. Plain data
+/// carrier: `None` = the stub path already applied synchronously, else
+/// the oneshot the background apply loop answers on.
+pub struct ApplyTicket {
+    reply: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
 }
 
 /// Snapshot of the control plane as seen by command handlers.
@@ -95,13 +102,19 @@ pub fn raft_stats_get(state: &RaftState, key: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Apply one replicated entry.
+/// Start applying one replicated entry. NEVER blocks: leader check, then
+/// either the stub's direct write (unit tests) or queueing onto the
+/// background client_write loop. Callers must DROP any `shared.raft`
+/// guard taken for this call BEFORE awaiting [`raft_apply_await`] -- the
+/// real path parks for up to Go's 5s Apply timeout and must not hold the
+/// control-plane lock while doing so.
 ///
-/// Real raft: queued to the background client_write loop (5s timeout);
-/// the error text mirrors hashicorp raft.ErrNotLeader, which Go surfaces
-/// as `internal error err: not leader` for `raft set`. Stub path (unit
-/// tests): leader-only direct write.
-pub fn raft_apply(state: &mut RaftState, entry: &rtypes::RaftLogEntryData) -> Result<(), String> {
+/// Error text mirrors hashicorp raft.ErrNotLeader, which Go surfaces as
+/// `internal error err: not leader` for `raft set`.
+pub fn raft_apply_start(
+    state: &mut RaftState,
+    entry: &rtypes::RaftLogEntryData,
+) -> Result<ApplyTicket, String> {
     if !state.is_leader {
         return Err("not leader".to_string());
     }
@@ -109,9 +122,9 @@ pub fn raft_apply(state: &mut RaftState, entry: &rtypes::RaftLogEntryData) -> Re
         state.kv.insert(entry.key.clone(), entry.value.clone());
         state.apply_count += 1;
         refresh_stub_stats(state);
-        return Ok(());
+        return Ok(ApplyTicket { reply: None });
     };
-    let (reply, rx) = std::sync::mpsc::channel();
+    let (reply, rx) = tokio::sync::oneshot::channel();
     if tx
         .send(ApplyReq {
             entry: entry.clone(),
@@ -121,10 +134,21 @@ pub fn raft_apply(state: &mut RaftState, entry: &rtypes::RaftLogEntryData) -> Re
     {
         return Err("apply loop stopped".to_string());
     }
-    // The worker enforces the 5s client_write deadline; this bound only
-    // guards against a dead worker.
-    rx.recv_timeout(APPLY_TIMEOUT + Duration::from_secs(1))
-        .map_err(|_| "apply timeout".to_string())?
+    Ok(ApplyTicket { reply: Some(rx) })
+}
+
+/// Await a started apply. The worker enforces the 5s client_write
+/// deadline; this bound only guards against a dead worker. Lost sender
+/// (dropped apply loop) reads the same as a timeout.
+pub async fn raft_apply_await(ticket: ApplyTicket) -> Result<(), String> {
+    let Some(rx) = ticket.reply else {
+        return Ok(()); // stub path: already applied in raft_apply_start
+    };
+    match tokio::time::timeout(APPLY_TIMEOUT + Duration::from_secs(1), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_sender_dropped)) => Err("apply timeout".to_string()),
+        Err(_elapsed) => Err("apply timeout".to_string()),
+    }
 }
 
 /// Background loop executing queued applies through `client_write` (Go:
@@ -328,5 +352,81 @@ pub mod testutil {
             raft_token: "test-token".to_string(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use rtypes::RaftLogEntryData;
+
+    /// RaftState plus the stalled loop's receiver: alive (so the send
+    /// succeeds) but never draining (so the reply never arrives).
+    fn leader_with_stalled_apply_loop() -> (RaftState, tokio::sync::mpsc::UnboundedReceiver<ApplyReq>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            RaftState {
+                apply_tx: Some(tx),
+                ..stub_raft(&testutil::test_config())
+            },
+            rx,
+        )
+    }
+
+    /// A dead apply loop surfaces as `apply timeout` without blocking a
+    /// worker thread for the whole window: tokio's paused clock
+    /// auto-advances through the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn apply_await_reports_timeout_on_dead_loop() {
+        let (mut state, _stalled_rx) = leader_with_stalled_apply_loop();
+        let entry = RaftLogEntryData {
+            key: "k".to_string(),
+            value: "v".to_string(),
+        };
+        let ticket = raft_apply_start(&mut state, &entry).expect("queueing succeeds");
+        assert_eq!(
+            raft_apply_await(ticket).await.expect_err("must time out"),
+            "apply timeout",
+            "dropped receiver reads the same as a timeout"
+        );
+    }
+
+    /// Non-leader start fails fast: no ticket, no wait.
+    #[tokio::test(start_paused = true)]
+    async fn apply_start_rejects_follower_immediately() {
+        let (mut state, _stalled_rx) = leader_with_stalled_apply_loop();
+        state.is_leader = false;
+        let entry = RaftLogEntryData {
+            key: "k".to_string(),
+            value: "v".to_string(),
+        };
+        let err = match raft_apply_start(&mut state, &entry) {
+            Ok(_) => panic!("follower start must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err, "not leader");
+    }
+
+    /// While a ticket is pending (loop stalled), `shared.raft` stays
+    /// readable: the guard covering `raft_apply_start` is dropped before
+    /// the await, so a stalled apply can no longer freeze the control-
+    /// plane view for up to 6s.
+    #[tokio::test(start_paused = true)]
+    async fn pending_apply_does_not_hold_raft_guard() {
+        let (state, _stalled_rx) = leader_with_stalled_apply_loop();
+        let raft: Arc<RwLock<RaftState>> = Arc::new(RwLock::new(state));
+        let entry = RaftLogEntryData {
+            key: "k".to_string(),
+            value: "v".to_string(),
+        };
+        let ticket = {
+            let mut guard = raft.write().unwrap();
+            raft_apply_start(&mut guard, &entry).expect("queueing succeeds")
+        }; // guard dropped HERE, before any waiting
+        assert!(
+            raft.try_read().is_ok(),
+            "raft lock must be free while the apply is in flight"
+        );
+        let _ = raft_apply_await(ticket).await;
     }
 }

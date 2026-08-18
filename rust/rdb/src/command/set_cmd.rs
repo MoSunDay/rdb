@@ -96,7 +96,8 @@ pub async fn sadd(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
@@ -126,7 +127,8 @@ pub async fn srem(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
@@ -245,7 +247,8 @@ pub async fn spop(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
@@ -317,10 +320,8 @@ pub async fn smove(ctx: &mut Ctx<'_>) {
     // Latch both keys in byte order (ABBA rule; see ds::latch docs).
     let mut guards = Vec::new();
     for k in [&src, &dst] {
-        guards.push(latch::lock(
-            &ctx.shared.latch,
-            &keys_core::latch_key(&ctx.prefix_key, k),
-        ));
+        guards
+            .push(latch::lock(&ctx.shared.latch, &keys_core::latch_key(&ctx.prefix_key, k)).await);
     }
     let (src_expire, src_base) = match set_state(ctx, &src) {
         SetState::Set { expire_ms, count } => (expire_ms, count),

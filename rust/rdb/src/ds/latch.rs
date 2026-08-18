@@ -4,6 +4,12 @@
 //! logic): [`lock`] hands out a RAII [`KeyGuard`] for one physical root
 //! key; the guard releases the key on drop.
 //!
+//! ASYNC: each key is a `tokio::sync::Semaphore` with one permit, so a
+//! waiter parks a TASK (not an OS thread) and the guard's drop wakes the
+//! next waiter FIFO. This is load-bearing: handlers hold guards across
+//! `.await` points (e.g. the commit after a blocked pop), which under a
+//! Condvar latch would pin tokio worker threads.
+//!
 //! Deadlock rule: operations touching MULTIPLE keys must sort the root
 //! keys bytewise and lock them in that order (see the RENAME handler);
 //! single-key operations are always safe.
@@ -14,21 +20,17 @@
 //! is dropped along with the entry it is queued on.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Shard count; 256 keeps shard-mutex contention negligible.
 pub const SHARDS: usize = 256;
 
-/// Per-key wait cell: the held flag lives INSIDE the mutex so waiters and
-/// the releasing guard share one source of truth.
-struct LatchCell {
-    state: Mutex<bool>, // true = key held
-    cv: Condvar,
-}
-
-/// Latch table: fixed shards of root-key -> cell maps.
+/// Latch table: fixed shards of root-key -> semaphore maps. One permit
+/// per key semaphore = at most one holder at a time.
 pub struct Latch {
-    shards: Vec<Mutex<HashMap<Vec<u8>, Arc<LatchCell>>>>,
+    shards: Vec<Mutex<HashMap<Vec<u8>, Arc<Semaphore>>>>,
 }
 
 impl Latch {
@@ -45,23 +47,12 @@ impl Default for Latch {
     }
 }
 
-/// RAII holder of one latched key; dropping it releases the key and wakes
-/// the next waiter.
+/// RAII holder of one latched key; dropping the permit releases the key
+/// and hands the permit to the next queued waiter (semaphores are
+/// FIFO-fair and wake on release). Pure data carrier: the token's own
+/// Drop does the work, no business logic here.
 pub struct KeyGuard {
-    cell: Arc<LatchCell>,
-}
-
-impl Drop for KeyGuard {
-    fn drop(&mut self) {
-        let mut held = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *held = false;
-        drop(held);
-        self.cell.cv.notify_one();
-    }
+    _permit: OwnedSemaphorePermit,
 }
 
 /// FNV-1a over the key bytes, folded into the shard range.
@@ -74,43 +65,29 @@ pub fn shard_of(key: &[u8]) -> usize {
     (hash as usize) % SHARDS
 }
 
-/// Acquire (blocking) the latch for `key`.
-pub fn lock(latch: &Latch, key: &[u8]) -> KeyGuard {
-    let cell = {
+/// Acquire (async) the latch for `key`. The shard mutex is held only for
+/// the map lookup; the semaphore wait parks AFTER it is released, so a
+/// blocked waiter never stalls unrelated keys in the same shard.
+pub async fn lock(latch: &Latch, key: &[u8]) -> KeyGuard {
+    let sem = {
         let mut shard = latch.shards[shard_of(key)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         shard
             .entry(key.to_vec())
-            .or_insert_with(|| {
-                Arc::new(LatchCell {
-                    state: Mutex::new(false),
-                    cv: Condvar::new(),
-                })
-            })
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
             .clone()
     };
-    let mut held = cell
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Sleep while ANOTHER holder owns the key; the releaser's notify_one
-    // wakes exactly one waiter.
-    while *held {
-        held = cell
-            .cv
-            .wait(held)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
-    *held = true;
-    drop(held);
-    KeyGuard { cell }
+    // Wait while ANOTHER holder owns the key; the permit is handed over
+    // on drop, waking exactly one waiter in FIFO order. The semaphore is
+    // never closed, so the acquire error is impossible.
+    let permit = sem.acquire_owned().await.expect("latch semaphore closed");
+    KeyGuard { _permit: permit }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
     #[test]
     fn shard_of_is_stable_and_bounded() {
@@ -122,24 +99,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn same_key_serializes_different_keys_do_not() {
+    #[tokio::test]
+    async fn same_key_serializes_different_keys_do_not() {
         let latch = Latch::new();
         {
-            let _g1 = lock(&latch, b"70/k");
+            let _g1 = lock(&latch, b"70/k").await;
             {
-                let _g2 = lock(&latch, b"71/other");
+                let _g2 = lock(&latch, b"71/other").await;
                 // different roots: both held simultaneously without deadlock
             }
             // re-locking the SAME key here would self-deadlock; asserted
-            // across threads below instead.
+            // across tasks below instead.
         }
         // dropped guards release: a fresh lock succeeds immediately.
-        let _g3 = lock(&latch, b"70/k");
+        let _g3 = lock(&latch, b"70/k").await;
     }
 
-    #[test]
-    fn mutual_exclusion_across_threads() {
+    /// A guard held ACROSS an await must not block the runtime: another
+    /// task acquires a different key, then the same key once released.
+    #[tokio::test]
+    async fn held_across_await_does_not_stall_other_tasks() {
+        let latch = Arc::new(Latch::new());
+        let holder = tokio::spawn({
+            let l = Arc::clone(&latch);
+            async move {
+                let _g = lock(&l, b"70/k").await;
+                // park WITH the guard held (the commit-across-await shape)
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+        // unrelated key: immediate even while 70/k is held.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let _other = lock(&latch, b"71/x").await;
+        })
+        .await
+        .expect("different key must not wait on 70/k");
+        holder.await.unwrap();
+        // after release the same key is lockable again.
+        tokio::time::timeout(std::time::Duration::from_secs(2), lock(&latch, b"70/k"))
+            .await
+            .expect("release must wake the next waiter");
+    }
+
+    #[tokio::test]
+    async fn mutual_exclusion_across_tasks() {
         let latch = Arc::new(Latch::new());
         let counter = Arc::new(Mutex::new(0usize));
         let inside = Arc::new(Mutex::new(0usize));
@@ -150,13 +153,13 @@ mod tests {
                 Arc::clone(&counter),
                 Arc::clone(&inside),
             );
-            handles.push(thread::spawn(move || {
+            handles.push(tokio::spawn(async move {
                 for _ in 0..200 {
-                    let _g = lock(&l, b"70/hot");
+                    let _g = lock(&l, b"70/hot").await;
                     {
                         let mut seen = i.lock().unwrap();
                         *seen += 1;
-                        assert_eq!(*seen, 1, "two threads inside the latch");
+                        assert_eq!(*seen, 1, "two tasks inside the latch");
                     }
                     *c.lock().unwrap() += 1;
                     {
@@ -167,7 +170,7 @@ mod tests {
             }));
         }
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
         assert_eq!(*counter.lock().unwrap(), 8 * 200);
     }

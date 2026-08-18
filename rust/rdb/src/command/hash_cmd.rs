@@ -123,7 +123,8 @@ pub async fn hset(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
@@ -156,7 +157,8 @@ pub async fn hsetnx(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
@@ -229,7 +231,8 @@ pub async fn hdel(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };

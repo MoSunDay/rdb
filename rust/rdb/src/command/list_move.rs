@@ -55,7 +55,8 @@ pub async fn linsert(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let (expire_ms, meta) =
         match list_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
             ListState::List { expire_ms, meta } => (expire_ms, meta),
@@ -261,7 +262,7 @@ async fn move_elem(
         return;
     }
     // Distinct latch keys in byte order (multi-key ABBA rule).
-    let _guards = lock_sorted(ctx, &[src.clone(), dst.clone()]);
+    let _guards = lock_sorted(ctx, &[src.clone(), dst.clone()]).await;
 
     let now = expire::now_ms();
     let (src_expire, src_meta) = match list_state(&ctx.shared.store, &ctx.prefix_key, &src, now) {

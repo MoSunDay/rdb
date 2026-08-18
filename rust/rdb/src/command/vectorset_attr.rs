@@ -33,7 +33,8 @@ pub async fn vsetattr(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let dim = match vectorset_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
         VectorSetState::WrongType => {
             append_error(ctx.out, WRONGTYPE);
