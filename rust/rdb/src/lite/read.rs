@@ -59,9 +59,13 @@ fn nil_array(out: &mut Vec<u8>) {
     resp::append_raw(out, b"*-1\r\n");
 }
 
-/// Park until entries with id > `after` exist or `block_ms` elapses
-/// (bounded by the deadline computed at entry). Registering the waiter
-/// BEFORE the final read closes the lost-notify window against XADD.
+/// Park until entries with id > `after` exist or `block_ms` elapses;
+/// `block_ms == 0` means forever (Redis BLOCK 0 semantics). Waiting is
+/// chunked: every park is at most MAX_SLICE_MS long and the remaining
+/// budget is recomputed on each wake, so "forever" loops in renewable
+/// slices and oversized BLOCK values are never clamped to one capped
+/// deadline. Registering the waiter BEFORE the final read closes the
+/// lost-notify window against XADD.
 async fn wait_entries(
     ctx: &mut Ctx<'_>,
     prefix: &[u8],
@@ -71,7 +75,13 @@ async fn wait_entries(
     block_ms: u64,
 ) -> Option<Result<Vec<Entry>, String>> {
     let wake = model::meta_key(prefix, stream);
-    let deadline = Instant::now() + Duration::from_millis(block_ms.min(MAX_SLICE_MS));
+    // None = no time limit (BLOCK 0, or a value too large for Instant);
+    // Some(t) = absolute expiry.
+    let end = if block_ms == 0 {
+        None
+    } else {
+        Instant::now().checked_add(Duration::from_millis(block_ms))
+    };
     loop {
         let waiter = wait::register(&ctx.shared.wait_hub, &wake);
         match entries::scan_entries(&ctx.shared.store, prefix, stream, after, count) {
@@ -85,18 +95,23 @@ async fn wait_entries(
             }
             Ok(_) => {}
         }
+        // Renewable slice: whatever remains of the budget, capped at
+        // MAX_SLICE_MS; an unbounded wait parks full slices forever.
         let now = Instant::now();
-        if now >= deadline {
-            wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
-            return None;
-        }
-        let left = deadline - now;
+        let slice = match end {
+            None => Duration::from_millis(MAX_SLICE_MS),
+            Some(t) if now >= t => {
+                wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
+                return None;
+            }
+            Some(t) => (t - now).min(Duration::from_millis(MAX_SLICE_MS)),
+        };
         let w = Arc::clone(&waiter);
-        let woke = tokio::task::spawn_blocking(move || wait::wait(&w, left)).await;
+        let woke = tokio::task::spawn_blocking(move || wait::wait(&w, slice)).await;
         wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
         match woke.unwrap_or(WaitOutcome::Timeout) {
-            WaitOutcome::Timeout if Instant::now() >= deadline => return None,
-            _ => {} // signaled or spurious: re-read
+            WaitOutcome::Timeout if end.is_some_and(|t| Instant::now() >= t) => return None,
+            _ => {} // signaled, spurious, or slice edge with budget left: re-read
         }
     }
 }
@@ -274,9 +289,14 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
     // between attempts (never while holding the latch).
     let _ = consumer;
     let wake = model::meta_key(&prefix, &stream);
-    let deadline = opts
+    // Absolute expiry for a bounded BLOCK; None when no bound is
+    // computable -- no BLOCK at all, BLOCK 0 (forever), or a value too
+    // large for Instant. wait_entries re-parks in slices itself, so no
+    // clamped deadline is built here.
+    let end = opts
         .block_ms
-        .map(|ms| Instant::now() + Duration::from_millis(ms.min(MAX_SLICE_MS)));
+        .filter(|ms| *ms > 0)
+        .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)));
     let mut after_snapshot;
     loop {
         {
@@ -318,14 +338,22 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
                 Ok(_) => {}
             }
         }
-        let Some(deadline) = deadline else {
+        let Some(block_ms) = opts.block_ms else {
             return nil_array(ctx.out);
         };
-        let now = Instant::now();
-        if now >= deadline {
-            return nil_array(ctx.out);
-        }
-        let left = (deadline - now).as_millis() as u64;
+        // Budget still left to hand to wait_entries; 0 reaches it only
+        // for BLOCK 0 (forever): a bounded wait whose expiry has passed
+        // returns nil inside the match below instead.
+        let left = match end {
+            None => block_ms,
+            Some(t) => {
+                let now = Instant::now();
+                if now >= t {
+                    return nil_array(ctx.out);
+                }
+                (t - now).as_millis() as u64
+            }
+        };
         match wait_entries(ctx, &prefix, &stream, after_snapshot, opts.count, left).await {
             None => return nil_array(ctx.out),
             Some(Err(e)) => {

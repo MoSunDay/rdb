@@ -93,7 +93,9 @@ impl LogStore {
     /// Load the current snapshot: meta from the stable column family, data
     /// from `snapshots/`. `Ok(None)` if none has been saved yet.
     pub fn load_snapshot(&self) -> StorageResult<Option<StoredSnapshot>> {
-        let meta = match self.get_cf_json(KEY_SNAPSHOT_META, |e| StorageIOError::read(e))? {
+        let meta = match self.get_cf_json(KEY_SNAPSHOT_META, |e| {
+            io_err(ErrorSubject::Snapshot(None), ErrorVerb::Read, e)
+        })? {
             Some(meta) => meta,
             None => return Ok(None),
         };
@@ -134,7 +136,11 @@ mod tests {
         let loaded = store.load_snapshot().unwrap().expect("snapshot 1");
         assert_eq!(loaded.meta.snapshot_id, "snap-1");
         assert_eq!(loaded.data, br#"{"a":"1"}"#.to_vec());
-        assert!(dir.path().join("snapshots").join(snapshot_file_name(&meta(1))).exists());
+        assert!(dir
+            .path()
+            .join("snapshots")
+            .join(snapshot_file_name(&meta(1)))
+            .exists());
 
         store.save_snapshot(&meta(2), br#"{"a":"2"}"#).unwrap();
         let files: Vec<String> = fs::read_dir(dir.path().join("snapshots"))

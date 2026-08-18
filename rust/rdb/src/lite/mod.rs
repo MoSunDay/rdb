@@ -111,6 +111,11 @@ pub fn spawn_background(shared: Arc<state::Shared>) {
         loop {
             ticker.tick().await;
             let dirty = offset::flush_dirty(&shared.lite.offsets);
+            // Re-validate against the CURRENT dirty state before writing:
+            // entries superseded by a newer ack since the snapshot stay
+            // dirty and ride the next round, so a late old batch can
+            // never lower the committed watermark already on disk.
+            let dirty = offset::drop_superseded(&shared.lite.offsets, dirty);
             monitor::set_lite_offset_dirty(&shared.monitor, dirty.len() as f64);
             if let Some(batch) = offset::build_flush_batch(&dirty) {
                 if let Err(e) = ops::batch_write_async(Arc::clone(&shared.store), batch).await {

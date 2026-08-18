@@ -226,6 +226,25 @@ fn sscan_pages_over_an_empty_member() {
 }
 
 #[test]
+fn sscan_negated_class_match_over_empty_member() {
+    let (_g, s) = shared_for("127.0.0.1:40770");
+    call(&s, "sadd", &[b"k", b"", b"a", b"b"]);
+    // MATCH [^a]* runs the empty member through glob_match with a
+    // negated class; a class consumes a byte, so "" must simply not
+    // match (the old matcher panicked slicing past the empty member).
+    let page = test_reader::parse(&call(&s, "sscan", &[b"k", b"0", b"MATCH", b"[^a]*"]));
+    let Frame::Array(items) = &page[1] else {
+        panic!("items array");
+    };
+    // "b" matches ([^a] eats it, '*' eats nothing); "" cannot (the
+    // class needs a byte) and "a" is excluded by the negation.
+    let mut got: Vec<Vec<u8>> = items.iter().map(test_reader::bulk).collect();
+    got.sort();
+    assert_eq!(got, vec![b"b".to_vec()]);
+    assert_eq!(test_reader::bulk(&page[0]), b"0".to_vec());
+}
+
+#[test]
 fn smove_both_directions_and_crossslot() {
     let (_g, s) = shared_for("127.0.0.1:40316");
     let (src, dst, same) = (
@@ -328,4 +347,52 @@ fn set_algebra_store_variants() {
         call(&s, "sunionstore", &[b"{g}str", a]),
         b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
     );
+}
+
+/// Negative SPOP counts must error like zero: unchecked they wrap in
+/// `n as u64` and pop the WHOLE set (regression guard).
+#[test]
+fn spop_negative_count_errors_and_keeps_set() {
+    let (_g, s) = shared_for("127.0.0.1:40319");
+    call(&s, "sadd", &[b"k", b"a", b"b", b"c"]);
+    let err = b"-ERR value is out of range, must be positive\r\n".to_vec();
+    assert_eq!(call(&s, "spop", &[b"k", b"-1"]), err);
+    assert_eq!(call(&s, "spop", &[b"k", b"-5"]), err);
+    // The set is untouched by both attempts.
+    assert_eq!(int_of(&call(&s, "scard", &[b"k"])), 3);
+    assert_eq!(
+        members(&s, b"k"),
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+    );
+}
+
+/// SMOVE core semantics: move, missing member, WRONGTYPE on either side.
+#[test]
+fn smove_semantics_and_wrongtype() {
+    let (_g, s) = shared_for("127.0.0.1:40320");
+    let (src, dst) = (b"{g}s".as_slice(), b"{g}d".as_slice());
+    call(&s, "sadd", &[src, b"a", b"b"]);
+    call(&s, "sadd", &[dst, b"c"]);
+    // Moved member changes both sides atomically.
+    assert_eq!(int_of(&call(&s, "smove", &[src, dst, b"a"])), 1);
+    assert_eq!(members(&s, src), vec![b"b".to_vec()]);
+    assert_eq!(members(&s, dst), vec![b"a".to_vec(), b"c".to_vec()]);
+    // Missing member replies 0 and changes nothing.
+    assert_eq!(int_of(&call(&s, "smove", &[src, dst, b"zz"])), 0);
+    assert_eq!(members(&s, src), vec![b"b".to_vec()]);
+    assert_eq!(members(&s, dst), vec![b"a".to_vec(), b"c".to_vec()]);
+    // A non-set source errors WRONGTYPE before any mutation.
+    set_raw(&s, b"{g}str", b"v");
+    assert_eq!(
+        call(&s, "smove", &[b"{g}str", dst, b"c"]),
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
+    );
+    // A non-set destination errors WRONGTYPE too.
+    assert_eq!(
+        call(&s, "smove", &[src, b"{g}str", b"b"]),
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
+    );
+    // Neither error disturbed the operands.
+    assert_eq!(members(&s, src), vec![b"b".to_vec()]);
+    assert_eq!(members(&s, dst), vec![b"a".to_vec(), b"c".to_vec()]);
 }

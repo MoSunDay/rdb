@@ -239,7 +239,9 @@ pub async fn spop(ctx: &mut Ctx<'_>) {
             }
         },
     };
-    if count == Some(0) {
+    // count must be positive: zero is a no-op error and a negative n
+    // would wrap in `n as u64` below and pop the WHOLE set.
+    if count.is_some_and(|n| n <= 0) {
         append_error(ctx.out, "ERR value is out of range, must be positive");
         return;
     }
@@ -293,7 +295,8 @@ pub async fn spop(ctx: &mut Ctx<'_>) {
 }
 
 /// `SMOVE source dest member`: 1 when moved. Requires both keys to hash to
-/// the same slot (cluster rule); locks both latch keys in byte order.
+/// the same slot (cluster rule); both latch keys are locked in sorted
+/// byte order so reversed-direction callers cannot deadlock.
 /// Moving into the same key answers by membership only.
 pub async fn smove(ctx: &mut Ctx<'_>) {
     if ctx.args.len() != 3 {
@@ -317,12 +320,20 @@ pub async fn smove(ctx: &mut Ctx<'_>) {
         append_int(ctx.out, i64::from(has_member(ctx, &src, &member)));
         return;
     }
-    // Latch both keys in byte order (ABBA rule; see ds::latch docs).
-    let mut guards = Vec::new();
-    for k in [&src, &dst] {
-        guards
-            .push(latch::lock(&ctx.shared.latch, &keys_core::latch_key(&ctx.prefix_key, k)).await);
+    // Both latch keys, locked in SORTED byte order (ABBA rule; see
+    // ds::latch docs): concurrent callers may swap src/dst, so the
+    // handler's argument order is not a safe lock order.
+    let mut latches: Vec<Vec<u8>> = [&src, &dst]
+        .iter()
+        .map(|k| keys_core::latch_key(&ctx.prefix_key, k))
+        .collect();
+    latches.sort();
+    latches.dedup();
+    let mut guards = Vec::with_capacity(latches.len());
+    for k in &latches {
+        guards.push(latch::lock(&ctx.shared.latch, k).await);
     }
+    let _guards = guards;
     let (src_expire, src_base) = match set_state(ctx, &src) {
         SetState::Set { expire_ms, count } => (expire_ms, count),
         SetState::Missing => {

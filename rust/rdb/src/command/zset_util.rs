@@ -74,6 +74,20 @@ pub(crate) fn parse_score_bound(s: &[u8]) -> Option<(f64, bool)> {
     }
 }
 
+/// Seek sortable for a score window's LOWER bound. `-0.0` sorts strictly
+/// before `+0.0` (distinct bits, distinct sortables), and numerically
+/// the two zeros are EQUAL -- so an INCLUSIVE min of either zero must
+/// seek from `score_sortable(-0.0)` or every `-0.0` member lands below
+/// the seek and silently drops out of the window. Exclusive bounds keep
+/// the caller's own sortable: the record filter skips both zeros anyway.
+pub(crate) fn seek_from_sortable(min: f64, incl: bool) -> u64 {
+    if incl && min == 0.0 {
+        zset_ds::score_sortable(-0.0)
+    } else {
+        zset_ds::score_sortable(min)
+    }
+}
+
 /// Append one score as a bulk string: f64's shortest roundtrip repr
 /// (`3.5`, `inf`, ...); Redis prints %.17g, both roundtrip to the same
 /// value (see `hash_incr::hincrbyfloat`).

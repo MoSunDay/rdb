@@ -219,7 +219,11 @@ mod tests {
         assert_eq!(p1.next, Some(b"f1".to_vec()));
         let p2 = collect_fields(&store, P, b"h", p1.next.as_deref(), Some(b"f*"), 1);
         assert_eq!(p2.fields, vec![(b"f2".to_vec(), b"2".to_vec())]);
-        assert_eq!(p2.next, Some(b"f2".to_vec()), "page 2 also stopped at its limit");
+        assert_eq!(
+            p2.next,
+            Some(b"f2".to_vec()),
+            "page 2 also stopped at its limit"
+        );
         // A cursor past every matching field returns an empty page.
         let p3 = collect_fields(&store, P, b"h", p2.next.as_deref(), Some(b"f*"), 1);
         assert!(p3.fields.is_empty() && p3.next.is_none());
@@ -232,12 +236,7 @@ mod tests {
     #[test]
     fn empty_field_is_a_valid_resume_cursor() {
         let (_dir, store) = open_tmp();
-        write_hash(
-            &store,
-            b"h",
-            0,
-            &[(b"", b"0"), (b"a", b"1"), (b"b", b"2")],
-        );
+        write_hash(&store, b"h", 0, &[(b"", b"0"), (b"a", b"1"), (b"b", b"2")]);
         // A page cutting exactly AT the empty field carries Some(b""),
         // not the finished sentinel.
         let p1 = collect_fields(&store, P, b"h", None, None, 1);

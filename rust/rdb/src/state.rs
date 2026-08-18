@@ -362,7 +362,8 @@ mod apply_tests {
 
     /// RaftState plus the stalled loop's receiver: alive (so the send
     /// succeeds) but never draining (so the reply never arrives).
-    fn leader_with_stalled_apply_loop() -> (RaftState, tokio::sync::mpsc::UnboundedReceiver<ApplyReq>) {
+    fn leader_with_stalled_apply_loop(
+    ) -> (RaftState, tokio::sync::mpsc::UnboundedReceiver<ApplyReq>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
             RaftState {

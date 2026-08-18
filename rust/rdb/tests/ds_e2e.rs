@@ -112,7 +112,7 @@ fn sampler_purges_expired_families_and_stale_index() {
     batch.put(codec::expire_index_key(P, past, &ghost_root), b"");
     ops::batch_write(store, batch).unwrap();
 
-    let purged = expire::sample_once(store, now, 10);
+    let purged = expire::sample_once(store, now, 10, b"").0;
     // "due" + the stale ghost index entry.
     assert_eq!(purged, 2, "one real purge plus one stale index sweep");
 
@@ -176,7 +176,7 @@ fn delete_range_wipes_family_records_sampler_sweeps_index() {
     );
 
     // The active-expire sampler sweeps the now-stale index entry.
-    let purged = expire::sample_once(store, expire_at + 1, 10);
+    let purged = expire::sample_once(store, expire_at + 1, 10, b"").0;
     assert_eq!(purged, 1, "stale index swept");
     assert!(ops::get_physical(store, &idx).unwrap().is_none());
     assert!(
