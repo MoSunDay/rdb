@@ -189,6 +189,43 @@ fn sscan_pages_and_matches() {
 }
 
 #[test]
+fn sscan_pages_over_an_empty_member() {
+    let (_g, s) = shared_for("127.0.0.1:40513");
+    call(&s, "sadd", &[b"k", b"", b"a", b"b"]);
+    // COUNT 1 puts the empty member on a page boundary: the hex cursor of
+    // "" is "" itself, which must resume STRICTLY AFTER "" — a restart
+    // there would loop forever, and the old empty-bytes sentinel misread
+    // it as "done", silently dropping the remaining members.
+    let mut cursor = b"0".to_vec();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = test_reader::parse(&call(&s, "sscan", &[b"k", &cursor, b"COUNT", b"1"]));
+        cursor = test_reader::bulk(&page[0]);
+        let Frame::Array(items) = &page[1] else {
+            panic!("items array");
+        };
+        seen.extend(items.iter().map(test_reader::bulk));
+        pages += 1;
+        if cursor == b"0" {
+            break;
+        }
+        assert!(pages < 32, "cursor loop did not terminate");
+    }
+    seen.sort();
+    assert_eq!(seen, vec![Vec::new(), b"a".to_vec(), b"b".to_vec()]);
+    // Sanity: unbounded page returns everything with the reset cursor.
+    let page = test_reader::parse(&call(&s, "sscan", &[b"k", b"0"]));
+    let Frame::Array(items) = &page[1] else {
+        panic!("items array");
+    };
+    let mut all: Vec<Vec<u8>> = items.iter().map(test_reader::bulk).collect();
+    all.sort();
+    assert_eq!(all, vec![Vec::new(), b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(test_reader::bulk(&page[0]), b"0".to_vec());
+}
+
+#[test]
 fn smove_both_directions_and_crossslot() {
     let (_g, s) = shared_for("127.0.0.1:40316");
     let (src, dst, same) = (

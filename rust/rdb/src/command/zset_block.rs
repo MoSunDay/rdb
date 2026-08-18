@@ -87,7 +87,9 @@ async fn block_pop(
     cmd: &str,
     block_ms: u64,
 ) -> ZBlockResult {
-    let deadline = Instant::now() + Duration::from_millis(block_ms.min(MAX_SLICE_MS));
+    // BLOCK 0 means "forever" (`None`): the park runs in MAX_SLICE_MS
+    // slices renewed each round. Any other timeout is a hard deadline.
+    let deadline = (block_ms > 0).then(|| Instant::now() + Duration::from_millis(block_ms));
     loop {
         // 1. one shared waiter under every key's root, BEFORE the read.
         let waiter = Arc::new(wait::new_waiter());
@@ -125,15 +127,20 @@ async fn block_pop(
                 ZSetState::ZSet { .. } | ZSetState::Missing => {}
             }
         }
-        // 3. deadline check, then a bounded park on the waiter.
+        // 3. deadline check, then a bounded park on the waiter. `None`
+        // (BLOCK 0) never elapses: a slice expiry just renews the loop.
         let now = Instant::now();
-        if now >= deadline {
+        if deadline.is_some_and(|d| now >= d) {
             for root in &roots {
                 wait::unregister(&ctx.shared.wait_hub, root, &waiter);
             }
             return ZBlockResult::Timeout;
         }
-        let left_ms = ((deadline - now).as_millis() as u64).min(MAX_SLICE_MS);
+        let left_ms = deadline
+            .map_or(MAX_SLICE_MS, |d| {
+                d.saturating_duration_since(now).as_millis() as u64
+            })
+            .min(MAX_SLICE_MS);
         let parked = Arc::clone(&waiter);
         let woke = tokio::task::spawn_blocking(move || {
             wait::wait(&parked, Duration::from_millis(left_ms))
@@ -143,10 +150,10 @@ async fn block_pop(
             wait::unregister(&ctx.shared.wait_hub, root, &waiter);
         }
         match woke.unwrap_or(wait::WaitOutcome::Timeout) {
-            wait::WaitOutcome::Timeout if Instant::now() >= deadline => {
+            wait::WaitOutcome::Timeout if deadline.is_some_and(|d| Instant::now() >= d) => {
                 return ZBlockResult::Timeout
             }
-            _ => {} // signaled or spurious: loop and re-read
+            _ => {} // signaled, spurious, or a renewed forever-slice: loop and re-read
         }
     }
 }

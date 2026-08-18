@@ -88,11 +88,13 @@ pub fn has_member(store: &Store, prefix: &[u8], key: &[u8], member: &[u8]) -> Re
     Ok(ops::get_physical(store, &member_key(prefix, key, member))?.is_some())
 }
 
-/// One page of members in physical (bytewise member) order. `next` = the
-/// last MATCHED member's bytes; empty when iteration finished.
+/// One page of members in physical (bytewise member) order. `next` =
+/// Some(last MATCHED member) is the resume cursor; None means iteration
+/// finished (an EMPTY member is a valid member, so the cursor must be an
+/// Option, not an empty-bytes sentinel).
 pub struct MemberPage {
     pub members: Vec<Vec<u8>>,
-    pub next: Vec<u8>,
+    pub next: Option<Vec<u8>>,
 }
 
 /// Collect up to `count` members (0 = unbounded), optionally glob-filtered,
@@ -130,7 +132,7 @@ pub fn collect_members(
     });
     MemberPage {
         members,
-        next: resume.unwrap_or_default(),
+        next: resume,
     }
 }
 
@@ -188,7 +190,7 @@ mod tests {
         write_set(&store, b"s1x", 0, &[b"leak"]);
         let page = collect_members(&store, P, b"s1", None, None, 0);
         assert_eq!(page.members, vec![b"a".to_vec(), b"z".to_vec()]);
-        assert!(page.next.is_empty());
+        assert!(page.next.is_none());
     }
 
     #[test]
@@ -197,14 +199,37 @@ mod tests {
         write_set(&store, b"s", 0, &[b"m1", b"m2", b"n3"]);
         let p1 = collect_members(&store, P, b"s", None, Some(b"m?"), 1);
         assert_eq!(p1.members, vec![b"m1".to_vec()]);
-        assert_eq!(p1.next, b"m1".to_vec());
-        let p2 = collect_members(&store, P, b"s", Some(&p1.next), Some(b"m?"), 1);
+        assert_eq!(p1.next, Some(b"m1".to_vec()));
+        let p2 = collect_members(&store, P, b"s", p1.next.as_deref(), Some(b"m?"), 1);
         assert_eq!(p2.members, vec![b"m2".to_vec()]);
         let p3 = collect_members(&store, P, b"s", Some(b"n3"), None, 5);
-        assert!(p3.members.is_empty() && p3.next.is_empty());
+        assert!(p3.members.is_empty() && p3.next.is_none());
         assert!(collect_members(&store, P, b"gone", None, None, 0)
             .members
             .is_empty());
+    }
+
+    #[test]
+    fn empty_member_is_a_valid_resume_cursor() {
+        let (_dir, store) = open_tmp();
+        write_set(&store, b"s", 0, &[b"", b"a", b"b"]);
+        // A page cutting exactly AT the empty member carries Some(b""),
+        // not the finished sentinel — otherwise SCAN would misreport done
+        // with members remaining.
+        let p1 = collect_members(&store, P, b"s", None, None, 1);
+        assert_eq!(p1.members, vec![b"".to_vec()]);
+        assert_eq!(p1.next, Some(Vec::new()));
+        // Some(b"") resumes strictly after "": the rest still flows.
+        let p2 = collect_members(&store, P, b"s", p1.next.as_deref(), None, 1);
+        assert_eq!(p2.members, vec![b"a".to_vec()]);
+        assert_eq!(p2.next, Some(b"a".to_vec()));
+        let p3 = collect_members(&store, P, b"s", p2.next.as_deref(), None, 5);
+        assert_eq!(p3.members, vec![b"b".to_vec()]);
+        assert_eq!(p3.next, None, "true end only after the last member");
+        // Unbounded read: one page, cursor None.
+        let all = collect_members(&store, P, b"s", None, None, 0);
+        assert_eq!(all.members, vec![Vec::new(), b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(all.next, None);
     }
 
     #[test]

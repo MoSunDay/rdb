@@ -286,6 +286,47 @@ fn hscan_pages_with_count_and_match() {
 }
 
 #[test]
+fn hscan_pages_over_an_empty_field() {
+    let (_g, s) = shared_for("127.0.0.1:40513");
+    let argv: Vec<Vec<u8>> = vec![
+        b"k".to_vec(),
+        Vec::new(),
+        b"0".to_vec(),
+        b"a".to_vec(),
+        b"1".to_vec(),
+        b"b".to_vec(),
+        b"2".to_vec(),
+    ];
+    call(
+        &s,
+        "hset",
+        &argv.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+    );
+    // COUNT 1 puts the empty field on a page boundary: the hex cursor of
+    // "" is "" itself, which must resume STRICTLY AFTER "" — a restart
+    // there would loop forever, and the old empty-bytes sentinel misread
+    // it as "done", silently dropping the remaining fields.
+    let mut cursor = b"0".to_vec();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = test_reader::parse(&call(&s, "hscan", &[b"k", &cursor, b"COUNT", b"1"]));
+        cursor = test_reader::bulk(&page[0]);
+        let Frame::Array(items) = &page[1] else {
+            panic!("items array");
+        };
+        seen.extend(items.iter().map(test_reader::bulk));
+        pages += 1;
+        if cursor == b"0" {
+            break;
+        }
+        assert!(pages < 32, "cursor loop did not terminate");
+    }
+    seen.sort();
+    assert_eq!(seen, vec![Vec::new(), b"a".to_vec(), b"b".to_vec()]);
+}
+
+#[test]
 fn hash_commands_reject_string_key() {
     let (_g, s) = shared_for("127.0.0.1:40310");
     set_raw(&s, b"str", b"v");

@@ -134,6 +134,25 @@ fn inline_unbalanced_quotes() {
 }
 
 #[test]
+fn multibulk_count_is_capped() {
+    // A huge (or negative) "*N" header must error before the parser
+    // preallocates for `count` elements.
+    assert_eq!(err_msg(b"*2000000\r\n"), "invalid multibulk length");
+    assert_eq!(err_msg(b"*999999999999\r\n"), "invalid multibulk length");
+    assert_eq!(err_msg(b"*-1\r\n"), "invalid multibulk length");
+    // Boundary: 1_048_576 is accepted (no payload yet -> Incomplete),
+    // one past it errors.
+    assert!(matches!(
+        parse_command(b"*1048576\r\n"),
+        ParseOutcome::Incomplete
+    ));
+    assert_eq!(err_msg(b"*1048577\r\n"), "invalid multibulk length");
+    // Normal small multibulks are unaffected.
+    let (args, _) = complete(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+    assert_eq!(s(&args), ["GET", "foo"]);
+}
+
+#[test]
 fn writers_byte_exact() {
     let mut buf = Vec::new();
     append_string(&mut buf, "OK");
