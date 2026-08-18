@@ -27,6 +27,9 @@ pub mod set_cmd;
 pub mod set_scan;
 pub mod setops_cmd;
 pub mod string;
+pub mod vectorset_attr;
+pub mod vectorset_cmd;
+pub mod vectorset_sim;
 pub mod zset_block;
 pub mod zset_cmd;
 pub mod zset_pop;
@@ -206,6 +209,14 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "json.arrtrim" => Some(|ctx| Box::pin(json_arr::json_arrtrim(ctx))),
         "json.objkeys" => Some(|ctx| Box::pin(json_obj::json_objkeys(ctx))),
         "json.objlen" => Some(|ctx| Box::pin(json_obj::json_objlen(ctx))),
+        // Vector sets (vectorset_cmd/vectorset_attr/vectorset_sim).
+        "vadd" => Some(|ctx| Box::pin(vectorset_cmd::vadd(ctx))),
+        "vrem" => Some(|ctx| Box::pin(vectorset_cmd::vrem(ctx))),
+        "vcard" => Some(|ctx| Box::pin(vectorset_cmd::vcard(ctx))),
+        "vdim" => Some(|ctx| Box::pin(vectorset_cmd::vdim(ctx))),
+        "vsetattr" => Some(|ctx| Box::pin(vectorset_attr::vsetattr(ctx))),
+        "vgetattr" => Some(|ctx| Box::pin(vectorset_attr::vgetattr(ctx))),
+        "vsim" => Some(|ctx| Box::pin(vectorset_sim::vsim(ctx))),
         _ => None,
     }
 }
@@ -240,3 +251,7 @@ mod json_arr_tests;
 #[cfg(test)]
 #[path = "json_tests.rs"]
 mod json_tests;
+
+#[cfg(test)]
+#[path = "vectorset_tests.rs"]
+mod vectorset_tests;

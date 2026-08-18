@@ -16,6 +16,7 @@ pub mod latch;
 pub mod list_ds;
 pub mod set_ds;
 pub mod setops;
+pub mod vectorset_ds;
 pub mod wait;
 pub mod zset_ds;
 

@@ -135,6 +135,23 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     (Redis skips such keys).
   - `JSON.DEL`/`JSON.FORGET` are aliases; a root path drops the kind-0x10 record through the
     shared expire machinery (TTL index maintained), a sub-path splices the document.
+- **VectorSet (P4, vadd/vrem/vcard/vdim/vsetattr/vgetattr/vsim)**: brute-force O(n*dim) cosine
+  scan per VSIM (no HNSW graph, no EF/QSIP quantization) -- `FILTER`/`EF`/`EXPLORE` options are
+  unimplemented and rejected as arity/unknown-option errors.
+  - Vectors are stored raw f64 (kind-0x11 meta + kind-0x12 elem records, LE components; no L2
+    normalization at rest -- cosine scoring makes it equivalent).
+  - `score = (cos + 1) / 2` in [0,1]; a zero vector (either side) has cosine 0, i.e. score 0.5.
+    Scores format as Rust's shortest-roundtrip f64 (`1`, `0.5`, `0.8535533905932737`), not
+    Redis' fixed decimals.
+  - `VDIM`/`VSIM` on a missing key error with `ERR vector set does not exist` (VSIM answers nil
+    in Redis); `VSETATTR` on a missing key/element replies `:0`.
+  - `VGETATTR` implements the single-attribute model only (Redis 8.2 adds multi-attribute
+    `ATTRS`); the empty string clears back to the null bulk.
+  - `VADD` on an existing element replaces the vector but KEEPS the stored attribute (Redis
+    parity) and preserves the key's TTL; dimension must be 1..=4096 (`ERR invalid dim`) and
+    match the set's (`ERR dimension mismatch`).
+  - VSIM ties break by element byte order ascending (Redis breaks by internal HNSW order);
+    `COUNT`/`WITHSCORES`/`WITHATTRIBS` parse in any order, `VALUES` swallows the argument tail.
 
 ## Runtime verification (this tree)
 
