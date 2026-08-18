@@ -1,6 +1,9 @@
 Commit: d481b1d708c248f86be394189d01ca7305fc8528
 # server
 
+> **已归档**：Go 实现已移至 `archive/go/internal/server`（git mv 保留历史，不再维护）。当前实现见 [agents/rust/index.md](../rust/index.md)。以下内容描述归档前的 Go 实现。
+
+
 ## 职责
 - 进程装配：初始化 Raft 控制面（`newRCache`）与 pebble 数据面（`newDB`），组装 `RDB`。
 - RESP 协议接入：基于 redcon 提供 Redis 兼容 TCP 服务，服务密码为配置 `raft_token`（`redcon.NewServer` 第二参数，客户端需 AUTH）。
