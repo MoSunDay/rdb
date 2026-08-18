@@ -68,7 +68,21 @@ pub fn append_entry_frame(out: &mut Vec<u8>, e: &Entry) {
 /// Count a lazy idle-reclaim observed through a meta read.
 pub(super) fn count_reap(ctx: &Ctx<'_>) {
     let stats = &ctx.shared.lite.stats;
-    stats.streams_live.fetch_sub(1, Ordering::Relaxed);
+    // Decrement with a floor at zero: two readers observing the same
+    // purge (or a reap without a matching live count) must not drive the
+    // gauge negative, so retry until a compare-and-swap lands in range.
+    let mut cur = stats.streams_live.load(Ordering::Relaxed);
+    while cur > 0 {
+        match stats.streams_live.compare_exchange_weak(
+            cur,
+            cur - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(v) => cur = v,
+        }
+    }
     stats.streams_reaped.fetch_add(1, Ordering::Relaxed);
 }
 

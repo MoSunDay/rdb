@@ -94,3 +94,112 @@ fn zrank_counts_equal_scores_by_member() {
         b"*2\r\n:1\r\n$1\r\n5\r\n".to_vec()
     );
 }
+
+/// -0.0 sorts strictly before +0.0 in the physical score index, yet the
+/// two zeros compare EQUAL numerically: an INCLUSIVE zero lower bound
+/// must seek from score_sortable(-0.0) or every "-0" member falls below
+/// the seek and drops out of the window (regression guard).
+#[test]
+fn zrangebyscore_inclusive_zero_includes_negative_zero_members() {
+    let (_g, s) = shared_for("127.0.0.1:40524");
+    // a at -0.0, b at +0.0 (numerically equal), c at 1.
+    call(&s, "zadd", &[b"k", b"-0", b"a", b"0", b"b", b"1", b"c"]);
+    // Inclusive +0 min covers BOTH zeros.
+    assert_eq!(
+        call(&s, "zrangebyscore", &[b"k", b"0", b"0"]),
+        b"*2\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec()
+    );
+    // An inclusive "-0" min behaves the same.
+    assert_eq!(
+        call(&s, "zrangebyscore", &[b"k", b"-0", b"0"]),
+        b"*2\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec()
+    );
+    // An EXCLUSIVE zero min skips both zeros: (0 equals -0 numerically.
+    assert_eq!(
+        call(&s, "zrangebyscore", &[b"k", b"(0", b"1"]),
+        b"*1\r\n$1\r\nc\r\n".to_vec()
+    );
+    // A window starting below zero still sweeps the -0.0 members.
+    call(&s, "zadd", &[b"k", b"-1", b"x"]);
+    assert_eq!(
+        call(&s, "zrangebyscore", &[b"k", b"-1", b"0"]),
+        b"*3\r\n$1\r\nx\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec()
+    );
+}
+
+/// ZCOUNT shares the window seek: an inclusive zero lower bound must
+/// count the "-0" members, an exclusive one must not.
+#[test]
+fn zcount_zero_lower_bound_counts_negative_zero() {
+    let (_g, s) = shared_for("127.0.0.1:40525");
+    call(
+        &s,
+        "zadd",
+        &[b"k", b"-1", b"x", b"-0", b"a", b"0", b"b", b"1", b"y"],
+    );
+    // [0, +inf]: a (-0.0), b (+0.0), y.
+    assert_eq!(int_of(&call(&s, "zcount", &[b"k", b"0", b"inf"])), 3);
+    // [-0, 0]: both zeros only.
+    assert_eq!(int_of(&call(&s, "zcount", &[b"k", b"-0", b"0"])), 2);
+    // (0, +inf]: neither zero.
+    assert_eq!(int_of(&call(&s, "zcount", &[b"k", b"(0", b"inf"])), 1);
+    // [-inf, 0]: x, a, b.
+    assert_eq!(int_of(&call(&s, "zcount", &[b"k", b"-inf", b"0"])), 3);
+}
+
+/// ZSCORE echoes a stored -0.0 back as the bulk "-0" (the sortable
+/// round-trip is bit-exact for both zeros).
+#[test]
+fn zscore_serializes_negative_zero_as_minus_zero() {
+    let (_g, s) = shared_for("127.0.0.1:40526");
+    call(&s, "zadd", &[b"k", b"-0", b"a"]);
+    assert_eq!(call(&s, "zscore", &[b"k", b"a"]), b"$2\r\n-0\r\n".to_vec());
+    // And via the increment path on a fresh member.
+    assert_eq!(
+        call(&s, "zincrby", &[b"k2", b"-0", b"m"]),
+        b"$2\r\n-0\r\n".to_vec()
+    );
+    assert_eq!(call(&s, "zscore", &[b"k2", b"m"]), b"$2\r\n-0\r\n".to_vec());
+    // A plain +0 member serializes WITHOUT the sign: Rust prints "0".
+    call(&s, "zadd", &[b"k", b"0", b"b"]);
+    assert_eq!(call(&s, "zscore", &[b"k", b"b"]), b"$1\r\n0\r\n".to_vec());
+}
+
+/// ZRANGEBYLEX/ZREVRANGEBYLEX take no WITHSCORES: the option must be
+/// answered with a plain syntax error (as in Redis), not swallowed,
+/// while the BYSCORE twin keeps it legal.
+#[test]
+fn zrangebylex_family_rejects_withscores() {
+    let (_g, s) = shared_for("127.0.0.1:40527");
+    call(&s, "zadd", &[b"k", b"0", b"a", b"0", b"b", b"0", b"c"]);
+    let err = b"-ERR syntax error\r\n".to_vec();
+    assert_eq!(
+        call(&s, "zrangebylex", &[b"k", b"-", b"+", b"WITHSCORES"]),
+        err
+    );
+    assert_eq!(
+        call(&s, "zrangebylex", &[b"k", b"[a", b"(d", b"withscores"]),
+        err
+    );
+    assert_eq!(
+        call(&s, "zrevrangebylex", &[b"k", b"+", b"-", b"WITHSCORES"]),
+        err
+    );
+    // Plain lex queries still reply, and BYSCORE keeps WITHSCORES legal.
+    assert_eq!(
+        call(&s, "zrangebylex", &[b"k", b"-", b"+"]),
+        b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, "zrevrangebylex", &[b"k", b"[c", b"-"]),
+        b"*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n".to_vec()
+    );
+    assert_eq!(
+        call(
+            &s,
+            "zrangebyscore",
+            &[b"k", b"-inf", b"+inf", b"WITHSCORES"]
+        ),
+        b"*6\r\n$1\r\na\r\n$1\r\n0\r\n$1\r\nb\r\n$1\r\n0\r\n$1\r\nc\r\n$1\r\n0\r\n".to_vec()
+    );
+}

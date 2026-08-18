@@ -124,9 +124,11 @@ pub fn flag_allows(flag: TtlFlag, old: u64, new: u64) -> bool {
 }
 
 /// DEL/UNLINK: remove the key in whichever shape it exists. `Ok(true)`
-/// only when something was deleted. The delete range covers the whole
-/// family regardless of races; a stale index entry left behind by a
-/// concurrent TTL write is swept later by the active-expire sampler.
+/// only when something was deleted. Both shapes take the per-user-key
+/// latch (a concurrent EXPIRE migrates raw strings to enveloped records
+/// under that same latch); the delete range covers the whole family
+/// regardless of races; a stale index entry left behind by a concurrent
+/// TTL write is swept later by the active-expire sampler.
 pub async fn delete_records(
     shared: &Shared,
     prefix: &[u8],
@@ -136,7 +138,11 @@ pub async fn delete_records(
     match resolve(&shared.store, prefix, key, now) {
         KeyState::Missing => Ok(false),
         KeyState::RawString { .. } => {
-            // Fast path: one bare record, atomic single delete.
+            // Fast path: one bare record, atomic single delete — but
+            // still latched, or a concurrent EXPIRE (raw -> enveloped
+            // RMW) could leave the migrated record behind after a
+            // reported delete.
+            let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
             store::del_async(Arc::clone(&shared.store), prefix.to_vec(), key.to_vec()).await
         }
         KeyState::Enveloped {

@@ -226,20 +226,16 @@ fn push_target(ctx: &Ctx<'_>, key: &[u8]) -> Option<(u64, list_ds::ListMeta)> {
 /// order is preserved. The caller holds the src+dst latches; a failed
 /// restore keeps the store-failure reply `commit_list` already wrote.
 async fn restore_popped(ctx: &mut Ctx<'_>, key: &[u8], elem: &[u8], left: bool) {
-    let (expire_ms, mut after) = match list_state(
-        &ctx.shared.store,
-        &ctx.prefix_key,
-        key,
-        expire::now_ms(),
-    ) {
-        ListState::List { expire_ms, meta } => (expire_ms, meta),
-        ListState::Missing => (0, blank_meta()),
-        // src itself changed type mid-move: no list to restore onto.
-        ListState::WrongType => {
-            append_error(ctx.out, WRONGTYPE);
-            return;
-        }
-    };
+    let (expire_ms, mut after) =
+        match list_state(&ctx.shared.store, &ctx.prefix_key, key, expire::now_ms()) {
+            ListState::List { expire_ms, meta } => (expire_ms, meta),
+            ListState::Missing => (0, blank_meta()),
+            // src itself changed type mid-move: no list to restore onto.
+            ListState::WrongType => {
+                append_error(ctx.out, WRONGTYPE);
+                return;
+            }
+        };
     let mut batch = WriteBatch::default();
     if left {
         list_ds::put_l(&mut batch, &ctx.prefix_key, key, after.l_next, elem);

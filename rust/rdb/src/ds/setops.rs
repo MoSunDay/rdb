@@ -16,6 +16,7 @@ use crate::command::keys_core::{self, KeyState};
 use crate::ds::codec::{self, KIND_SET_META};
 use crate::ds::expire;
 use crate::ds::set_ds;
+use crate::resp::codec::append_error;
 use crate::store::Store;
 
 /// Error text for keys hashing to different slots (Redis cluster wording).
@@ -31,6 +32,17 @@ pub fn same_slot(keys: &[Vec<u8>]) -> bool {
         None => true, // no keys: vacuously same
         Some(first) => slots.all(|s| s == first),
     }
+}
+
+/// Entry-point guard for multi-key commands (MGET/MSET/DEL/EXISTS/RENAME
+/// family): unless every key hashes to one slot, append the CROSSSLOT
+/// error to `out` and return false so the caller can stop right there.
+pub fn require_same_slot(out: &mut Vec<u8>, keys: &[Vec<u8>]) -> bool {
+    if same_slot(keys) {
+        return true;
+    }
+    append_error(out, CROSSSLOT_ERROR);
+    false
 }
 
 /// One operand's members; `WrongType` = key exists but is not a set.

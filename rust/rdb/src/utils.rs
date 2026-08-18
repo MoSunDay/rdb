@@ -37,7 +37,10 @@ pub fn glob_match(pattern: &[u8], s: &[u8]) -> bool {
         }
         Some(b'?') => !s.is_empty() && glob_match(&pattern[1..], &s[1..]),
         Some(b'[') => match match_class(pattern, s) {
-            Some((hit, rest)) => hit && glob_match(rest, &s[1..]),
+            // A class consumes one byte: never a hit for empty `s` (a
+            // negated class "matches" empty in match_class, so slicing
+            // `&s[1..]` below would panic; Redis also bails out early).
+            Some((hit, rest)) => hit && !s.is_empty() && glob_match(rest, &s[1..]),
             None => s.first() == Some(&b'[') && glob_match(&pattern[1..], &s[1..]),
         },
         Some(b'\\') => match (pattern.get(1), s.first()) {
@@ -186,6 +189,22 @@ mod tests {
         // Unterminated class degrades to a literal '['.
         assert!(glob_match(b"h[aello", b"h[aello"));
         assert!(!glob_match(b"h[aello", b"hallo"));
+    }
+
+    #[test]
+    fn glob_match_class_consumes_one_byte() {
+        // A class always consumes a byte, so empty s never matches — even
+        // negated, where match_class reports a "hit" and the old
+        // `&s[1..]` sliced out of range (SSCAN over an empty member with
+        // MATCH [^x]* used to panic).
+        assert!(!glob_match(b"[^x]*", b""));
+        assert!(!glob_match(b"[a]*", b""));
+        assert!(!glob_match(b"[^x]", b""));
+        assert!(!glob_match(b"*[^x]*", b""));
+        // One byte present: class semantics unchanged.
+        assert!(glob_match(b"[^x]*", b"y"));
+        assert!(!glob_match(b"[^x]*", b"x"));
+        assert!(glob_match(b"[a]*", b"a"));
     }
 
     #[test]

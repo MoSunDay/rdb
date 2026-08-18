@@ -173,5 +173,5 @@ fn ttl_interplay_lazy_purge() {
     assert_eq!(call(&s, "json.get", &[b"k"]), b"$-1\r\n".to_vec());
     assert_eq!(int_of(&call(&s, "exists", &[b"k"])), 0);
     // The expire index entry went with it.
-    assert_eq!(crate::ds::expire::sample_once(&s.store, 1000, 10), 0);
+    assert_eq!(crate::ds::expire::sample_once(&s.store, 1000, 10, b"").0, 0);
 }

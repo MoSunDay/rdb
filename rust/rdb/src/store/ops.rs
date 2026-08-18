@@ -66,6 +66,105 @@ pub async fn delete_range_async(
         .map_err(|e| e.to_string())?
 }
 
+/// Keys per batch in [`delete_range_paged`]: bounds each synced write so
+/// an empty-upper wipe cannot grow one unbounded fsync-ed WriteBatch.
+const DELETE_PAGE: usize = 1000;
+
+/// Paged deletion of `[lower, upper)` (EMPTY `upper` = to the end of the
+/// keyspace). Unlike [`delete_range`]'s empty-upper path -- one batch
+/// holding every key in the keyspace behind a single fsync -- each page
+/// deletes at most [`DELETE_PAGE`] keys in its own synced batch and the
+/// scan resumes where the last page stopped, until a page comes back
+/// empty. Returns the number of keys deleted.
+pub fn delete_range_paged(store: &Store, lower: &[u8], upper: &[u8]) -> Result<usize, String> {
+    delete_range_paged_inner(store, lower, upper, DELETE_PAGE)
+}
+
+/// Async twin of [`delete_range_paged`]: every page's collect-and-fsync
+/// runs on tokio's blocking pool, with a yield between pages so a long
+/// wipe stays cooperative.
+pub async fn delete_range_paged_async(
+    store: Arc<Store>,
+    lower: Vec<u8>,
+    upper: Vec<u8>,
+) -> Result<usize, String> {
+    let mut cursor = lower;
+    let mut total = 0usize;
+    loop {
+        let (deleted, next) = {
+            let from = cursor.clone();
+            let to = upper.clone();
+            let shared = Arc::clone(&store);
+            tokio::task::spawn_blocking(move || delete_page_once(&shared, &from, &to, DELETE_PAGE))
+                .await
+                .map_err(|e| e.to_string())??
+        };
+        tokio::task::yield_now().await;
+        if deleted == 0 {
+            return Ok(total);
+        }
+        total += deleted;
+        cursor = next;
+    }
+}
+
+/// Testable core of [`delete_range_paged`] with an explicit page size.
+fn delete_range_paged_inner(
+    store: &Store,
+    lower: &[u8],
+    upper: &[u8],
+    page: usize,
+) -> Result<usize, String> {
+    let mut cursor = lower.to_vec();
+    let mut total = 0usize;
+    loop {
+        let (deleted, next) = delete_page_once(store, &cursor, upper, page)?;
+        if deleted == 0 {
+            return Ok(total); // empty page: the range is exhausted
+        }
+        total += deleted;
+        cursor = next;
+    }
+}
+
+/// One page of a paged wipe: collect up to `page` keys in
+/// `[cursor, upper)` (empty `upper` = no upper bound) and batch-delete
+/// them in one synced write. Returns `(deleted, next_cursor)` where
+/// `next_cursor` is the first key the page did NOT take -- the next page
+/// scans inclusive from it; when the scan ran out (or left the window)
+/// it stays at `cursor`, whose keys are gone, so the follow-up page
+/// comes back empty. `(0, _)` means nothing left to delete.
+fn delete_page_once(
+    store: &Store,
+    cursor: &[u8],
+    upper: &[u8],
+    page: usize,
+) -> Result<(usize, Vec<u8>), String> {
+    let page = page.max(1); // a 0 page would never collect anything
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page);
+    let mut next = cursor.to_vec();
+    for_each_from(store, cursor, false, &mut |k, _| {
+        if !upper.is_empty() && k >= upper {
+            return false; // left the window
+        }
+        if keys.len() == page {
+            next = k.to_vec(); // page full: resume at this unvisited key
+            return false;
+        }
+        keys.push(k.to_vec());
+        true
+    })?;
+    if keys.is_empty() {
+        return Ok((0, next));
+    }
+    let mut batch = WriteBatch::default();
+    for k in &keys {
+        batch.delete(k);
+    }
+    batch_write(store, batch)?;
+    Ok((keys.len(), next))
+}
+
 fn forward_iter<'a>(
     store: &'a Store,
     from: &[u8],
@@ -258,6 +357,84 @@ mod tests {
         assert_eq!(first_key_from(&store, b"").unwrap(), Some(b"70/m".to_vec()));
     }
 
+    #[test]
+    fn delete_range_paged_wipes_in_multiple_batches() {
+        let (_dir, store) = open_tmp();
+        for (k, v) in [
+            ("a", b"1"),
+            ("b", b"2"),
+            ("c", b"3"),
+            ("d", b"4"),
+            ("e", b"5"),
+        ] {
+            rocksdb::set(&store, b"70/", k.as_bytes(), v).unwrap();
+        }
+        rocksdb::set(&store, b"90/", b"keep", b"x").unwrap(); // outside the window
+        let upper = b"70/z".to_vec();
+        // page=2: three deleting rounds (2 + 2 + 1), then an empty page.
+        let (n1, c1) = delete_page_once(&store, b"70/a", &upper, 2).unwrap();
+        assert_eq!((n1, c1.as_slice()), (2, b"70/c".as_slice()));
+        let (n2, c2) = delete_page_once(&store, &c1, &upper, 2).unwrap();
+        assert_eq!((n2, c2.as_slice()), (2, b"70/e".as_slice()));
+        let (n3, c3) = delete_page_once(&store, &c2, &upper, 2).unwrap();
+        assert_eq!((n3, c3.as_slice()), (1, b"70/e".as_slice()));
+        let (n4, _) = delete_page_once(&store, &c3, &upper, 2).unwrap();
+        assert_eq!(n4, 0);
+        for k in ["a", "b", "c", "d", "e"] {
+            assert_eq!(rocksdb::get(&store, b"70/", k.as_bytes()), Ok(None));
+        }
+        assert_eq!(
+            rocksdb::get(&store, b"90/", b"keep"),
+            Ok(Some(b"x".to_vec()))
+        );
+        // reseed: the packaged loop returns the same total
+        for (k, v) in [
+            ("a", b"1"),
+            ("b", b"2"),
+            ("c", b"3"),
+            ("d", b"4"),
+            ("e", b"5"),
+        ] {
+            rocksdb::set(&store, b"70/", k.as_bytes(), v).unwrap();
+        }
+        assert_eq!(
+            delete_range_paged_inner(&store, b"70/a", &upper, 2).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn delete_range_paged_empty_upper_wipes_to_end() {
+        let (_dir, store) = open_tmp();
+        rocksdb::set(&store, b"10/", b"low", b"0").unwrap();
+        rocksdb::set(&store, b"70/", b"a", b"1").unwrap();
+        rocksdb::set(&store, b"99/", b"z", b"9").unwrap();
+        assert_eq!(delete_range_paged_inner(&store, b"70/", b"", 2).unwrap(), 2);
+        assert_eq!(rocksdb::get(&store, b"70/", b"a"), Ok(None));
+        assert_eq!(rocksdb::get(&store, b"99/", b"z"), Ok(None)); // >= 70/
+        assert_eq!(
+            rocksdb::get(&store, b"10/", b"low"),
+            Ok(Some(b"0".to_vec()))
+        ); // < 70/
+    }
+
+    #[test]
+    fn delete_range_paged_empty_range_returns_zero() {
+        let (_dir, store) = open_tmp();
+        rocksdb::set(&store, b"70/", b"a", b"1").unwrap();
+        // window with nothing inside
+        assert_eq!(
+            delete_range_paged_inner(&store, b"80/", b"90/", 2).unwrap(),
+            0
+        );
+        // open-ended range starting past the last key
+        assert_eq!(
+            delete_range_paged_inner(&store, b"70/b", b"", 2).unwrap(),
+            0
+        );
+        assert_eq!(rocksdb::get(&store, b"70/", b"a"), Ok(Some(b"1".to_vec())));
+    }
+
     #[tokio::test]
     async fn async_twins_match_sync_results() {
         let (_dir, store) = open_tmp();
@@ -270,5 +447,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_physical(&shared, b"70/k").unwrap(), None);
+        // paged async twin deletes to the same effect and reports the total
+        let mut batch = WriteBatch::default();
+        batch.put(b"70/p1", b"1");
+        batch.put(b"70/p2", b"2");
+        batch_write_async(Arc::clone(&shared), batch).await.unwrap();
+        assert_eq!(
+            delete_range_paged_async(Arc::clone(&shared), b"70/p".to_vec(), b"70/q".to_vec())
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(get_physical(&shared, b"70/p2").unwrap(), None);
     }
 }

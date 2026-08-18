@@ -252,7 +252,7 @@ fn pick_many(fields: &[(Vec<u8>, Vec<u8>)], count: i64) -> Vec<usize> {
         return Vec::new();
     }
     if count < 0 {
-        return (0..(-count) as u64)
+        return (0..count.unsigned_abs())
             .map(|_| (rand_u64() % n as u64) as usize)
             .collect();
     }
@@ -267,4 +267,36 @@ fn pick_many(fields: &[(Vec<u8>, Vec<u8>)], count: i64) -> Vec<usize> {
         }
     }
     picks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_fields() -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ]
+    }
+
+    #[test]
+    fn pick_many_negative_count_bound_survives_i64_min() {
+        let fields = two_fields();
+        // Bounded negative draw: |count| independent picks, in range.
+        let picks = pick_many(&fields, -5);
+        assert_eq!(picks.len(), 5);
+        assert!(picks.iter().all(|&i| i < fields.len()));
+        // The draw bound comes from unsigned_abs(): plain `-count`
+        // overflows at i64::MIN (panic in debug, wrap in release) and
+        // would ask for a ~2^63-element vector.
+        assert_eq!(i64::MIN.unsigned_abs(), 1u64 << 63);
+    }
+
+    #[test]
+    fn pick_many_positive_and_zero_bounds() {
+        assert!(pick_many(&two_fields(), 0).is_empty());
+        assert!(pick_many(&[], 7).is_empty());
+        assert_eq!(pick_many(&two_fields(), 99).len(), 2);
+    }
 }

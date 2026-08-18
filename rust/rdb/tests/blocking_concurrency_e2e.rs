@@ -93,9 +93,9 @@ async fn concurrent_blpop_same_and_distinct_keys_wake_within_bounds() {
     }
     for key in ["a1", "a2"] {
         let s = Arc::clone(&shared);
-        waiters.push(tokio::spawn(async move {
-            call(&s, "blpop", &[key, "5"]).await
-        }));
+        waiters.push(tokio::spawn(
+            async move { call(&s, "blpop", &[key, "5"]).await },
+        ));
     }
     // Let every waiter reach its park before waking them.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -106,11 +106,17 @@ async fn concurrent_blpop_same_and_distinct_keys_wake_within_bounds() {
     // length replies; final consistency is checked after the joins.
     for elem in ["e1", "e2", "e3"] {
         let reply = call(&shared, "rpush", &["hot", elem]).await;
-        assert!(reply.starts_with(b":") && reply.ends_with(b"\r\n"), "{reply:?}");
+        assert!(
+            reply.starts_with(b":") && reply.ends_with(b"\r\n"),
+            "{reply:?}"
+        );
     }
     for (key, elem) in [("a1", "v1"), ("a2", "v2")] {
         let reply = call(&shared, "rpush", &[key, elem]).await;
-        assert!(reply.starts_with(b":") && reply.ends_with(b"\r\n"), "{reply:?}");
+        assert!(
+            reply.starts_with(b":") && reply.ends_with(b"\r\n"),
+            "{reply:?}"
+        );
     }
 
     // Bounded completion: 10s wall clock for the whole fan.
@@ -129,14 +135,21 @@ async fn concurrent_blpop_same_and_distinct_keys_wake_within_bounds() {
         .iter()
         .map(|r| {
             let text = String::from_utf8_lossy(r).into_owned();
-            assert!(text.starts_with("*2\r\n$3\r\nhot\r\n"), "same-key pop: {text:?}");
+            assert!(
+                text.starts_with("*2\r\n$3\r\nhot\r\n"),
+                "same-key pop: {text:?}"
+            );
             let elem = text.trim_start_matches("*2\r\n$3\r\nhot\r\n$2\r\n");
             assert_eq!(elem.len(), 4, "element plus CRLF: {text:?}");
             elem[..2].to_string()
         })
         .collect();
     hot_elems.sort();
-    assert_eq!(hot_elems, vec!["e1", "e2", "e3"], "each waiter got one element");
+    assert_eq!(
+        hot_elems,
+        vec!["e1", "e2", "e3"],
+        "each waiter got one element"
+    );
 
     // Distinct-key waiters were not serialized behind "hot".
     assert_eq!(replies[3], arr2(b"a1", b"v1"));
@@ -155,7 +168,10 @@ async fn blocking_concurrency_leaves_no_stray_data_or_waiters() {
     let s = Arc::clone(&shared);
     let waiter = tokio::spawn(async move { call(&s, "blpop", &["k", "1"]).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(call(&shared, "rpush", &["k", "x"]).await, b":1\r\n".to_vec());
+    assert_eq!(
+        call(&shared, "rpush", &["k", "x"]).await,
+        b":1\r\n".to_vec()
+    );
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), waiter)
             .await
@@ -166,9 +182,12 @@ async fn blocking_concurrency_leaves_no_stray_data_or_waiters() {
     assert_eq!(call(&shared, "llen", &["k"]).await, b":0\r\n".to_vec());
     // A second blocked pop on the drained key times out cleanly (1s).
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), call(&shared, "blpop", &["k", "0.5"]))
-            .await
-            .expect("timeout path completes"),
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            call(&shared, "blpop", &["k", "0.5"])
+        )
+        .await
+        .expect("timeout path completes"),
         b"*-1\r\n".to_vec()
     );
 }
@@ -194,7 +213,10 @@ async fn blpop_zero_blocks_until_push() {
     let waiter = tokio::spawn(async move { call(&s, "blpop", &["k", "0"]).await });
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!waiter.is_finished(), "BLOCK 0 must park, not time out");
-    assert_eq!(call(&shared, "rpush", &["k", "v"]).await, b":1\r\n".to_vec());
+    assert_eq!(
+        call(&shared, "rpush", &["k", "v"]).await,
+        b":1\r\n".to_vec()
+    );
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), waiter)
             .await
@@ -240,7 +262,10 @@ async fn blmove_restore_on_wake_time_wrongtype_dst() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!waiter.is_finished(), "BLMOVE 0 must park on empty src");
     // dst turns wrong-type while the move is parked.
-    assert_eq!(call(&shared, "set", &["{g}dst", "x"]).await, b"+OK\r\n".to_vec());
+    assert_eq!(
+        call(&shared, "set", &["{g}dst", "x"]).await,
+        b"+OK\r\n".to_vec()
+    );
     // The wake pops the element off src; dst cannot receive it.
     assert_eq!(
         call(&shared, "rpush", &["{g}src", "a"]).await,
@@ -257,4 +282,160 @@ async fn blmove_restore_on_wake_time_wrongtype_dst() {
         b"*1\r\n$1\r\na\r\n".to_vec()
     );
     assert_eq!(call(&shared, "llen", &["{g}src"]).await, b":1\r\n".to_vec());
+}
+
+/// A MULTI-element push must wake as many parked waiters as it has
+/// elements: three BLPOPs on one key, then ONE `LPUSH k e1 e2 e3`. The
+/// push notifies min(3 elements, 3 waiters) = 3; each woken waiter pops
+/// exactly one element and the key drains to zero -- all inside 10s.
+#[tokio::test]
+async fn multi_element_lpush_wakes_all_parked_waiters() {
+    let shared = Arc::new(shared_for("44115"));
+    let mut waiters = Vec::new();
+    for _ in 0..3 {
+        let s = Arc::clone(&shared);
+        waiters.push(tokio::spawn(async move {
+            call(&s, "blpop", &["key", "5"]).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for w in &waiters {
+        assert!(!w.is_finished(), "all three BLPOPs must park first");
+    }
+
+    let reply = call(&shared, "lpush", &["key", "e1", "e2", "e3"]).await;
+    assert_eq!(reply, b":3\r\n".to_vec(), "lpush reply");
+
+    let replies = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut replies = Vec::new();
+        for w in waiters {
+            replies.push(w.await.expect("waiter task"));
+        }
+        replies
+    })
+    .await
+    .expect("all three waiters wake within 10s of one multi-push");
+
+    let mut elems: Vec<String> = replies
+        .iter()
+        .map(|r| {
+            let text = String::from_utf8_lossy(r).into_owned();
+            assert!(
+                text.starts_with("*2\r\n$3\r\nkey\r\n"),
+                "pair reply: {text:?}"
+            );
+            let elem = text.trim_start_matches("*2\r\n$3\r\nkey\r\n$2\r\n");
+            assert_eq!(elem.len(), 4, "element plus CRLF: {text:?}");
+            elem[..2].to_string()
+        })
+        .collect();
+    elems.sort();
+    assert_eq!(elems, vec!["e1", "e2", "e3"], "each waiter got one element");
+    assert_eq!(call(&shared, "llen", &["key"]).await, b":0\r\n".to_vec());
+}
+
+/// The zset twin: two BZPOPMIN waiters parked on one key, then ONE
+/// `ZADD` landing two members. The notify wakes min(2, 2) = 2; both
+/// waiters pop one member each and the zset is fully drained.
+#[tokio::test]
+async fn zadd_multiple_members_wake_all_parked_bzpopmin() {
+    let shared = Arc::new(shared_for("44116"));
+    let mut waiters = Vec::new();
+    for _ in 0..2 {
+        let s = Arc::clone(&shared);
+        waiters.push(tokio::spawn(async move {
+            call(&s, "bzpopmin", &["z", "5"]).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for w in &waiters {
+        assert!(!w.is_finished(), "both BZPOPMINs must park first");
+    }
+
+    let added = call(&shared, "zadd", &["z", "1.5", "m1", "2.5", "m2"]).await;
+    assert_eq!(added, b":2\r\n".to_vec(), "zadd reply");
+
+    let replies = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut replies = Vec::new();
+        for w in waiters {
+            replies.push(w.await.expect("waiter task"));
+        }
+        replies
+    })
+    .await
+    .expect("both waiters wake within 10s of one multi-zadd");
+
+    let mut triples = replies.clone();
+    triples.sort();
+    assert_eq!(
+        triples,
+        vec![arr3(b"z", b"m1", b"1.5"), arr3(b"z", b"m2", b"2.5")],
+        "each waiter popped one member"
+    );
+    assert_eq!(call(&shared, "zcard", &["z"]).await, b":0\r\n".to_vec());
+}
+
+/// Reversed SMOVEs (`a->b` vs `b->a`) hammer the same latch pair from
+/// opposite sides across many rounds. SMOVE must lock the two latch
+/// keys in SORTED byte order (ABBA rule): the pre-fix handler locked
+/// them in argument order, so an interleaving where each task held one
+/// latch and parked on the other deadlocked forever. Every reply is :0
+/// or :1 and the whole exchange must finish inside a bounded window.
+#[tokio::test]
+async fn concurrent_reversed_smove_never_deadlocks() {
+    let shared = Arc::new(shared_for("44117"));
+    call(&shared, "sadd", &["{g}a", "m"]).await;
+    call(&shared, "sadd", &["{g}b", "n"]).await;
+
+    const ROUNDS: usize = 500;
+    let forward = {
+        let s = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let mut replies = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                replies.push(call(&s, "smove", &["{g}a", "{g}b", "m"]).await);
+            }
+            replies
+        })
+    };
+    let backward = {
+        let s = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let mut replies = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                replies.push(call(&s, "smove", &["{g}b", "{g}a", "m"]).await);
+            }
+            replies
+        })
+    };
+
+    let (fwd, bwd) = tokio::time::timeout(Duration::from_secs(30), async {
+        (
+            forward.await.expect("forward smove task"),
+            backward.await.expect("backward smove task"),
+        )
+    })
+    .await
+    .expect("reversed SMOVE pair must not deadlock on the latch pair");
+
+    for r in fwd.iter().chain(bwd.iter()) {
+        assert!(r == b":0\r\n" || r == b":1\r\n", "smove reply {r:?}");
+    }
+    // The member ping-ponged atomically: it lives on exactly one side
+    // and the two cardinalities still sum to the initial total.
+    let mut on_sides = 0i64;
+    let mut cards = 0i64;
+    for (key, args) in [("{g}a", "m"), ("{g}b", "m"), ("{g}a", "n"), ("{g}b", "n")] {
+        let r = call(&shared, "sismember", &[key, args]).await;
+        on_sides += if r == b":1\r\n" { 1 } else { 0 };
+    }
+    assert_eq!(on_sides, 2, "m and n each live on exactly one side");
+    for key in ["{g}a", "{g}b"] {
+        let r = call(&shared, "scard", &[key]).await;
+        cards += std::str::from_utf8(&r[1..r.len() - 2])
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+    }
+    assert_eq!(cards, 2, "members m and n both survive");
 }

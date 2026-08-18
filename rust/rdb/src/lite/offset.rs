@@ -169,6 +169,24 @@ pub fn dirty_len(cache: &OffsetCache) -> usize {
     cache.inner.read().unwrap().dirty.len()
 }
 
+/// Re-validate a flush snapshot under the cache lock before it is
+/// written: keep only entries that are STILL clean (no newer
+/// ack/set-position re-marked them dirty after the snapshot was taken)
+/// and whose group still exists. A dropped entry stays dirty and rides
+/// the next round, so an old-snapshot batch can never land after a
+/// newer write and drag the committed watermark backwards (which would
+/// redeliver already-acked messages after a crash).
+pub fn drop_superseded(
+    cache: &OffsetCache,
+    dirty: Vec<((String, String), GroupState)>,
+) -> Vec<((String, String), GroupState)> {
+    let inner = cache.inner.read().unwrap();
+    dirty
+        .into_iter()
+        .filter(|(key, _)| !inner.dirty.contains(key) && inner.map.contains_key(key))
+        .collect()
+}
+
 /// Build the flush batch: one kind-0x0E record per dirty group.
 pub fn build_flush_batch(dirty: &[((String, String), GroupState)]) -> Option<WriteBatch> {
     if dirty.is_empty() {
@@ -256,5 +274,38 @@ mod tests {
         remove_stream(&c, "t/q0");
         assert_eq!(dirty_len(&c), 0);
         assert_eq!(ack(&c, "t/q0", "g", &[EntryId { ms: 9, seq: 0 }]), None);
+    }
+
+    #[test]
+    fn drop_superseded_keeps_only_current_snapshots() {
+        let c = new_cache();
+        insert_new(
+            &c,
+            "t/q0",
+            "g",
+            GroupState {
+                created_ms: 1,
+                delivered: EntryId { ms: 10, seq: 0 },
+                committed: EntryId { ms: 10, seq: 0 },
+            },
+        );
+        // Flush round A snapshots committed=20; a newer ack (committed=30)
+        // lands BEFORE A's write: A's stale snapshot must be dropped.
+        ack(&c, "t/q0", "g", &[EntryId { ms: 20, seq: 0 }]).unwrap();
+        let round_a = flush_dirty(&c);
+        ack(&c, "t/q0", "g", &[EntryId { ms: 30, seq: 0 }]).unwrap();
+        assert!(drop_superseded(&c, round_a).is_empty(), "superseded");
+        assert_eq!(dirty_len(&c), 1, "the newer state stays dirty");
+        // Round B (committed=30) is still current: it survives and keeps
+        // the advanced watermark.
+        let round_b = drop_superseded(&c, flush_dirty(&c));
+        assert_eq!(round_b.len(), 1);
+        assert_eq!(round_b[0].1.committed, EntryId { ms: 30, seq: 0 });
+        // A group removed between snapshot and write is also dropped:
+        // writing it would resurrect a deleted group record.
+        ack(&c, "t/q0", "g", &[EntryId { ms: 40, seq: 0 }]).unwrap();
+        let round_c = flush_dirty(&c);
+        remove_stream(&c, "t/q0");
+        assert!(drop_superseded(&c, round_c).is_empty(), "removed group");
     }
 }
