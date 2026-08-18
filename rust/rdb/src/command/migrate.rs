@@ -18,7 +18,7 @@ pub async fn handle(ctx: &mut Ctx<'_>) {
     };
     match first.as_slice() {
         b"help" => migrate_helper(ctx),
-        b"task" => migrate_task(ctx),
+        b"task" => migrate_task(ctx).await,
         b"list" => migrate_list(ctx),
         _ => migrate_helper(ctx),
     }
@@ -40,7 +40,7 @@ fn migrate_list(ctx: &mut Ctx<'_>) {
     }
 }
 
-fn migrate_task(ctx: &mut Ctx<'_>) {
+async fn migrate_task(ctx: &mut Ctx<'_>) {
     if ctx.args.len() != 4 {
         migrate_helper(ctx);
         return;
@@ -59,9 +59,18 @@ fn migrate_task(ctx: &mut Ctx<'_>) {
         key: TASK_KEY.to_string(),
         value,
     };
-    let mut raft = ctx.shared.raft.write().unwrap();
-    // Go applies with a 5s timeout; the stub applies synchronously.
-    match state::raft_apply(&mut raft, &entry) {
+    // Go applies with a 5s timeout; the stub applies synchronously. The
+    // write guard covers only the non-blocking start and is DROPPED
+    // before the await (see raft_set).
+    let started = {
+        let mut raft = ctx.shared.raft.write().unwrap();
+        state::raft_apply_start(&mut raft, &entry)
+    };
+    let result = match started {
+        Ok(ticket) => state::raft_apply_await(ticket).await,
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(()) => append_string(ctx.out, "OK"),
         Err(_) => append_error(ctx.out, "Raft Apply failed"),
     }

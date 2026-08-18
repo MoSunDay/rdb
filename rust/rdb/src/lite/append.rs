@@ -52,7 +52,7 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     stream.push(b'/');
     stream.extend_from_slice(&child);
     let prefix = hash::slot_with_prefix(&parent).1;
-    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream));
+    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
 
     let now = expire::now_ms();
     let read = model::read_meta(&ctx.shared.store, &prefix, &stream);
@@ -235,7 +235,7 @@ pub async fn xtrim(ctx: &mut Ctx<'_>) {
     let Some((stream, prefix)) = stream_of(ctx, 0) else {
         return;
     };
-    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream));
+    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
     let Some(meta) = model::read_meta(&ctx.shared.store, &prefix, &stream)
         .ok()
         .and_then(|r| r.live())
@@ -289,7 +289,7 @@ pub async fn xdel(ctx: &mut Ctx<'_>) {
     let Some((stream, prefix)) = stream_of(ctx, 0) else {
         return;
     };
-    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream));
+    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
     let Some(meta) = model::read_meta(&ctx.shared.store, &prefix, &stream)
         .ok()
         .and_then(|r| r.live())
@@ -351,7 +351,7 @@ pub async fn xidle(ctx: &mut Ctx<'_>) {
     else {
         return resp::append_error(ctx.out, "ERR invalid idle seconds");
     };
-    let _guard = latch::lock(&ctx.shared.latch, &mkey);
+    let _guard = latch::lock(&ctx.shared.latch, &mkey).await;
     let read = model::read_meta(&ctx.shared.store, &prefix, &stream);
     let Some(meta) = read.ok().and_then(|r| r.live()) else {
         return resp::append_error(ctx.out, "ERR no such key");
