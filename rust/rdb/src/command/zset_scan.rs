@@ -1,6 +1,6 @@
 //! ZSCAN: cursor iteration over one zset's member records. Mirrors
 //! `set_scan` exactly -- the cursor is the hex of the last member
-//! returned ("0"/"" restarts), MATCH filters with the glob matcher,
+//! returned ("0" restarts; "" resumes after the empty member), MATCH filters with the glob matcher,
 //! COUNT bounds one page (default 10) -- except the reply is FLAT:
 //! `[cursor, member, score?, member, score?, ...]` with a score bulk
 //! after each member under WITHSCORES (Redis's ZSCAN shape).
@@ -19,10 +19,11 @@ use crate::store::{key_upper_bound, ops, Store};
 use crate::utils::glob_match;
 
 /// One ZSCAN page: matched `(member, score)` pairs plus the resume
-/// member (empty = iteration finished).
+/// cursor — Some(last member) continues strictly after it, None means
+/// iteration finished (an empty member is a valid member).
 struct ZScanPage {
     items: Vec<(Vec<u8>, f64)>,
-    next: Vec<u8>,
+    next: Option<Vec<u8>>,
 }
 
 /// Scan `key`'s member window from `from_member` (None = start),
@@ -45,7 +46,7 @@ fn collect_page(
     };
     let base = lower.len();
     let mut items: Vec<(Vec<u8>, f64)> = Vec::new();
-    let mut next: Vec<u8> = Vec::new();
+    let mut next: Option<Vec<u8>> = None;
     let _ = ops::for_each_from(store, &start, excl_start, &mut |k, v| {
         if k >= upper.as_slice() {
             return false; // left this zset's member window
@@ -61,7 +62,7 @@ fn collect_page(
                     .unwrap_or(0.0);
                 items.push((member.to_vec(), score));
                 if count != 0 && items.len() >= count {
-                    next = member.to_vec();
+                    next = Some(member.to_vec());
                     return false;
                 }
             }
@@ -78,7 +79,12 @@ pub async fn zscan(ctx: &mut Ctx<'_>) {
         arity(ctx.out, "zscan");
         return;
     }
-    let cursor_start = ctx.args[1].is_empty() || ctx.args[1] == b"0";
+    // "0" restarts; every other cursor hex-decodes to a member to resume
+    // STRICTLY after. That includes "" (hex of an EMPTY member): treating
+    // it as a restart would livelock paging when the empty member lands
+    // exactly on a page boundary, and for sets without an empty member
+    // resuming after "" is identical to a fresh start anyway.
+    let cursor_start = ctx.args[1] == b"0";
     let mut pattern: Option<Vec<u8>> = None;
     let mut count: usize = 10;
     let mut withscores = false;
@@ -138,10 +144,9 @@ pub async fn zscan(ctx: &mut Ctx<'_>) {
         pattern.as_deref(),
         count,
     );
-    let cursor = if page.next.is_empty() {
-        "0".to_string()
-    } else {
-        hex::encode(&page.next)
+    let cursor = match &page.next {
+        None => "0".to_string(),
+        Some(member) => hex::encode(member),
     };
     let per = if withscores { 2 } else { 1 };
     append_array(ctx.out, 1 + page.items.len() * per);

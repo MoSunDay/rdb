@@ -7,7 +7,10 @@
 //!
 //! BLMOVE/BRPOPLPUSH commit TWICE: the blocked pop lands first (the
 //! element must not be lost while pushing), then the push onto dst. A
-//! crash in between drops only the move's destination half.
+//! crash in between drops only the move's destination half. dst is
+//! prechecked for wrong-type BEFORE the pop, and if it turns wrong-type
+//! while the pop half is blocked, the popped element is restored to src
+//! before the error reply -- an element is never silently dropped.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,7 +63,9 @@ async fn block_pop(
     cmd: &str,
     block_ms: u64,
 ) -> BlockResult {
-    let deadline = Instant::now() + Duration::from_millis(block_ms.min(MAX_SLICE_MS));
+    // BLOCK 0 means "forever" (`None`): the park runs in MAX_SLICE_MS
+    // slices renewed each round. Any other timeout is a hard deadline.
+    let deadline = (block_ms > 0).then(|| Instant::now() + Duration::from_millis(block_ms));
     loop {
         // 1. one shared waiter under every key's root, BEFORE the read.
         let waiter = Arc::new(wait::new_waiter());
@@ -134,15 +139,20 @@ async fn block_pop(
                 ListState::List { .. } | ListState::Missing => {}
             }
         }
-        // 3. deadline check, then a bounded park on the waiter.
+        // 3. deadline check, then a bounded park on the waiter. `None`
+        // (BLOCK 0) never elapses: a slice expiry just renews the loop.
         let now = Instant::now();
-        if now >= deadline {
+        if deadline.is_some_and(|d| now >= d) {
             for root in &roots {
                 wait::unregister(&ctx.shared.wait_hub, root, &waiter);
             }
             return BlockResult::Timeout;
         }
-        let left_ms = ((deadline - now).as_millis() as u64).min(MAX_SLICE_MS);
+        let left_ms = deadline
+            .map_or(MAX_SLICE_MS, |d| {
+                d.saturating_duration_since(now).as_millis() as u64
+            })
+            .min(MAX_SLICE_MS);
         let parked = Arc::clone(&waiter);
         let woke = tokio::task::spawn_blocking(move || {
             wait::wait(&parked, Duration::from_millis(left_ms))
@@ -152,10 +162,10 @@ async fn block_pop(
             wait::unregister(&ctx.shared.wait_hub, root, &waiter);
         }
         match woke.unwrap_or(wait::WaitOutcome::Timeout) {
-            wait::WaitOutcome::Timeout if Instant::now() >= deadline => {
+            wait::WaitOutcome::Timeout if deadline.is_some_and(|d| Instant::now() >= d) => {
                 return BlockResult::Timeout
             }
-            _ => {} // signaled or spurious: loop and re-read
+            _ => {} // signaled, spurious, or a renewed forever-slice: loop and re-read
         }
     }
 }
@@ -198,6 +208,57 @@ pub async fn brpop(ctx: &mut Ctx<'_>) {
     block_pop_cmd(ctx, false, "brpop").await;
 }
 
+/// What a push onto `key` starts from: `(expire_ms, meta)`, or `None`
+/// when the key holds a non-list value (the caller replies WRONGTYPE).
+fn push_target(ctx: &Ctx<'_>, key: &[u8]) -> Option<(u64, list_ds::ListMeta)> {
+    match list_state(&ctx.shared.store, &ctx.prefix_key, key, expire::now_ms()) {
+        ListState::List { expire_ms, meta } => Some((expire_ms, meta)),
+        ListState::Missing => Some((0, blank_meta())),
+        ListState::WrongType => None,
+    }
+}
+
+/// Race guard for BLMOVE/BRPOPLPUSH: dst turned wrong-type while the pop
+/// half was blocked, so push the popped element back onto the SAME end
+/// of `key` it came from (`left`), commit, wake `key`'s blocked waiters,
+/// and only then reply WRONGTYPE -- the element must never be lost. A
+/// pop/push pair through `next` round-trips the physical index, so
+/// order is preserved. The caller holds the src+dst latches; a failed
+/// restore keeps the store-failure reply `commit_list` already wrote.
+async fn restore_popped(ctx: &mut Ctx<'_>, key: &[u8], elem: &[u8], left: bool) {
+    let (expire_ms, mut after) = match list_state(
+        &ctx.shared.store,
+        &ctx.prefix_key,
+        key,
+        expire::now_ms(),
+    ) {
+        ListState::List { expire_ms, meta } => (expire_ms, meta),
+        ListState::Missing => (0, blank_meta()),
+        // src itself changed type mid-move: no list to restore onto.
+        ListState::WrongType => {
+            append_error(ctx.out, WRONGTYPE);
+            return;
+        }
+    };
+    let mut batch = WriteBatch::default();
+    if left {
+        list_ds::put_l(&mut batch, &ctx.prefix_key, key, after.l_next, elem);
+        after.l_next += 1;
+        after.l_count += 1;
+    } else {
+        list_ds::put_r(&mut batch, &ctx.prefix_key, key, after.r_next, elem);
+        after.r_next += 1;
+        after.r_count += 1;
+    }
+    if commit_list(ctx, key, expire_ms, Some(&after), batch, "blmove").await {
+        wait::notify(
+            &ctx.shared.wait_hub,
+            &list_ds::meta_key(&ctx.prefix_key, key),
+        );
+        append_error(ctx.out, WRONGTYPE);
+    }
+}
+
 /// Shared body of BLMOVE/BRPOPLPUSH: block on `src` alone, then push
 /// the popped element onto `dst` in a second commit under both latches.
 async fn block_move(
@@ -212,6 +273,19 @@ async fn block_move(
         append_error(ctx.out, setops::CROSSSLOT_ERROR);
         return;
     }
+    // Precheck dst under its latch BEFORE the pop: a wrong-type dst can
+    // never receive the element, so fail fast while src is still intact.
+    {
+        let _guard = latch::lock(
+            &ctx.shared.latch,
+            &keys_core::latch_key(&ctx.prefix_key, &dst),
+        )
+        .await;
+        if push_target(ctx, &dst).is_none() {
+            append_error(ctx.out, WRONGTYPE);
+            return;
+        }
+    }
     match block_pop(
         ctx,
         std::slice::from_ref(&src),
@@ -223,15 +297,12 @@ async fn block_move(
     {
         BlockResult::Got { elem, .. } => {
             let _guards = lock_sorted(ctx, &[src.clone(), dst.clone()]).await;
-            let (dst_expire, mut dst_after) =
-                match list_state(&ctx.shared.store, &ctx.prefix_key, &dst, expire::now_ms()) {
-                    ListState::List { expire_ms, meta } => (expire_ms, meta),
-                    ListState::Missing => (0, blank_meta()),
-                    ListState::WrongType => {
-                        append_error(ctx.out, WRONGTYPE);
-                        return;
-                    }
-                };
+            let Some((dst_expire, mut dst_after)) = push_target(ctx, &dst) else {
+                // dst changed to a non-list while we were blocked: put
+                // the element back onto src, then surface the error.
+                restore_popped(ctx, &src, &elem, pop_left).await;
+                return;
+            };
             let mut batch = WriteBatch::default();
             if push_left {
                 list_ds::put_l(&mut batch, &ctx.prefix_key, &dst, dst_after.l_next, &elem);

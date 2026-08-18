@@ -15,6 +15,11 @@
 //!   panics on malformed data; a `len == 2` guard plus log replaces it.
 //! - Go's leader-notify goroutine only toggles the unread HTTP
 //!   `ENABLE_WRITE` flag: intentionally skipped.
+//! - Go's `strings.Replace`/`strings.Contains` on the instances list are
+//!   SUBSTRING operations and corrupt overlapping addresses ("10.0.0.1"
+//!   also matches inside "10.0.0.11"); the port replaces/matches exact
+//!   comma-separated elements and rejects empty src/target map halves as
+//!   BadMap.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -68,23 +73,44 @@ fn decide(ret_type: &str, backup_map_val: &str, instances: &str) -> FailoverDeci
         return FailoverDecision::UnknownType;
     }
     let parts: Vec<&str> = backup_map_val.split(',').collect();
-    if parts.len() != 2 {
+    // Both halves must be present: an empty src/target would make the
+    // replacement meaningless (Go's strings.Replace with an empty old
+    // inserts between characters) — treat like any other malformed map.
+    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
         return FailoverDecision::BadMap(parts.iter().map(|s| s.to_string()).collect());
     }
     let (src, target) = (parts[0], parts[1]);
     let new = if ret_type == RET_FAILED {
-        instances.replace(src, target)
+        replace_element(instances, src, target)
     } else {
-        if instances.contains(src) {
+        if contains_element(instances, src) {
             return FailoverDecision::SkipResumed;
         }
-        instances.replace(target, src)
+        replace_element(instances, target, src)
     };
     if new == instances {
         FailoverDecision::Unchanged
     } else {
         FailoverDecision::Replace(new)
     }
+}
+
+/// Exact-element replace over the comma-separated `instances` list:
+/// EVERY element equal to `from` becomes `to` (duplicates included).
+/// Unlike `str::replace` this is not a substring replace, so an address
+/// that merely CONTAINS `from` survives untouched ("10.0.0.1" no longer
+/// mangles the "10.0.0.11" element).
+fn replace_element(list: &str, from: &str, to: &str) -> String {
+    list.split(',')
+        .map(|elem| if elem == from { to } else { elem })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Exact-element membership over the same comma-separated list shape
+/// (`str::contains` would match inside a longer element).
+fn contains_element(list: &str, elem: &str) -> bool {
+    list.split(',').any(|e| e == elem)
 }
 
 /// Testable pure core: the new `cluster_slots_stable_instances` value, or
@@ -199,14 +225,14 @@ async fn self_recover(raft: &RdbRaft, kv: &KvMap, self_addr: &str) {
     let backup_val = kv_get(kv, &format!("backup_target_map_{self_addr}"));
     let instances = kv_get(kv, INSTANCES_KEY);
     let parts: Vec<&str> = backup_val.split(',').collect();
-    if parts.len() != 2 {
+    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
         if !backup_val.is_empty() {
             eprintln!("failedNodeBackupMap error: {parts:?}");
         }
         return;
     }
-    if instances.contains(parts[1]) {
-        let new = instances.replace(parts[1], parts[0]);
+    if contains_element(&instances, parts[1]) {
+        let new = replace_element(&instances, parts[1], parts[0]);
         update_cluster_stable_slots(raft, &new, &instances, RET_RESUMED, parts[0]).await;
     }
 }
@@ -338,9 +364,54 @@ mod tests {
 
     #[test]
     fn unchanged_result_yields_none() {
-        // Absent src/target: Go's ReplaceAll leaves input unchanged -> no-op.
+        // Absent src/target: element-wise replace leaves input unchanged.
         assert_eq!(failover_action(RET_FAILED, "x,y", "a,b"), None);
         assert_eq!(failover_action(RET_RESUMED, "x,y", "a,b"), None);
+    }
+
+    #[test]
+    fn failed_replaces_only_the_exact_element_not_prefix_overlaps() {
+        // src "10.0.0.1" is a strict prefix of "10.0.0.11": only the exact
+        // element swaps (Go's substring Replace turned this into
+        // "10.0.0.2,10.0.0.21", corrupting the survivor's address).
+        let got = failover_action(
+            RET_FAILED,
+            "10.0.0.1,10.0.0.2",
+            "10.0.0.1,10.0.0.11",
+        );
+        assert_eq!(got, Some("10.0.0.2,10.0.0.11".to_string()));
+        // Duplicate elements: every equal element is replaced.
+        assert_eq!(
+            failover_action(RET_FAILED, "a,b", "a,a,c"),
+            Some("b,b,c".to_string())
+        );
+        // Same for the Resumed direction (target back to src).
+        assert_eq!(
+            failover_action(RET_RESUMED, "10.0.0.1,10.0.0.2", "10.0.0.2,10.0.0.21"),
+            Some("10.0.0.1,10.0.0.21".to_string())
+        );
+        // Resumed skip check is element-exact too: "ab" contains "a" as a
+        // substring but is NOT the src element, so the swap proceeds.
+        assert_eq!(
+            failover_action(RET_RESUMED, "a,b", "ab,b"),
+            Some("ab,a".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_map_halves_are_bad_map() {
+        // An empty src or target half can't name an instance: BadMap
+        // (never replicated), like any other malformed value.
+        assert_eq!(
+            decide(RET_FAILED, ",b", "a,b"),
+            FailoverDecision::BadMap(vec![String::new(), "b".to_string()])
+        );
+        assert_eq!(
+            decide(RET_FAILED, "a,", "a,b"),
+            FailoverDecision::BadMap(vec!["a".to_string(), String::new()])
+        );
+        assert_eq!(failover_action(RET_FAILED, ",b", "a,b"), None);
+        assert_eq!(failover_action(RET_RESUMED, "a,", "a,b"), None);
     }
 
     #[test]

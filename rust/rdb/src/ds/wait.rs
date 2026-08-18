@@ -78,23 +78,31 @@ pub fn register_shared(hub: &WaitHub, key: &[u8], waiter: &Arc<Waiter>) {
         .push_back(Arc::clone(waiter));
 }
 
-/// Signal ONE waiter (the oldest) for `key` and pop it from the queue.
-/// A key with no waiters is a no-op. Returns whether anyone was woken.
+/// Signal ONE LIVE (not yet signaled) waiter for `key`, popping it — and
+/// any stale waiters ahead of it — from the queue. A multi-key blocking
+/// command parks the SAME waiter under several roots; once it was woken
+/// via one key, its remaining queue entries are stale: skipping them (and
+/// discarding them) keeps FIFO order for the real waiters behind, which a
+/// plain pop-and-signal would silently swallow. A drained queue with no
+/// live waiter removes the entry. Returns whether anyone was woken.
 pub fn notify(hub: &WaitHub, key: &[u8]) -> bool {
     let mut map = hub
         .inner
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match map.get_mut(key).and_then(VecDeque::pop_front) {
-        Some(waiter) => {
-            signal(&waiter);
-            if map.get(key).is_some_and(|q| q.is_empty()) {
-                map.remove(key);
+    let mut woke = false;
+    if let Some(queue) = map.get_mut(key) {
+        while let Some(waiter) = queue.pop_front() {
+            if signal_if_armed(&waiter) {
+                woke = true;
+                break;
             }
-            true
         }
-        None => false,
     }
+    if map.get(key).is_some_and(|q| q.is_empty()) {
+        map.remove(key);
+    }
+    woke
 }
 
 /// Timeout cleanup: drop a waiter that was never signaled.
@@ -120,6 +128,22 @@ pub fn signal(waiter: &Waiter) {
     *signaled = true;
     drop(signaled);
     waiter.cv.notify_all();
+}
+
+/// [`signal`] guarded against double-waking: flips `signaled` and wakes
+/// only when it was still false; returns whether this call did the wake.
+fn signal_if_armed(waiter: &Waiter) -> bool {
+    let mut signaled = waiter
+        .signaled
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *signaled {
+        return false;
+    }
+    *signaled = true;
+    drop(signaled);
+    waiter.cv.notify_all();
+    true
 }
 
 /// Park until signaled or `timeout` elapses.
@@ -167,15 +191,53 @@ mod tests {
             wait(&waiter, Duration::from_millis(0)),
             WaitOutcome::Signaled
         );
-        // idempotent wake: the other key still holds the shared waiter
-        assert!(notify(&hub, b"70/k1"));
-        assert_eq!(
-            wait(&waiter, Duration::from_millis(0)),
-            WaitOutcome::Signaled
-        );
+        // the other key now holds only a STALE entry: popping it wakes
+        // nobody (the command already finished) and the queue is dropped
+        assert!(!notify(&hub, b"70/k1"));
         // both queues are now drained
         assert!(!notify(&hub, b"70/k1"));
         assert!(!notify(&hub, b"70/k2"));
+    }
+
+    #[test]
+    fn notify_skips_stale_waiter_and_signals_next_live_one() {
+        let hub = WaitHub::new();
+        // A multi-key BLPOP parks one waiter under "a" AND "b"; it was
+        // woken via "a", so "b"'s queue starts with that stale entry.
+        let stale = register(&hub, b"70/a");
+        register_shared(&hub, b"70/b", &stale);
+        signal(&stale);
+        let live = register(&hub, b"70/b");
+        // notify(b) must skip the stale front and wake the live waiter.
+        assert!(notify(&hub, b"70/b"));
+        assert_eq!(
+            wait(&live, Duration::from_millis(0)),
+            WaitOutcome::Signaled
+        );
+        assert_eq!(
+            wait(&stale, Duration::from_millis(0)),
+            WaitOutcome::Signaled,
+            "stale waiter keeps its original wake"
+        );
+        // queue drained behind them
+        assert!(!notify(&hub, b"70/b"));
+    }
+
+    #[test]
+    fn notify_on_all_stale_queue_returns_false_and_removes_entry() {
+        let hub = WaitHub::new();
+        let stale = register(&hub, b"70/a");
+        register_shared(&hub, b"70/b", &stale);
+        signal(&stale);
+        assert!(!notify(&hub, b"70/b"));
+        // the emptied entry is cleaned up, not left behind
+        let gone = b"70/b".to_vec();
+        assert!(!hub
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&gone));
+        assert!(!notify(&hub, b"70/b"), "entry gone: no wake, no panic");
     }
 
     #[test]

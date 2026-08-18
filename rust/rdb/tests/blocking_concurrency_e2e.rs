@@ -172,3 +172,89 @@ async fn blocking_concurrency_leaves_no_stray_data_or_waiters() {
         b"*-1\r\n".to_vec()
     );
 }
+
+/// A flat three-element RESP array of bulk payloads.
+fn arr3(a: &[u8], b: &[u8], c: &[u8]) -> Vec<u8> {
+    let mut buf = b"*3\r\n".to_vec();
+    for part in [a, b, c] {
+        buf.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        buf.extend_from_slice(part);
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
+}
+
+/// BLOCK 0 means FOREVER: with the key empty the BLPOP must still be
+/// parked after 300ms (a regression turns it into an instant null),
+/// then wake from a push with the popped pair -- all under a 10s cap.
+#[tokio::test]
+async fn blpop_zero_blocks_until_push() {
+    let shared = Arc::new(shared_for("44112"));
+    let s = Arc::clone(&shared);
+    let waiter = tokio::spawn(async move { call(&s, "blpop", &["k", "0"]).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiter.is_finished(), "BLOCK 0 must park, not time out");
+    assert_eq!(call(&shared, "rpush", &["k", "v"]).await, b":1\r\n".to_vec());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("pop completes")
+            .expect("task"),
+        arr2(b"k", b"v")
+    );
+    assert_eq!(call(&shared, "llen", &["k"]).await, b":0\r\n".to_vec());
+}
+
+/// BZPOPMIN with BLOCK 0: parked after 300ms, then a ZADD wakes it with
+/// the (key, member, score) triple.
+#[tokio::test]
+async fn bzpopmin_zero_blocks_until_zadd() {
+    let shared = Arc::new(shared_for("44113"));
+    let s = Arc::clone(&shared);
+    let waiter = tokio::spawn(async move { call(&s, "bzpopmin", &["z", "0"]).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiter.is_finished(), "BLOCK 0 must park, not time out");
+    let added = call(&shared, "zadd", &["z", "1.5", "m"]).await;
+    assert!(added.starts_with(b":"), "zadd reply: {added:?}");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("pop completes")
+            .expect("task"),
+        arr3(b"z", b"m", b"1.5")
+    );
+    assert_eq!(call(&shared, "zcard", &["z"]).await, b":0\r\n".to_vec());
+}
+
+/// Wake-time race guard: dst is a valid (missing) list when BLMOVE 0
+/// starts blocking, becomes a raw string while it is parked, and the
+/// push that wakes it pops the element -- the restore path must put it
+/// back onto src before the WRONGTYPE reply instead of dropping it.
+#[tokio::test]
+async fn blmove_restore_on_wake_time_wrongtype_dst() {
+    let shared = Arc::new(shared_for("44114"));
+    let s = Arc::clone(&shared);
+    let waiter = tokio::spawn(async move {
+        call(&s, "blmove", &["{g}src", "{g}dst", "LEFT", "LEFT", "0"]).await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiter.is_finished(), "BLMOVE 0 must park on empty src");
+    // dst turns wrong-type while the move is parked.
+    assert_eq!(call(&shared, "set", &["{g}dst", "x"]).await, b"+OK\r\n".to_vec());
+    // The wake pops the element off src; dst cannot receive it.
+    assert_eq!(
+        call(&shared, "rpush", &["{g}src", "a"]).await,
+        b":1\r\n".to_vec()
+    );
+    let reply = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("move completes")
+        .expect("task");
+    assert!(reply.starts_with(b"-WRONGTYPE"), "reply: {reply:?}");
+    // The popped element was restored onto src (same LEFT end), intact.
+    assert_eq!(
+        call(&shared, "lrange", &["{g}src", "0", "-1"]).await,
+        b"*1\r\n$1\r\na\r\n".to_vec()
+    );
+    assert_eq!(call(&shared, "llen", &["{g}src"]).await, b":1\r\n".to_vec());
+}

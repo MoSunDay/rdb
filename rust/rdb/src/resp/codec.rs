@@ -19,6 +19,12 @@ fn protocol_error(msg: &str) -> ParseOutcome {
     }
 }
 
+/// Upper bound on a `*N` multibulk header: the count drives eager
+/// preallocation (`Vec::with_capacity`) before any payload arrives, so a
+/// garbage/huge header must error instead of attempting a giant (or
+/// overflowing) allocation. 1M elements is far beyond any real command.
+const MAX_MULTIBULK_COUNT: i64 = 1_048_576;
+
 /// Parse one command from `buf` (redcon `ReadNextCommand`, Redis-kind).
 pub fn parse_command(buf: &[u8]) -> ParseOutcome {
     if buf.is_empty() {
@@ -65,7 +71,8 @@ fn parse_multibulk(buf: &[u8]) -> ParseOutcome {
                 return protocol_error("invalid multibulk length");
             }
             let count = match parse_int(&buf[1..i - 1]) {
-                Some(n) if n >= 0 => n as usize,
+                // Negative or over-cap counts error before allocation.
+                Some(n) if (0..=MAX_MULTIBULK_COUNT).contains(&n) => n as usize,
                 _ => return protocol_error("invalid multibulk length"),
             };
             i += 1; // first byte past the header
