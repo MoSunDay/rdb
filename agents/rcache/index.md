@@ -1,6 +1,9 @@
 Commit: d481b1d708c248f86be394189d01ca7305fc8528
 # rcache
 
+> **已归档**：Go 实现已移至 `archive/go/internal/rcache`（git mv 保留历史，不再维护）。当前实现见 [agents/rust/index.md](../rust/index.md)。以下内容描述归档前的 Go 实现。
+
+
 ## 职责
 - 基于 hashicorp/raft 的集群控制面：节点成员管理、元数据复制、快照与恢复。
 - 元数据存储 `cacheManager`：concurrent-map 实现的 string→string KV（`CM`）。

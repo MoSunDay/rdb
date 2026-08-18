@@ -10,7 +10,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 
 ## 边界
 - 负责：整个 Rust 进程（入口 `rust/rdb/src/main.rs`）——RESP 接入、命令处理器、openraft 节点装配、HTTP 控制 API、HA 心跳观察、备份实例监听。
-- 与 Go 代码（`internal/`、`cmd/`）无编译期依赖、无共享代码，仅行为对齐：共用 yaml 配置格式（`config/` 下文件可直接复用）、RESP 应答文本与 HTTP 路由。
+- 与 Go 代码（已归档至 `archive/go/`）无编译期依赖、无共享代码，仅行为对齐：共用 yaml 配置格式（`config/` 下文件可直接复用）、RESP 应答文本与 HTTP 路由。
 - Go 与 Rust 节点不能混组同一 raft 集群（线协议不兼容），部署须全 Go 或全 Rust。
 
 ## 构建要求（关键）
@@ -20,7 +20,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 - 详见 `rust/COMPAT.md`。
 
 ## 模块结构
-源码位于 `rust/rdb/src/`，布局对照 Go `internal/`：
+源码位于 `rust/rdb/src/`，布局对照归档 Go `archive/go/internal/`：
 - `main.rs`：进程入口——runtime 构建（含 `disable_lifo_slot`）、`-config` 参数解析、进程装配；私有 `mod beacon`。
 - `conf.rs`：yaml 配置 `Config`（字段键名与 Go 一致）+ env 读取（`RAFT_BOOTSTRAP` 严格等于 `true` 才生效、`RAFT_JOIN_ADDR`），默认配置路径 `config/config.yml`。
 - `resp/`：RESP 层。
