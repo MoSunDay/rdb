@@ -14,11 +14,12 @@ use common::{
     wait_leader, wait_resp_ready, ProcNode, TOKEN,
 };
 
-/// Poll `raft get <key>` on `node` until it returns exactly `+<want>`.
+/// Poll `raft get <key>` on `node` until it returns the bulk frame for
+/// `<want>` (BREAKING: RAFTGET replies bulk, not a simple string).
 /// (`raft get` reads the node's live FSM, so it works on followers and
 /// reflects catch-up the moment replicated entries are applied.)
 async fn poll_raft_get(node: &ProcNode, key: &str, want: &str, secs: u64) {
-    let want_reply = format!("+{want}").into_bytes();
+    let want_reply = format!("${}\r\n{want}", want.len()).into_bytes();
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         let r = cmd_one_shot(&node.resp, TOKEN, &[b"raft", b"get", key.as_bytes()]).await;

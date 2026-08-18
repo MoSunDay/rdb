@@ -220,8 +220,8 @@ async fn drill_py_scenario_again_three_real_processes() {
         let r = cmd_one_shot(&n.resp, TOKEN, &[b"raft", b"get", b"rk1"]).await;
         assert_eq!(
             r,
-            b"+rv1",
-            "raft get rk1 must see the replicated value on {}\n{}",
+            b"$3\r\nrv1",
+            "raft get rk1 must see the replicated value (bulk frame) on {}\n{}",
             n.resp,
             n.ctx()
         );

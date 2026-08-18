@@ -2,7 +2,8 @@
 //!
 //! Rust mirror of Go `internal/utils/hash.go` (256-entry static table,
 //! poly 0x1021, init 0, no reflection, no final xor) plus the hash-tag
-//! parsing rules of Go `internal/server/server.go`.
+//! parsing rules of Go `internal/server/server.go`, except that an empty
+//! hash tag falls back to the whole key (approved breaking fix).
 
 /// CRC-16/XMODEM polynomial.
 const POLY: u16 = 0x1021;
@@ -58,7 +59,8 @@ pub fn slot_with_prefix(key: &[u8]) -> (u16, Vec<u8>) {
     (slot, prefix)
 }
 
-/// Hash-tag extraction, replicated EXACTLY from Go `internal/server/server.go`:
+/// Hash-tag extraction following Redis semantics (approved breaking
+/// divergence from Go `internal/server/server.go`):
 ///
 /// ```text
 /// start = bytes.Index(key, "{")
@@ -67,14 +69,15 @@ pub fn slot_with_prefix(key: &[u8]) -> (u16, Vec<u8>) {
 /// ```
 ///
 /// Only the FIRST `{` is considered; `}` is searched strictly after it.
-/// Empty braces `{}` yield an empty slice (=> slot 0), a `{` without a
-/// closing `}` falls back to the whole key. NOTE: the empty-tag behavior
-/// intentionally differs from real Redis; the Go behavior is the contract.
+/// An EMPTY tag (`{}`, as in `foo{}bar`) means NO tag: the whole key is
+/// hashed (Redis semantics). The Go code hashed the empty string, pinning
+/// every such key to slot 0; that quirk is intentionally NOT replicated.
 pub fn hash_tag(key: &[u8]) -> &[u8] {
     if let Some(start) = key.iter().position(|&b| b == b'{') {
         let rest = &key[start + 1..];
         if let Some(end) = rest.iter().position(|&b| b == b'}') {
-            return &rest[..end];
+            // Empty tag content means NO tag: hash the whole key (Redis).
+            return if end == 0 { key } else { &rest[..end] };
         }
     }
     key
@@ -120,7 +123,10 @@ mod tests {
             "user1000",
             3443,
         ),
-        ("{}", 0x7B99, 15257, 153, "15257/", "", 0),
+        // Empty tag => NO tag: hash the whole key (approved breaking fix;
+        // Go hashed the empty string, i.e. slot 0).
+        ("{}", 0x7B99, 15257, 153, "15257/", "{}", 15257),
+        ("foo{}bar", 0xB7D4, 14292, 212, "14292/", "foo{}bar", 14292),
         (
             "hello:world",
             0xA762,
@@ -159,8 +165,10 @@ mod tests {
     #[test]
     fn hash_tag_edge_cases() {
         assert_eq!(hash_tag(b"{user1000}.following"), b"user1000");
-        // Empty braces -> empty tag (Go quirk: slot 0, unlike real Redis).
-        assert_eq!(hash_tag(b"{}"), b"");
+        // Empty braces -> NO tag: the whole key is hashed (Redis semantics,
+        // approved breaking fix; Go hashed the empty string -> slot 0).
+        assert_eq!(hash_tag(b"{}"), b"{}");
+        assert_eq!(hash_tag(b"foo{}bar"), b"foo{}bar");
         // '{' without a closing '}' -> whole key.
         assert_eq!(hash_tag(b"{abc"), b"{abc");
         // Only the FIRST '{' is considered.
@@ -175,10 +183,30 @@ mod tests {
 
     #[test]
     fn empty_key_and_empty_tag_slot_zero() {
+        // A truly EMPTY key still hashes to slot 0 (CRC16("") == 0).
         assert_eq!(slot_number(b""), 0);
         assert_eq!(slot_with_prefix(b""), (0, b"0/".to_vec()));
-        // Go server flow for key "{}": tag is empty -> slot 0, prefix "0/".
-        assert_eq!(slot_with_prefix(hash_tag(b"{}")), (0, b"0/".to_vec()));
+        // But an empty TAG means no tag: "{}" hashes as the whole key, NOT
+        // slot 0 (approved breaking fix; Go produced slot 0 / prefix "0/").
+        assert_eq!(
+            slot_with_prefix(hash_tag(b"{}")),
+            (15257, b"15257/".to_vec())
+        );
+    }
+
+    #[test]
+    fn empty_tag_hashes_whole_key_not_slot_zero() {
+        // slot("foo{}bar") == slot of the WHOLE key "foo{}bar" and differs
+        // from slot 0, so empty-tag keys no longer pile up on slot 0.
+        let whole = slot_number(b"foo{}bar");
+        assert_eq!(slot_number(hash_tag(b"foo{}bar")), whole);
+        assert_eq!(whole, crc16(b"foo{}bar") % 16384);
+        assert_eq!(whole, 14292);
+        assert_ne!(whole, 0);
+        // Distinct whole keys with empty tags land on distinct slots.
+        assert_ne!(slot_number(hash_tag(b"a{}b")), whole);
+        // A non-empty tag still wins over the whole key.
+        assert_eq!(slot_number(hash_tag(b"foo{bar}baz")), slot_number(b"bar"));
     }
 
     #[test]
