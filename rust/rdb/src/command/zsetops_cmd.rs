@@ -269,9 +269,10 @@ async fn store_variant(ctx: &mut Ctx<'_>, cmd: &str, op: Op) {
         return;
     }
     if !result.is_empty() {
-        wait::notify(
+        wait::notify_n(
             &ctx.shared.wait_hub,
             &zset_ds::meta_key(&ctx.prefix_key, &opts.dest),
+            result.len(),
         );
     }
     append_int(ctx.out, result.len() as i64);

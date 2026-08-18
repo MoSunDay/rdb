@@ -214,6 +214,47 @@ fn zincrby_adds_updates_and_rejects_nan() {
     );
 }
 
+/// A NEW member created by ZINCRBY -0 keeps the sign: the naive
+/// `0.0 + (-0.0)` collapses to +0.0 and loses the "-0" both the reply
+/// and a later ZSCORE must show (regression guard for the fix).
+#[test]
+fn zincrby_negative_zero_on_new_member_keeps_sign() {
+    let (_g, s) = shared_for("127.0.0.1:40570");
+    assert_eq!(
+        call(&s, "zincrby", &[b"k", b"-0", b"a"]),
+        b"$2\r\n-0\r\n".to_vec()
+    );
+    // The STORED score keeps the sign, not just the reply.
+    assert_eq!(call(&s, "zscore", &[b"k", b"a"]), b"$2\r\n-0\r\n".to_vec());
+    // Non-zero negatives on new members keep working.
+    assert_eq!(
+        call(&s, "zincrby", &[b"k", b"-2.5", b"b"]),
+        b"$4\r\n-2.5\r\n".to_vec()
+    );
+    // An EXISTING member still goes through the add path.
+    assert_eq!(
+        call(&s, "zincrby", &[b"k", b"2.5", b"b"]),
+        b"$1\r\n0\r\n".to_vec()
+    );
+}
+
+/// ZADD ... INCR -0 on a missing member: same trap as ZINCRBY -- the
+/// delta must land verbatim, reply AND stored score both "-0".
+#[test]
+fn zadd_incr_negative_zero_keeps_sign() {
+    let (_g, s) = shared_for("127.0.0.1:40571");
+    assert_eq!(
+        call(&s, "zadd", &[b"k", b"INCR", b"-0", b"a"]),
+        b"$2\r\n-0\r\n".to_vec()
+    );
+    assert_eq!(call(&s, "zscore", &[b"k", b"a"]), b"$2\r\n-0\r\n".to_vec());
+    // Incrementing that member onwards still adds normally.
+    assert_eq!(
+        call(&s, "zadd", &[b"k", b"INCR", b"1", b"a"]),
+        b"$1\r\n1\r\n".to_vec()
+    );
+}
+
 #[test]
 fn zscore_and_zmscore_formats() {
     let (_g, s) = shared_for("127.0.0.1:40507");
@@ -402,4 +443,42 @@ fn zscan_pages_over_an_empty_member() {
     assert_eq!(flat[0], b"".to_vec(), "cursor of the empty member");
     assert_eq!(flat[1], b"".to_vec(), "the empty member itself");
     assert_eq!(flat[2], b"1".to_vec(), "its score");
+}
+
+/// CH counts new members and genuine score changes, but NOT a
+/// same-score re-add of an existing member (Redis reports those as
+/// unchanged); without CH the reply is new members only.
+#[test]
+fn zadd_ch_ignores_same_score_readds() {
+    let (_g, s) = shared_for("127.0.0.1:40515");
+    zadd3(&s, b"k", b"a", b"1", b"b", b"2");
+    // Re-adding existing members with identical scores: CH reports 0.
+    assert_eq!(
+        int_of(&call(&s, "zadd", &[b"k", b"CH", b"1", b"a", b"2", b"b"])),
+        0
+    );
+    // One changed score plus one new member: CH reports 2.
+    assert_eq!(
+        int_of(&call(&s, "zadd", &[b"k", b"CH", b"7", b"a", b"9", b"c"])),
+        2
+    );
+    // A same-score re-add mixed with a genuine change counts just the one.
+    assert_eq!(
+        int_of(&call(&s, "zadd", &[b"k", b"CH", b"7", b"a", b"4", b"b"])),
+        1
+    );
+    // Without CH only NEW members are counted: two updates, one add -> 1.
+    assert_eq!(
+        int_of(&call(
+            &s,
+            "zadd",
+            &[b"k", b"8", b"a", b"5", b"b", b"6", b"c3"]
+        )),
+        1
+    );
+    assert_eq!(call(&s, "zscore", &[b"k", b"a"]), b"$1\r\n8\r\n".to_vec());
+    assert_eq!(call(&s, "zscore", &[b"k", b"b"]), b"$1\r\n5\r\n".to_vec());
+    assert_eq!(call(&s, "zscore", &[b"k", b"c3"]), b"$1\r\n6\r\n".to_vec());
+    // An unchanged member also stays uncounted without CH.
+    assert_eq!(int_of(&call(&s, "zadd", &[b"k", b"8", b"a"])), 0);
 }

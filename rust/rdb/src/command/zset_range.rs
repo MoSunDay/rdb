@@ -9,8 +9,8 @@
 use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
 use crate::command::list_cmd::clamp_range;
 use crate::command::zset_util::{
-    append_score, collect_scored, lex_within, parse_lex_bound, parse_score_bound, zset_state,
-    LexBound, ZSetState,
+    append_score, collect_scored, lex_within, parse_lex_bound, parse_score_bound,
+    seek_from_sortable, zset_state, LexBound, ZSetState,
 };
 use crate::command::Ctx;
 use crate::ds::{expire, zset_ds};
@@ -87,7 +87,8 @@ fn emit(out: &mut Vec<u8>, items: &[(Vec<u8>, f64)], withscores: bool, limit: Op
 
 /// All members with scores in `[min, max]` (each bound honoring its
 /// inclusivity), ascending: the scan seeks the min bound's sortable
-/// prefix and stops as soon as scores pass the max bound.
+/// prefix (an inclusive zero starts at -0.0 so both zeros match) and
+/// stops as soon as scores pass the max bound.
 fn collect_score_window(
     ctx: &Ctx<'_>,
     key: &[u8],
@@ -95,7 +96,7 @@ fn collect_score_window(
     (max, max_incl): (f64, bool),
 ) -> Vec<(Vec<u8>, f64)> {
     let mut items = Vec::new();
-    let from = zset_ds::score_sortable(min).to_be_bytes();
+    let from = seek_from_sortable(min, min_incl).to_be_bytes();
     let _ = zset_ds::for_each_scored(
         &ctx.shared.store,
         &ctx.prefix_key,
@@ -302,7 +303,8 @@ pub async fn zrevrangebyscore(ctx: &mut Ctx<'_>) {
     score_window_reply(ctx, &key, min, max, true, opts.withscores, opts.limit);
 }
 
-/// ZRANGEBYLEX key min max [LIMIT o c] -> members in byte order.
+/// ZRANGEBYLEX key min max [LIMIT o c] -> members in byte order
+/// (WITHSCORES is rejected with a syntax error, as in Redis).
 pub async fn zrangebylex(ctx: &mut Ctx<'_>) {
     if ctx.args.len() < 3 {
         arity(ctx.out, "zrangebylex");
@@ -311,6 +313,12 @@ pub async fn zrangebylex(ctx: &mut Ctx<'_>) {
     let Some(opts) = parse_range_opts(ctx.out, &ctx.args[3..], false) else {
         return;
     };
+    if opts.withscores {
+        // Redis rejects WITHSCORES for lex windows: members of a lex
+        // query share one score, so the option is a plain syntax error.
+        append_error(ctx.out, "ERR syntax error");
+        return;
+    }
     let parsed = (parse_lex_bound(&ctx.args[1]), parse_lex_bound(&ctx.args[2]));
     let (Some(min), Some(max)) = parsed else {
         append_error(ctx.out, "ERR min or max not valid string range item");
@@ -321,7 +329,8 @@ pub async fn zrangebylex(ctx: &mut Ctx<'_>) {
 }
 
 /// ZREVRANGEBYLEX key max min [LIMIT o c] -> members in reverse byte
-/// order; the bounds arrive highest first.
+/// order; the bounds arrive highest first. WITHSCORES is rejected with a
+/// syntax error, matching ZRANGEBYLEX.
 pub async fn zrevrangebylex(ctx: &mut Ctx<'_>) {
     if ctx.args.len() < 3 {
         arity(ctx.out, "zrevrangebylex");
@@ -330,6 +339,11 @@ pub async fn zrevrangebylex(ctx: &mut Ctx<'_>) {
     let Some(opts) = parse_range_opts(ctx.out, &ctx.args[3..], false) else {
         return;
     };
+    if opts.withscores {
+        // Same as ZRANGEBYLEX: no scores in a lex window.
+        append_error(ctx.out, "ERR syntax error");
+        return;
+    }
     let parsed = (parse_lex_bound(&ctx.args[2]), parse_lex_bound(&ctx.args[1]));
     let (Some(min), Some(max)) = parsed else {
         append_error(ctx.out, "ERR min or max not valid string range item");

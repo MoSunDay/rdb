@@ -57,7 +57,8 @@ fn zadd_flag(arg: &[u8]) -> Option<&'static str> {
 }
 
 /// ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [...] -> count of
-/// NEW members (updated ones too with CH); with INCR the new score as a
+/// NEW members (updated ones too with CH -- but a same-score re-add
+/// counts as neither new nor changed); with INCR the new score as a
 /// bulk string (null when the flags veto the update). All-skipped calls
 /// leave a missing key missing (Redis semantics).
 pub async fn zadd(ctx: &mut Ctx<'_>) {
@@ -157,12 +158,23 @@ pub async fn zadd(ctx: &mut Ctx<'_>) {
             }
         }
         match old {
+            Some(prev) if prev == *score => {
+                // Unchanged score: counts under neither flag (Redis does
+                // not report same-score re-adds as changed) and there is
+                // nothing to rewrite -- the stored records already say
+                // exactly this (member, score) pair.
+                pending.insert(member.clone(), *score);
+                continue;
+            }
             Some(prev) => {
                 zset_ds::del_scored(&mut batch, &ctx.prefix_key, &key, prev, member);
                 changed += 1;
             }
             None => {
+                // New members count as added AND changed: `changed`
+                // subsumes `added`, so it alone is the CH reply.
                 added += 1;
+                changed += 1;
                 count += 1;
             }
         }
@@ -176,19 +188,13 @@ pub async fn zadd(ctx: &mut Ctx<'_>) {
     }
     if commit_zset(ctx, &key, expire_ms, count, batch, "zadd").await {
         if added > 0 {
-            wait::notify(
+            wait::notify_n(
                 &ctx.shared.wait_hub,
                 &zset_ds::meta_key(&ctx.prefix_key, &key),
+                added as usize,
             );
         }
-        append_int(
-            ctx.out,
-            if ch {
-                (added + changed) as i64
-            } else {
-                added as i64
-            },
-        );
+        append_int(ctx.out, if ch { changed as i64 } else { added as i64 });
     }
 }
 
@@ -215,7 +221,12 @@ async fn zadd_incr(
         append_null(ctx.out); // GT/LT never create members, INCR honours that
         return;
     }
-    let result = old.unwrap_or(0.0) + delta;
+    // A MISSING member takes delta verbatim: `0.0 + (-0.0)` collapses
+    // to +0.0 and would lose the sign INCR must preserve ("-0").
+    let result = match old {
+        None => delta,
+        Some(prev) => prev + delta,
+    };
     if result.is_nan() {
         append_error(ctx.out, "ERR resulting score is not a number");
         return;
@@ -278,7 +289,12 @@ pub async fn zincrby(ctx: &mut Ctx<'_>) {
             return;
         }
     };
-    let result = old.unwrap_or(0.0) + delta;
+    // Missing member -> delta itself: `0.0 + (-0.0)` is +0.0 and would
+    // drop the "-0" sign ZSCORE must echo back.
+    let result = match old {
+        None => delta,
+        Some(prev) => prev + delta,
+    };
     if result.is_nan() {
         append_error(ctx.out, "ERR resulting score is not a number");
         return;

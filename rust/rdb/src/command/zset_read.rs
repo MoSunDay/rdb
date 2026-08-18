@@ -8,7 +8,8 @@
 
 use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
 use crate::command::zset_util::{
-    append_score, collect_scored, eq_ignore_case, parse_score_bound, zset_state, ZSetState,
+    append_score, collect_scored, eq_ignore_case, parse_score_bound, seek_from_sortable,
+    zset_state, ZSetState,
 };
 use crate::command::Ctx;
 use crate::ds::{expire, zset_ds};
@@ -122,7 +123,7 @@ pub async fn zcount(ctx: &mut Ctx<'_>) {
         ZSetState::Missing => append_int(ctx.out, 0),
         ZSetState::ZSet { .. } => {
             let key = ctx.args[0].clone();
-            let from = zset_ds::score_sortable(min).to_be_bytes();
+            let from = seek_from_sortable(min, min_incl).to_be_bytes();
             let mut n = 0u64;
             let _ = zset_ds::for_each_scored(
                 &ctx.shared.store,

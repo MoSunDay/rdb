@@ -385,3 +385,38 @@ async fn bzpopmin_wakes_on_zadd_over_wire() {
         "wake-up, not timeout"
     );
 }
+
+/// ZADD CH must not count same-score re-adds as changed, and the lex
+/// window commands must reject WITHSCORES with a syntax error.
+#[test]
+fn zadd_ch_unchanged_and_bylex_withscores_errors() {
+    let shared = shared_for("45008");
+    let e = |n: &str, a: &[&str], w: &[u8]| expect(&shared, n, a, w);
+    e("zadd", &["m", "1", "a", "2", "b"], b":2\r\n");
+    // CH: a same-score re-add counts as neither new nor changed.
+    e("zadd", &["m", "CH", "1", "a"], b":0\r\n");
+    // CH: a genuinely changed score and a new member each count once.
+    e("zadd", &["m", "CH", "5", "a", "3", "c"], b":2\r\n");
+    // Without CH only new members are reported (a updated, d added).
+    e("zadd", &["m", "6", "a", "7", "d"], b":1\r\n");
+    e("zscore", &["m", "a"], b"$1\r\n6\r\n");
+    // Lex windows reject WITHSCORES with a plain syntax error.
+    e(
+        "zrangebylex",
+        &["m", "-", "+", "WITHSCORES"],
+        b"-ERR syntax error\r\n",
+    );
+    e(
+        "zrevrangebylex",
+        &["m", "+", "-", "WITHSCORES"],
+        b"-ERR syntax error\r\n",
+    );
+    // Plain BYLEX still works, and BYSCORE keeps WITHSCORES legal.
+    e("zadd", &["lex", "0", "a", "0", "b", "0", "c"], b":3\r\n");
+    e("zrangebylex", &["lex", "-", "+"], &arr(&["a", "b", "c"]));
+    e(
+        "zrangebyscore",
+        &["lex", "-inf", "+inf", "WITHSCORES"],
+        b"*6\r\n$1\r\na\r\n$1\r\n0\r\n$1\r\nb\r\n$1\r\n0\r\n$1\r\nc\r\n$1\r\n0\r\n",
+    );
+}

@@ -284,28 +284,23 @@ fn blmove_wrongtype_dst_precheck_keeps_src() {
     set_raw(&s, b"{g}dst", b"x");
     call(&s, "rpush", &[b"{g}src", b"a"]);
     // The dst precheck fires BEFORE the pop: WRONGTYPE, src untouched.
-    assert!(
-        call(
-            &s,
-            "blmove",
-            &[b"{g}src", b"{g}dst", b"LEFT", b"LEFT", b"0.1"]
-        )
-        .starts_with(b"-WRONGTYPE")
-    );
+    assert!(call(
+        &s,
+        "blmove",
+        &[b"{g}src", b"{g}dst", b"LEFT", b"LEFT", b"0.1"]
+    )
+    .starts_with(b"-WRONGTYPE"));
     assert_eq!(elems(&s, b"{g}src"), vec![b"a".to_vec()]);
     // BRPOPLPUSH shares the precheck: the tail element survives too.
     call(&s, "rpush", &[b"{g}src", b"b"]);
-    assert!(
-        call(&s, "brpoplpush", &[b"{g}src", b"{g}dst", b"0.1"]).starts_with(b"-WRONGTYPE")
-    );
-    assert_eq!(
-        elems(&s, b"{g}src"),
-        vec![b"a".to_vec(), b"b".to_vec()]
-    );
+    assert!(call(&s, "brpoplpush", &[b"{g}src", b"{g}dst", b"0.1"]).starts_with(b"-WRONGTYPE"));
+    assert_eq!(elems(&s, b"{g}src"), vec![b"a".to_vec(), b"b".to_vec()]);
     // A wrong-type SRC still surfaces WRONGTYPE through the pop itself.
     set_raw(&s, b"{g}str", b"y");
-    assert!(
-        call(&s, "blmove", &[b"{g}str", b"{g}dst", b"LEFT", b"LEFT", b"0.1"])
-            .starts_with(b"-WRONGTYPE")
-    );
+    assert!(call(
+        &s,
+        "blmove",
+        &[b"{g}str", b"{g}dst", b"LEFT", b"LEFT", b"0.1"]
+    )
+    .starts_with(b"-WRONGTYPE"));
 }

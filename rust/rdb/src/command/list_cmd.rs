@@ -150,7 +150,7 @@ pub(crate) fn pop_one(
 /// Shared body of LPUSH/RPUSH/LPUSHX/RPUSHX: append every element at
 /// one end in one batch and reply the new length. `create` = false
 /// (the *X variants) leaves a missing key untouched and replies 0.
-/// Pushes wake one parked blocking reader of the key.
+/// Pushes wake as many parked blocking readers as elements landed.
 async fn push_variant(ctx: &mut Ctx<'_>, left: bool, create: bool, cmd: &str) {
     if ctx.args.len() < 2 {
         arity(ctx.out, cmd);
@@ -204,9 +204,10 @@ async fn push_variant(ctx: &mut Ctx<'_>, left: bool, create: bool, cmd: &str) {
     }
     let len = meta.len();
     if commit_list(ctx, &key, meta.expire_ms, Some(&meta), batch, cmd).await {
-        wait::notify(
+        wait::notify_n(
             &ctx.shared.wait_hub,
             &list_ds::meta_key(&ctx.prefix_key, &key),
+            n as usize,
         );
         append_int(ctx.out, len as i64);
     }

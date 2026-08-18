@@ -10,10 +10,11 @@
 //! slot rather than one global window -- accepted, documented.
 //!
 //! Lazy path: reads decode the envelope and purge in place when due.
-//! Active path: [`sample_once`] scans the index, re-reads each victim to
-//! confirm it is still expired (guards against racing writers), then
-//! range-deletes the family and the index entry. [`spawn_active_expire`]
-//! runs the loop every 100ms with Redis-style adaptive extra rounds.
+//! Active path: [`sample_once`] scans the index from a rotating cursor,
+//! re-reads each victim to confirm it is still expired (guards against
+//! racing writers), then range-deletes the family and the index entry.
+//! [`spawn_active_expire`] runs the loop every 100ms with Redis-style
+//! adaptive extra rounds.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -134,14 +135,23 @@ pub fn slot_prefix_len(k: &[u8]) -> Option<usize> {
 
 /// One active-expiration round: scan index entries with
 /// `expire_ms <= now_ms`, confirm-and-purge each, at most `budget`
-/// deletions. Returns the number purged (stale index entries whose record
-/// vanished or changed count too -- they needed deleting either way).
-pub fn sample_once(store: &Store, now: u64, budget: usize) -> usize {
+/// deletions, resuming the scan strictly after `from` (empty = head).
+/// Returns the number purged (stale index entries whose record vanished
+/// or changed count too -- they needed deleting either way) plus the
+/// scan cursor: the key the round stopped on when `budget`/SCAN_LIMIT
+/// cut it short, or EMPTY when the scan ran to the tail -- feed that
+/// back into the next call so the sampler keeps ROTATING instead of
+/// always restarting at the head (high slots would starve otherwise).
+pub fn sample_once(store: &Store, now: u64, budget: usize, from: &[u8]) -> (usize, Vec<u8>) {
     let mut purged = 0usize;
     let mut scanned = 0usize;
-    let _ = ops::for_each_from(store, b"", false, &mut |k, _| {
+    let mut cursor = from.to_vec();
+    let mut stopped = false;
+    let _ = ops::for_each_from(store, from, true, &mut |k, _| {
+        cursor = k.to_vec();
         scanned += 1;
         if purged >= budget || scanned > SCAN_LIMIT {
+            stopped = true;
             return false;
         }
         let Some(plen) = slot_prefix_len(k) else {
@@ -161,7 +171,11 @@ pub fn sample_once(store: &Store, now: u64, budget: usize) -> usize {
         }
         true
     });
-    purged
+    if stopped {
+        (purged, cursor)
+    } else {
+        (purged, Vec::new()) // hit the tail: the next round wraps to the head
+    }
 }
 
 /// Re-read the indexed record, then purge it (record + index) if it is
@@ -209,19 +223,23 @@ fn purge_indexed(store: &Store, prefix: &[u8], body: &[u8], expire: u64, now: u6
 
 /// Active-expiration loop: every 100ms sample `budget` deletions; when the
 /// whole budget was due (busy keyspace), take up to 4 extra immediate
-/// rounds (Redis adaptive behavior) before sleeping again.
+/// rounds (Redis adaptive behavior) before sleeping again. The scan
+/// cursor survives ticks and extra rounds alike, so consecutive rounds
+/// keep advancing through the keyspace instead of re-reading the head.
 pub fn spawn_active_expire(shared: Arc<state::Shared>) {
     const BUDGET: usize = 20;
     const MAX_ROUNDS: usize = 5;
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut cursor: Vec<u8> = Vec::new();
         loop {
             ticker.tick().await;
             let mut rounds = 0;
             loop {
                 rounds += 1;
-                let purged = sample_once(&shared.store, now_ms(), BUDGET);
+                let (purged, next) = sample_once(&shared.store, now_ms(), BUDGET, &cursor);
+                cursor = next;
                 if purged < BUDGET || rounds >= MAX_ROUNDS {
                     break;
                 }
@@ -245,10 +263,21 @@ mod tests {
     const P: &[u8] = b"70/";
 
     fn write_enveloped(store: &Store, kind: u8, key: &[u8], expire: u64, payload: &[u8]) {
-        let root = codec::data_key(P, kind, key);
+        write_enveloped_at(store, P, kind, key, expire, payload);
+    }
+
+    fn write_enveloped_at(
+        store: &Store,
+        prefix: &[u8],
+        kind: u8,
+        key: &[u8],
+        expire: u64,
+        payload: &[u8],
+    ) {
+        let root = codec::data_key(prefix, kind, key);
         let mut batch = WriteBatch::default();
         batch.put(&root, codec::encode_envelope(expire, payload));
-        set_ttl_entries(&mut batch, P, root, 0, expire);
+        set_ttl_entries(&mut batch, prefix, root, 0, expire);
         ops::batch_write(store, batch).unwrap();
     }
 
@@ -283,7 +312,7 @@ mod tests {
         batch.put(&elem, b"x");
         ops::batch_write(&store, batch).unwrap();
 
-        assert_eq!(sample_once(&store, 200, 10), 2);
+        assert_eq!(sample_once(&store, 200, 10, b"").0, 2);
         assert_eq!(read_enveloped(&store, P, b"due").unwrap(), None);
         // element went with the meta
         assert_eq!(ops::get_physical(&store, &elem).unwrap(), None);
@@ -291,7 +320,7 @@ mod tests {
         let (expire, payload) = read_enveloped(&store, P, b"later").unwrap().unwrap();
         assert_eq!((expire, payload), (9_000_000_000_000, b"v".to_vec()));
         // index entries for the purged keys are gone; a resample is idle
-        assert_eq!(sample_once(&store, 200, 10), 0);
+        assert_eq!(sample_once(&store, 200, 10, b"").0, 0);
     }
 
     #[test]
@@ -303,7 +332,7 @@ mod tests {
         batch.put(&root, codec::encode_envelope(0, b"v"));
         set_ttl_entries(&mut batch, P, root, 111, 0);
         ops::batch_write(&store, batch).unwrap();
-        assert_eq!(sample_once(&store, 500, 10), 0);
+        assert_eq!(sample_once(&store, 500, 10, b"").0, 0);
         let (expire, payload) = read_enveloped(&store, P, b"k").unwrap().unwrap();
         assert_eq!((expire, payload), (0, b"v".to_vec()));
     }
@@ -314,7 +343,7 @@ mod tests {
         write_enveloped(&store, KIND_STRING_TTL, b"k", 5, b"v");
         assert!(purge_if_expired(&store, P, STRING_FAMILY, b"k", 10));
         assert!(!purge_if_expired(&store, P, STRING_FAMILY, b"k", 10));
-        assert_eq!(sample_once(&store, 10, 10), 0);
+        assert_eq!(sample_once(&store, 10, 10, b"").0, 0);
         // an index entry whose record vanished is still swept
         let mut batch = WriteBatch::default();
         batch.put(
@@ -322,7 +351,87 @@ mod tests {
             b"",
         );
         ops::batch_write(&store, batch).unwrap();
-        assert_eq!(sample_once(&store, 10, 10), 1);
+        assert_eq!(sample_once(&store, 10, 10, b"").0, 1);
+    }
+
+    #[test]
+    fn sampler_cursor_resumes_after_stop() {
+        let (_dir, store) = open_tmp("resume");
+        write_enveloped_at(&store, b"10/", KIND_STRING_TTL, b"k", 100, b"v");
+        write_enveloped_at(&store, b"99/", KIND_STRING_TTL, b"k", 100, b"v");
+        // budget=1: the round purges the 10/ victim, then stops on the
+        // next key it touches -- the 99/ data record.
+        let (purged, cursor) = sample_once(&store, 200, 1, b"");
+        assert_eq!(purged, 1);
+        assert_eq!(
+            cursor,
+            codec::data_key(b"99/", KIND_STRING_TTL, b"k"),
+            "cursor sits on the last key the round accessed"
+        );
+        // resuming after that cursor clears the 99/ victim in slot order
+        let (purged2, cursor2) = sample_once(&store, 200, 1, &cursor);
+        assert_eq!(purged2, 1);
+        assert!(cursor2.is_empty(), "scan reached the tail and wrapped");
+        assert_eq!(read_enveloped(&store, b"10/", b"k").unwrap(), None);
+        assert_eq!(read_enveloped(&store, b"99/", b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn sampler_cursor_wraps_after_tail() {
+        let (_dir, store) = open_tmp("wrap");
+        write_enveloped_at(&store, b"99/", KIND_STRING_TTL, b"tail", 100, b"v");
+        let (purged, cursor) = sample_once(&store, 200, 10, b"");
+        assert_eq!(purged, 1);
+        assert!(
+            cursor.is_empty(),
+            "natural exhaustion returns an empty cursor"
+        );
+        // a NEW victim sorting before everything the sweep just saw: only
+        // a wrapped (head restart) round can reach it
+        write_enveloped_at(&store, b"10/", KIND_STRING_TTL, b"head", 100, b"v");
+        let (purged2, cursor2) = sample_once(&store, 200, 10, &cursor);
+        assert_eq!(purged2, 1, "wrapped round restarts from the head");
+        assert!(cursor2.is_empty());
+        assert_eq!(read_enveloped(&store, b"10/", b"head").unwrap(), None);
+        assert_eq!(read_enveloped(&store, b"99/", b"tail").unwrap(), None);
+    }
+
+    #[test]
+    fn sampler_reaches_keys_past_scan_limit() {
+        let (_dir, store) = open_tmp("limit");
+        // >SCAN_LIMIT live records at slot 10/ push the cursor forward one
+        // SCAN_LIMIT-window per round (written in one batch to keep the
+        // test off the fsync path).
+        let far = 9_000_000_000_000u64;
+        let mut batch = WriteBatch::default();
+        for i in 0..=SCAN_LIMIT {
+            let key = format!("bulk{i:04}").into_bytes();
+            let root = codec::data_key(b"10/", KIND_STRING_TTL, &key);
+            batch.put(&root, codec::encode_envelope(far, b"v"));
+            batch.put(codec::expire_index_key(b"10/", far, &root), b"");
+        }
+        ops::batch_write(&store, batch).unwrap();
+        // the due key sits in a slot BEYOND the bulk window
+        write_enveloped_at(&store, b"99/", KIND_STRING_TTL, b"due", 100, b"v");
+        let due = codec::data_key(b"99/", KIND_STRING_TTL, b"due");
+
+        let mut cursor = Vec::new();
+        let mut rounds = 0;
+        while ops::get_physical(&store, &due).unwrap().is_some() {
+            rounds += 1;
+            assert!(rounds < 16, "cursor rotation never reached the high slot");
+            let (_, next) = sample_once(&store, 200, 20, &cursor);
+            cursor = next;
+        }
+        assert!(rounds > 1, "the scan limit forced multiple rounds");
+        // the live bulk records were only ever passed over, never purged
+        assert_eq!(
+            read_enveloped(&store, b"10/", b"bulk0000")
+                .unwrap()
+                .unwrap()
+                .0,
+            far
+        );
     }
 
     #[test]

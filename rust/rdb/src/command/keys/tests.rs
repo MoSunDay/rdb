@@ -62,7 +62,8 @@ fn type_exists_and_del_roundtrip() {
     assert_eq!(call(&s, |c| Box::pin(del(c)), &[b"k"]), b":0\r\n".to_vec());
 
     // Typed records TYPE by their kind: write a hash meta directly.
-    let meta = crate::ds::codec::data_key(PREFIX, crate::ds::codec::KIND_HASH_META, b"h");
+    // Multi-key EXISTS/DEL need same-slot keys, hence the {x} tag.
+    let meta = crate::ds::codec::data_key(PREFIX, crate::ds::codec::KIND_HASH_META, b"{x}h");
     crate::store::ops::batch_write(&s.store, {
         let mut b = rocksdb::WriteBatch::default();
         b.put(&meta, crate::ds::codec::encode_envelope(0, b"1"));
@@ -70,17 +71,17 @@ fn type_exists_and_del_roundtrip() {
     })
     .expect("batch");
     assert_eq!(
-        call(&s, |c| Box::pin(type_(c)), &[b"h"]),
+        call(&s, |c| Box::pin(type_(c)), &[b"{x}h"]),
         b"+hash\r\n".to_vec()
     );
     // EXISTS counts multiple keys; DEL counts only real deletions.
     assert_eq!(
-        call(&s, |c| Box::pin(exists(c)), &[b"h", b"nope"]),
+        call(&s, |c| Box::pin(exists(c)), &[b"{x}h", b"{x}nope"]),
         b":1\r\n".to_vec()
     );
-    set_raw(&s, b"j", b"w");
+    set_raw(&s, b"{x}j", b"w");
     assert_eq!(
-        call(&s, |c| Box::pin(del(c)), &[b"h", b"j", b"gone"]),
+        call(&s, |c| Box::pin(del(c)), &[b"{x}h", b"{x}j", b"{x}gone"]),
         b":2\r\n".to_vec()
     );
 }
@@ -277,62 +278,63 @@ fn keys_pattern_and_randomkey() {
 
 #[test]
 fn rename_moves_raw_and_ttl_records() {
+    // RENAME moves across two keys: all of them share the {r} slot tag.
     let (_g, s) = shared_for("127.0.0.1:40207");
-    set_raw(&s, b"a", b"1");
-    set_raw(&s, b"b", b"2");
+    set_raw(&s, b"{r}a", b"1");
+    set_raw(&s, b"{r}b", b"2");
     assert_eq!(
-        call(&s, |c| Box::pin(rename(c)), &[b"a", b"c"]),
+        call(&s, |c| Box::pin(rename(c)), &[b"{r}a", b"{r}c"]),
         b"+OK\r\n".to_vec()
     );
     assert_eq!(
-        call(&s, |c| Box::pin(exists(c)), &[b"a"]),
+        call(&s, |c| Box::pin(exists(c)), &[b"{r}a"]),
         b":0\r\n".to_vec()
     );
     assert_eq!(
-        call(&s, |c| Box::pin(crate::command::string::get(c)), &[b"c"]),
+        call(&s, |c| Box::pin(crate::command::string::get(c)), &[b"{r}c"]),
         b"$1\r\n1\r\n".to_vec()
     );
     // Plain RENAME overwrites the destination.
     assert_eq!(
-        call(&s, |c| Box::pin(rename(c)), &[b"c", b"b"]),
+        call(&s, |c| Box::pin(rename(c)), &[b"{r}c", b"{r}b"]),
         b"+OK\r\n".to_vec()
     );
     assert_eq!(
-        call(&s, |c| Box::pin(crate::command::string::get(c)), &[b"b"]),
+        call(&s, |c| Box::pin(crate::command::string::get(c)), &[b"{r}b"]),
         b"$1\r\n1\r\n".to_vec()
     );
     // RENAMENX refuses when the destination exists; works when not.
-    set_raw(&s, b"d", b"9");
+    set_raw(&s, b"{r}d", b"9");
     assert_eq!(
-        call(&s, |c| Box::pin(renamenx(c)), &[b"d", b"b"]),
+        call(&s, |c| Box::pin(renamenx(c)), &[b"{r}d", b"{r}b"]),
         b":0\r\n".to_vec()
     );
     assert_eq!(
-        call(&s, |c| Box::pin(renamenx(c)), &[b"d", b"e"]),
+        call(&s, |c| Box::pin(renamenx(c)), &[b"{r}d", b"{r}e"]),
         b":1\r\n".to_vec()
     );
     // Missing source, and self-rename of an existing key.
     assert_eq!(
-        call(&s, |c| Box::pin(rename(c)), &[b"nope", b"x"]),
+        call(&s, |c| Box::pin(rename(c)), &[b"{r}nope", b"{r}x"]),
         b"-ERR no such key\r\n".to_vec()
     );
     assert_eq!(
-        call(&s, |c| Box::pin(rename(c)), &[b"e", b"e"]),
+        call(&s, |c| Box::pin(rename(c)), &[b"{r}e", b"{r}e"]),
         b"+OK\r\n".to_vec()
     );
     // TTL travels with the renamed record.
     assert_eq!(
-        call(&s, |c| Box::pin(pexpire(c)), &[b"e", b"60000"]),
+        call(&s, |c| Box::pin(pexpire(c)), &[b"{r}e", b"60000"]),
         b":1\r\n".to_vec()
     );
     assert_eq!(
-        call(&s, |c| Box::pin(rename(c)), &[b"e", b"f"]),
+        call(&s, |c| Box::pin(rename(c)), &[b"{r}e", b"{r}f"]),
         b"+OK\r\n".to_vec()
     );
-    let ms = int_of(&call(&s, |c| Box::pin(pttl(c)), &[b"f"]));
+    let ms = int_of(&call(&s, |c| Box::pin(pttl(c)), &[b"{r}f"]));
     assert!(ms > 0 && ms <= 60_000, "pttl {ms}");
     assert_eq!(
-        call(&s, |c| Box::pin(pttl(c)), &[b"e"]),
+        call(&s, |c| Box::pin(pttl(c)), &[b"{r}e"]),
         b":-2\r\n".to_vec()
     );
 }
@@ -361,4 +363,76 @@ fn arity_errors_for_every_handler() {
         let expect = format!("-ERR wrong number of arguments for '{name}' command\r\n");
         assert_eq!(reply, expect.into_bytes(), "cmd {name}");
     }
+}
+
+/// CROSSSLOT error text shared with the set/zset/list algebra commands.
+const CROSSSLOT_REPLY: &[u8] = b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n";
+
+#[test]
+fn del_and_exists_crossslot_replied_error() {
+    let (_g, s) = shared_for("127.0.0.1:40211");
+    set_raw(&s, b"k", b"v");
+    // Untagged keys land in different slots: both commands refuse and
+    // leave the keyspace untouched.
+    assert_eq!(
+        call(&s, |c| Box::pin(del(c)), &[b"k", b"other"]),
+        CROSSSLOT_REPLY.to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(exists(c)), &[b"k", b"other"]),
+        CROSSSLOT_REPLY.to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(exists(c)), &[b"k"]),
+        b":1\r\n".to_vec()
+    );
+    // Same-slot keys (shared {x} tag) go through: DEL counts both real
+    // keys, EXISTS sees the survivors.
+    set_raw(&s, b"{x}a", b"1");
+    set_raw(&s, b"{x}b", b"2");
+    assert_eq!(
+        call(&s, |c| Box::pin(exists(c)), &[b"{x}a", b"{x}b", b"{x}c"]),
+        b":2\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(del(c)), &[b"{x}a", b"{x}b", b"{x}c"]),
+        b":2\r\n".to_vec()
+    );
+    // UNLINK shares the DEL handler and its CROSSSLOT rule.
+    let unlink = crate::command::lookup("unlink").expect("unlink registered");
+    assert_eq!(call(&s, unlink, &[b"k", b"{x}a"]), CROSSSLOT_REPLY.to_vec());
+}
+
+#[test]
+fn rename_crossslot_dst_not_created() {
+    let (_g, s) = shared_for("127.0.0.1:40212");
+    set_raw(&s, b"src", b"v");
+    // Different slots: both RENAME and RENAMENX refuse outright -- the
+    // destination is never created and the source survives.
+    assert_eq!(
+        call(&s, |c| Box::pin(rename(c)), &[b"src", b"dst"]),
+        CROSSSLOT_REPLY.to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(renamenx(c)), &[b"src", b"dst"]),
+        CROSSSLOT_REPLY.to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(exists(c)), &[b"dst"]),
+        b":0\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(exists(c)), &[b"src"]),
+        b":1\r\n".to_vec()
+    );
+    // Same-slot rename still moves the value.
+    set_raw(&s, b"{r}src", b"v");
+    assert_eq!(
+        call(&s, |c| Box::pin(rename(c)), &[b"{r}src", b"{r}dst"]),
+        b"+OK\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(exists(c)), &[b"{r}dst"]),
+        b":1\r\n".to_vec()
+    );
 }

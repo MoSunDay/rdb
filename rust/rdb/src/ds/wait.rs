@@ -4,8 +4,9 @@
 //!
 //! [`WaitHub`] maps a physical root key to a FIFO queue of [`Waiter`]s.
 //! A blocking command [`register`]s a waiter, then [`wait`]s on it with a
-//! timeout; a mutating command calls [`notify`] to pop and signal the
-//! OLDEST waiter. Waiters are plain data carriers; all logic is free
+//! timeout; a mutating command calls [`notify`] (or [`notify_n`] when it
+//! lands several elements at once) to pop and signal the OLDEST live
+//! waiter(s). Waiters are plain data carriers; all logic is free
 //! functions.
 
 use std::collections::{HashMap, VecDeque};
@@ -86,16 +87,30 @@ pub fn register_shared(hub: &WaitHub, key: &[u8], waiter: &Arc<Waiter>) {
 /// plain pop-and-signal would silently swallow. A drained queue with no
 /// live waiter removes the entry. Returns whether anyone was woken.
 pub fn notify(hub: &WaitHub, key: &[u8]) -> bool {
+    notify_n(hub, key, 1) > 0
+}
+
+/// Signal up to `n` LIVE waiters for `key` under ONE lock take: a
+/// multi-element push (LPUSH a b c, ZADD k s1 m1 s2 m2) must wake as
+/// many waiters as it has elements to serve, or all but the first park
+/// out their full timeout. FIFO semantics match [`notify`] — stale
+/// entries (a multi-key waiter already woken via another root) are
+/// popped and skipped without counting. A drained queue removes the
+/// map entry. Returns how many waiters were actually woken
+/// (min of `n` and the live waiters present).
+pub fn notify_n(hub: &WaitHub, key: &[u8], n: usize) -> usize {
     let mut map = hub
         .inner
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut woke = false;
+    let mut woke = 0usize;
     if let Some(queue) = map.get_mut(key) {
-        while let Some(waiter) = queue.pop_front() {
-            if signal_if_armed(&waiter) {
-                woke = true;
+        while woke < n {
+            let Some(waiter) = queue.pop_front() else {
                 break;
+            };
+            if signal_if_armed(&waiter) {
+                woke += 1;
             }
         }
     }
@@ -210,10 +225,7 @@ mod tests {
         let live = register(&hub, b"70/b");
         // notify(b) must skip the stale front and wake the live waiter.
         assert!(notify(&hub, b"70/b"));
-        assert_eq!(
-            wait(&live, Duration::from_millis(0)),
-            WaitOutcome::Signaled
-        );
+        assert_eq!(wait(&live, Duration::from_millis(0)), WaitOutcome::Signaled);
         assert_eq!(
             wait(&stale, Duration::from_millis(0)),
             WaitOutcome::Signaled,
@@ -308,5 +320,33 @@ mod tests {
         );
         assert!(!notify(&hub, &key), "queue drained");
         assert!(!notify(&hub, b"99/nope"), "unknown key");
+    }
+
+    #[test]
+    fn notify_n_wakes_min_of_n_and_waiters() {
+        let hub = WaitHub::new();
+        let key = b"70/multi".to_vec();
+        let w1 = register(&hub, &key);
+        let w2 = register(&hub, &key);
+        let w3 = register(&hub, &key);
+        // Two elements wake exactly the two OLDEST waiters (FIFO).
+        assert_eq!(notify_n(&hub, &key, 2), 2);
+        assert_eq!(wait(&w1, Duration::from_millis(0)), WaitOutcome::Signaled);
+        assert_eq!(wait(&w2, Duration::from_millis(0)), WaitOutcome::Signaled);
+        assert_eq!(
+            wait(&w3, Duration::from_millis(0)),
+            WaitOutcome::Timeout,
+            "third waiter must stay parked"
+        );
+        // Asking for more than remain wakes only the live waiter.
+        assert_eq!(notify_n(&hub, &key, 5), 1);
+        assert_eq!(wait(&w3, Duration::from_millis(0)), WaitOutcome::Signaled);
+        // The drained queue removed its map entry.
+        assert_eq!(notify_n(&hub, &key, 4), 0);
+        let map = hub
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!map.contains_key(&key), "drained queue drops the entry");
     }
 }

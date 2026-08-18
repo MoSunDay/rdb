@@ -114,16 +114,24 @@ impl LogStore {
             .map_err(|e| io_err(subject, verb, AnyError::new(&e)))
     }
 
+    /// Read a JSON value from the stable CF. Three distinct outcomes:
+    /// RocksDB error -> `Err`; key absent -> `Ok(None)` (truly absent);
+    /// key present but corrupt JSON -> `Err`. Swallowing the third case as
+    /// `Ok(None)` would e.g. silently drop a persisted vote and let the
+    /// node vote again in the same term (Raft safety violation).
     fn get_cf_json<T: serde::de::DeserializeOwned>(
         &self,
         key: &[u8],
-        err: impl FnOnce(&rocksdb::Error) -> StorageIOError<NodeId>,
+        err: impl FnOnce(AnyError) -> StorageError<NodeId>,
     ) -> StorageResult<Option<T>> {
-        Ok(self
-            .db
-            .get_cf(self.store(), key)
-            .map_err(|e| err(&e))?
-            .and_then(|v| serde_json::from_slice(&v).ok()))
+        let val = match self.db.get_cf(self.store(), key) {
+            Err(e) => return Err(err(AnyError::new(&e))),
+            Ok(None) => return Ok(None),
+            Ok(Some(v)) => v,
+        };
+        serde_json::from_slice(&val)
+            .map(Some)
+            .map_err(|e| err(AnyError::new(&e)))
     }
 
     fn put_cf_json<T: serde::Serialize>(
@@ -195,7 +203,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         };
         drop(iter);
 
-        let last_purged_log_id = self.get_cf_json(KEY_LAST_PURGED, |e| StorageIOError::read(e))?;
+        let last_purged_log_id = self.get_cf_json(KEY_LAST_PURGED, |e| {
+            io_err(ErrorSubject::Store, ErrorVerb::Read, e)
+        })?;
         Ok(LogState {
             last_purged_log_id,
             last_log_id: last.or(last_purged_log_id),
@@ -212,7 +222,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn read_vote(&mut self) -> StorageResult<Option<Vote<NodeId>>> {
-        self.get_cf_json(KEY_VOTE, |e| StorageIOError::read_vote(e))
+        self.get_cf_json(KEY_VOTE, |e| io_err(ErrorSubject::Vote, ErrorVerb::Read, e))
     }
 
     /// Persist the committed log id; openraft rebuilds `committed` from it
@@ -224,7 +234,15 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn read_committed(&mut self) -> StorageResult<Option<LogId<NodeId>>> {
-        self.get_cf_json(KEY_COMMITTED, |e| StorageIOError::read(e))
+        // The committed pointer is persisted as an Option (`null` when
+        // cleared by save_committed(None)), so a key holding `null` is a
+        // legal value, not corruption: deserialize the full Option and
+        // flatten; only genuinely corrupt bytes surface as Err.
+        Ok(self
+            .get_cf_json::<Option<LogId<NodeId>>>(KEY_COMMITTED, |e| {
+                io_err(ErrorSubject::Store, ErrorVerb::Read, e)
+            })?
+            .flatten())
     }
 
     async fn append<I>(&mut self, entries: I, callback: LogFlushed<TypeConfig>) -> StorageResult<()>
@@ -287,6 +305,31 @@ mod tests {
         let vote = Vote::new_committed(3, 1);
         store.save_vote(&vote).await.unwrap();
         assert_eq!(store.read_vote().await.unwrap(), Some(vote));
+    }
+
+    /// A vote key holding garbage must be a hard error, not "no vote":
+    /// `Ok(None)` would let the node grant a conflicting vote in the same
+    /// term (Raft safety violation).
+    #[tokio::test]
+    async fn corrupted_vote_is_error_not_absent() {
+        let (_dir, mut store) = open_tmp();
+        store
+            .db
+            .put_cf(store.store(), KEY_VOTE, b"not-json")
+            .unwrap();
+        assert!(store.read_vote().await.is_err());
+    }
+
+    /// Same for snapshot meta: corrupt JSON must surface, not read as
+    /// "no snapshot" (which would resurrect purged logs as fresh).
+    #[tokio::test]
+    async fn corrupted_snapshot_meta_is_error_not_absent() {
+        let (_dir, store) = open_tmp();
+        store
+            .db
+            .put_cf(store.store(), KEY_SNAPSHOT_META, b"not-json")
+            .unwrap();
+        assert!(store.load_snapshot().is_err());
     }
 
     #[tokio::test]

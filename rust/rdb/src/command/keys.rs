@@ -52,6 +52,9 @@ pub async fn exists(ctx: &mut Ctx<'_>) {
         arity(ctx.out, "exists");
         return;
     }
+    if !ds::setops::require_same_slot(ctx.out, &ctx.args) {
+        return;
+    }
     let now = ds::expire::now_ms();
     let mut n = 0i64;
     for key in &ctx.args {
@@ -66,6 +69,9 @@ pub async fn exists(ctx: &mut Ctx<'_>) {
 pub async fn del(ctx: &mut Ctx<'_>) {
     if ctx.args.is_empty() {
         arity(ctx.out, "del");
+        return;
+    }
+    if !ds::setops::require_same_slot(ctx.out, &ctx.args) {
         return;
     }
     let now = ds::expire::now_ms();
@@ -274,6 +280,9 @@ pub async fn randomkey(ctx: &mut Ctx<'_>) {
 async fn rename_common(ctx: &mut Ctx<'_>, cmd: &str, nx: bool) {
     if ctx.args.len() != 2 {
         arity(ctx.out, cmd);
+        return;
+    }
+    if !ds::setops::require_same_slot(ctx.out, &ctx.args) {
         return;
     }
     let now = ds::expire::now_ms();
