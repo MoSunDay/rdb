@@ -87,7 +87,7 @@ pub async fn hvals(ctx: &mut Ctx<'_>) {
 
 /// `HSCAN key cursor [MATCH pattern] [COUNT n] [WITHVALUES]` -> `[cursor,
 /// [f1, (v1,) f2, ...]]`. The cursor is the hex of the last field returned
-/// ("0"/"" restarts); COUNT is a hint (default 10), MATCH globs fields.
+/// ("0" restarts, "" resumes after an empty field); COUNT is a hint (default 10), MATCH globs fields.
 /// WITHVALUES flattens value bulks after every field (this deviates from
 /// real Redis, whose HSCAN ALWAYS returns pairs; the Go rdb has no HSCAN,
 /// so this explicit opt-in is the local contract).
@@ -96,7 +96,12 @@ pub async fn hscan(ctx: &mut Ctx<'_>) {
         arity(ctx.out, "hscan");
         return;
     }
-    let cursor_start = ctx.args[1].is_empty() || ctx.args[1] == b"0";
+    // "0" restarts; every other cursor hex-decodes to a field to resume
+    // STRICTLY after — including "" (hex of an EMPTY field); treating ""
+    // as a restart would livelock paging when the empty field lands on a
+    // page boundary, and resuming after "" equals a fresh start for every
+    // hash that has no empty field.
+    let cursor_start = ctx.args[1] == b"0";
     let mut pattern: Option<Vec<u8>> = None;
     let mut count: usize = 10;
     let mut with_values = false;
@@ -151,10 +156,9 @@ pub async fn hscan(ctx: &mut Ctx<'_>) {
         pattern.as_deref(),
         count,
     );
-    let cursor = if page.next.is_empty() {
-        "0".to_string()
-    } else {
-        hex::encode(&page.next)
+    let cursor = match &page.next {
+        None => "0".to_string(),
+        Some(field) => hex::encode(field),
     };
     append_array(ctx.out, 2);
     append_bulk_string(ctx.out, &cursor);

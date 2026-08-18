@@ -97,11 +97,13 @@ pub fn read_field(
 }
 
 /// One page of `[field, value]` pairs in physical (bytewise field) order.
-/// `next` = the last MATCHED field's bytes (the resume cursor); empty when
-/// iteration finished. `from_field` resumes strictly after that field.
+/// `next` = Some(last MATCHED field) is the resume cursor; None means
+/// iteration finished (an EMPTY field is a valid field, so the cursor is
+/// an Option, not an empty-bytes sentinel). `from_field` resumes strictly
+/// after that field.
 pub struct FieldPage {
     pub fields: Vec<(Vec<u8>, Vec<u8>)>,
-    pub next: Vec<u8>,
+    pub next: Option<Vec<u8>>,
 }
 
 /// Collect up to `count` fields (0 = unbounded), optionally glob-filtered,
@@ -139,7 +141,7 @@ pub fn collect_fields(
     });
     FieldPage {
         fields,
-        next: resume.unwrap_or_default(),
+        next: resume,
     }
 }
 
@@ -199,7 +201,7 @@ mod tests {
         let page = collect_fields(&store, P, b"h1", None, None, 0);
         let got: Vec<Vec<u8>> = page.fields.iter().map(|(f, _)| f.clone()).collect();
         assert_eq!(got, vec![b"a".to_vec(), b"z".to_vec()]);
-        assert!(page.next.is_empty(), "unbounded read finished");
+        assert!(page.next.is_none(), "unbounded read finished");
         assert_eq!(read_field(&store, P, b"h2", b"b"), Ok(Some(b"3".to_vec())));
         // Another key whose bytes extend h1's root ("h1x") stays separate.
         write_hash(&store, b"h1x", 0, &[(b"a", b"9")]);
@@ -214,17 +216,42 @@ mod tests {
         write_hash(&store, b"h", 0, &pairs);
         let p1 = collect_fields(&store, P, b"h", None, Some(b"f*"), 1);
         assert_eq!(p1.fields, vec![(b"f1".to_vec(), b"1".to_vec())]);
-        assert_eq!(p1.next, b"f1".to_vec());
-        let p2 = collect_fields(&store, P, b"h", Some(&p1.next), Some(b"f*"), 1);
+        assert_eq!(p1.next, Some(b"f1".to_vec()));
+        let p2 = collect_fields(&store, P, b"h", p1.next.as_deref(), Some(b"f*"), 1);
         assert_eq!(p2.fields, vec![(b"f2".to_vec(), b"2".to_vec())]);
-        assert_eq!(p2.next, b"f2".to_vec(), "page 2 also stopped at its limit");
+        assert_eq!(p2.next, Some(b"f2".to_vec()), "page 2 also stopped at its limit");
         // A cursor past every matching field returns an empty page.
-        let p3 = collect_fields(&store, P, b"h", Some(&p2.next), Some(b"f*"), 1);
-        assert!(p3.fields.is_empty() && p3.next.is_empty());
+        let p3 = collect_fields(&store, P, b"h", p2.next.as_deref(), Some(b"f*"), 1);
+        assert!(p3.fields.is_empty() && p3.next.is_none());
         // Missing key: empty page, no error.
         assert!(collect_fields(&store, P, b"nope", None, None, 0)
             .fields
             .is_empty());
+    }
+
+    #[test]
+    fn empty_field_is_a_valid_resume_cursor() {
+        let (_dir, store) = open_tmp();
+        write_hash(
+            &store,
+            b"h",
+            0,
+            &[(b"", b"0"), (b"a", b"1"), (b"b", b"2")],
+        );
+        // A page cutting exactly AT the empty field carries Some(b""),
+        // not the finished sentinel.
+        let p1 = collect_fields(&store, P, b"h", None, None, 1);
+        assert_eq!(p1.fields, vec![(Vec::new(), b"0".to_vec())]);
+        assert_eq!(p1.next, Some(Vec::new()));
+        // Some(b"") resumes strictly after "": the rest still flows.
+        let p2 = collect_fields(&store, P, b"h", p1.next.as_deref(), None, 1);
+        assert_eq!(p2.fields, vec![(b"a".to_vec(), b"1".to_vec())]);
+        let p3 = collect_fields(&store, P, b"h", p2.next.as_deref(), None, 5);
+        assert_eq!(p3.fields, vec![(b"b".to_vec(), b"2".to_vec())]);
+        assert_eq!(p3.next, None, "true end only after the last field");
+        let all = collect_fields(&store, P, b"h", None, None, 0);
+        assert_eq!(all.fields.len(), 3);
+        assert_eq!(all.next, None);
     }
 
     #[test]

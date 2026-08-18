@@ -81,13 +81,18 @@ pub async fn srandmember(ctx: &mut Ctx<'_>) {
 }
 
 /// `SSCAN key cursor [MATCH pattern] [COUNT n]` -> `[cursor, [member ...]]`
-/// (cursor = hex of the last member returned; "0"/"" restarts).
+/// (cursor = hex of the last member returned; "0" restarts, "" resumes after the empty member).
 pub async fn sscan(ctx: &mut Ctx<'_>) {
     if ctx.args.len() < 2 {
         arity(ctx.out, "sscan");
         return;
     }
-    let cursor_start = ctx.args[1].is_empty() || ctx.args[1] == b"0";
+    // "0" restarts; every other cursor hex-decodes to a member to resume
+    // STRICTLY after — including "" (hex of an EMPTY member); treating ""
+    // as a restart would livelock paging when the empty member lands on a
+    // page boundary, and resuming after "" equals a fresh start for every
+    // set that has no empty member.
+    let cursor_start = ctx.args[1] == b"0";
     let mut pattern: Option<Vec<u8>> = None;
     let mut count: usize = 10;
     let mut i = 2;
@@ -137,10 +142,9 @@ pub async fn sscan(ctx: &mut Ctx<'_>) {
         pattern.as_deref(),
         count,
     );
-    let cursor = if page.next.is_empty() {
-        "0".to_string()
-    } else {
-        hex::encode(&page.next)
+    let cursor = match &page.next {
+        None => "0".to_string(),
+        Some(member) => hex::encode(member),
     };
     append_array(ctx.out, 2);
     append_bulk_string(ctx.out, &cursor);
