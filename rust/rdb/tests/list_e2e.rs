@@ -288,17 +288,19 @@ async fn blpop_wakes_on_lpush_over_wire() {
         .await
         .expect("connect");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // AUTH separately: replies flush per read-batch, so a pipelined
-    // BLPOP would hold the +OK hostage until it stops parking.
-    sock.write_all(&frame(&["AUTH", t]))
+    // Pipelined AUTH + BLPOP in one write: the blocking-dispatch flush
+    // delivers the +OK before the BLPOP parks.
+    let mut pipelined = frame(&["AUTH", t]);
+    pipelined.extend_from_slice(&frame(&["BLPOP", "wake:key", "5000"]));
+    sock.write_all(&pipelined)
         .await
-        .expect("auth write");
+        .expect("pipelined auth+blpop write");
     let mut hello = [0u8; 5];
-    sock.read_exact(&mut hello).await.expect("auth reply");
-    assert_eq!(&hello, b"+OK\r\n");
-    sock.write_all(&frame(&["BLPOP", "wake:key", "5000"]))
+    tokio::time::timeout(Duration::from_secs(1), sock.read_exact(&mut hello))
         .await
-        .expect("blpop write");
+        .expect("+OK flushed before the BLPOP parks")
+        .expect("auth reply");
+    assert_eq!(&hello, b"+OK\r\n");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let started = Instant::now();
     let pushed = cmd_one_shot(&node.resp, t, &[b"lpush", b"wake:key", b"hello"]).await;
@@ -342,4 +344,60 @@ async fn blpop_wakes_on_lpush_over_wire() {
     assert_eq!(brp, b"$-1".to_vec());
     let blpop_to = cmd_one_shot(&node.resp, t, &[b"blpop", b"wmissing", b"0.15"]).await;
     assert_eq!(blpop_to, b"*-1".to_vec());
+}
+
+/// Pipelined AUTH + BLPOP in ONE write: the +OK must hit the socket
+/// BEFORE the BLPOP parks (blocking dispatch flushes prior replies of
+/// the same read batch), instead of being held hostage for the whole
+/// park. A second connection's LPUSH then wakes the parked pop.
+#[tokio::test]
+async fn pipelined_replies_flush_before_blpop_parks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut node = spawn_node(dir.path(), 0, true, None);
+    wait_resp_ready(&mut node, 10).await;
+    let t = TOKEN;
+    let mut sock = tokio::net::TcpStream::connect(&node.resp)
+        .await
+        .expect("connect");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Two frames, one TCP write: AUTH followed by a parking BLPOP.
+    let mut pipelined = frame(&["AUTH", t]);
+    pipelined.extend_from_slice(&frame(&["BLPOP", "flush:key", "5"]));
+    sock.write_all(&pipelined).await.expect("pipelined write");
+
+    // The +OK must arrive within 1s -- far short of the 5s park, so only
+    // a pre-park flush can satisfy this (the old code held it back).
+    let mut hello = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(1), sock.read_exact(&mut hello))
+        .await
+        .expect("+OK must flush before the BLPOP parks")
+        .expect("read");
+    assert_eq!(&hello, b"+OK\r\n");
+
+    // The parked BLPOP still answers: an LPUSH from a second connection
+    // wakes it and the *2 pair reply follows the already-flushed +OK.
+    let pushed = cmd_one_shot(&node.resp, t, &[b"lpush", b"flush:key", b"v"]).await;
+    assert_eq!(pushed, b":1".to_vec(), "lpush reply (line sans CRLF)");
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(4), sock.read(&mut chunk))
+            .await
+            .expect("reader woken within 4s")
+            .expect("read");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if contains_bytes(&buf, b"\r\n$1\r\nv\r\n") {
+            break;
+        }
+    }
+    assert!(
+        contains_bytes(&buf, b"*2\r\n")
+            && contains_bytes(&buf, b"flush:key")
+            && contains_bytes(&buf, b"\r\n$1\r\nv\r\n"),
+        "reply {:?}",
+        buf
+    );
 }

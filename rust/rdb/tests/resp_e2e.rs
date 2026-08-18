@@ -134,11 +134,12 @@ async fn resp_server_end_to_end() {
     )
     .await;
 
-    // 6. Lone non-whitelisted command: Go's cmd.Args[1] panic text.
+    // 6. Lone non-whitelisted command: Redis-standard arity error
+    //    (BREAKING, approved: no more fabricated Go panic text).
     rpc(
         &mut s,
         &resp_req(&[b"get"]),
-        b"-fatal error: runtime error: index out of range [1] with length 1\r\n",
+        b"-ERR wrong number of arguments for 'get' command\r\n",
     )
     .await;
 
@@ -206,8 +207,9 @@ async fn resp_server_end_to_end() {
     };
     rpc(&mut s, &resp_req(&[b"get", high_key.as_bytes()]), &expected).await;
 
-    // 8. quit replies PONG+OK then closes the connection.
-    rpc(&mut s, &resp_req(&[b"quit"]), b"+PONG\r\n+OK\r\n").await;
+    // 8. quit replies exactly one +OK (BREAKING, approved: the old fork
+    //    also sent +PONG) then closes the connection.
+    rpc(&mut s, &resp_req(&[b"quit"]), b"+OK\r\n").await;
     assert_eof(&mut s).await;
 
     // 9. Protocol error on a fresh connection: error reply, then close.
@@ -221,7 +223,7 @@ async fn resp_server_end_to_end() {
 }
 
 #[tokio::test]
-async fn empty_multibulk_reproduces_go_args0_panic_text() {
+async fn empty_multibulk_replies_arity_error() {
     let shared = Arc::new(test_shared(test_config(), "empty-multibulk"));
     let listener = resp::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -232,11 +234,13 @@ async fn empty_multibulk_reproduces_go_args0_panic_text() {
         .expect("connect timeout")
         .expect("connect");
     rpc(&mut s, &resp_req(&[b"AUTH", b"test-token"]), b"+OK\r\n").await;
-    // `*0\r\n` parses to zero args; Go's cmd.Args[0] panic text is returned.
+    // `*0\r\n` parses to zero args; no command name exists, so the arity
+    // error carries an empty name (BREAKING, approved: replaces Go's
+    // fabricated cmd.Args[0] panic text).
     rpc(
         &mut s,
         b"*0\r\n",
-        b"-fatal error: runtime error: index out of range [0] with length 0\r\n",
+        b"-ERR wrong number of arguments for '' command\r\n",
     )
     .await;
     // Connection stays usable afterwards.

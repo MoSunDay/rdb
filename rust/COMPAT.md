@@ -36,16 +36,41 @@ parity).
    otherwise equivalent.
 4. **DBSIZE/Size**: Go counted store entries directly; Rust reads the RocksDB
    `rocksdb.estimate-num-keys` property (approximate, O(1)).
+5. **QUIT reply** (BREAKING, approved): the Go fork wrote `+PONG` then `+OK`;
+   Rust replies exactly one `+OK` before closing, like Redis.
+6. **Missing key argument / empty multibulk** (BREAKING, approved): Go's
+   unconditional `cmd.Args[0]`/`cmd.Args[1]` indexing surfaced as
+   `-fatal error: runtime error: index out of range ...`; Rust replies the
+   Redis-standard `ERR wrong number of arguments for '<command>' command`
+   (empty name for `*0`). Handler panics still reply `fatal error: <panic>`.
+7. **RAFTGET value framing** (BREAKING, approved): Go wrote the value as a
+   RESP simple string (a CRLF-containing value corrupts the frame); Rust
+   replies a bulk string. No latency sample is recorded on the arity-error
+   or panic paths (Go observes only after the handler returns).
+8. **Empty hash tag means no tag** (BREAKING, approved): `foo{}bar` now hashes
+   the WHOLE key, as Redis does. Go hashed the empty tag, pinning every such
+   key to slot 0 (CRC16("")==0), so existing empty-tag keys change slot.
+9. **Slot coverage when 16384 % N != 0** (BREAKING, approved): the LAST node
+   owns the leftover slots through 16383, so every slot has exactly one owner
+   and bands stay disjoint. Go matched no node for the remainder and served
+   those slots locally on whichever node received the request.
+10. **Single-node `cluster nodes`/`cluster slots` range** (BREAKING, approved):
+   reports the full `0-16383`. Go rendered the last node as `end+1..16383`,
+   which for N=1 omitted slot 0 (`1-16383`).
+11. **`/join` & `/depart` auth failure is `401`** (BREAKING, approved): a wrong
+   raft token now answers `401 unauthorized` instead of the Go fake `ok`; the
+   outgoing join URL percent-encodes query values so tokens containing
+   `&`/`+`/`%` reach the peer intact. The mux-held membership section is also
+   bounded by a 30s timeout (an unreachable peer can no longer wedge the
+   control plane), and a departed voter is fully removed (openraft
+   `change_membership(.., false)`, no lingering learner).
 
 ## Preserved Go quirks (byte-compatible)
 
 - `MGET`/`MSET` route by the **first key only** (all keys go to the first key's node).
 - `cluster test` returns the hardcoded literal `-MOVED 5465 127.0.0.1:32681`.
-- Empty hash tag `{}` hashes to slot 0 (Go `FindHashTag` behavior).
 - Slot range routing uses inclusive upper bound: `slot <= (i+1)*per`, `per = 16384/len`.
-- Single-instance `cluster nodes` reports the full `1-16383` range.
 - `migrate task` overwrites `migrate_task` unconditionally.
-- `/join` with a **wrong** raft token still replies `ok` (token not enforced; parity with Go).
 - `epoch = term + commit_index` concatenated as strings.
 - Cluster-not-ready error text contains the Go typo: `instanes01`.
 - Unknown command reply: `ERR unknown command '<raw-arg-bytes>'` (first arg verbatim).
@@ -90,9 +115,12 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   the Go string `internal error err: not leader` (variant match, not string sniffing).
 - **Join ordering**: Rust binds RESP + HTTP *before* issuing the join request (so peers can
   reach this node immediately); Go joins first. Join response must be exactly `ok`, else the
-  process exits (fail-fast, same as Go). Stagger joins (start nodes
-  one at a time, ~3-5s apart): two simultaneous `change_membership` calls race
-  in openraft and one gets `internal error`, exiting that node (retryable). Bootstrap/`RAFT_JOIN_ADDR` semantics are identical,
+  process exits (fail-fast, same as Go). Concurrent `/join`/`/depart` on one server are
+  serialized by a membership mutex spanning the whole add_learner → read-voters →
+  `change_membership` sequence, so simultaneous joins are safe (fixed: previously two
+  overlapping `change_membership` calls raced in openraft, one got `internal error` and its
+  joiner process exited — the old workaround was staggering node starts ~3-5s apart).
+  Bootstrap/`RAFT_JOIN_ADDR` semantics are identical,
   including the silent skip when `RAFT_JOIN_ADDR` is unset on a fresh data dir.
 - **Storage fsync**: RocksDB WAL defaults vs Go pebble/bolt fsync-per-commit — durability
   windows are comparable but not bit-identical.

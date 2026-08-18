@@ -85,8 +85,9 @@ fn raft_get_cmd(ctx: &mut Ctx<'_>) {
     if val.is_empty() {
         append_null(ctx.out);
     } else {
-        // Go WriteString: simple string, not bulk.
-        append_string(ctx.out, &val);
+        // BREAKING (approved): bulk string, not Go's WriteString simple
+        // string -- a value containing CRLF would corrupt the RESP frame.
+        append_bulk_string(ctx.out, &val);
     }
 }
 
@@ -151,12 +152,13 @@ mod tests {
     }
 
     #[test]
-    fn set_get_roundtrip_simple_string() {
+    fn set_get_roundtrip_bulk_reply() {
         let (_guard, shared) = shared_for("127.0.0.1:40303");
         assert_eq!(call(&shared, &[b"set", b"k", b"v"]), b"+OK\r\n");
-        // Go replies a SIMPLE string, not bulk.
-        assert_eq!(call(&shared, &[b"get", b"k"]), b"+v\r\n");
-        assert_eq!(call(&shared, &[b"GET", b"k"]), b"+v\r\n");
+        // BREAKING (approved): the value replies as a BULK string, not the
+        // Go simple string (CRLF values would break RESP framing).
+        assert_eq!(call(&shared, &[b"get", b"k"]), b"$1\r\nv\r\n");
+        assert_eq!(call(&shared, &[b"GET", b"k"]), b"$1\r\nv\r\n");
         assert_eq!(call(&shared, &[b"get", b"missing"]), b"$-1\r\n");
         assert_eq!(
             call(&shared, &[b"set", b"only-key"]),
@@ -166,6 +168,17 @@ mod tests {
             call(&shared, &[b"get"]),
             b"-ERR wrong number of arguments for get command\r\n"
         );
+    }
+
+    #[test]
+    fn get_value_containing_crlf_keeps_bulk_framing() {
+        let (_guard, shared) = shared_for("127.0.0.1:40305");
+        // "a\r\nb" is 4 bytes; the bulk header must frame the embedded CRLF.
+        assert_eq!(call(&shared, &[b"set", b"k", b"a\r\nb"]), b"+OK\r\n");
+        assert_eq!(call(&shared, &[b"get", b"k"]), b"$4\r\na\r\nb\r\n");
+        // A trailing-CRLF value is likewise length-prefixed, not +line.
+        assert_eq!(call(&shared, &[b"set", b"c", b"x\r\n"]), b"+OK\r\n");
+        assert_eq!(call(&shared, &[b"get", b"c"]), b"$3\r\nx\r\n\r\n");
     }
 
     #[test]

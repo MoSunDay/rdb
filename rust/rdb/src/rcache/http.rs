@@ -2,11 +2,16 @@
 //! `/join` and `/depart` served over a hand-rolled HTTP/1.1 listener.
 //!
 //! Byte-compat notes from the Go original:
-//! - no method check: every HTTP method is accepted, known routes always
-//!   answer status 200;
+//! - no method check: every HTTP method is accepted, known routes answer
+//!   status 200 (except the 401 below);
 //! - `/get` reads the FSM live (Go `CM.Get`);
-//! - `/join` and `/depart` with a wrong token log "join cluster failed"
-//!   but still respond "ok" (a bug in the Go original, kept on purpose);
+//! - `/join` and `/depart` are serialized per server by a membership
+//!   mutex covering the full add_learner/read-voters/change_membership
+//!   sequence (deviation from Go, where concurrent requests race; see
+//!   [`MembershipMux`]);
+//! - `/join` and `/depart` with a wrong token respond `401
+//!   unauthorized` (deviation from the Go original, which logged "join
+//!   cluster failed" but still answered "ok" -- silent fake success);
 //! - unknown paths get Go `http.ServeMux`'s plain 404 page.
 
 use std::collections::BTreeSet;
@@ -21,16 +26,42 @@ use crate::rcache::fsm::KvMap;
 use crate::rcache::transport;
 use crate::rcache::{NodeId, RdbRaft};
 
+/// Serializes membership mutations on ONE server instance: the whole
+/// `add_learner` -> read voters -> `change_membership` (or read voters ->
+/// `change_membership`) sequence runs under it. Without the lock, two
+/// concurrent `/join`s (or a `/join` racing a `/depart`) are a
+/// check-then-act on the voter snapshot: one update is lost, and openraft
+/// rejects the overlapping `change_membership` with `internal error`,
+/// which kills the losing joiner process.
+pub type MembershipMux = Arc<tokio::sync::Mutex<()>>;
+
+/// A fresh per-server membership mux.
+pub fn membership_mux() -> MembershipMux {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
 /// Go `http.DefaultMaxHeaderBytes`.
 const MAX_HEAD_BYTES: usize = 1 << 20;
 /// Read deadline for one request head; the Go server has none, but a
 /// stalled client must not pin a task forever.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for one mux-held membership mutation (`/join` or
+/// `/depart`): add_learner with blocking=true waits for the learner to
+/// catch up, so an unreachable peer would hold the mux forever and wedge
+/// every control-plane op on this server. No Go/config counterpart
+/// exists; 30s is a generous bound for a healthy catch-up.
+const MEMBERSHIP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bind `addr` and serve the control API forever (Go `http.Serve`).
-pub async fn serve(addr: &str, raft: Arc<RdbRaft>, kv: KvMap, token: String) -> io::Result<()> {
+pub async fn serve(
+    addr: &str,
+    raft: Arc<RdbRaft>,
+    kv: KvMap,
+    token: String,
+    mux: MembershipMux,
+) -> io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    serve_on(listener, raft, kv, token).await
+    serve_on(listener, raft, kv, token, mux).await
 }
 
 /// Serve on an already bound listener (tests use ephemeral ports).
@@ -39,13 +70,14 @@ pub async fn serve_on(
     raft: Arc<RdbRaft>,
     kv: KvMap,
     token: String,
+    mux: MembershipMux,
 ) -> io::Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let (raft, kv, token) = (raft.clone(), kv.clone(), token.clone());
+                let (raft, kv, token, mux) = (raft.clone(), kv.clone(), token.clone(), mux.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, &raft, &kv, &token).await {
+                    if let Err(e) = handle_conn(stream, &raft, &kv, &token, &mux).await {
                         if e.kind() != io::ErrorKind::UnexpectedEof {
                             eprintln!("rcache http: connection failed: {e}");
                         }
@@ -63,6 +95,7 @@ async fn handle_conn(
     raft: &RdbRaft,
     kv: &KvMap,
     token: &str,
+    mux: &MembershipMux,
 ) -> io::Result<()> {
     let (head, _rest) = read_head(&mut stream).await?;
     let Some(target) = request_target(&head) else {
@@ -70,10 +103,13 @@ async fn handle_conn(
     };
     let (path, query) = split_target(target);
     let params = parse_query(query);
+    // Only the membership-mutating routes touch `mux`; `/get` and 404s
+    // stay lock-free. `/join` and `/depart` pick their own status (401 on
+    // a wrong token), the rest is always 200.
     let (status, body) = match path {
         "/get" => ("200 OK", do_get(kv, token, &params)),
-        "/join" => ("200 OK", do_join(raft, token, &params).await),
-        "/depart" => ("200 OK", do_depart(raft, token, &params).await),
+        "/join" => do_join(raft, mux, token, &params).await,
+        "/depart" => do_depart(raft, mux, token, &params).await,
         // Go http.ServeMux plain 404.
         _ => ("404 Not Found", "404 page not found\n".to_string()),
     };
@@ -209,43 +245,96 @@ fn do_get(kv: &KvMap, token: &str, params: &[(String, String)]) -> String {
     format!("{ret}\n")
 }
 
-/// Go `doJoin`. Wrong token is a logged no-op that still answers "ok"
-/// (bug parity with the Go original, see module docs).
-async fn do_join(raft: &RdbRaft, token: &str, params: &[(String, String)]) -> String {
+/// Response pair (status line + body) shared by the membership-mutating
+/// routes so a wrong token can answer 401 instead of the Go original's
+/// fake "ok".
+type RouteResponse = (&'static str, String);
+
+/// Go `doJoin`, with two deviations from the Go bug set: a wrong token
+/// answers `401 unauthorized` instead of a fake "ok", and the mux-held
+/// section is bounded by [`MEMBERSHIP_TIMEOUT`].
+async fn do_join(
+    raft: &RdbRaft,
+    mux: &MembershipMux,
+    token: &str,
+    params: &[(String, String)],
+) -> RouteResponse {
     let peer = first_param(params, "peerAddress");
     if peer.is_empty() {
         eprintln!("invalid PeerAddress");
-        return "invalid peerAddress\n".to_string();
+        return ("200 OK", "invalid peerAddress\n".to_string());
     }
     if first_param(params, "raft-token") != token {
         eprintln!("join cluster failed");
-        return "ok".to_string();
+        return ("401 Unauthorized", "unauthorized\n".to_string());
     }
-    match add_voter(raft, peer).await {
-        Ok(()) => "ok".to_string(),
-        Err(e) => {
+    // Hold the membership mux across the WHOLE add_learner -> read
+    // voters -> change_membership sequence (not just change_membership):
+    // the voter snapshot must not change under the caller. add_learner
+    // blocks until the learner catches up, so an unreachable peer would
+    // hold the mux forever; the timeout releases it and answers the same
+    // internal-error body as a failed membership change.
+    let joined = tokio::time::timeout(MEMBERSHIP_TIMEOUT, async {
+        let _membership = mux.lock().await;
+        add_voter(raft, peer).await
+    })
+    .await;
+    match joined {
+        Ok(Ok(())) => ("200 OK", "ok".to_string()),
+        Ok(Err(e)) => {
             eprintln!("Error joining peer to raft, peeraddress:{peer}, err:{e}, code:500");
-            "internal error\n".to_string()
+            ("200 OK", "internal error\n".to_string())
+        }
+        Err(_) => {
+            eprintln!(
+                "Error joining peer to raft, peeraddress:{peer}, \
+                 err:membership change timed out after {}s, code:500",
+                MEMBERSHIP_TIMEOUT.as_secs()
+            );
+            ("200 OK", "internal error\n".to_string())
         }
     }
 }
 
-/// Go `doDepart`; same skeleton (and same wrong-token bug) as `doJoin`.
-async fn do_depart(raft: &RdbRaft, token: &str, params: &[(String, String)]) -> String {
+/// Go `doDepart`; same skeleton as `doJoin` (same 401-on-wrong-token and
+/// mux timeout deviations).
+async fn do_depart(
+    raft: &RdbRaft,
+    mux: &MembershipMux,
+    token: &str,
+    params: &[(String, String)],
+) -> RouteResponse {
     let peer = first_param(params, "peerAddress");
     if peer.is_empty() {
         eprintln!("invalid PeerAddress");
-        return "invalid peerAddress\n".to_string();
+        return ("200 OK", "invalid peerAddress\n".to_string());
     }
     if first_param(params, "raft-token") != token {
         eprintln!("join cluster failed");
-        return "ok".to_string();
+        return ("401 Unauthorized", "unauthorized\n".to_string());
     }
-    match remove_voter(raft, peer).await {
-        Ok(()) => "ok".to_string(),
-        Err(e) => {
+    // Same serialization as `/join`: a departing peer must not be
+    // computed from a voter snapshot a concurrent join is replacing.
+    // change_membership can also stall (e.g. a lost leader), so this
+    // mux-held section is bounded just like `/join`'s.
+    let departed = tokio::time::timeout(MEMBERSHIP_TIMEOUT, async {
+        let _membership = mux.lock().await;
+        remove_voter(raft, peer).await
+    })
+    .await;
+    match departed {
+        Ok(Ok(())) => ("200 OK", "ok".to_string()),
+        Ok(Err(e)) => {
             eprintln!("Error depart peer to raft, peeraddress:{peer}, err:{e}, code:500");
-            "internal error\n".to_string()
+            ("200 OK", "internal error\n".to_string())
+        }
+        Err(_) => {
+            eprintln!(
+                "Error depart peer to raft, peeraddress:{peer}, \
+                 err:membership change timed out after {}s, code:500",
+                MEMBERSHIP_TIMEOUT.as_secs()
+            );
+            ("200 OK", "internal error\n".to_string())
         }
     }
 }
@@ -285,7 +374,10 @@ async fn remove_voter(raft: &RdbRaft, peer: &str) -> Result<(), String> {
         return Err(format!("peer {peer} not found in configuration"));
     }
     let members: BTreeSet<NodeId> = voters.into_iter().filter(|v| *v != id).collect();
-    raft.change_membership(members, true)
+    // retain=false: the removed voter must leave the cluster entirely;
+    // openraft's retain=true would keep it as a learner forever, so a
+    // departed node could never really rejoin.
+    raft.change_membership(members, false)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
