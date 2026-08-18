@@ -1,5 +1,5 @@
 //! Storage mechanics shared by the generic key-space commands
-//! (`rdb/src/command/keys.rs`): key resolution, latched deletes, TTL
+//! (sibling `keys.rs`): key resolution, latched deletes, TTL
 //! writes and RENAME moves. Enumeration (SCAN/KEYS/RANDOMKEY) lives in
 //! `keys_scan.rs`.
 //!

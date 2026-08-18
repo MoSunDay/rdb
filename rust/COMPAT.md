@@ -7,7 +7,7 @@ JSON framing vs hashicorp msgpack), so Go and Rust nodes cannot join the same ra
 ## Critical build requirement (tokio LIFO-slot freeze)
 
 `rust/.cargo/config.toml` sets `rustflags = ["--cfg", "tokio_unstable"]` so that
-`tokio::runtime::Builder::disable_lifo_slot()` in `rdb/src/main.rs` compiles and takes effect.
+`tokio::runtime::Builder::disable_lifo_slot()` in `src/main.rs` compiles and takes effect.
 
 Why this exists: with the tokio multi_thread runtime's default LIFO slot, this workload suffers
 lost-wakeup freezes (~6s stalls, and multiples thereof) — tokio-rs/tokio#4941 family. Reproduced
@@ -91,7 +91,7 @@ value      = LEB128 varuint expire_ms (0 = no TTL) ++ payload
 expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind on>
 ```
 
-- Kind registry lives in `rdb/src/ds/codec.rs` (0x00 raw string .. 0x12 vectorset elem).
+- Kind registry lives in `src/ds/codec.rs` (0x00 raw string .. 0x12 vectorset elem).
 - EXCEPTION: kind 0x00 raw STRING keeps the legacy `<prefix> ++ <key>` bare layout (no envelope),
   so pre-TTL databases keep working; the first EXPIRE migrates the record to kind 0x01.
 - Classification rule during scans: a physical key whose first post-prefix byte is `<= 0x12` or
