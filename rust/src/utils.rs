@@ -27,42 +27,101 @@ pub fn bytes_combine(parts: &[&[u8]]) -> Vec<u8> {
 
 /// Redis-style glob for `SCAN ... MATCH` / `KEYS`: `*`, `?`, `[...]`
 /// classes (with `^` negation and `a-z` ranges) and `\` escaping the next
-/// byte. An unterminated `[` is a literal `[` (Redis quirk). Backtracking
-/// like Redis's own matcher; pathological `*` patterns can be slow.
+/// byte. An unterminated `[` is a literal `[` (Redis quirk).
+///
+/// Iterative two-pointer matching with last-star backtracking: O(1) stack
+/// and O(|pattern|*|s|) worst case, so deep inputs (64KB keys) cannot
+/// overflow the stack and pathological multi-`*` patterns cannot explode
+/// exponentially (the recursive form did both).
 pub fn glob_match(pattern: &[u8], s: &[u8]) -> bool {
-    match pattern.first() {
-        None => s.is_empty(),
-        Some(b'*') => {
-            glob_match(&pattern[1..], s) || (!s.is_empty() && glob_match(pattern, &s[1..]))
+    let (mut p, mut i) = (0usize, 0usize);
+    // Last `*` seen: its pattern index and how many bytes it has consumed.
+    let (mut star, mut star_s) = (usize::MAX, 0usize);
+    loop {
+        if p < pattern.len() {
+            match pattern[p] {
+                b'*' => {
+                    star = p;
+                    star_s = i;
+                    p += 1;
+                    continue;
+                }
+                b'?' if i < s.len() => {}
+                b'[' => match class_at(pattern, p, s.get(i).copied()) {
+                    // A class consumes one byte: never a hit for empty `s`
+                    // (a negated class "matches" empty in class_at, and
+                    // Redis also bails out early).
+                    Some((hit, next_p)) if hit && i < s.len() => {
+                        p = next_p;
+                        i += 1;
+                        continue;
+                    }
+                    // Unterminated class degrades to a literal '['.
+                    None if s.get(i) == Some(&b'[') => {
+                        p += 1;
+                        i += 1;
+                        continue;
+                    }
+                    _ => {
+                        if !retry(&mut p, &mut i, &mut star_s, star, s.len()) {
+                            return false;
+                        }
+                        continue;
+                    }
+                },
+                b'\\' => {
+                    if p + 1 < pattern.len() && s.get(i) == Some(&pattern[p + 1]) {
+                        p += 2;
+                        i += 1;
+                        continue;
+                    }
+                    if !retry(&mut p, &mut i, &mut star_s, star, s.len()) {
+                        return false;
+                    }
+                    continue;
+                }
+                c if s.get(i) == Some(&c) => {}
+                _ => {
+                    if !retry(&mut p, &mut i, &mut star_s, star, s.len()) {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+            p += 1;
+            i += 1;
+        } else if i == s.len() {
+            return true;
+        } else if !retry(&mut p, &mut i, &mut star_s, star, s.len()) {
+            return false;
         }
-        Some(b'?') => !s.is_empty() && glob_match(&pattern[1..], &s[1..]),
-        Some(b'[') => match match_class(pattern, s) {
-            // A class consumes one byte: never a hit for empty `s` (a
-            // negated class "matches" empty in match_class, so slicing
-            // `&s[1..]` below would panic; Redis also bails out early).
-            Some((hit, rest)) => hit && !s.is_empty() && glob_match(rest, &s[1..]),
-            None => s.first() == Some(&b'[') && glob_match(&pattern[1..], &s[1..]),
-        },
-        Some(b'\\') => match (pattern.get(1), s.first()) {
-            (Some(&c), Some(&d)) => c == d && glob_match(&pattern[2..], &s[1..]),
-            _ => false,
-        },
-        Some(&c) => s.first() == Some(&c) && glob_match(&pattern[1..], &s[1..]),
     }
 }
 
-/// One `[...]` class against `s[0]`; `Some((hit, rest-after-']'))`, or
-/// `None` when the class never closes.
-fn match_class<'a>(pattern: &'a [u8], s: &[u8]) -> Option<(bool, &'a [u8])> {
-    let close = pattern.iter().skip(1).position(|&b| b == b']')? + 1;
-    let mut body = &pattern[1..close];
+/// Mismatch handler: retry the last `*` consuming one more byte.
+/// Returns false when no star remains or it already swallowed `s`.
+fn retry(p: &mut usize, i: &mut usize, star_s: &mut usize, star: usize, len: usize) -> bool {
+    if star == usize::MAX || *star_s >= len {
+        return false;
+    }
+    *star_s += 1;
+    *i = *star_s;
+    *p = star + 1;
+    true
+}
+
+/// One `[...]` class starting at `pattern[at] == b'['` against `ch`;
+/// `Some((hit, index-after-']'))`, or `None` when the class never closes.
+fn class_at(pattern: &[u8], at: usize, ch: Option<u8>) -> Option<(bool, usize)> {
+    let close = pattern[at + 1..].iter().position(|&b| b == b']')? + at + 1;
+    let mut body = &pattern[at + 1..close];
     let negate = body.first() == Some(&b'^');
     if negate {
         body = &body[1..];
     }
-    let hit = match s.first() {
+    let hit = match ch {
         None => false,
-        Some(&ch) => {
+        Some(ch) => {
             let mut found = false;
             let mut i = 0;
             while i < body.len() {
@@ -81,7 +140,7 @@ fn match_class<'a>(pattern: &'a [u8], s: &[u8]) -> Option<(bool, &'a [u8])> {
             found
         }
     };
-    Some((hit != negate, &pattern[close + 1..]))
+    Some((hit != negate, close + 1))
 }
 
 /// Cheap randomness without a rand dependency: splitmix64 over a global
@@ -217,6 +276,43 @@ mod tests {
         assert!(!glob_match(b"a??", b"ab"));
         // Binary bytes are just bytes.
         assert!(glob_match(&[0x01, b'*', 0xFF], &[0x01, 0x00, 0xFF]));
+    }
+
+    #[test]
+    fn glob_match_deep_input_no_stack_overflow() {
+        // Regression: the recursive matcher blew the stack on a 64KB key
+        // with `KEYS *zz` (O(len) recursion). In-process survival of this
+        // test is the assertion.
+        let mut key = vec![b'a'; 64 * 1024];
+        key.push(b'z');
+        key.push(b'z');
+        assert!(glob_match(b"*zz", &key));
+        assert!(!glob_match(b"*zq", &key));
+        // Literal-free deep pattern against deep key.
+        let stars: Vec<u8> = std::iter::repeat(b'*').take(1000).collect();
+        assert!(glob_match(&stars, &key));
+    }
+
+    #[test]
+    fn glob_match_pathological_multi_star_is_polynomial() {
+        // Regression: multiple `*` used to branch exponentially. Bound the
+        // work so a hang shows up as a timeout rather than a silent pass.
+        let s: Vec<u8> = std::iter::repeat(b'a').take(4096).collect();
+        for pat in [
+            &b"*a*a*a*a*a*a*a*a*b"[..],
+            &b"*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b!"[..],
+            b"*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zz*zq",
+        ] {
+            let t = std::time::Instant::now();
+            assert!(!glob_match(pat, &s), "pattern should miss");
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(2),
+                "matcher blew up on {:?}",
+                String::from_utf8_lossy(pat)
+            );
+        }
+        // Sanity: same shape with matching tail does hit.
+        assert!(glob_match(b"*a*a*a*a*b", b"aaaab"));
     }
 
     #[test]
