@@ -247,8 +247,14 @@ pub async fn xtrim(ctx: &mut Ctx<'_>) {
         return resp::append_int(ctx.out, 0);
     }
     let base = model::entry_base(&prefix, &stream);
-    let mut victims = Vec::with_capacity(trim);
+    // Cap the preallocation (trim is user-controlled u64) and never walk
+    // past this stream's key range: a corrupted/over-counted meta.len must
+    // not delete neighbouring keys.
+    let mut victims = Vec::with_capacity(trim.min(4096));
     let _ = ops::for_each_from(&ctx.shared.store, &base, false, &mut |k, _| {
+        if !k.starts_with(&base) {
+            return false;
+        }
         victims.push(k.to_vec());
         victims.len() < trim
     });
@@ -257,7 +263,7 @@ pub async fn xtrim(ctx: &mut Ctx<'_>) {
         batch.delete(k);
     }
     let mut next = meta.clone();
-    next.len -= victims.len() as u64;
+    next.len = next.len.saturating_sub(victims.len() as u64);
     let kept_expire = model::current_expire(&ctx.shared.store, &prefix, &stream);
     batch.put(
         model::meta_key(&prefix, &stream),
@@ -296,6 +302,10 @@ pub async fn xdel(ctx: &mut Ctx<'_>) {
     else {
         return resp::append_int(ctx.out, 0);
     };
+    // Duplicate ids must count once each (the batch delete is not visible
+    // to the physical reads below), else XLEN drifts negative-ish.
+    ids.sort_unstable();
+    ids.dedup();
     let mut batch = WriteBatch::default();
     let mut found = 0usize;
     for id in &ids {
@@ -311,7 +321,7 @@ pub async fn xdel(ctx: &mut Ctx<'_>) {
     }
     if found > 0 {
         let mut next = meta.clone();
-        next.len -= found as u64;
+        next.len = next.len.saturating_sub(found as u64);
         let kept_expire = model::current_expire(&ctx.shared.store, &prefix, &stream);
         batch.put(
             model::meta_key(&prefix, &stream),
