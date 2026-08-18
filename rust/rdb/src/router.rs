@@ -4,14 +4,15 @@
 //! The Go loop picks the first node whose inclusive upper bound covers the
 //! slot: `slot <= (index+1)*perNodeslots`. If that node is `host` the
 //! command is served locally; otherwise the client is redirected with
-//! `MOVED <slot> <addr>`. If no node covers the slot (empty addrs, or a
-//! remainder slot beyond `len*per`) the Go code falls through and serves
-//! locally - that quirk is preserved here.
+//! `MOVED <slot> <addr>`. APPROVED BREAKING FIX: when 16384 % N != 0 the
+//! leftover slots matched no node in Go (and were served locally on
+//! whichever node received them); here the LAST node owns everything
+//! through slot 16383, so every slot has exactly one owner.
 
 /// Outcome of routing one slot against the stable topology.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RouteDecision {
-    /// Serve on this instance (owner is `host`, or no node matched).
+    /// Serve on this instance (owner is `host`, or `addrs` is empty).
     Local,
     /// Redirect the client to `addr`, which owns `slot`.
     Moved { slot: u16, addr: String },
@@ -19,13 +20,17 @@ pub enum RouteDecision {
 
 /// Route `slot` across `addrs`, each owning `per_node_slots` slots.
 ///
-/// Mirrors the Go loop exactly: the first index satisfying the inclusive
-/// `slot <= (index+1)*per_node_slots` boundary wins. `host` == owner means
-/// local. Falling off the end (no match) returns `Local`, matching Go.
+/// The first index satisfying the inclusive `slot <= (index+1)*per_node_slots`
+/// boundary wins; `host` == owner means local. APPROVED BREAKING FIX: the
+/// LAST node additionally owns every slot beyond `len*per_node_slots`, so
+/// coverage is total (through 16383) and ranges stay disjoint. Only empty
+/// `addrs` falls through to `Local`, matching Go's empty-list behavior.
 pub fn route(slot: u16, addrs: &[String], per_node_slots: usize, host: &str) -> RouteDecision {
     let slot = slot as usize;
+    let last = addrs.len().saturating_sub(1);
     for (index, addr) in addrs.iter().enumerate() {
-        if slot <= (index + 1) * per_node_slots {
+        // The last node absorbs the remainder when 16384 % N != 0.
+        if index == last || slot <= (index + 1) * per_node_slots {
             return if addr == host {
                 RouteDecision::Local
             } else {
@@ -36,8 +41,7 @@ pub fn route(slot: u16, addrs: &[String], per_node_slots: usize, host: &str) -> 
             };
         }
     }
-    // No node matched (empty addrs or remainder beyond len*per): Go serves
-    // locally by falling through the loop.
+    // No nodes at all: Go serves locally by falling through the loop.
     RouteDecision::Local
 }
 
@@ -144,14 +148,100 @@ mod tests {
     }
 
     #[test]
-    fn five_nodes_per_3276_remainder_quirk() {
-        // 5 * 3276 == 16380, so slots 16381..=16383 match no node and the
-        // Go loop falls through to local service (documented quirk).
+    fn five_nodes_last_node_absorbs_remainder() {
+        // 5 * 3276 == 16380, so slots 16380..=16383 are remainder slots:
+        // the LAST node owns them (approved fix; Go served them locally on
+        // whichever node received the request).
         let a = addrs(5);
+        // 4*3276 == 13104 is node 3's inclusive upper bound.
+        expect_node(13104, &a, 3276, 3);
+        expect_node(13105, &a, 3276, 4);
         expect_node(16380, &a, 3276, 4);
-        expect_local(16381, &a, 3276);
-        expect_local(16382, &a, 3276);
-        expect_local(16383, &a, 3276);
+        expect_node(16381, &a, 3276, 4);
+        expect_node(16382, &a, 3276, 4);
+        expect_node(16383, &a, 3276, 4);
+    }
+
+    /// Owner index of `slot`; `host` is "self", which never matches any
+    /// generated addr, so the decision is always a MOVED to the owner.
+    fn owner_of(slot: u16, list: &[String], per: usize) -> usize {
+        match route(slot, list, per, "self") {
+            RouteDecision::Moved { addr, .. } => addr[1..].parse::<usize>().unwrap(),
+            RouteDecision::Local => panic!("slot {} has no owner", slot),
+        }
+    }
+
+    #[test]
+    fn every_slot_owned_for_one_to_seventeen_nodes() {
+        // Total coverage with disjoint, ordered bands for any node count,
+        // including every N in 1..=17 where 16384 % N != 0.
+        for n in 1..=17usize {
+            let a = addrs(n);
+            let per = 16384 / n;
+            let mut prev = 0usize;
+            for slot in 0..=16383u16 {
+                let owner = owner_of(slot, &a, per);
+                assert!(
+                    owner < n,
+                    "n={} slot {} owner {} out of range",
+                    n,
+                    slot,
+                    owner
+                );
+                assert!(
+                    owner >= prev,
+                    "n={} slot {} owner {} regressed below {}",
+                    n,
+                    slot,
+                    owner,
+                    prev
+                );
+                prev = owner;
+            }
+            assert_eq!(owner_of(0, &a, per), 0);
+            assert_eq!(owner_of(16383, &a, per), n - 1);
+        }
+    }
+
+    #[test]
+    fn exactly_one_local_owner_for_representative_node_counts() {
+        // For every slot exactly one node serves locally and every other
+        // node redirects to that same owner (no overlap, no gaps).
+        for n in [2usize, 3, 5, 7, 17] {
+            let a = addrs(n);
+            let per = 16384 / n;
+            for slot in 0..=16383u16 {
+                let mut locals = 0usize;
+                let mut owner: Option<usize> = None;
+                for addr in a.iter() {
+                    match route(slot, &a, per, addr) {
+                        RouteDecision::Local => locals += 1,
+                        RouteDecision::Moved { addr: to, .. } => {
+                            let idx = to[1..].parse::<usize>().unwrap();
+                            assert!(idx < n, "n={} slot {} redirects to bogus {}", n, slot, idx);
+                            if let Some(seen) = owner {
+                                assert_eq!(seen, idx, "n={} slot {} redirects disagree", n, slot);
+                            } else {
+                                owner = Some(idx);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    locals, 1,
+                    "n={} slot {} must have exactly one local owner",
+                    n, slot
+                );
+                let owner = owner.unwrap_or_else(|| panic!("n={} slot {} unowned", n, slot));
+                assert_eq!(a[owner], format!("n{}", owner));
+            }
+        }
+    }
+
+    #[test]
+    fn five_nodes_slot_16383_maps_to_last_node() {
+        let a = addrs(5);
+        assert_eq!(owner_of(16383, &a, 3276), 4);
     }
 
     #[test]

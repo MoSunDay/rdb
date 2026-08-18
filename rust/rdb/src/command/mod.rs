@@ -27,6 +27,7 @@ pub mod set_cmd;
 pub mod set_scan;
 pub mod setops_cmd;
 pub mod string;
+pub mod string_opts;
 pub mod vectorset_attr;
 pub mod vectorset_cmd;
 pub mod vectorset_sim;

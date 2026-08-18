@@ -53,12 +53,13 @@ pub fn refresh(instances: &str) -> Topology {
 
 /// Per-node displayed slot ranges used by `cluster nodes` / `cluster slots`.
 ///
-/// Replicates Go `getNodeSlots()` exactly, including its display bug: the
-/// loop only writes an explicit `start-end` range for non-last nodes, and the
-/// last node is rendered from the running `end` as `end+1 .. SLOT_NUMBER-1`.
-/// With a single node the loop body for the last node runs with `end == 0`,
-/// producing `"1-16383"` and silently omitting slot 0. That bug is kept
-/// intentionally (known-not-fixed) to stay byte-identical with the Go output.
+/// Follows Go `getNodeSlots()`: non-last nodes get explicit `start-end`
+/// bands of `SLOT_NUMBER / len` slots; the last node is rendered as
+/// `start..SLOT_NUMBER-1`, i.e. it always ends at 16383 and (approved fix)
+/// starts at the running `start`. The Go version rendered the last node as
+/// `end+1..16383`, which for a single node (end == 0) produced `"1-16383"`
+/// and silently omitted slot 0; that off-by-one is fixed here so a
+/// single-node cluster reports the full `0-16383` range.
 pub fn parse_node_slots(addrs: &[String]) -> HashMap<String, String> {
     let mut slots = HashMap::new();
     if addrs.is_empty() {
@@ -66,16 +67,15 @@ pub fn parse_node_slots(addrs: &[String]) -> HashMap<String, String> {
     }
     let per = SLOT_NUMBER / addrs.len();
     let mut start = 0usize;
-    let mut end = 0usize;
     for (index, addr) in addrs.iter().enumerate() {
         if index == addrs.len() - 1 {
-            // Last node: Go uses slotNumber-1 where slotNumber == 16384.
-            slots.insert(addr.clone(), format!("{}-{}", end + 1, SLOT_NUMBER - 1));
+            // Last node: runs through slot 16383; `start` is where the
+            // previous band ended plus one (0 for a single node).
+            slots.insert(addr.clone(), format!("{}-{}", start, SLOT_NUMBER - 1));
         } else {
-            end = per * (index + 1);
+            let end = per * (index + 1);
             slots.insert(addr.clone(), format!("{}-{}", start, end));
-            start = end;
-            start += 1;
+            start = end + 1;
         }
     }
     slots
@@ -135,10 +135,11 @@ mod tests {
     }
 
     #[test]
-    fn node_slots_single_node_keeps_go_display_bug() {
-        // Go omits slot 0 for a single node (known-not-fixed display bug).
+    fn node_slots_single_node_full_range() {
+        // Approved fix: a single node reports the full 0-16383 range (the
+        // Go version omitted slot 0 with "1-16383").
         let m = parse_node_slots(&strings(&["solo"]));
-        assert_eq!(m.get("solo").unwrap(), "1-16383");
+        assert_eq!(m.get("solo").unwrap(), "0-16383");
     }
 
     #[test]

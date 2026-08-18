@@ -341,17 +341,19 @@ async fn bzpopmin_wakes_on_zadd_over_wire() {
         .await
         .expect("connect");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // AUTH separately: replies flush per read-batch, so a pipelined
-    // BZPOPMIN would hold the +OK hostage until it stops parking.
-    sock.write_all(&frame(&["AUTH", t]))
+    // Pipelined AUTH + BZPOPMIN in one write: the blocking-dispatch flush
+    // delivers the +OK before the BZPOPMIN parks.
+    let mut pipelined = frame(&["AUTH", t]);
+    pipelined.extend_from_slice(&frame(&["BZPOPMIN", "wake:z", "5000"]));
+    sock.write_all(&pipelined)
         .await
-        .expect("auth write");
+        .expect("pipelined auth+bzpopmin write");
     let mut hello = [0u8; 5];
-    sock.read_exact(&mut hello).await.expect("auth reply");
-    assert_eq!(&hello, b"+OK\r\n");
-    sock.write_all(&frame(&["BZPOPMIN", "wake:z", "5000"]))
+    tokio::time::timeout(Duration::from_secs(1), sock.read_exact(&mut hello))
         .await
-        .expect("bzpopmin write");
+        .expect("+OK flushed before the BZPOPMIN parks")
+        .expect("auth reply");
+    assert_eq!(&hello, b"+OK\r\n");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let started = Instant::now();
     let added = cmd_one_shot(&node.resp, t, &[b"zadd", b"wake:z", b"1.5", b"one"]).await;

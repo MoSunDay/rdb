@@ -10,9 +10,14 @@
 //! 4. Handlers run under `catch_unwind`, reproducing Go's `defer recover()`
 //!    which replies `fatal error: <panic>` instead of dropping the client.
 //!
+//! DEVIATION (BREAKING, approved): Go indexed cmd.Args[0]/[1] unconditionally,
+//! so an empty multibulk or a lone command name surfaced as a fabricated
+//! runtime-panic reply; here both reply the Redis-standard arity error.
+//!
 //! DEVIATION (documented per task): Go measured latency with a fake clock
 //! ticking every 5ms (`conf.Content.Sentinel.RTime`); here we observe real
-//! elapsed milliseconds. Histogram buckets are unchanged.
+//! elapsed milliseconds. Histogram buckets are unchanged. Like Go, no
+//! latency sample is recorded on the arity-error or panic paths.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -56,6 +61,21 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
                 }
                 codec::ParseOutcome::Complete { args, consumed } => {
                     buf.drain(..consumed);
+                    // A blocking command parks INSIDE dispatch; replies
+                    // already buffered for earlier pipelined commands
+                    // must reach the socket first or they are held
+                    // hostage until the pop returns (flush-per-batch is
+                    // too coarse once the batch itself blocks).
+                    if args
+                        .first()
+                        .is_some_and(|a| may_block(&String::from_utf8_lossy(a).to_lowercase()))
+                        && !out.is_empty()
+                    {
+                        if wr.write_all(&out).await.is_err() {
+                            return;
+                        }
+                        out.clear();
+                    }
                     process_command(&shared, args, &mut authed, &mut out, &mut close).await;
                     if close {
                         break;
@@ -76,6 +96,24 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
     }
 }
 
+/// Commands whose dispatch may PARK the connection (blocking pops and
+/// stream reads): any replies already buffered for earlier pipelined
+/// commands must be flushed to the socket BEFORE dispatch, mirroring
+/// Redis's behavior of answering everything ahead of a blocking call.
+fn may_block(first: &str) -> bool {
+    matches!(
+        first,
+        "blpop"
+            | "brpop"
+            | "blmove"
+            | "brpoplpush"
+            | "bzpopmin"
+            | "bzpopmax"
+            | "xread"
+            | "xreadgroup"
+    )
+}
+
 /// Dispatch one parsed command (Go `server.go` handler closure).
 async fn process_command(
     shared: &state::Shared,
@@ -84,13 +122,11 @@ async fn process_command(
     out: &mut Vec<u8>,
     close: &mut bool,
 ) {
-    // Go indexes cmd.Args[0] unconditionally; an empty multibulk (`*0`)
-    // panics and the deferred recover replies with the runtime text.
+    // BREAKING (approved): Go indexed cmd.Args[0] unconditionally, so an
+    // empty multibulk (`*0`) surfaced as a fabricated runtime-panic reply;
+    // use the Redis-standard arity error instead (no command name exists).
     if argv.is_empty() {
-        codec::append_error(
-            out,
-            "fatal error: runtime error: index out of range [0] with length 0",
-        );
+        arity_error(out, "");
         return;
     }
 
@@ -126,17 +162,12 @@ async fn process_command(
     // Slot routing for non-whitelisted commands.
     let mut prefix_key: Vec<u8> = Vec::new();
     if !router::is_whitelisted(&first) {
-        // Go indexes cmd.Args[1] unconditionally; a lone command name panics
-        // and the deferred recover replies with the runtime text.
+        // BREAKING (approved): Go indexed cmd.Args[1] unconditionally, so a
+        // lone command name surfaced as a fabricated runtime-panic reply;
+        // use the Redis-standard arity error instead. No latency sample on
+        // this error path (Go observes only after the handler returns).
         if argv.len() < 2 {
-            codec::append_error(
-                out,
-                &format!(
-                    "fatal error: runtime error: index out of range [1] with length {}",
-                    argv.len()
-                ),
-            );
-            observe(shared, &first, false, start);
+            arity_error(out, &first);
             return;
         }
         let tag = hash::hash_tag(&argv[1]);
@@ -173,18 +204,30 @@ async fn process_command(
             .await
             .err()
     };
-    if let Some(payload) = panicked {
-        codec::append_error(ctx.out, &format!("fatal error: {}", payload_str(&payload)));
+    match panicked {
+        Some(payload) => {
+            codec::append_error(ctx.out, &format!("fatal error: {}", payload_str(&payload)));
+        }
+        // Label order mirrors Go: (mode, lowercase command, was-MOVED). Go
+        // observes after `fn(...)` returns; a panicking handler unwinds past
+        // it, so no late sample is recorded on this error path.
+        None => observe(shared, &first, false, start),
     }
-
-    // Label order mirrors Go: (mode, lowercase command, was-MOVED).
-    observe(shared, &first, false, start);
 
     if ctx.close_conn {
         // Go `quit` writes its replies then closes the connection; the flush
         // happens in the caller before we return.
         *close = true;
     }
+}
+
+/// Redis-standard arity error; identical text to the command-module
+/// `arity` helpers (e.g. `string::arity` / `hash_cmd::arity`).
+fn arity_error(out: &mut Vec<u8>, cmd: &str) {
+    codec::append_error(
+        out,
+        &format!("ERR wrong number of arguments for '{cmd}' command"),
+    );
 }
 
 /// Latency helper keeping the Go label order via monitor::observe_latency.
@@ -221,5 +264,24 @@ mod tests {
         assert_eq!(payload_str(&lit), "bang");
         let n: i32 = 7;
         assert_eq!(payload_str(&n), "unknown panic payload");
+    }
+
+    #[test]
+    fn may_block_covers_exactly_the_parking_commands() {
+        for cmd in [
+            "blpop",
+            "brpop",
+            "blmove",
+            "brpoplpush",
+            "bzpopmin",
+            "bzpopmax",
+            "xread",
+            "xreadgroup",
+        ] {
+            assert!(may_block(cmd), "{cmd} parks");
+        }
+        for cmd in ["lpop", "zadd", "get", "xadd", "auth", ""] {
+            assert!(!may_block(cmd), "{cmd} never parks");
+        }
     }
 }

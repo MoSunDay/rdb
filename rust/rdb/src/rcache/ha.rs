@@ -20,6 +20,15 @@
 //!   also matches inside "10.0.0.11"); the port replaces/matches exact
 //!   comma-separated elements and rejects empty src/target map halves as
 //!   BadMap.
+//! - Go's `handlerObserver`/`updateClusterStableSlots` read the FSM, then
+//!   blind-apply over several awaits: concurrent observers (or a lock-free
+//!   `cluster init` write) decide on stale snapshots and clobber each
+//!   other. The port serializes the whole read -> decide -> apply sequence
+//!   on a per-process [`ObserverMux`] and CONVERGES (re-read + re-decide
+//!   after every successful apply). Log order thus deviates slightly from
+//!   Go: "done" is only printed after a successful apply (Go logs it even
+//!   when `raft.Apply` failed), and a convergence re-check round stays
+//!   silent instead of re-logging "don't need update".
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -33,6 +42,19 @@ use crate::rcache::{Node, NodeId, RdbRaft};
 use crate::rtypes;
 use crate::state::APPLY_TIMEOUT;
 use crate::topology;
+
+/// Serializes every observer "read snapshots -> decide -> raft apply"
+/// sequence on one process (probe loop, self-recovery and any concurrent
+/// `handler_observer` caller share a single instance): each FSM read is
+/// separated from the apply by awaits, so two unlocked in-flight
+/// observers decide on stale snapshots and blind-write over each other —
+/// or over a lock-free writer such as `cluster init`.
+pub type ObserverMux = Arc<tokio::sync::Mutex<()>>;
+
+/// A fresh observer mux (create once per process, share it).
+pub fn observer_mux() -> ObserverMux {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
 
 /// Replicated routing key (Go `cluster_slots_stable_instances`).
 const INSTANCES_KEY: &str = "cluster_slots_stable_instances";
@@ -169,42 +191,94 @@ async fn raft_apply(raft: &RdbRaft, key: &str, value: &str) -> Result<(), String
     }
 }
 
-/// Go `updateClusterStableSlots`: log+stop when equal; else apply and
-/// ALWAYS log "done" afterwards, even on apply failure (Go ordering).
-async fn update_cluster_stable_slots(
-    raft: &RdbRaft,
-    new_instances: &str,
-    current_instances: &str,
+/// One convergence round of the locked observer loop: what to do with the
+/// LATEST committed instances value. `already_applied` marks rounds after
+/// this observer's own write landed (Go has no re-check; the port's
+/// re-check stays silent instead of re-logging "don't need update").
+#[derive(Debug, PartialEq, Eq)]
+enum RoundAction {
+    /// Replicate this new instances value, then re-check.
+    Apply(String),
+    /// First round found nothing to change: Go logs "<retType> <peer> don't need update".
+    DontNeedUpdate,
+    /// Own write is durable and nothing else changed: stop silently.
+    Converged,
+    /// Resumed with src present / unknown retType: Go returns silently.
+    Silent,
+    /// Backup map malformed: Go logs "failedNodeBackupMap error: ...".
+    BadMap(Vec<String>),
+}
+
+/// Map a pure [`decide`] over the fresh snapshots to a [`RoundAction`].
+fn observer_round(
+    already_applied: bool,
     ret_type: &str,
-    peer_addr: &str,
-) {
-    if new_instances == current_instances {
-        eprintln!("{ret_type} {peer_addr} don't need update");
-        return;
+    backup_val: &str,
+    instances: &str,
+) -> RoundAction {
+    match decide(ret_type, backup_val, instances) {
+        FailoverDecision::Replace(new) => RoundAction::Apply(new),
+        FailoverDecision::Unchanged => {
+            if already_applied {
+                RoundAction::Converged
+            } else {
+                RoundAction::DontNeedUpdate
+            }
+        }
+        FailoverDecision::BadMap(parts) => RoundAction::BadMap(parts),
+        FailoverDecision::SkipResumed | FailoverDecision::UnknownType => RoundAction::Silent,
     }
-    if let Err(e) = raft_apply(raft, INSTANCES_KEY, new_instances).await {
-        eprintln!("raft.Apply failed:{e}");
+}
+
+/// Converge `INSTANCES_KEY` toward the observer decision (caller holds
+/// [`ObserverMux`]): re-read the latest committed value, decide, apply,
+/// and loop only while the decision is Replace AND the apply succeeded —
+/// a lock-free writer (e.g. `cluster init`) that landed meanwhile is
+/// absorbed by the next round's fresh read. An apply failure stops
+/// WITHOUT the Go "done" log (deviation, see module docs).
+async fn converge_instances(raft: &RdbRaft, kv: &KvMap, ret_type: &str, peer_addr: &str) {
+    let mut applied = false;
+    loop {
+        let backup_val = kv_get(kv, &format!("backup_target_map_{peer_addr}"));
+        let instances = kv_get(kv, INSTANCES_KEY);
+        match observer_round(applied, ret_type, &backup_val, &instances) {
+            RoundAction::Apply(new) => match raft_apply(raft, INSTANCES_KEY, &new).await {
+                Ok(()) => {
+                    eprintln!("{ret_type} {peer_addr} done");
+                    applied = true;
+                }
+                Err(e) => {
+                    eprintln!("raft.Apply failed:{e}");
+                    return;
+                }
+            },
+            RoundAction::DontNeedUpdate => {
+                eprintln!("{ret_type} {peer_addr} don't need update");
+                return;
+            }
+            RoundAction::BadMap(parts) => {
+                eprintln!("failedNodeBackupMap error: {parts:?}");
+                return;
+            }
+            RoundAction::Converged | RoundAction::Silent => return,
+        }
     }
-    eprintln!("{ret_type} {peer_addr} done");
 }
 
 /// Go `handlerObserver`: read backup map + instances from the live FSM,
-/// then fail over (or back) via raft.
-pub async fn handler_observer(raft: Arc<RdbRaft>, kv: KvMap, ret_type: &str, peer_addr: &str) {
-    let backup_val = kv_get(&kv, &format!("backup_target_map_{peer_addr}"));
-    let instances = kv_get(&kv, INSTANCES_KEY);
-    match decide(ret_type, &backup_val, &instances) {
-        FailoverDecision::Replace(new) => {
-            update_cluster_stable_slots(&raft, &new, &instances, ret_type, peer_addr).await;
-        }
-        FailoverDecision::Unchanged => {
-            eprintln!("{ret_type} {peer_addr} don't need update");
-        }
-        FailoverDecision::BadMap(parts) => {
-            eprintln!("failedNodeBackupMap error: {parts:?}");
-        }
-        FailoverDecision::SkipResumed | FailoverDecision::UnknownType => {}
-    }
+/// then fail over (or back) via raft. The whole read -> decide -> apply
+/// sequence is serialized on `mux` (shared with the leader probe loop and
+/// self-recovery) and converges instead of trusting the pre-await
+/// snapshot.
+pub async fn handler_observer(
+    raft: Arc<RdbRaft>,
+    kv: KvMap,
+    ret_type: &str,
+    peer_addr: &str,
+    mux: ObserverMux,
+) {
+    let _observer = mux.lock().await;
+    converge_instances(&raft, &kv, ret_type, peer_addr).await;
 }
 
 /// Deviation probe: TCP-connect liveness check instead of Go's raw RPC.
@@ -221,29 +295,51 @@ async fn probe_peer(addr: &str) -> Result<(), String> {
 
 /// Go self-recovery: if this leader's own entry was failed over (backup
 /// address in the instances list), swap back (`len == 2` guard: Go panics).
-async fn self_recover(raft: &RdbRaft, kv: &KvMap, self_addr: &str) {
-    let backup_val = kv_get(kv, &format!("backup_target_map_{self_addr}"));
-    let instances = kv_get(kv, INSTANCES_KEY);
-    let parts: Vec<&str> = backup_val.split(',').collect();
-    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
-        if !backup_val.is_empty() {
-            eprintln!("failedNodeBackupMap error: {parts:?}");
+/// Same mux + convergence discipline as the observer: serialized, and
+/// re-read after every successful apply so a concurrent lock-free writer
+/// is absorbed instead of clobbered.
+async fn self_recover(raft: &RdbRaft, kv: &KvMap, self_addr: &str, mux: &ObserverMux) {
+    let _observer = mux.lock().await;
+    let mut applied = false;
+    loop {
+        let backup_val = kv_get(kv, &format!("backup_target_map_{self_addr}"));
+        let instances = kv_get(kv, INSTANCES_KEY);
+        let parts: Vec<&str> = backup_val.split(',').collect();
+        if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
+            if !backup_val.is_empty() {
+                eprintln!("failedNodeBackupMap error: {parts:?}");
+            }
+            return;
         }
-        return;
-    }
-    if contains_element(&instances, parts[1]) {
+        if !contains_element(&instances, parts[1]) {
+            // Nothing to heal: Go returns silently (no "don't need update").
+            return;
+        }
         let new = replace_element(&instances, parts[1], parts[0]);
-        update_cluster_stable_slots(raft, &new, &instances, RET_RESUMED, parts[0]).await;
+        if new == instances {
+            if !applied {
+                eprintln!("{RET_RESUMED} {} don't need update", parts[0]);
+            }
+            return;
+        }
+        if let Err(e) = raft_apply(raft, INSTANCES_KEY, &new).await {
+            eprintln!("raft.Apply failed:{e}");
+            return; // no "done": the write did not land (Go deviation)
+        }
+        eprintln!("{RET_RESUMED} {} done", parts[0]);
+        applied = true;
     }
 }
 
 /// Go leader probe: every 5s, while ready and leading, verify leadership,
 /// heal the own failover entry, probe voters (success->Resumed, fail->Failed).
+/// Every read-decide-apply sequence runs under `mux` (see [`ObserverMux`]).
 pub fn spawn_leader_probe(
     raft: Arc<RdbRaft>,
     kv: KvMap,
     topo: Arc<RwLock<topology::Topology>>,
     self_addr: String,
+    mux: ObserverMux,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(PROBE_INTERVAL);
@@ -261,7 +357,7 @@ pub fn spawn_leader_probe(
                 eprintln!("Raft.VerifyLeader() err:{e}");
                 continue;
             }
-            self_recover(&raft, &kv, &self_addr).await;
+            self_recover(&raft, &kv, &self_addr, &mux).await;
 
             let peers: Vec<String> = {
                 let m = raft.metrics().borrow().clone();
@@ -275,11 +371,13 @@ pub fn spawn_leader_probe(
             for peer in peers {
                 match probe_peer(&peer).await {
                     Ok(()) => {
-                        handler_observer(raft.clone(), kv.clone(), RET_RESUMED, &peer).await;
+                        handler_observer(raft.clone(), kv.clone(), RET_RESUMED, &peer, mux.clone())
+                            .await;
                     }
                     Err(e) => {
                         eprintln!("rcache heartbeat failed err:{e}");
-                        handler_observer(raft.clone(), kv.clone(), RET_FAILED, &peer).await;
+                        handler_observer(raft.clone(), kv.clone(), RET_FAILED, &peer, mux.clone())
+                            .await;
                     }
                 }
             }
@@ -374,11 +472,7 @@ mod tests {
         // src "10.0.0.1" is a strict prefix of "10.0.0.11": only the exact
         // element swaps (Go's substring Replace turned this into
         // "10.0.0.2,10.0.0.21", corrupting the survivor's address).
-        let got = failover_action(
-            RET_FAILED,
-            "10.0.0.1,10.0.0.2",
-            "10.0.0.1,10.0.0.11",
-        );
+        let got = failover_action(RET_FAILED, "10.0.0.1,10.0.0.2", "10.0.0.1,10.0.0.11");
         assert_eq!(got, Some("10.0.0.2,10.0.0.11".to_string()));
         // Duplicate elements: every equal element is replaced.
         assert_eq!(
@@ -450,5 +544,52 @@ mod tests {
         assert_eq!(entries[0].value, "127.0.0.1:32681,127.0.0.1:32684");
         assert_eq!(entries[1].key, BACKUP_INIT_KEY);
         assert_eq!(entries[1].value, "done");
+    }
+
+    /// The convergence loop's round mapping: a lock-free writer that lands
+    /// between this observer's own apply and the re-check is absorbed —
+    /// the next round decides on the WRITER's value, folds this observer's
+    /// effect into it, and only stops once nothing changes anymore.
+    #[test]
+    fn converge_rounds_absorb_lock_free_writer() {
+        // Round 1 (fresh): fail over a -> a2 over "a,b,c".
+        assert_eq!(
+            observer_round(false, RET_FAILED, "a,a2", "a,b,c"),
+            RoundAction::Apply("a2,b,c".to_string())
+        );
+        // Round 2: an operator wrote "a,b,c,d" over our "a2,b,c" while we
+        // held the lock — decide again on the fresh value (union).
+        assert_eq!(
+            observer_round(true, RET_FAILED, "a,a2", "a,b,c,d"),
+            RoundAction::Apply("a2,b,c,d".to_string())
+        );
+        // Round 3: own write durable, no further change: stop silently
+        // (no second "done", no "don't need update").
+        assert_eq!(
+            observer_round(true, RET_FAILED, "a,a2", "a2,b,c,d"),
+            RoundAction::Converged
+        );
+    }
+
+    /// First-round log parity: Unchanged keeps Go's "don't need update"
+    /// branch, SkipResumed/UnknownType/BadMap map to their Go exits.
+    #[test]
+    fn converge_round_keeps_go_first_pass_branches() {
+        assert_eq!(
+            observer_round(false, RET_FAILED, "a,a2", "a2,b,c"),
+            RoundAction::DontNeedUpdate
+        );
+        assert_eq!(
+            observer_round(false, RET_RESUMED, "a,a2", "a,b,c"),
+            RoundAction::Silent
+        );
+        assert_eq!(
+            observer_round(false, "other", "a,a2", "a,b,c"),
+            RoundAction::Silent
+        );
+        assert_eq!(
+            observer_round(false, RET_FAILED, "solo", "a,b"),
+            RoundAction::BadMap(vec!["solo".to_string()])
+        );
     }
 }

@@ -286,28 +286,30 @@ async fn block_wakes_on_xadd_over_wire() {
         "*-1"
     );
     // Persistent AUTHed connection parks on XREAD; a second connection XADDs.
-    // AUTH separately: replies flush per read-batch, so a pipelined XREAD
-    // would hold the +OK hostage until it stops parking.
+    // Pipelined AUTH + XREAD in one write: the blocking-dispatch flush
+    // delivers the +OK before the XREAD parks.
     let mut sock = tokio::net::TcpStream::connect(&node.resp)
         .await
         .expect("connect");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    sock.write_all(&frame(&[b"AUTH", t.as_bytes()]))
-        .await
-        .expect("auth write");
-    let mut hello = [0u8; 5];
-    sock.read_exact(&mut hello).await.expect("auth reply");
-    assert_eq!(&hello, b"+OK\r\n");
-    sock.write_all(&frame(&[
+    let mut pipelined = frame(&[b"AUTH", t.as_bytes()]);
+    pipelined.extend_from_slice(&frame(&[
         b"XREAD",
         b"BLOCK",
         b"5000",
         b"STREAMS",
         b"orders/q0",
         b"$",
-    ]))
-    .await
-    .expect("xread write");
+    ]));
+    sock.write_all(&pipelined)
+        .await
+        .expect("pipelined auth+xread write");
+    let mut hello = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(1), sock.read_exact(&mut hello))
+        .await
+        .expect("+OK flushed before the XREAD parks")
+        .expect("auth reply");
+    assert_eq!(&hello, b"+OK\r\n");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let started = std::time::Instant::now();
     let r = cmd_one_shot(
@@ -368,4 +370,170 @@ fn lite_metrics_series_exposed() {
         "{metrics}"
     );
     assert!(metrics.contains("rdb_lite_offset_dirty"), "{metrics}");
+}
+
+/// Open an AUTHed connection, pipeline `cmd` right after AUTH, consume
+/// the +OK reply, and return the connection now parked inside `cmd`.
+async fn park_reader(addr: &str, token: &str, cmd: &[&[u8]]) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut pipelined = frame(&[b"AUTH", token.as_bytes()]);
+    pipelined.extend_from_slice(&frame(cmd));
+    sock.write_all(&pipelined)
+        .await
+        .expect("pipeline AUTH + blocking cmd");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut hello = [0u8; 5];
+    sock.read_exact(&mut hello)
+        .await
+        .expect("+OK flushed before the command parks");
+    assert_eq!(&hello, b"+OK\r\n");
+    sock
+}
+
+/// Read from a parked connection until `needle` shows up (bounded).
+async fn read_until(sock: &mut tokio::net::TcpStream, needle: &[u8], secs: u64) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(secs), sock.read(&mut chunk))
+            .await
+            .expect("parked reader must be woken, not parked out its block")
+            .expect("read");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if contains_bytes(&buf, needle) {
+            break;
+        }
+    }
+    buf
+}
+
+#[tokio::test]
+async fn block_zero_and_oversized_block_wait_for_xadd() {
+    // Regression: BLOCK 0 must mean "wait indefinitely" (Redis semantics),
+    // not an instant nil reply; and BLOCK values larger than the internal
+    // slice cap must keep waiting too. Each parked reader sits on its own
+    // queue, so one XADD per queue wakes exactly one waiter. The whole
+    // dance is bounded by an outer timeout: a regression fails fast
+    // instead of hanging the suite.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let dir = std::env::temp_dir().join(format!("rdb-lite-block0-{}", std::process::id()));
+        let mut node = spawn_node(&dir, 0, true, None);
+        wait_resp_ready(&mut node, 10).await;
+        let t = common::TOKEN;
+        // Empty queue + group for the XREADGROUP reader.
+        assert!(
+            text(
+                &cmd_one_shot(
+                    &node.resp,
+                    t,
+                    &[
+                        b"xgroup",
+                        b"create",
+                        b"orders/q1",
+                        b"g",
+                        b"0-0",
+                        b"MKSTREAM"
+                    ]
+                )
+                .await
+            )
+            .contains("OK"),
+            "xgroup create"
+        );
+        let mut plain = park_reader(
+            &node.resp,
+            t,
+            &[b"XREAD", b"BLOCK", b"0", b"STREAMS", b"orders/q0", b"$"],
+        )
+        .await;
+        let mut grouped = park_reader(
+            &node.resp,
+            t,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"g",
+                b"c1",
+                b"BLOCK",
+                b"0",
+                b"STREAMS",
+                b"orders/q1",
+                b">",
+            ],
+        )
+        .await;
+        // 25h: larger than the 24h internal park slice.
+        let mut oversized = park_reader(
+            &node.resp,
+            t,
+            &[
+                b"XREAD",
+                b"BLOCK",
+                b"90000000",
+                b"STREAMS",
+                b"orders/q2",
+                b"$",
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await; // let all three park
+        assert!(
+            text(
+                &cmd_one_shot(
+                    &node.resp,
+                    t,
+                    &[b"xadd", b"orders/q0", b"1-1", b"f", b"wake"]
+                )
+                .await
+            )
+            .contains("1-1"),
+            "xadd q0"
+        );
+        let r = read_until(&mut plain, b"1-1", 5).await;
+        assert!(
+            contains_bytes(&r, b"1-1") && !contains_bytes(&r, b"*-1"),
+            "XREAD BLOCK 0 must park until data, got {r:?}"
+        );
+        assert!(
+            text(
+                &cmd_one_shot(
+                    &node.resp,
+                    t,
+                    &[b"xadd", b"orders/q1", b"1-1", b"f", b"wake"]
+                )
+                .await
+            )
+            .contains("1-1"),
+            "xadd q1"
+        );
+        let g = read_until(&mut grouped, b"1-1", 5).await;
+        assert!(
+            contains_bytes(&g, b"1-1") && !contains_bytes(&g, b"*-1"),
+            "XREADGROUP BLOCK 0 must park until data, got {g:?}"
+        );
+        assert!(
+            text(
+                &cmd_one_shot(
+                    &node.resp,
+                    t,
+                    &[b"xadd", b"orders/q2", b"1-1", b"f", b"wake"]
+                )
+                .await
+            )
+            .contains("1-1"),
+            "xadd q2"
+        );
+        let big = read_until(&mut oversized, b"1-1", 5).await;
+        assert!(
+            contains_bytes(&big, b"1-1") && !contains_bytes(&big, b"*-1"),
+            "oversized BLOCK must park until data, got {big:?}"
+        );
+    })
+    .await
+    .expect("BLOCK 0 / oversized BLOCK regression: reader never woke");
 }

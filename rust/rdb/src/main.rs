@@ -34,6 +34,17 @@ fn config_path_arg(args: &[String]) -> String {
     path
 }
 
+/// Go `conf.init`: `ioutil.ReadFile` fails fast (`Fatalf`) when the config
+/// file is unreadable, so a dangling `-config <path>` never reaches the
+/// listener stage with default bind ports. Pure check: `None` = file exists.
+fn config_missing_error(path: &str) -> Option<String> {
+    if std::path::Path::new(path).is_file() {
+        None
+    } else {
+        Some(format!("read config file {path}: no such file"))
+    }
+}
+
 /// Open the store for one listener (Go `newDB`: `filepath.Join(path, bind)`).
 fn open_store(store_path: &str, bind: &str) -> Result<store::Store, String> {
     let path = store::data_path(store_path, bind);
@@ -170,6 +181,11 @@ async fn do_main() {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config_path = config_path_arg(&args);
+    // Fail fast on a dangling -config path (Go's conf.init Fatalf).
+    if let Some(e) = config_missing_error(&config_path) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     let conf = match conf::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -236,8 +252,10 @@ async fn do_main() {
     let http_raft = raft.clone();
     let http_kv = node.kv.clone();
     let http_token = conf.raft_token.clone();
+    let http_mux = rcache::http::membership_mux();
     tokio::spawn(async move {
-        let _ = rcache::http::serve_on(http_listener, http_raft, http_kv, http_token).await;
+        let _ =
+            rcache::http::serve_on(http_listener, http_raft, http_kv, http_token, http_mux).await;
     });
 
     // Cluster join (Go JoinRaftCluster; any non-"ok" reply is fatal).
@@ -283,11 +301,13 @@ async fn do_main() {
 
     // HA observer/failover (Go starts these unconditionally; they self-gate).
     rcache::ha::spawn_backup_map_init(raft.clone(), node.kv.clone(), &conf);
+    let ha_mux = rcache::ha::observer_mux();
     rcache::ha::spawn_leader_probe(
         raft.clone(),
         node.kv.clone(),
         topo.clone(),
         conf.raft_tcp_address.clone(),
+        ha_mux,
     );
 
     // Optional read-only backup listener (Go `BackupServer`, mode "backup").
@@ -380,6 +400,21 @@ mod tests {
             conf::DEFAULT_CONFIG_PATH
         );
         assert_eq!(parse(&["stray"]), conf::DEFAULT_CONFIG_PATH);
+    }
+
+    #[test]
+    fn missing_config_file_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yml");
+        std::fs::write(&path, "bind: 127.0.0.1:32681\n").expect("write");
+        assert_eq!(config_missing_error(path.to_str().unwrap()), None);
+        // Dangling -config path: named like conf::load's read error.
+        let missing = dir.path().join("nope.yml");
+        let err = config_missing_error(missing.to_str().unwrap()).expect("err");
+        assert!(err.contains("read config file"), "got: {err}");
+        assert!(err.contains("no such file"), "got: {err}");
+        // A directory is not a readable config file either.
+        assert!(config_missing_error(dir.path().to_str().unwrap()).is_some());
     }
 
     #[test]

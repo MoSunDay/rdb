@@ -336,6 +336,21 @@ mod tests {
     }
 
     #[test]
+    fn slots_single_node_reports_full_zero_to_16383_range() {
+        // Approved fix: a single-node cluster reports the full 0-16383
+        // range (the Go display omitted slot 0 with "1-16383").
+        let (_guard, shared) = shared_for("127.0.0.1:40208");
+        *shared.topology.write().unwrap() = topology::refresh("127.0.0.1:32681");
+        let uuid = utils::md5_with40("127.0.0.1:32681");
+        let expected = format!(
+            "*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:32681\r\n${}\r\n{}\r\n",
+            uuid.len(),
+            uuid
+        );
+        assert_eq!(call(&shared, &[b"slots"]), expected.into_bytes());
+    }
+
+    #[test]
     fn test_subcommand_always_moved() {
         let (_guard, shared) = shared_for("127.0.0.1:40207");
         *shared.topology.write().unwrap() = topology::refresh(INSTANCES);
