@@ -57,7 +57,8 @@ pub async fn zremrangebyrank(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
@@ -111,7 +112,8 @@ pub async fn zremrangebyscore(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
@@ -159,7 +161,8 @@ pub async fn zremrangebylex(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };

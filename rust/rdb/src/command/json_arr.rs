@@ -64,7 +64,8 @@ pub async fn json_arrappend(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     match json_state(ctx, &key) {
         JsonState::WrongType => append_error(ctx.out, WRONGTYPE),
         JsonState::Missing => append_error(ctx.out, ERR_PATH_MISSING),
@@ -116,7 +117,8 @@ pub async fn json_arrpop(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     match json_state(ctx, &key) {
         JsonState::WrongType => append_error(ctx.out, WRONGTYPE),
         JsonState::Missing => append_null(ctx.out),
@@ -250,7 +252,8 @@ pub async fn json_arrinsert(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     match json_state(ctx, &key) {
         JsonState::WrongType => append_error(ctx.out, WRONGTYPE),
         JsonState::Missing => append_error(ctx.out, ERR_PATH_MISSING),
@@ -337,7 +340,8 @@ pub async fn json_arrtrim(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     match json_state(ctx, &key) {
         JsonState::WrongType => append_error(ctx.out, WRONGTYPE),
         JsonState::Missing => append_null(ctx.out),

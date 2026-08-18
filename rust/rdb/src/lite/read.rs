@@ -280,7 +280,7 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
     let mut after_snapshot;
     loop {
         {
-            let _guard = crate::ds::latch::lock(&ctx.shared.latch, &wake);
+            let _guard = crate::ds::latch::lock(&ctx.shared.latch, &wake).await;
             let Some(st) = offset::load(
                 &ctx.shared.lite.offsets,
                 &ctx.shared.store,

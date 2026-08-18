@@ -103,7 +103,8 @@ async fn block_pop(
             let _guard = latch::lock(
                 &ctx.shared.latch,
                 &keys_core::latch_key(&ctx.prefix_key, key),
-            );
+            )
+            .await;
             match zset_state(&ctx.shared.store, &ctx.prefix_key, key, expire::now_ms()) {
                 ZSetState::WrongType => {
                     for root in &roots {

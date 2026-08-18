@@ -76,7 +76,8 @@ async fn block_pop(
             let _guard = latch::lock(
                 &ctx.shared.latch,
                 &keys_core::latch_key(&ctx.prefix_key, key),
-            );
+            )
+            .await;
             match list_state(&ctx.shared.store, &ctx.prefix_key, key, expire::now_ms()) {
                 ListState::WrongType => {
                     for root in &roots {
@@ -221,7 +222,7 @@ async fn block_move(
     .await
     {
         BlockResult::Got { elem, .. } => {
-            let _guards = lock_sorted(ctx, &[src.clone(), dst.clone()]);
+            let _guards = lock_sorted(ctx, &[src.clone(), dst.clone()]).await;
             let (dst_expire, mut dst_after) =
                 match list_state(&ctx.shared.store, &ctx.prefix_key, &dst, expire::now_ms()) {
                     ListState::List { expire_ms, meta } => (expire_ms, meta),

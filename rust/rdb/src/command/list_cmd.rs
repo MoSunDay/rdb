@@ -94,17 +94,18 @@ pub(crate) async fn commit_list(
 
 /// Lock every DISTINCT latch key of `keys` in byte order (the multi-key
 /// ABBA rule) and return the guards; they release on drop.
-pub(crate) fn lock_sorted(ctx: &Ctx<'_>, keys: &[Vec<u8>]) -> Vec<latch::KeyGuard> {
+pub(crate) async fn lock_sorted(ctx: &Ctx<'_>, keys: &[Vec<u8>]) -> Vec<latch::KeyGuard> {
     let mut latches: Vec<Vec<u8>> = keys
         .iter()
         .map(|k| keys_core::latch_key(&ctx.prefix_key, k))
         .collect();
     latches.sort();
     latches.dedup();
-    latches
-        .iter()
-        .map(|k| latch::lock(&ctx.shared.latch, k))
-        .collect()
+    let mut guards = Vec::with_capacity(latches.len());
+    for k in &latches {
+        guards.push(latch::lock(&ctx.shared.latch, k).await);
+    }
+    guards
 }
 
 /// Plan a single-element pop off one end WITHOUT writing: fetches the
@@ -159,7 +160,8 @@ async fn push_variant(ctx: &mut Ctx<'_>, left: bool, create: bool, cmd: &str) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let mut meta = match list_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
         ListState::List { meta, .. } => meta,
         ListState::Missing if create => blank_meta(),
@@ -365,7 +367,8 @@ pub async fn lset(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let (expire_ms, meta) =
         match list_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
             ListState::List { expire_ms, meta } => (expire_ms, meta),

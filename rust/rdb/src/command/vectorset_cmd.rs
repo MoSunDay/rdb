@@ -141,7 +141,8 @@ pub async fn vadd(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     let (expire_ms, count) =
         match vectorset_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
             VectorSetState::WrongType => {
@@ -212,7 +213,8 @@ pub async fn vrem(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(
         &ctx.shared.latch,
         &keys_core::latch_key(&ctx.prefix_key, &key),
-    );
+    )
+    .await;
     match vectorset_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
         VectorSetState::WrongType => append_error(ctx.out, WRONGTYPE),
         VectorSetState::Missing => append_int(ctx.out, 0),

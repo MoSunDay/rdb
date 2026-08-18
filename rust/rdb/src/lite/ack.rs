@@ -53,7 +53,7 @@ pub async fn xack(ctx: &mut Ctx<'_>) {
         // synchronously so acks survive kill -9 between flush rounds (the
         // 200ms flusher then only covers the delivered watermark).
         if n > 0 {
-            let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream));
+            let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
             if let Some(st) = offset::load(
                 &ctx.shared.lite.offsets,
                 &ctx.shared.store,

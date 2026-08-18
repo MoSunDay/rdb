@@ -82,7 +82,7 @@ async fn create(ctx: &mut Ctx<'_>) {
         return;
     };
     let group = ctx.args[2].clone();
-    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream));
+    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
     let read = model::read_meta(&ctx.shared.store, &prefix, &stream);
     let meta = match &read {
         Ok(MetaRead::Live(m)) => Some(m.clone()),
@@ -171,7 +171,7 @@ async fn destroy(ctx: &mut Ctx<'_>) {
         return;
     };
     let group = ctx.args[2].clone();
-    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream));
+    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
     let gkey = model::group_key(&prefix, &stream, &group);
     let existed = ops::get_physical(&ctx.shared.store, &gkey)
         .ok()
@@ -203,7 +203,7 @@ async fn setid(ctx: &mut Ctx<'_>) {
         return;
     };
     let group = ctx.args[2].clone();
-    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream));
+    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
     let gkey = model::group_key(&prefix, &stream, &group);
     let Some(raw) = ops::get_physical(&ctx.shared.store, &gkey).ok().flatten() else {
         return resp::append_error(
