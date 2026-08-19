@@ -1,5 +1,6 @@
 //! Consuming side: XREAD / XREADGROUP (+ XLEN). Blocking reads park on
-//! the shared WaitHub via `spawn_blocking` (the hub is a sync Condvar);
+//! the shared WaitHub via the dedicated park pool (the hub is a sync
+//! Condvar, run off tokio's shared blocking threads);
 //! XADD notifies the stream's meta key after its batch commits. XACK
 //! lives in [`ack`].
 
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::command::Ctx;
 use crate::ds::wait::{self, WaitOutcome};
+use crate::park;
 use crate::resp::codec as resp;
 
 use super::entries::{self, Entry};
@@ -107,7 +109,7 @@ async fn wait_entries(
             Some(t) => (t - now).min(Duration::from_millis(MAX_SLICE_MS)),
         };
         let w = Arc::clone(&waiter);
-        let woke = tokio::task::spawn_blocking(move || wait::wait(&w, slice)).await;
+        let woke = park::park(move || wait::wait(&w, slice)).await;
         wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
         match woke.unwrap_or(WaitOutcome::Timeout) {
             WaitOutcome::Timeout if end.is_some_and(|t| Instant::now() >= t) => return None,
