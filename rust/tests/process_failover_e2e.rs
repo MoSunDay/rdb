@@ -55,6 +55,25 @@ async fn poll_get_bulk(node: &ProcNode, key: &str, want: &str, secs: u64) {
     }
 }
 
+/// Poll any one-shot command until its reply equals `want` exactly
+/// (single-line / bulk replies; the post-restart topology resync is a
+/// 3s ticker, so refused reads are simply retried).
+async fn poll_reply(node: &ProcNode, args: &[&[u8]], want: &[u8], secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let r = cmd_one_shot(&node.resp, TOKEN, args).await;
+        if r == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{args:?} never returned {want:?}\nlast reply={r:?}\n{}",
+            node.ctx()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
 /// Scenario B: kill -9 the leader, survivors elect, the restarted old
 /// leader catches up on writes it missed while dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -159,4 +178,91 @@ async fn full_restart_preserves_rocksdb_data() {
         "get after del is nil\n{}",
         node.ctx()
     );
+}
+
+/// Scenario C': single-node cluster carrying all SEVEN data families
+/// (string, hash, list, set, zset, JSON, vectorset), one key each.
+/// SIGKILL + respawn on the same dir must leave every family readable
+/// (rocksdb stores them all; data-plane writes are synchronous, so a
+/// kill between write and read cannot lose them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill9_restart_preserves_all_seven_families() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut node = spawn_node(dir.path(), 0, true, None);
+    wait_resp_ready(&mut node, 30).await;
+    assert_eq!(
+        wait_leader(std::slice::from_ref(&node), 60).await,
+        0,
+        "the lone bootstrapped node must lead\n{}",
+        node.ctx()
+    );
+    let binds = vec![node.resp.clone()];
+    cluster_init(&node, &binds).await;
+    wait_cluster_nodes_list_all(std::slice::from_ref(&node), &binds, 30).await;
+
+    // One write per family (replies are the line/bulk read_one returns).
+    let t = TOKEN;
+    let r = node.resp.clone();
+    assert_eq!(
+        cmd_one_shot(&r, t, &[b"set", b"f:str", b"sval"]).await,
+        b"+OK",
+        "set\n{}",
+        node.ctx()
+    );
+    assert_eq!(
+        cmd_one_shot(&r, t, &[b"hset", b"f:hash", b"field", b"hval"]).await,
+        b":1",
+        "hset\n{}",
+        node.ctx()
+    );
+    assert_eq!(
+        cmd_one_shot(&r, t, &[b"lpush", b"f:list", b"lelem"]).await,
+        b":1",
+        "lpush\n{}",
+        node.ctx()
+    );
+    assert_eq!(
+        cmd_one_shot(&r, t, &[b"sadd", b"f:set", b"smember"]).await,
+        b":1",
+        "sadd\n{}",
+        node.ctx()
+    );
+    assert_eq!(
+        cmd_one_shot(&r, t, &[b"zadd", b"f:zset", b"1", b"zmember"]).await,
+        b":1",
+        "zadd\n{}",
+        node.ctx()
+    );
+    assert_eq!(
+        cmd_one_shot(
+            &r,
+            t,
+            &[b"json.set", b"f:json", b"$", b"{\"j\":1}"]
+        )
+        .await,
+        b"+OK",
+        "json.set\n{}",
+        node.ctx()
+    );
+    assert_eq!(
+        cmd_one_shot(&r, t, &[b"vadd", b"f:vec", b"VALUES", b"2", b"v elem", b"1", b"0"]).await,
+        b":1",
+        "vadd\n{}",
+        node.ctx()
+    );
+
+    // SIGKILL + restart with the same config path + data dir.
+    node.kill_now();
+    node.respawn();
+    wait_resp_ready(&mut node, 60).await;
+
+    // Every family must read back its value after the restart.
+    poll_reply(&node, &[b"get", b"f:str"], b"$4\r\nsval", 30).await;
+    poll_reply(&node, &[b"hget", b"f:hash", b"field"], b"$4\r\nhval", 30).await;
+    poll_reply(&node, &[b"lindex", b"f:list", b"0"], b"$5\r\nlelem", 30).await;
+    poll_reply(&node, &[b"scard", b"f:set"], b":1", 30).await;
+    poll_reply(&node, &[b"zscore", b"f:zset", b"zmember"], b"$1\r\n1", 30).await;
+    poll_reply(&node, &[b"json.get", b"f:json"], b"$7\r\n{\"j\":1}", 30).await;
+    poll_reply(&node, &[b"vcard", b"f:vec"], b":1", 30).await;
 }
