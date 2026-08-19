@@ -21,6 +21,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,6 +34,37 @@ use crate::resp::codec;
 use crate::router;
 use crate::state;
 
+/// Cumulative per-connection read-buffer cap: a client that streams
+/// incomplete-but-valid data forever would grow `buf` without bound.
+const MAX_CONN_BUF: usize = 1024 * 1024 * 1024; // 1GB
+
+/// Pre-auth read window: an unauthenticated connection that sends nothing
+/// usable for this long is dropped (authenticated reads are unbounded).
+const PREAUTH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Pure helper: has the cumulative buffer grown past the cap?
+fn exceeds_conn_cap(len: usize) -> bool {
+    len > MAX_CONN_BUF
+}
+
+/// Pure decision for the pre-auth read timeout: only an unauthenticated
+/// connection whose read has already stalled for the full deadline expires.
+fn preauth_expired(authed: bool, elapsed: Duration) -> bool {
+    !authed && elapsed >= PREAUTH_DEADLINE
+}
+
+/// Constant-time byte equality for the AUTH token: folds XOR over the full
+/// length of BOTH slices (double-walk) so the running time does not depend
+/// on how many leading bytes matched; differing lengths are false.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    let mut diff = 0u8;
+    long.iter().enumerate().for_each(|(i, byte)| {
+        diff |= byte ^ short.get(i).copied().unwrap_or(0);
+    });
+    a.len() == b.len() && diff == 0
+}
+
 /// One connection: parse-loop with pipelining, write-after-drain.
 pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
     let (mut rd, mut wr) = sock.into_split();
@@ -42,11 +74,34 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
     let mut authed = false;
 
     loop {
-        let n = match rd.read(&mut chunk).await {
-            Ok(0) | Err(_) => return, // EOF or socket error (redcon: close)
-            Ok(n) => n,
+        let n = if authed {
+            match rd.read(&mut chunk).await {
+                Ok(0) | Err(_) => return, // EOF or socket error (redcon: close)
+                Ok(n) => n,
+            }
+        } else {
+            // Unauthenticated reads are bounded by PREAUTH_DEADLINE so an
+            // idle pre-auth client cannot hold a slot forever.
+            let started = std::time::Instant::now();
+            match tokio::time::timeout(PREAUTH_DEADLINE, rd.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return,
+                Ok(Ok(n)) => n,
+                Err(_) if preauth_expired(authed, started.elapsed()) => {
+                    codec::append_error(&mut out, "ERR unauthenticated connection timeout");
+                    let _ = wr.write_all(&out).await;
+                    return;
+                }
+                // Defensive only: the timeout never fires before the full
+                // deadline has elapsed since `started`.
+                Err(_) => return,
+            }
         };
         buf.extend_from_slice(&chunk[..n]);
+        if exceeds_conn_cap(buf.len()) {
+            codec::append_error(&mut out, "ERR Protocol error: too big cumulative request");
+            let _ = wr.write_all(&out).await;
+            return;
+        }
 
         // Drain ALL complete commands currently buffered (pipelining).
         let mut close = false;
@@ -136,7 +191,7 @@ async fn process_command(
     if !*authed {
         if argv.len() == 2
             && (argv[0] == b"AUTH"[..] || argv[0] == b"auth"[..])
-            && argv[1] == shared.conf.raft_token.as_bytes()
+            && ct_eq(&argv[1], shared.conf.raft_token.as_bytes())
         {
             *authed = true;
             codec::append_string(out, "OK");
@@ -207,6 +262,10 @@ async fn process_command(
     match panicked {
         Some(payload) => {
             codec::append_error(ctx.out, &format!("fatal error: {}", payload_str(&payload)));
+            // Reply text is unchanged, but the connection now closes after
+            // the flush: a panicked handler may have desynced the framing,
+            // so keep talking on it is unsafe.
+            *close = true;
         }
         // Label order mirrors Go: (mode, lowercase command, was-MOVED). Go
         // observes after `fn(...)` returns; a panicking handler unwinds past
@@ -255,6 +314,32 @@ fn payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exceeds_conn_cap_boundary() {
+        assert!(!exceeds_conn_cap(0));
+        assert!(!exceeds_conn_cap(MAX_CONN_BUF));
+        assert!(exceeds_conn_cap(MAX_CONN_BUF + 1));
+    }
+
+    #[test]
+    fn preauth_expired_only_for_stalled_unauthenticated_reads() {
+        assert!(!preauth_expired(true, Duration::from_secs(1000)));
+        assert!(!preauth_expired(false, Duration::from_secs(29)));
+        assert!(preauth_expired(false, Duration::from_secs(30)));
+        assert!(preauth_expired(false, Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn ct_eq_is_exact_and_length_aware() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"tok", b"tok"));
+        assert!(!ct_eq(b"tok", b"toK"));
+        assert!(!ct_eq(b"tok", b"to"));
+        assert!(!ct_eq(b"to", b"tok"));
+        assert!(!ct_eq(b"", b"t"));
+        assert!(!ct_eq(b"t", b""));
+    }
 
     #[test]
     fn payload_str_handles_common_types() {

@@ -25,6 +25,11 @@ fn protocol_error(msg: &str) -> ParseOutcome {
 /// overflowing) allocation. 1M elements is far beyond any real command.
 const MAX_MULTIBULK_COUNT: i64 = 1_048_576;
 
+/// Upper bound on a single `$N` bulk payload, mirroring Redis
+/// `proto-max-bulk-len` (512MiB). Checked on the header alone, before any
+/// payload bytes are read. i64 because `parse_int` yields i64.
+pub const MAX_BULK_LEN: i64 = 512 * 1024 * 1024;
+
 /// Parse one command from `buf` (redcon `ReadNextCommand`, Redis-kind).
 pub fn parse_command(buf: &[u8]) -> ParseOutcome {
     if buf.is_empty() {
@@ -100,8 +105,11 @@ fn parse_multibulk(buf: &[u8]) -> ParseOutcome {
                         }
                         // Go fork typo-checks `count <= 0` (never fires); the
                         // intent is a non-negative bulk length, enforced here.
+                        // N > MAX_BULK_LEN errors on the header alone
+                        // (Redis `proto-max-bulk-len` parity), BEFORE the
+                        // Incomplete check below, so no payload is needed.
                         let n = match parse_int(&buf[s..i - 1]) {
-                            Some(v) if v >= 0 => v as usize,
+                            Some(v) if (0..=MAX_BULK_LEN).contains(&v) => v as usize,
                             _ => return protocol_error("invalid bulk length"),
                         };
                         let start = i + 1;
