@@ -246,3 +246,28 @@ async fn empty_multibulk_replies_arity_error() {
     // Connection stays usable afterwards.
     rpc(&mut s, &resp_req(&[b"ping"]), b"+PONG\r\n").await;
 }
+
+#[tokio::test]
+async fn oversized_bulk_header_gets_protocol_error_and_close() {
+    let shared = Arc::new(test_shared(test_config(), "bulk-cap"));
+    let listener = resp::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(resp::serve(listener, shared));
+
+    let mut s = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
+        .await
+        .expect("connect timeout")
+        .expect("connect");
+    rpc(&mut s, &resp_req(&[b"AUTH", b"test-token"]), b"+OK\r\n").await;
+    // Header only, NO payload: $536870913 is one byte over the 512MiB
+    // single-bulk cap, so the parser errors on the header alone and the
+    // server closes the connection (same path as other protocol errors;
+    // redcon-fork reply shape `-ERR <msg>`, like the `*x` case above).
+    rpc(
+        &mut s,
+        b"*2\r\n$3\r\nSET\r\n$536870913\r\n",
+        b"-ERR invalid bulk length\r\n",
+    )
+    .await;
+    assert_eof(&mut s).await;
+}
