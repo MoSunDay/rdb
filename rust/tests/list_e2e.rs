@@ -237,6 +237,48 @@ fn blpop_timeout_and_immediate_hit() {
     );
 }
 
+/// BRPOP twin of the BLPOP pair above: the immediate hit must come off
+/// the TAIL (not the head), and the drained key then times out with the
+/// same null array (`*-1`). The over-the-wire wakeup path is shared
+/// with BLPOP (`block_pop_cmd`), which `blpop_wakes_on_lpush_over_wire`
+/// already drives.
+#[test]
+fn brpop_immediate_tail_hit_and_timeout() {
+    let shared = shared_for("44008");
+    let e = |n: &str, a: &[&str], w: &[u8]| expect(&shared, n, a, w);
+    e("rpush", &["rk", "head", "mid", "tail"], b":3\r\n");
+    // Immediate hit on the latched quick path: *2 (key, TAIL element).
+    e("brpop", &["rk", "1"], &arr(&["rk", "tail"]));
+    // The head is still there -- only the right end was popped.
+    e("lrange", &["rk", "0", "-1"], &arr(&["head", "mid"]));
+    // The second pop takes the new tail; then the key is drained.
+    e("brpop", &["rk", "0.1"], &arr(&["rk", "mid"]));
+    e("brpop", &["rk", "0.1"], &arr(&["rk", "head"]));
+    // Drained: the next BRPOP parks for its ~100ms and answers *-1.
+    let started = Instant::now();
+    e("brpop", &["rk", "0.1"], b"*-1\r\n");
+    let parked = started.elapsed();
+    assert!(
+        parked >= Duration::from_millis(90),
+        "returned early: {parked:?}"
+    );
+    assert!(
+        parked < Duration::from_secs(5),
+        "parked too long: {parked:?}"
+    );
+    // Multi-key BRPOP serves the FIRST non-empty key in argument order
+    // (and multi-key crossing slots is CROSSSLOT, like BLPOP).
+    e("rpush", &["{b}one", "x"], b":1\r\n");
+    e("rpush", &["{b}two", "y"], b":1\r\n");
+    e("brpop", &["{b}one", "{b}two", "0.1"], &arr(&["{b}one", "x"]));
+    e("brpop", &["{b}one", "{b}two", "0.1"], &arr(&["{b}two", "y"]));
+    e(
+        "brpop",
+        &["{b}one", "far", "0.1"],
+        b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n",
+    );
+}
+
 /// Regression for the lost-wakeup fix in `command::list_block`: the
 /// latched quick-pop Got path used to return without unregistering its
 /// shared waiter, so the next notify for that slot was swallowed by the

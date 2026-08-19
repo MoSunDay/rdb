@@ -329,6 +329,34 @@ fn bzpopmin_immediate_and_timeout() {
     );
 }
 
+/// BZPOPMAX twin: the immediate hit takes the HIGHEST score (the last
+/// record of the ascending score index) and replies the same flat *3
+/// triple; the drained key then times out with the null array.
+#[test]
+fn bzpopmax_immediate_and_timeout() {
+    let shared = shared_for("45009");
+    let e = |n: &str, a: &[&str], w: &[u8]| expect(&shared, n, a, w);
+    e("zadd", &["mk", "1", "low", "2.5", "high"], b":2\r\n");
+    // Immediate hit on the latched quick path: *3 (key, member, score).
+    e("bzpopmax", &["mk", "1"], &arr(&["mk", "high", "2.5"]));
+    // Only the low end survives; popping it empties the zset.
+    e("zcard", &["mk"], b":1\r\n");
+    e("zscore", &["mk", "low"], b"$1\r\n1\r\n");
+    e("bzpopmax", &["mk", "1"], &arr(&["mk", "low", "1"]));
+    // The drained key now times out with the null array (~100ms parked).
+    let started = Instant::now();
+    e("bzpopmax", &["mk", "0.1"], b"*-1\r\n");
+    let parked = started.elapsed();
+    assert!(
+        parked >= Duration::from_millis(90),
+        "returned early: {parked:?}"
+    );
+    assert!(
+        parked < Duration::from_secs(5),
+        "parked too long: {parked:?}"
+    );
+}
+
 /// Over the wire: a parked BZPOPMIN on connection A is woken by a ZADD
 /// from connection B (modeled on lite's `block_wakes_on_xadd_over_wire`).
 #[tokio::test]
@@ -421,4 +449,55 @@ fn zadd_ch_unchanged_and_bylex_withscores_errors() {
         &["lex", "-inf", "+inf", "WITHSCORES"],
         b"*6\r\n$1\r\na\r\n$1\r\n0\r\n$1\r\nb\r\n$1\r\n0\r\n$1\r\nc\r\n$1\r\n0\r\n",
     );
+}
+
+/// ZINTERSTORE (2 sets, weights + aggregate folds) and ZDIFFSTORE (2
+/// sets), plus the CROSSSLOT guard for multi-key store variants (the
+/// ZUNIONSTORE twin lives in `zunionstore_weights_aggregate_...`).
+#[test]
+fn zinterstore_zdiffstore_weights_aggregate_crossslot() {
+    let shared = shared_for("45010");
+    let e = |n: &str, a: &[&str], w: &[u8]| expect(&shared, n, a, w);
+    e("zadd", &["{i}1", "1", "a", "2", "b"], b":2\r\n");
+    e("zadd", &["{i}2", "10", "a", "20", "c"], b":2\r\n");
+    // INTER keeps only shared members: a alone, SUM by default (1+10).
+    e("zinterstore", &["{i}d", "2", "{i}1", "{i}2"], b":1\r\n");
+    e("zscore", &["{i}d", "a"], b"$2\r\n11\r\n");
+    e("zcard", &["{i}d"], b":1\r\n");
+    // WEIGHTS scale per source before folding: a = 1*2 + 10*0.5.
+    e(
+        "zinterstore",
+        &["{i}w", "2", "{i}1", "{i}2", "WEIGHTS", "2", "0.5"],
+        b":1\r\n",
+    );
+    e("zscore", &["{i}w", "a"], b"$1\r\n7\r\n");
+    // AGGREGATE MIN / MAX fold the weighted scores instead of summing.
+    e(
+        "zinterstore",
+        &["{i}m", "2", "{i}1", "{i}2", "AGGREGATE", "MIN"],
+        b":1\r\n",
+    );
+    e("zscore", &["{i}m", "a"], b"$1\r\n1\r\n");
+    e(
+        "zinterstore",
+        &["{i}x", "2", "{i}1", "{i}2", "AGGREGATE", "MAX"],
+        b":1\r\n",
+    );
+    e("zscore", &["{i}x", "a"], b"$2\r\n10\r\n");
+    // A missing operand reads as an empty set: the intersection is empty
+    // and the destination ends up gone (empty zsets do not exist).
+    e("zinterstore", &["{i}e", "2", "{i}1", "{i}none"], b":0\r\n");
+    e("zcard", &["{i}e"], b":0\r\n");
+    // DIFF keeps source 0's exclusives: b (2) only.
+    e("zdiffstore", &["{i}f", "2", "{i}1", "{i}2"], b":1\r\n");
+    e("zscore", &["{i}f", "b"], b"$1\r\n2\r\n");
+    e("zscore", &["{i}f", "a"], b"$-1\r\n");
+    // Reversed operand order: c (20) survives instead.
+    e("zdiffstore", &["{i}r", "2", "{i}2", "{i}1"], b":1\r\n");
+    e("zscore", &["{i}r", "c"], b"$2\r\n20\r\n");
+    // Different slots are rejected before any mutation (exact bytes).
+    let far_i = call(&shared, "zinterstore", &["{i}d", "2", "{i}1", "other"]);
+    assert_eq!(far_i, CROSSSLOT.to_vec(), "in 'zinterstore'");
+    let far_d = call(&shared, "zdiffstore", &["{i}d", "2", "{i}1", "other"]);
+    assert_eq!(far_d, CROSSSLOT.to_vec(), "in 'zdiffstore'");
 }

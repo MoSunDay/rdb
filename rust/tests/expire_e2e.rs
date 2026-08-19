@@ -190,3 +190,60 @@ fn scan_and_keys_across_whole_instance_prefix() {
         "some key came back"
     );
 }
+
+/// RENAME must stay inside one slot: `{a}`-tagged source vs `{b}`-tagged
+/// destination is CROSSSLOT (refused before any mutation), while a
+/// same-slot `{t}`-tagged pair moves key + TTL together.
+#[test]
+fn rename_crossslot_rejected_and_same_slot_moves_ttl() {
+    let shared = shared_for("42006");
+    // Cross-slot: nothing moves, the source keeps key AND deadline.
+    set(&shared, b"{a}src", b"v");
+    assert_eq!(
+        call(&shared, "pexpire", &[b"{a}src", b"60000"]),
+        b":1\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&shared, "rename", &[b"{a}src", b"{b}dst"]),
+        b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&shared, "get", &[b"{a}src"]),
+        b"$1\r\nv\r\n".to_vec()
+    );
+    let ms = String::from_utf8(call(&shared, "pttl", &[b"{a}src"]))
+        .unwrap()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse::<i64>()
+        .unwrap();
+    assert!(ms > 0 && ms <= 60_000, "source ttl survived the refusal: {ms}");
+    assert_eq!(call(&shared, "exists", &[b"{b}dst"]), b":0\r\n".to_vec());
+    // RENAMENX runs through the same guard.
+    assert_eq!(
+        call(&shared, "renamenx", &[b"{a}src", b"{b}dst"]),
+        b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
+    );
+    // Same-slot hash-tagged pair: the deadline travels with the key.
+    set(&shared, b"{t}a", b"moved");
+    assert_eq!(
+        call(&shared, "pexpire", &[b"{t}a", b"60000"]),
+        b":1\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&shared, "rename", &[b"{t}a", b"{t}b"]),
+        b"+OK\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&shared, "get", &[b"{t}b"]),
+        b"$5\r\nmoved\r\n".to_vec()
+    );
+    let ms = String::from_utf8(call(&shared, "pttl", &[b"{t}b"]))
+        .unwrap()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse::<i64>()
+        .unwrap();
+    assert!(ms > 0 && ms <= 60_000, "moved ttl: {ms}");
+    assert_eq!(call(&shared, "exists", &[b"{t}a"]), b":0\r\n".to_vec());
+}
