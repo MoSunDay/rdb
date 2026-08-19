@@ -46,6 +46,12 @@ pub fn mode_label(mode: Mode) -> &'static str {
 /// Go `Apply(..., 5*time.Second)` — the same 5s at every Go call site.
 pub const APPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// D5: apply queue depth. The channel is BOUNDED so a stalled raft (each
+/// queued apply parks the worker for up to [`APPLY_TIMEOUT`]) can no
+/// longer buffer unbounded memory: a full queue fails the caller FAST
+/// with `apply queue full` instead of queueing behind the stall.
+pub const APPLY_CHANNEL_CAPACITY: usize = 1024;
+
 /// One queued apply (Go raft.Apply future): the entry plus the channel
 /// the awaiting caller is woken on.
 pub struct ApplyReq {
@@ -80,7 +86,7 @@ pub struct RaftState {
     /// Live FSM map (Go `CM`); present once real raft runs.
     pub live_kv: Option<KvMap>,
     /// Queue to the background client_write loop; None in the stub.
-    pub apply_tx: Option<tokio::sync::mpsc::UnboundedSender<ApplyReq>>,
+    pub apply_tx: Option<tokio::sync::mpsc::Sender<ApplyReq>>,
 }
 
 /// Go cacheManager.Get: missing key -> "". Live reads go through the FSM
@@ -125,14 +131,21 @@ pub fn raft_apply_start(
         return Ok(ApplyTicket { reply: None });
     };
     let (reply, rx) = tokio::sync::oneshot::channel();
-    if tx
-        .send(ApplyReq {
-            entry: entry.clone(),
-            reply,
-        })
-        .is_err()
-    {
-        return Err("apply loop stopped".to_string());
+    // D5: try_send on the BOUNDED queue. A full queue answers FAST with
+    // `apply queue full` (surfaced by `raft set` as
+    // `internal error err: apply queue full`); a closed one keeps the
+    // old dead-worker text.
+    match tx.try_send(ApplyReq {
+        entry: entry.clone(),
+        reply,
+    }) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            return Err("apply queue full".to_string());
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err("apply loop stopped".to_string());
+        }
     }
     Ok(ApplyTicket { reply: Some(rx) })
 }
@@ -154,10 +167,7 @@ pub async fn raft_apply_await(ticket: ApplyTicket) -> Result<(), String> {
 /// Background loop executing queued applies through `client_write` (Go:
 /// every Apply future blocks until the entry commits). Spawned once at
 /// startup; exits when every `apply_tx` sender is dropped.
-pub fn spawn_apply_loop(
-    raft: Arc<RdbRaft>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<ApplyReq>,
-) {
+pub fn spawn_apply_loop(raft: Arc<RdbRaft>, mut rx: tokio::sync::mpsc::Receiver<ApplyReq>) {
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             let result = apply_entry(&raft, req.entry).await;
@@ -362,9 +372,8 @@ mod apply_tests {
 
     /// RaftState plus the stalled loop's receiver: alive (so the send
     /// succeeds) but never draining (so the reply never arrives).
-    fn leader_with_stalled_apply_loop(
-    ) -> (RaftState, tokio::sync::mpsc::UnboundedReceiver<ApplyReq>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn leader_with_stalled_apply_loop() -> (RaftState, tokio::sync::mpsc::Receiver<ApplyReq>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(APPLY_CHANNEL_CAPACITY);
         (
             RaftState {
                 apply_tx: Some(tx),
@@ -372,6 +381,46 @@ mod apply_tests {
             },
             rx,
         )
+    }
+
+    /// D5: with the BOUNDED queue full (stalled loop, nobody draining),
+    /// `raft_apply_start` fails FAST with `apply queue full` instead of
+    /// queueing without bound behind the stall.
+    #[test]
+    fn apply_start_fails_fast_when_queue_is_full() {
+        let (mut state, _stalled_rx) = leader_with_stalled_apply_loop();
+        let entry = RaftLogEntryData {
+            key: "k".to_string(),
+            value: "v".to_string(),
+        };
+        for _ in 0..APPLY_CHANNEL_CAPACITY {
+            raft_apply_start(&mut state, &entry).expect("capacity not yet reached");
+        }
+        let err = match raft_apply_start(&mut state, &entry) {
+            Ok(_) => panic!("a full apply queue must reject the next entry"),
+            Err(e) => e,
+        };
+        assert_eq!(err, "apply queue full");
+    }
+
+    /// D5: a dropped apply loop (closed queue) keeps the old dead-worker
+    /// text, not the queue-full one.
+    #[test]
+    fn apply_start_reports_closed_loop_when_receiver_dropped() {
+        let (mut state, stalled_rx) = leader_with_stalled_apply_loop();
+        drop(stalled_rx);
+        let entry = RaftLogEntryData {
+            key: "k".to_string(),
+            value: "v".to_string(),
+        };
+        // Drain-free drop: the sender sees a closed channel only after
+        // every in-flight try_send; with nothing queued the first send
+        // must report the closed loop.
+        let err = match raft_apply_start(&mut state, &entry) {
+            Ok(_) => panic!("a closed apply queue must reject the entry"),
+            Err(e) => e,
+        };
+        assert_eq!(err, "apply loop stopped");
     }
 
     /// A dead apply loop surfaces as `apply timeout` without blocking a
