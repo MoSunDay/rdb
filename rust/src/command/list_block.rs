@@ -1,5 +1,6 @@
 //! Blocking list commands (BLPOP/BRPOP/BLMOVE/BRPOPLPUSH): the timeout
-//! parks on the shared WaitHub via `spawn_blocking` (a sync Condvar);
+//! parks on the shared WaitHub via the dedicated park pool (a sync
+//! Condvar, run off tokio's shared blocking threads);
 //! push-style list commands notify a list's meta root after committing.
 //! The loop mirrors `lite::read::wait_entries`: register FIRST, then one
 //! latched quick-path pass over the keys in order, then park -- so a
@@ -24,6 +25,7 @@ use crate::command::list_cmd::{
 use crate::command::list_move::parse_dirs;
 use crate::command::{keys_core, Ctx};
 use crate::ds::{expire, latch, list_ds, setops, wait};
+use crate::park;
 use crate::resp::codec::{append_bulk, append_error, append_null, append_raw};
 
 /// BLOCK 0 means "forever": park in 24h slices so Condvar math stays sane.
@@ -154,7 +156,7 @@ async fn block_pop(
             })
             .min(MAX_SLICE_MS);
         let parked = Arc::clone(&waiter);
-        let woke = tokio::task::spawn_blocking(move || {
+        let woke = park::park(move || {
             wait::wait(&parked, Duration::from_millis(left_ms))
         })
         .await;

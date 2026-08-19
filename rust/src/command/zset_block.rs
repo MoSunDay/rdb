@@ -1,5 +1,6 @@
 //! Blocking sorted-set pops BZPOPMIN/BZPOPMAX: the timeout parks on
-//! the shared WaitHub via `spawn_blocking` (a sync Condvar) exactly
+//! the shared WaitHub via the dedicated park pool (a sync Condvar, run
+//! off tokio's shared blocking threads) exactly
 //! like `list_block` -- register FIRST, then one latched quick-pop
 //! pass over the keys in order, then park -- so a ZADD/STORE notify
 //! landing between the read and the park is never lost. Writers notify
@@ -20,6 +21,7 @@ use crate::command::list_block::{parse_timeout, MAX_SLICE_MS};
 use crate::command::zset_util::{append_score, commit_zset, zset_state, ZSetState};
 use crate::command::{keys_core, Ctx};
 use crate::ds::{expire, latch, setops, wait, zset_ds};
+use crate::park;
 use crate::resp::codec::{append_bulk, append_error, append_raw};
 
 /// Outcome of a blocking zset pop attempt.
@@ -142,7 +144,7 @@ async fn block_pop(
             })
             .min(MAX_SLICE_MS);
         let parked = Arc::clone(&waiter);
-        let woke = tokio::task::spawn_blocking(move || {
+        let woke = park::park(move || {
             wait::wait(&parked, Duration::from_millis(left_ms))
         })
         .await;
