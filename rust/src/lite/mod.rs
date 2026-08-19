@@ -100,8 +100,24 @@ pub fn new_runtime() -> Runtime {
     }
 }
 
+/// One offset-flush round, shared by the 200ms background loop and the
+/// E1 shutdown path (`flush_offsets_once`): lock-swap the dirty set, then
+/// re-validate against the CURRENT dirty state before writing -- entries
+/// superseded by a newer ack since the snapshot stay dirty and ride the
+/// next round, so a late old batch can never lower the committed watermark
+/// already on disk -- then one async batched fsync.
+pub async fn flush_offsets_once(shared: &Arc<state::Shared>) -> Result<(), String> {
+    let dirty = offset::flush_dirty(&shared.lite.offsets);
+    let dirty = offset::drop_superseded(&shared.lite.offsets, dirty);
+    monitor::set_lite_offset_dirty(&shared.monitor, dirty.len() as f64);
+    if let Some(batch) = offset::build_flush_batch(&dirty) {
+        ops::batch_write_async(Arc::clone(&shared.store), batch).await?;
+    }
+    Ok(())
+}
+
 /// Background loop (normal mode only): every 200ms flush dirty group
-/// offsets (lock-swap, then one async batched fsync) and refresh gauges.
+/// offsets (one async batched fsync per round) and refresh gauges.
 pub fn spawn_background(shared: Arc<state::Shared>) {
     const PERIOD: Duration = Duration::from_millis(200);
     tokio::spawn(async move {
@@ -110,17 +126,8 @@ pub fn spawn_background(shared: Arc<state::Shared>) {
         ticker.tick().await; // consume the immediate first tick
         loop {
             ticker.tick().await;
-            let dirty = offset::flush_dirty(&shared.lite.offsets);
-            // Re-validate against the CURRENT dirty state before writing:
-            // entries superseded by a newer ack since the snapshot stay
-            // dirty and ride the next round, so a late old batch can
-            // never lower the committed watermark already on disk.
-            let dirty = offset::drop_superseded(&shared.lite.offsets, dirty);
-            monitor::set_lite_offset_dirty(&shared.monitor, dirty.len() as f64);
-            if let Some(batch) = offset::build_flush_batch(&dirty) {
-                if let Err(e) = ops::batch_write_async(Arc::clone(&shared.store), batch).await {
-                    eprintln!("[lite] offset flush failed: {e}");
-                }
+            if let Err(e) = flush_offsets_once(&shared).await {
+                eprintln!("[lite] offset flush failed: {e}");
             }
             monitor::set_lite_streams(
                 &shared.monitor,
