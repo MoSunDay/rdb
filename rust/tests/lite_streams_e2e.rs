@@ -157,3 +157,82 @@ fn xtrim_maxlen_zero_never_deletes_neighbours() {
     let kept = text(&call(&shared, "xrange", &[b"t/q2", b"-", b"+"]));
     assert!(kept.starts_with("*3\r\n") && kept.contains("7-2"), "{kept}");
 }
+
+/// Regression (C6): `XIDLE <stream> <huge-seconds>` — `secs * 1000` used
+/// to overflow u64 silently (e.g. secs = u64::MAX/1000 + 1 wraps idle_ms
+/// to ~384ms) and arm an instant TTL that reaped the whole stream family.
+/// The overflow must be REJECTED without touching the stored idle value.
+#[test]
+fn xidle_overflow_seconds_is_rejected_not_wrapped() {
+    let (shared, _dir) = shared_at("43010");
+    call(&shared, "xadd", &[b"s/qi", b"1-1", b"f", b"v"]);
+    assert_eq!(
+        call(&shared, "xidle", &[b"s/qi", b"30"]),
+        b"+OK\r\n".to_vec()
+    );
+    // u64::MAX seconds: secs.checked_mul(1000) overflows -> error reply.
+    assert_eq!(
+        call(&shared, "xidle", &[b"s/qi", b"18446744073709551615"]),
+        b"-ERR invalid idle seconds\r\n".to_vec()
+    );
+    // u64::MAX/1000 + 1: the classic wrap-to-small-value case.
+    assert_eq!(
+        call(&shared, "xidle", &[b"s/qi", b"18446744073709552"]),
+        b"-ERR invalid idle seconds\r\n".to_vec()
+    );
+    // u64::MAX/1000: idle_ms itself fits u64, but now_ms + idle_ms
+    // (epoch ~1.7e12) still overflows -> the deadline guard must reject.
+    assert_eq!(
+        call(&shared, "xidle", &[b"s/qi", b"18446744073709551"]),
+        b"-ERR invalid idle seconds\r\n".to_vec()
+    );
+    // The configured idle value is unchanged (read form), and the stream
+    // was not expired by an instant wrapped deadline.
+    assert_eq!(call(&shared, "xidle", &[b"s/qi"]), b":30\r\n".to_vec());
+    assert_eq!(call(&shared, "xlen", &[b"s/qi"]), b":1\r\n".to_vec());
+    // A sane value still works after the rejections.
+    assert_eq!(
+        call(&shared, "xidle", &[b"s/qi", b"60"]),
+        b"+OK\r\n".to_vec()
+    );
+    assert_eq!(call(&shared, "xidle", &[b"s/qi"]), b":60\r\n".to_vec());
+}
+
+/// Regression (C6): an explicit XADD id with a huge `id.ms` on a stream
+/// with XIDLE armed — `now.max(id.ms) + idle_ms` used to overflow u64 and
+/// wrap into a corrupted (small/past) deadline. Must reply an error,
+/// write NOTHING, and leave the stream usable.
+#[test]
+fn xadd_huge_id_with_idle_is_rejected_not_wrapped() {
+    let (shared, _dir) = shared_at("43011");
+    call(&shared, "xadd", &[b"s/qh", b"1-1", b"f", b"v"]);
+    assert_eq!(
+        call(&shared, "xidle", &[b"s/qh", b"3600"]),
+        b"+OK\r\n".to_vec()
+    );
+    // ms = 18446744073709551000 parses as u64 but now.max(ms)+idle_ms
+    // overflows: error, no write.
+    assert_eq!(
+        call(
+            &shared,
+            "xadd",
+            &[b"s/qh", b"18446744073709551000-0", b"f", b"v"]
+        ),
+        b"-ERR ID or idle deadline overflow\r\n".to_vec()
+    );
+    // Nothing was written: length unchanged, meta not clobbered.
+    assert_eq!(call(&shared, "xlen", &[b"s/qh"]), b":1\r\n".to_vec());
+    // A normal XADD still works afterwards.
+    assert_eq!(
+        call(&shared, "xadd", &[b"s/qh", b"1-2", b"f", b"v2"]),
+        b"$3\r\n1-2\r\n".to_vec()
+    );
+    assert_eq!(call(&shared, "xlen", &[b"s/qh"]), b":2\r\n".to_vec());
+    // Sanity: an id that itself overflows u64 fails at parse instead.
+    assert!(text(&call(
+        &shared,
+        "xadd",
+        &[b"s/qh", b"18446744073709551616-0", b"f", b"v"]
+    ))
+    .contains("ERR Invalid stream ID"));
+}

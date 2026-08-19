@@ -35,20 +35,22 @@ pub async fn xack(ctx: &mut Ctx<'_>) {
     let Some((stream, prefix)) = entries::stream_of(ctx, 0) else {
         return;
     };
-    let group = String::from_utf8_lossy(&ctx.args[1]).to_string();
-    let stream_str = String::from_utf8_lossy(&stream).to_string();
+    // Group names are raw bytes (no charset validation at this layer):
+    // pass them through undecoded so distinct byte names stay distinct
+    // cache keys (a lossy String key would merge them into U+FFFD).
+    let group = &ctx.args[1];
     let known = offset::load(
         &ctx.shared.lite.offsets,
         &ctx.shared.store,
         &prefix,
-        &stream_str,
-        &group,
+        &stream,
+        group,
     )
     .ok()
     .flatten()
     .is_some();
     let count = if known {
-        let n = offset::ack(&ctx.shared.lite.offsets, &stream_str, &group, &ids).unwrap_or(0);
+        let n = offset::ack(&ctx.shared.lite.offsets, &stream, group, &ids).unwrap_or(0);
         // The committed watermark is the restart resume point: persist it
         // synchronously so acks survive kill -9 between flush rounds (the
         // 200ms flusher then only covers the delivered watermark).
@@ -58,8 +60,8 @@ pub async fn xack(ctx: &mut Ctx<'_>) {
                 &ctx.shared.lite.offsets,
                 &ctx.shared.store,
                 &prefix,
-                &stream_str,
-                &group,
+                &stream,
+                group,
             )
             .ok()
             .flatten()

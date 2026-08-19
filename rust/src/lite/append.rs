@@ -105,11 +105,17 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     } else {
         model::current_expire(&ctx.shared.store, &prefix, &stream)
     };
-    // Every append retouches the idle deadline (idle = no writes).
+    // Every append retouches the idle deadline (idle = no writes). An
+    // explicit XADD id may carry a huge id.ms, so `now.max(id.ms) +
+    // idle_ms` can overflow u64 and wrap into a small/corrupted deadline
+    // that instantly reaps the family: reject the write instead.
     let new_expire = if next.idle_ms == 0 {
         0
     } else {
-        now.max(id.ms) + next.idle_ms
+        match now.max(id.ms).checked_add(next.idle_ms) {
+            Some(deadline) => deadline,
+            None => return resp::append_error(ctx.out, "ERR ID or idle deadline overflow"),
+        }
     };
 
     let mut batch = WriteBatch::default();
@@ -133,7 +139,7 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
             .stats
             .streams_live
             .fetch_add(1, Ordering::Relaxed);
-        offset::remove_stream(&ctx.shared.lite.offsets, &String::from_utf8_lossy(&stream));
+        offset::remove_stream(&ctx.shared.lite.offsets, &stream);
     }
     stat_bump(&ctx.shared.lite.stats.messages, 1);
     monitor::observe_lite_message(&ctx.shared.monitor, "add", 1);
@@ -361,6 +367,12 @@ pub async fn xidle(ctx: &mut Ctx<'_>) {
     else {
         return resp::append_error(ctx.out, "ERR invalid idle seconds");
     };
+    // `secs * 1000` can overflow u64 and wrap toward 0: the stream would
+    // get an instant/wrong expiry and the active-expiration loop would
+    // reap the whole family. Reject instead of writing a wrapped TTL.
+    let Some(idle_ms) = secs.checked_mul(1000) else {
+        return resp::append_error(ctx.out, "ERR invalid idle seconds");
+    };
     let _guard = latch::lock(&ctx.shared.latch, &mkey).await;
     let read = model::read_meta(&ctx.shared.store, &prefix, &stream);
     let Some(meta) = read.ok().and_then(|r| r.live()) else {
@@ -368,11 +380,17 @@ pub async fn xidle(ctx: &mut Ctx<'_>) {
     };
     let old_expire = model::current_expire(&ctx.shared.store, &prefix, &stream);
     let mut next = meta.clone();
-    next.idle_ms = secs * 1000;
-    let new_expire = if next.idle_ms == 0 {
+    next.idle_ms = idle_ms;
+    let new_expire = if idle_ms == 0 {
         0
     } else {
-        expire::now_ms() + next.idle_ms
+        // now + idle_ms can still overflow near the u64 ceiling even when
+        // idle_ms itself is in range: reject rather than arm a wrapped
+        // (past) deadline.
+        match expire::now_ms().checked_add(idle_ms) {
+            Some(deadline) => deadline,
+            None => return resp::append_error(ctx.out, "ERR invalid idle seconds"),
+        }
     };
     let mut batch = WriteBatch::default();
     batch.put(&mkey, model::encode_meta_at(&next, new_expire));
