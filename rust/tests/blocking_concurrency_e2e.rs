@@ -7,7 +7,7 @@
 //! waiter each and everything completes well inside a bounded window.
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rdb::{command, conf, hash, monitor, state, store, topology};
 
@@ -438,4 +438,56 @@ async fn concurrent_reversed_smove_never_deadlocks() {
             .unwrap();
     }
     assert_eq!(cards, 2, "members m and n both survive");
+}
+
+/// Park-pool isolation: 600 forever-blocked BLPOPs must not stall
+/// writes. Before the dedicated park pool, every park consumed a
+/// tokio `spawn_blocking` slot; 512 forever-parks filled the whole
+/// shared pool, the RocksDB fsync task never got a thread, and every
+/// write hung. Now parks live on their own pool, so while they hold
+/// >WORKERS slots the SET's fsync still completes well under 1s. The
+/// pops are then woken (one LPUSH per key) so the test ends promptly.
+#[tokio::test]
+async fn park_pool_saturation_does_not_stall_writes() {
+    let shared = Arc::new(shared_for("44118"));
+    const PARKS: usize = 600;
+    // One BLPOP per distinct key (same-slot would serialize nothing
+    // here, but distinct keys also prove the pool fans out).
+    let mut waiters = Vec::new();
+    for i in 0..PARKS {
+        let s = Arc::clone(&shared);
+        waiters.push(tokio::spawn(async move {
+            call(&s, "blpop", &[&format!("ppk{i}"), "0"]).await
+        }));
+    }
+    // Let every pop reach its park: 600 > 512 pool workers saturates it
+    // and leaves 88 jobs queued -- exactly the old starvation setup.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The write must land quickly even with the park pool full.
+    let t0 = Instant::now();
+    assert_eq!(
+        call(&shared, "set", &["{pp}w", "v"]).await,
+        b"+OK\r\n".to_vec()
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "SET stalled behind parks: {:?}",
+        t0.elapsed()
+    );
+
+    // Wake every parked pop so the test finishes promptly.
+    for i in 0..PARKS {
+        assert_eq!(
+            call(&shared, "lpush", &[&format!("ppk{i}"), "e"]).await,
+            b":1\r\n".to_vec()
+        );
+    }
+    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        for w in waiters {
+            w.await.expect("parked pop task");
+        }
+    })
+    .await;
+    assert!(drained.is_ok(), "all parked pops must wake after LPUSH");
 }
