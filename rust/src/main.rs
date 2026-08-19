@@ -54,6 +54,20 @@ fn open_store(store_path: &str, bind: &str) -> Result<store::Store, String> {
     store::open(path_str)
 }
 
+/// D6b: an empty `raft_token` must never reach the listener stage: the
+/// control plane's token check passes when BOTH sides are empty, so a
+/// tokenless config silently starts an unauthenticated cluster. Pure
+/// check: `None` = token present.
+fn empty_raft_token_error(conf: &conf::Config, config_path: &str) -> Option<String> {
+    if conf.raft_token.is_empty() {
+        Some(format!(
+            "raft_token is empty in {config_path}: an empty token disables control-plane auth; set a raft_token"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Go `opts.DataDir = StorePath + "/" + Bind + "/raft"`.
 fn raft_data_dir(conf: &conf::Config) -> String {
     format!("{}/{}/raft", conf.store_path, conf.bind)
@@ -162,6 +176,14 @@ fn main() {
         }
     }
     let runtime = builder.build().expect("build tokio runtime");
+    // D8: one-line startup status of the LIFO-slot hazard (see COMPAT.md
+    // "tokio LIFO slot freeze").
+    #[cfg(tokio_unstable)]
+    eprintln!("tokio LIFO slot: disabled (tokio_unstable cfg set)");
+    #[cfg(not(tokio_unstable))]
+    eprintln!(
+        "tokio LIFO slot: ENABLED (DANGER: rebuild with RUSTFLAGS=\"--cfg tokio_unstable\" -- see COMPAT.md)"
+    );
     runtime.block_on(do_main());
 }
 
@@ -193,6 +215,12 @@ async fn do_main() {
             std::process::exit(1);
         }
     };
+    // D6b: refuse to run without control-plane auth, before ANY listener
+    // (monitor included) is bound.
+    if let Some(e) = empty_raft_token_error(&conf, &config_path) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 
     println!("Start..");
     println!("Bind: {}", conf.bind);
@@ -209,13 +237,7 @@ async fn do_main() {
     });
 
     // --- rcache assembly (Go server.newRCache) ---
-    // Join decision must precede raft construction (which creates the data dir).
     let data_dir = raft_data_dir(&conf);
-    let join_addr = if std::path::Path::new(&data_dir).exists() {
-        String::new()
-    } else {
-        conf::raft_join_addr()
-    };
 
     let node = match rcache::new_raft_node(&data_dir, &conf.raft_tcp_address).await {
         Ok(n) => n,
@@ -225,6 +247,24 @@ async fn do_main() {
         }
     };
     let raft = node.raft.clone();
+
+    // D7b: join only when the node has NO persisted raft state. Go (and
+    // the old port) tested data-dir existence, but new_raft_node creates
+    // the dir (and its RocksDB CURRENT marker) BEFORE the join RPC: a
+    // first join that failed left a created-but-empty dir, and the retry
+    // then silently skipped joining. openraft's is_initialized() is the
+    // real signal -- initialize() and a successful join both persist a
+    // membership log entry (or a vote) to the log store, which a failed
+    // join never leaves behind. A read error falls back to "not
+    // initialized" so the join is retried rather than skipped.
+    let join_addr = match raft.is_initialized().await {
+        Ok(true) => String::new(),
+        Ok(false) => conf::raft_join_addr(),
+        Err(e) => {
+            eprintln!("check raft initialization failed:{e}");
+            conf::raft_join_addr()
+        }
+    };
 
     // Diagnostic heartbeat (silent task-death canary), opt-in: RDB_BEACON=1.
     if beacon::enabled() {
@@ -269,7 +309,11 @@ async fn do_main() {
     }
 
     // Shared control-plane state: apply loop + live FSM reads + sync tasks.
-    let (apply_tx, apply_rx) = tokio::sync::mpsc::unbounded_channel::<state::ApplyReq>();
+    // D5: BOUNDED queue (capacity 1024): a stalled raft can no longer
+    // buffer unbounded applies; overflow answers fast with
+    // `internal error err: apply queue full` (see raft_apply_start).
+    let (apply_tx, apply_rx) =
+        tokio::sync::mpsc::channel::<state::ApplyReq>(state::APPLY_CHANNEL_CAPACITY);
     state::spawn_apply_loop(raft.clone(), apply_rx);
 
     let raft_state = Arc::new(RwLock::new(state::RaftState {
@@ -415,6 +459,24 @@ mod tests {
         assert!(err.contains("no such file"), "got: {err}");
         // A directory is not a readable config file either.
         assert!(config_missing_error(dir.path().to_str().unwrap()).is_some());
+    }
+
+    /// D6b: a config without raft_token never reaches the listener stage.
+    #[test]
+    fn empty_raft_token_is_reported() {
+        let tokenless = conf::Config {
+            bind: "127.0.0.1:32681".to_string(),
+            ..Default::default()
+        };
+        let err = empty_raft_token_error(&tokenless, "conf.yaml").expect("err");
+        assert!(err.contains("raft_token is empty"), "got: {err}");
+        assert!(err.contains("conf.yaml"), "names the config: {err}");
+        // Any non-empty token passes.
+        let with_token = conf::Config {
+            raft_token: "some-token".to_string(),
+            ..tokenless
+        };
+        assert_eq!(empty_raft_token_error(&with_token, "conf.yaml"), None);
     }
 
     #[test]

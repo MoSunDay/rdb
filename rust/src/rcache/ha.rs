@@ -13,6 +13,9 @@
 //!   direction (the probe covers both directions).
 //! - Go's self-recovery indexes the backup map with no length check and
 //!   panics on malformed data; a `len == 2` guard plus log replaces it.
+//! - Go's backup-map init loop `Fatalf`s the whole process when an apply
+//!   fails; D7a breaks the tick's entry loop instead and retries the
+//!   whole (idempotent, blind-overwrite) list on the next 1s tick.
 //! - Go's leader-notify goroutine only toggles the unread HTTP
 //!   `ENABLE_WRITE` flag: intentionally skipped.
 //! - Go's `strings.Replace`/`strings.Contains` on the instances list are
@@ -391,7 +394,13 @@ pub fn spawn_leader_probe(
 }
 
 /// Go backup_target_map init: every 1s, while the sentinel is missing the
-/// leader seeds `backup_target_map_<k>` + sentinel (apply error: exit(1)).
+/// leader seeds `backup_target_map_<k>` + sentinel. Deviation (D7a): Go
+/// `Fatalf`-kills the process on an apply error; here a failure only
+/// breaks this tick's entry loop and the next 1s tick retries from
+/// scratch — safe because the FSM apply of these keys is a blind
+/// key/value overwrite (fsm.rs: `kv.insert(key, value)`), so re-applying
+/// entries that already landed is idempotent, and the sentinel is applied
+/// LAST so a partial pass never marks init done.
 pub fn spawn_backup_map_init(raft: Arc<RdbRaft>, kv: KvMap, conf: &conf::Config) {
     // Nothing to seed: Go would loop forever without applying anything.
     if conf.backup_target_map.is_empty() {
@@ -415,8 +424,13 @@ pub fn spawn_backup_map_init(raft: Arc<RdbRaft>, kv: KvMap, conf: &conf::Config)
             }
             for entry in &entries {
                 if let Err(e) = raft_apply(&raft, &entry.key, &entry.value).await {
-                    eprintln!("raft.Apply backup_target_map failed:{e}");
-                    std::process::exit(1);
+                    // D7a: transient apply failures (lost leadership, 5s
+                    // timeout) must not kill the process: retry the whole
+                    // list on the next tick. Partially applied entries are
+                    // blindly overwritten again (idempotent), and the
+                    // sentinel stays unwritten until the LAST entry lands.
+                    eprintln!("raft.Apply backup_target_map failed:{e} (retry next tick)");
+                    break;
                 }
             }
         }
@@ -544,6 +558,34 @@ mod tests {
         assert_eq!(entries[0].value, "127.0.0.1:32681,127.0.0.1:32684");
         assert_eq!(entries[1].key, BACKUP_INIT_KEY);
         assert_eq!(entries[1].value, "done");
+    }
+
+    /// D7a: a failed seed retries the WHOLE entry list on the next 1s
+    /// tick. That is safe only because the retry is a no-op for entries
+    /// that already landed: entries derive solely from the static config
+    /// (identical every tick) and the FSM apply is a blind key/value
+    /// overwrite, so partial progress never corrupts a later pass. The
+    /// sentinel stays LAST: a partial pass never reads as "init done".
+    #[test]
+    fn backup_map_seed_retry_is_idempotent() {
+        let inner = BTreeMap::from([
+            ("src".to_string(), "a".to_string()),
+            ("target".to_string(), "b".to_string()),
+        ]);
+        let map = BTreeMap::from([
+            ("p1".to_string(), inner.clone()),
+            ("p2".to_string(), inner),
+        ]);
+        let first = backup_map_entries(&map);
+        let retry = backup_map_entries(&map);
+        // Same list, same order, sentinel last -- on every tick.
+        assert_eq!(first, retry);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0], (rtypes::RaftLogEntryData {
+            key: "backup_target_map_p1".to_string(),
+            value: "a,b".to_string(),
+        }));
+        assert_eq!(first.last().map(|e| e.key.as_str()), Some(BACKUP_INIT_KEY));
     }
 
     /// The convergence loop's round mapping: a lock-free writer that lands
