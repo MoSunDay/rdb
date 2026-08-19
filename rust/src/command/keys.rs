@@ -77,11 +77,15 @@ pub async fn del(ctx: &mut Ctx<'_>) {
     let now = ds::expire::now_ms();
     let mut n = 0i64;
     for key in &ctx.args {
-        if keys_core::delete_records(ctx.shared, &ctx.prefix_key, key, now)
-            .await
-            .unwrap_or(false)
-        {
-            n += 1;
+        match keys_core::delete_records(ctx.shared, &ctx.prefix_key, key, now).await {
+            Ok(true) => n += 1,
+            Ok(false) => {}
+            // DEL is not transactional: keys already removed stay removed,
+            // but the count is NOT reported after a storage error.
+            Err(_) => {
+                append_error(ctx.out, "ERR: del failed");
+                return;
+            }
         }
     }
     append_int(ctx.out, n);
@@ -243,14 +247,22 @@ pub async fn scan(ctx: &mut Ctx<'_>) {
             }
         }
     };
-    let page = keys_scan::collect_user_keys(
+    let page = match keys_scan::collect_user_keys(
         &ctx.shared.store,
         &ctx.prefix_key,
         &from,
         pattern.as_deref(),
         type_filter.as_deref(),
         count,
-    );
+    ) {
+        Ok(page) => page,
+        // Storage failure: reply -ERR, never a "0" cursor (which would
+        // silently truncate a client's iteration as "finished").
+        Err(_) => {
+            append_error(ctx.out, "ERR: scan failed");
+            return;
+        }
+    };
     let cursor = if page.next.is_empty() {
         "0".to_string()
     } else {
@@ -270,7 +282,15 @@ pub async fn keys_cmd(ctx: &mut Ctx<'_>) {
         arity(ctx.out, "keys");
         return;
     }
-    let all = keys_scan::all_user_keys(&ctx.shared.store, &ctx.prefix_key, Some(&ctx.args[0]));
+    let all = match keys_scan::all_user_keys(&ctx.shared.store, &ctx.prefix_key, Some(&ctx.args[0]))
+    {
+        Ok(all) => all,
+        // Never reply a partial key list as if it were complete.
+        Err(_) => {
+            append_error(ctx.out, "ERR: keys failed");
+            return;
+        }
+    };
     append_array(ctx.out, all.len());
     for key in &all {
         append_bulk(ctx.out, key);
@@ -284,8 +304,10 @@ pub async fn randomkey(ctx: &mut Ctx<'_>) {
         return;
     }
     match keys_scan::random_user_key(&ctx.shared.store) {
-        Some(key) => append_bulk(ctx.out, &key),
-        None => append_null(ctx.out),
+        Ok(Some(key)) => append_bulk(ctx.out, &key),
+        Ok(None) => append_null(ctx.out),
+        // A miss must mean "database empty", never "read failed".
+        Err(_) => append_error(ctx.out, "ERR: randomkey failed"),
     }
 }
 

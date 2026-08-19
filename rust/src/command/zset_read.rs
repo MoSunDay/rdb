@@ -56,7 +56,8 @@ pub async fn zscore(ctx: &mut Ctx<'_>) {
                 &ctx.args[1],
             ) {
                 Ok(Some(score)) => append_score(ctx.out, score),
-                _ => append_null(ctx.out),
+                Ok(None) => append_null(ctx.out),
+                Err(_) => append_error(ctx.out, "ERR: zscore failed"),
             }
         }
     }
@@ -79,16 +80,32 @@ pub async fn zmscore(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    append_array(ctx.out, ctx.args.len() - 1);
+    // Resolve every member's record FIRST: a failed read must surface
+    // as one -ERR, never as a null buried inside an already-opened
+    // array reply.
+    let mut scores: Vec<Option<f64>> = Vec::with_capacity(ctx.args.len() - 1);
     for member in &ctx.args[1..] {
         let score = match state {
             ZSetState::ZSet { .. } => {
-                zset_ds::member_score(&ctx.shared.store, &ctx.prefix_key, &ctx.args[0], member)
-                    .ok()
-                    .flatten()
+                match zset_ds::member_score(
+                    &ctx.shared.store,
+                    &ctx.prefix_key,
+                    &ctx.args[0],
+                    member,
+                ) {
+                    Ok(score) => score,
+                    Err(_) => {
+                        append_error(ctx.out, "ERR: zmscore failed");
+                        return;
+                    }
+                }
             }
             _ => None,
         };
+        scores.push(score);
+    }
+    append_array(ctx.out, scores.len());
+    for score in scores {
         match score {
             Some(score) => append_score(ctx.out, score),
             None => append_null(ctx.out),
@@ -125,7 +142,7 @@ pub async fn zcount(ctx: &mut Ctx<'_>) {
             let key = ctx.args[0].clone();
             let from = seek_from_sortable(min, min_incl).to_be_bytes();
             let mut n = 0u64;
-            let _ = zset_ds::for_each_scored(
+            if zset_ds::for_each_scored(
                 &ctx.shared.store,
                 &ctx.prefix_key,
                 &key,
@@ -141,7 +158,12 @@ pub async fn zcount(ctx: &mut Ctx<'_>) {
                     n += 1;
                     true
                 },
-            );
+            )
+            .is_err()
+            {
+                append_error(ctx.out, "ERR: zcount failed");
+                return;
+            }
             append_int(ctx.out, n as i64);
         }
     }
@@ -165,12 +187,21 @@ async fn rank(ctx: &mut Ctx<'_>, rev: bool, cmd: &str) {
     let (key, member) = (ctx.args[0].clone(), ctx.args[1].clone());
     let (count, score) =
         match zset_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
-            ZSetState::ZSet { count, .. } => (
-                count,
-                zset_ds::member_score(&ctx.shared.store, &ctx.prefix_key, &key, &member)
-                    .ok()
-                    .flatten(),
-            ),
+            ZSetState::ZSet { count, .. } => {
+                let score = match zset_ds::member_score(
+                    &ctx.shared.store,
+                    &ctx.prefix_key,
+                    &key,
+                    &member,
+                ) {
+                    Ok(score) => score,
+                    Err(_) => {
+                        append_error(ctx.out, &format!("ERR: {cmd} failed"));
+                        return;
+                    }
+                };
+                (count, score)
+            }
             ZSetState::Missing => (0, None),
             ZSetState::WrongType => {
                 append_error(ctx.out, WRONGTYPE);
@@ -187,8 +218,14 @@ async fn rank(ctx: &mut Ctx<'_>, rev: bool, cmd: &str) {
     };
     let mut suffix = zset_ds::score_sortable(score).to_be_bytes().to_vec();
     suffix.extend_from_slice(&member);
-    let rank =
-        zset_ds::count_before(&ctx.shared.store, &ctx.prefix_key, &key, &suffix).unwrap_or(0);
+    // A failed rank scan must reply -ERR, never a silently wrong 0.
+    let rank = match zset_ds::count_before(&ctx.shared.store, &ctx.prefix_key, &key, &suffix) {
+        Ok(rank) => rank,
+        Err(_) => {
+            append_error(ctx.out, &format!("ERR: {cmd} failed"));
+            return;
+        }
+    };
     let reply = if rev { count - 1 - rank } else { rank };
     if withscore {
         append_array(ctx.out, 2);
@@ -243,7 +280,13 @@ pub async fn zrandmember(ctx: &mut Ctx<'_>) {
         return;
     }
     let items = match state {
-        ZSetState::ZSet { .. } => collect_scored(&ctx.shared.store, &ctx.prefix_key, &key),
+        ZSetState::ZSet { .. } => match collect_scored(&ctx.shared.store, &ctx.prefix_key, &key) {
+            Ok(items) => items,
+            Err(_) => {
+                append_error(ctx.out, "ERR: zrandmember failed");
+                return;
+            }
+        },
         _ => Vec::new(),
     };
     let n = items.len();

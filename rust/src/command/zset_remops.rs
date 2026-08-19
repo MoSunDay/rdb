@@ -71,10 +71,11 @@ pub async fn zremrangebyrank(ctx: &mut Ctx<'_>) {
         append_int(ctx.out, 0); // clamped to an empty window
         return;
     };
-    // Ascending scan with a rank counter; stops once past `hi`.
+    // Ascending scan with a rank counter; stops once past `hi`. A
+    // failed scan aborts BEFORE any batch is built.
     let mut window: Vec<(Vec<u8>, f64)> = Vec::new();
     let mut rank = 0u64;
-    let _ = zset_ds::for_each_scored(
+    if zset_ds::for_each_scored(
         &ctx.shared.store,
         &ctx.prefix_key,
         &key,
@@ -90,7 +91,12 @@ pub async fn zremrangebyrank(ctx: &mut Ctx<'_>) {
             rank += 1;
             true
         },
-    );
+    )
+    .is_err()
+    {
+        append_error(ctx.out, "ERR: zremrangebyrank failed");
+        return;
+    }
     remove_window(ctx, &key, expire_ms, base, "zremrangebyrank", window).await;
 }
 
@@ -125,9 +131,10 @@ pub async fn zremrangebyscore(ctx: &mut Ctx<'_>) {
     // Seek to the min bound's sortable prefix, filter to the window.
     // An INCLUSIVE zero min must seek at sortable(-0.0): -0.0 members
     // sort below sortable(+0.0) and would silently dodge the removal.
+    // A failed scan aborts BEFORE any batch is built.
     let from = seek_from_sortable(min, min_incl).to_be_bytes();
     let mut window: Vec<(Vec<u8>, f64)> = Vec::new();
-    let _ = zset_ds::for_each_scored(
+    if zset_ds::for_each_scored(
         &ctx.shared.store,
         &ctx.prefix_key,
         &key,
@@ -143,7 +150,12 @@ pub async fn zremrangebyscore(ctx: &mut Ctx<'_>) {
             window.push((member.to_vec(), score));
             true
         },
-    );
+    )
+    .is_err()
+    {
+        append_error(ctx.out, "ERR: zremrangebyscore failed");
+        return;
+    }
     remove_window(ctx, &key, expire_ms, base, "zremrangebyscore", window).await;
 }
 
@@ -173,10 +185,18 @@ pub async fn zremrangebylex(ctx: &mut Ctx<'_>) {
         append_int(ctx.out, 0);
         return;
     }
-    let window: Vec<(Vec<u8>, f64)> = collect_scored(&ctx.shared.store, &ctx.prefix_key, &key)
-        .into_iter()
-        .filter(|(member, _)| lex_within(member, &min, &max))
-        .collect();
+    // A failed scan aborts BEFORE any batch is built.
+    let window: Vec<(Vec<u8>, f64)> = match collect_scored(&ctx.shared.store, &ctx.prefix_key, &key)
+    {
+        Ok(items) => items
+            .into_iter()
+            .filter(|(member, _)| lex_within(member, &min, &max))
+            .collect(),
+        Err(_) => {
+            append_error(ctx.out, "ERR: zremrangebylex failed");
+            return;
+        }
+    };
     remove_window(ctx, &key, expire_ms, base, "zremrangebylex", window).await;
 }
 

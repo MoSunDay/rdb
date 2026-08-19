@@ -37,18 +37,20 @@ pub fn parse_strategy(s: &[u8]) -> Option<Strategy> {
 }
 
 /// Bounded, ordered discovery of `parent`'s queues (child stream names).
+/// `Err` propagates the iteration failure so callers never act on a
+/// truncated child list.
 pub fn discover_children(
     store: &Store,
     prefix: &[u8],
     parent: &[u8],
     limit: usize,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>, String> {
     let mut pat = parent.to_vec();
     pat.push(b'/');
     let start = codec::data_key(prefix, KIND_STREAM_META, parent);
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut examined = 0usize;
-    let _ = ops::for_each_from(store, &start, false, &mut |k, _| {
+    ops::for_each_from(store, &start, false, &mut |k, _| {
         examined += 1;
         // Left the kind-0x0C window of this slot: nothing more can match.
         if k.get(prefix.len()) != Some(&KIND_STREAM_META) {
@@ -67,8 +69,8 @@ pub fn discover_children(
             }
         }
         examined < SCAN_LIMIT
-    });
-    out
+    })?;
+    Ok(out)
 }
 
 /// Per-parent round robin; `counters` lives in the Lite Runtime.

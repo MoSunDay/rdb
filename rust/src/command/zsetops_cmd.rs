@@ -125,12 +125,22 @@ fn parse_store_opts(out: &mut Vec<u8>, args: &[Vec<u8>], cmd: &str) -> Option<St
 }
 
 /// Read one source into a member -> score map; `Err(())` already
-/// replied (wrong type). Missing keys read as empty zsets.
-fn source_map(ctx: &mut Ctx<'_>, key: &[u8], now: u64) -> Result<HashMap<Vec<u8>, f64>, ()> {
+/// replied (wrong type, or a failed scan). Missing keys read as empty
+/// zsets.
+fn source_map(
+    ctx: &mut Ctx<'_>,
+    key: &[u8],
+    now: u64,
+    cmd: &str,
+) -> Result<HashMap<Vec<u8>, f64>, ()> {
     match zset_state(&ctx.shared.store, &ctx.prefix_key, key, now) {
-        ZSetState::ZSet { .. } => Ok(collect_scored(&ctx.shared.store, &ctx.prefix_key, key)
-            .into_iter()
-            .collect()),
+        ZSetState::ZSet { .. } => match collect_scored(&ctx.shared.store, &ctx.prefix_key, key) {
+            Ok(items) => Ok(items.into_iter().collect()),
+            Err(_) => {
+                append_error(ctx.out, &format!("ERR: {cmd} failed"));
+                Err(())
+            }
+        },
         ZSetState::Missing => Ok(HashMap::new()),
         ZSetState::WrongType => {
             append_error(ctx.out, WRONGTYPE);
@@ -232,7 +242,7 @@ async fn store_variant(ctx: &mut Ctx<'_>, cmd: &str, op: Op) {
     let now = expire::now_ms();
     let mut maps: Vec<HashMap<Vec<u8>, f64>> = Vec::with_capacity(opts.keys.len());
     for key in &opts.keys {
-        match source_map(ctx, key, now) {
+        match source_map(ctx, key, now, cmd) {
             Ok(m) => maps.push(m),
             Err(()) => return,
         }

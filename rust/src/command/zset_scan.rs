@@ -29,7 +29,8 @@ struct ZScanPage {
 /// Scan `key`'s member window from `from_member` (None = start),
 /// keeping MATCH-passing members until `count` are in hand (0 =
 /// unbounded). The member window's bounds mirror `set_ds`'s
-/// `members_range` over the zset member kind.
+/// `members_range` over the zset member kind. Returns Err on storage
+/// failure -- the caller must reply -ERR, never a "0" (finished) cursor.
 fn collect_page(
     store: &Store,
     prefix: &[u8],
@@ -37,7 +38,7 @@ fn collect_page(
     from_member: Option<&[u8]>,
     pattern: Option<&[u8]>,
     count: usize,
-) -> ZScanPage {
+) -> Result<ZScanPage, String> {
     let lower = zset_ds::member_key(prefix, key, b"");
     let upper = key_upper_bound(&lower).unwrap_or_default();
     let (start, excl_start) = match from_member {
@@ -47,7 +48,7 @@ fn collect_page(
     let base = lower.len();
     let mut items: Vec<(Vec<u8>, f64)> = Vec::new();
     let mut next: Option<Vec<u8>> = None;
-    let _ = ops::for_each_from(store, &start, excl_start, &mut |k, v| {
+    ops::for_each_from(store, &start, excl_start, &mut |k, v| {
         if k >= upper.as_slice() {
             return false; // left this zset's member window
         }
@@ -68,8 +69,8 @@ fn collect_page(
             }
         }
         true
-    });
-    ZScanPage { items, next }
+    })?;
+    Ok(ZScanPage { items, next })
 }
 
 /// `ZSCAN key cursor [MATCH pattern] [COUNT n] [WITHSCORES]` ->
@@ -136,14 +137,22 @@ pub async fn zscan(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = collect_page(
+    let page = match collect_page(
         &ctx.shared.store,
         &ctx.prefix_key,
         &ctx.args[0],
         from.as_deref(),
         pattern.as_deref(),
         count,
-    );
+    ) {
+        Ok(page) => page,
+        // Storage failure: reply -ERR, never cursor "0" (which would
+        // silently end a client's iteration as "finished").
+        Err(_) => {
+            append_error(ctx.out, "ERR: zscan failed");
+            return;
+        }
+    };
     let cursor = match &page.next {
         None => "0".to_string(),
         Some(member) => hex::encode(member),

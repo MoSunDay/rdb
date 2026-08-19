@@ -169,14 +169,19 @@ pub(crate) async fn commit_zset(
 }
 
 /// Collect every member with its score in ascending order (the whole
-/// score window); the base for rank/lex/random reads.
-pub(crate) fn collect_scored(store: &Store, prefix: &[u8], key: &[u8]) -> Vec<(Vec<u8>, f64)> {
+/// score window); the base for rank/lex/random reads. `Err` = the scan
+/// failed -- a truncated collect must never pose as the full index.
+pub(crate) fn collect_scored(
+    store: &Store,
+    prefix: &[u8],
+    key: &[u8],
+) -> Result<Vec<(Vec<u8>, f64)>, String> {
     let mut items = Vec::new();
-    let _ = zset_ds::for_each_scored(store, prefix, key, b"", false, &mut |member, score| {
+    zset_ds::for_each_scored(store, prefix, key, b"", false, &mut |member, score| {
         items.push((member.to_vec(), score));
         true
-    });
-    items
+    })?;
+    Ok(items)
 }
 
 /// One ZRANGEBYLEX endpoint: `-`/`+` are the infinite ends, `[x` and

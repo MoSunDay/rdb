@@ -203,3 +203,24 @@ fn zrangebylex_family_rejects_withscores() {
         b"*6\r\n$1\r\na\r\n$1\r\n0\r\n$1\r\nb\r\n$1\r\n0\r\n$1\r\nc\r\n$1\r\n0\r\n".to_vec()
     );
 }
+
+/// ZMSCORE resolves every member record BEFORE opening the array reply
+/// (a failed read must one day surface as a single -ERR, never as a
+/// null buried mid-array). This locks the two-pass emit's success-path
+/// bytes: the header counts ARGUMENTS (duplicates included) and each
+/// slot stays a score or a null in argument order.
+#[test]
+fn zmscore_duplicate_and_absent_members_keep_reply_shape() {
+    let (_g, s) = shared_for("127.0.0.1:40528");
+    call(&s, "zadd", &[b"k", b"1", b"a", b"2.5", b"b"]);
+    assert_eq!(
+        call(&s, "zmscore", &[b"k", b"a", b"zz", b"a", b"b", b"a"]),
+        b"*5\r\n$1\r\n1\r\n$-1\r\n$1\r\n1\r\n$3\r\n2.5\r\n$1\r\n1\r\n".to_vec()
+    );
+    // A zset drained by ZREM keeps the per-slot nulls.
+    call(&s, "zrem", &[b"k", b"a"]);
+    assert_eq!(
+        call(&s, "zmscore", &[b"k", b"a", b"b"]),
+        b"*2\r\n$-1\r\n$3\r\n2.5\r\n".to_vec()
+    );
+}

@@ -53,8 +53,10 @@ fn write_meta_of(ctx: &mut Ctx<'_>, key: &[u8]) -> Option<(u64, u64)> {
     }
 }
 
-fn has_member(ctx: &Ctx<'_>, key: &[u8], member: &[u8]) -> bool {
-    set_ds::has_member(&ctx.shared.store, &ctx.prefix_key, key, member).unwrap_or(false)
+/// Member presence; `Err` propagates the storage read failure so write
+/// paths can abort instead of mistaking it for "member absent".
+fn has_member(ctx: &Ctx<'_>, key: &[u8], member: &[u8]) -> Result<bool, String> {
+    set_ds::has_member(&ctx.shared.store, &ctx.prefix_key, key, member)
 }
 
 /// Commit one set mutation: member puts/deletes plus the meta record (or a
@@ -103,7 +105,14 @@ pub async fn sadd(ctx: &mut Ctx<'_>) {
     };
     let mut fresh: Vec<Vec<u8>> = Vec::new();
     for m in &ctx.args[1..] {
-        if !fresh.contains(m) && !has_member(ctx, &key, m) {
+        let present = match has_member(ctx, &key, m) {
+            Ok(p) => p,
+            Err(_) => {
+                append_error(ctx.out, "ERR: sadd failed");
+                return;
+            }
+        };
+        if !fresh.contains(m) && !present {
             fresh.push(m.clone());
         }
     }
@@ -138,7 +147,14 @@ pub async fn srem(ctx: &mut Ctx<'_>) {
     }
     let mut gone: Vec<Vec<u8>> = Vec::new();
     for m in &ctx.args[1..] {
-        if !gone.contains(m) && has_member(ctx, &key, m) {
+        let present = match has_member(ctx, &key, m) {
+            Ok(p) => p,
+            Err(_) => {
+                append_error(ctx.out, "ERR: srem failed");
+                return;
+            }
+        };
+        if !gone.contains(m) && present {
             gone.push(m.clone());
         }
     }
@@ -193,7 +209,13 @@ pub async fn sismember(ctx: &mut Ctx<'_>) {
             return;
         }
         SetState::Missing => false,
-        SetState::Set { .. } => has_member(ctx, &ctx.args[0], &ctx.args[1]),
+        SetState::Set { .. } => match has_member(ctx, &ctx.args[0], &ctx.args[1]) {
+            Ok(p) => p,
+            Err(_) => {
+                append_error(ctx.out, "ERR: sismember failed");
+                return;
+            }
+        },
     };
     append_int(ctx.out, i64::from(answer));
 }
@@ -208,9 +230,21 @@ pub async fn smismember(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    append_array(ctx.out, ctx.args.len() - 1);
+    // Resolve every flag BEFORE the first append: an error mid-loop must
+    // not leave a half-written array in front of the error reply.
+    let mut flags: Vec<bool> = Vec::with_capacity(ctx.args.len() - 1);
     for m in &ctx.args[1..] {
-        append_int(ctx.out, i64::from(has_member(ctx, &ctx.args[0], m)));
+        match has_member(ctx, &ctx.args[0], m) {
+            Ok(p) => flags.push(p),
+            Err(_) => {
+                append_error(ctx.out, "ERR: smismember failed");
+                return;
+            }
+        }
+    }
+    append_array(ctx.out, flags.len());
+    for p in &flags {
+        append_int(ctx.out, i64::from(*p));
     }
 }
 
@@ -330,7 +364,14 @@ pub async fn smove(ctx: &mut Ctx<'_>) {
             append_error(ctx.out, WRONGTYPE);
             return;
         }
-        append_int(ctx.out, i64::from(has_member(ctx, &src, &member)));
+        let answer = match has_member(ctx, &src, &member) {
+            Ok(p) => p,
+            Err(_) => {
+                append_error(ctx.out, "ERR: smove failed");
+                return;
+            }
+        };
+        append_int(ctx.out, i64::from(answer));
         return;
     }
     // Both latch keys, locked in SORTED byte order (ABBA rule; see
@@ -358,9 +399,16 @@ pub async fn smove(ctx: &mut Ctx<'_>) {
             return;
         }
     };
-    if !has_member(ctx, &src, &member) {
-        append_int(ctx.out, 0);
-        return;
+    match has_member(ctx, &src, &member) {
+        Ok(false) => {
+            append_int(ctx.out, 0);
+            return;
+        }
+        Ok(true) => {}
+        Err(_) => {
+            append_error(ctx.out, "ERR: smove failed");
+            return;
+        }
     }
     let (dst_expire, dst_base) = match write_meta_of(ctx, &dst) {
         Some(pair) => pair,
