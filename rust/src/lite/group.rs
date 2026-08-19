@@ -144,12 +144,11 @@ async fn create(ctx: &mut Ctx<'_>) {
             .streams_live
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let stream_s = String::from_utf8_lossy(&stream).into_owned();
-    let group_s = String::from_utf8_lossy(&group).into_owned();
+    // Raw-byte cache key: group names are not charset-validated here.
     offset::insert_new(
         &ctx.shared.lite.offsets,
-        &stream_s,
-        &group_s,
+        &stream,
+        &group,
         GroupState {
             created_ms: now,
             delivered: start,
@@ -184,11 +183,7 @@ async fn destroy(ctx: &mut Ctx<'_>) {
             return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
         }
     }
-    offset::remove_group(
-        &ctx.shared.lite.offsets,
-        &String::from_utf8_lossy(&stream),
-        &String::from_utf8_lossy(&group),
-    );
+    offset::remove_group(&ctx.shared.lite.offsets, &stream, &group);
     resp::append_int(ctx.out, i64::from(existed));
 }
 
@@ -237,11 +232,6 @@ async fn setid(ctx: &mut Ctx<'_>) {
     if let Err(e) = ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
         return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
     }
-    offset::set_position(
-        &ctx.shared.lite.offsets,
-        &String::from_utf8_lossy(&stream),
-        &String::from_utf8_lossy(&group),
-        id,
-    );
+    offset::set_position(&ctx.shared.lite.offsets, &stream, &group, id);
     resp::append_string(ctx.out, "OK");
 }
