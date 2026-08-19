@@ -20,7 +20,10 @@ scheduling, not to write load. Evidence:
   catches up.
 
 If you build the binary without `rust/.cargo/config.toml` in scope (e.g. building from outside
-the `rust/` directory), set `RUSTFLAGS='--cfg tokio_unstable'`. Without the cfg, the code falls
+the `rust/` directory), set `RUSTFLAGS='--cfg tokio_unstable'`. At startup the binary now
+logs one line stating whether the cfg took effect (`tokio LIFO slot: disabled ...`) or not
+(`tokio LIFO slot: ENABLED (DANGER: ...)`) — check it after any build-pipeline change that
+overrides RUSTFLAGS. Without the cfg, the code falls
 back to a multi_thread runtime WITH the LIFO slot (freezes return); the escape hatch
 `RDB_CURRENT_THREAD=1` switches to the current_thread runtime, which is freeze-free but
 single-threaded. `RDB_WORKER_THREADS=N` tunes the worker pool size (default: Go's NumCPU
@@ -189,6 +192,24 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   and a handler panic, after its unchanged `fatal error: <panic>` reply, now CLOSES the
   connection instead of leaving a possibly-desynced one open; the AUTH token is compared in
   constant time.
+- **Ops-plane hardening** (none of these existed in the Go archive):
+  - startup REFUSES an empty `raft_token` (`exit(1)` before binding) — an accidental no-auth
+    cluster is a deployment error, not a supported mode (all `config/` files carry a token);
+  - the `backup_target_map` seed loop RETRIES on raft apply failure (next 1s tick, idempotent
+    overwrite + sentinel applied last) instead of Go's `log.Fatal`;
+  - the join-on-startup decision uses openraft `is_initialized()` (persisted vote/log) — the
+    Go code's "store dir exists" check and the naive "RocksDB CURRENT exists" check both
+    false-positive after a FAILED first join (the dir/DB is created before the join RPC),
+    which made the retry skip joining forever;
+  - the raft apply channel is BOUNDED (1024); an overflowing control-plane write fails fast
+    with `ERR: apply queue full` instead of queueing without limit;
+  - SIGTERM/SIGINT trigger a graceful shutdown: log line, one bounded (5s) flush of the Lite
+    group-offset watermarks, then `exit(0)` (Go had no signal handling; `kill -9` semantics
+    for the data plane are unchanged — RocksDB WAL is the durability boundary);
+  - blocking commands (BLPOP/BZPOPMIN/XREAD BLOCK) park on a dedicated bounded thread pool
+    (`src/park.rs`), isolated from tokio's shared blocking pool where RocksDB fsyncs run —
+    internal change, listed because 512+ concurrent blocking waits no longer stall writes
+    (client-visible only as better tail latency).
 
 ## Runtime verification (this tree)
 
