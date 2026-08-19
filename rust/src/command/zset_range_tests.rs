@@ -270,3 +270,43 @@ fn zrange_option_errors() {
         b"-ERR syntax error\r\n".to_vec()
     );
 }
+
+/// Regression: exclusive score bounds around ±0.0. Sortable order places
+/// -0.0 strictly BEFORE +0.0 while IEEE equality collapses the two, so
+/// IEEE-based window tests skipped +0.0 members below an exclusive -0.0
+/// min (and admitted -0.0 past an exclusive +0.0 max).
+#[test]
+fn zrangebyscore_exclusive_bounds_and_signed_zero() {
+    let (_g, s) = shared_for("127.0.0.1:40536");
+    call(
+        &s,
+        "zadd",
+        &[
+            b"k", b"-1.5", b"neg", b"-0", b"mzero", b"0", b"pzero", b"1.5", b"pos",
+        ],
+    );
+    // Exclusive -0.0 min: the +0.0 member is ABOVE the bound, not equal.
+    assert_eq!(
+        bulks_of(&call(&s, "zrangebyscore", &[b"k", b"(-0.0", b"+inf"])),
+        vec![b"pzero".to_vec(), b"pos".to_vec()]
+    );
+    // Inclusive -0.0 min + exclusive +0.0 max: only the -0.0 member.
+    assert_eq!(
+        bulks_of(&call(&s, "zrangebyscore", &[b"k", b"-0.0", b"(0.0"])),
+        vec![b"mzero".to_vec()]
+    );
+    // Strictly-between-±0.0 window is empty: nothing removed, all stay.
+    assert_eq!(
+        call(&s, "zremrangebyscore", &[b"k", b"(-0.0", b"(+0.0"]),
+        b":0\r\n".to_vec()
+    );
+    assert_eq!(
+        bulks_of(&call(&s, "zrangebyscore", &[b"k", b"-inf", b"+inf"])),
+        vec![
+            b"neg".to_vec(),
+            b"mzero".to_vec(),
+            b"pzero".to_vec(),
+            b"pos".to_vec()
+        ]
+    );
+}

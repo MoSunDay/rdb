@@ -103,7 +103,15 @@ async fn sigterm_exits_zero_and_flushes_lite_offsets() {
         &cmd_full_reply(
             &a,
             t,
-            &[b"xreadgroup", b"group", b"g", b"c1", b"streams", b"orders/q0", b">"],
+            &[
+                b"xreadgroup",
+                b"group",
+                b"g",
+                b"c1",
+                b"streams",
+                b"orders/q0",
+                b">",
+            ],
             400,
         )
         .await,
@@ -126,7 +134,8 @@ async fn sigterm_exits_zero_and_flushes_lite_offsets() {
     let code = signal_and_wait_exit(&mut node, "TERM").await;
     assert_eq!(code, 0, "SIGTERM must exit 0\n{}", node.ctx());
     assert!(
-        node.stderr_tail().contains("received SIGTERM, shutting down gracefully"),
+        node.stderr_tail()
+            .contains("received SIGTERM, shutting down gracefully"),
         "graceful-shutdown log line missing\n{}",
         node.ctx()
     );
@@ -142,9 +151,7 @@ async fn sigterm_exits_zero_and_flushes_lite_offsets() {
         "xlen after restart\n{}",
         node.ctx()
     );
-    let range = text(
-        &cmd_full_reply(&a, t, &[b"xrange", b"orders/q0", b"-", b"+"], 400).await,
-    );
+    let range = text(&cmd_full_reply(&a, t, &[b"xrange", b"orders/q0", b"-", b"+"], 400).await);
     assert!(
         range.contains("1-1") && range.contains("1-2") && range.contains("1-3"),
         "xrange after restart lost entries: {range}\n{}",
@@ -156,7 +163,15 @@ async fn sigterm_exits_zero_and_flushes_lite_offsets() {
         &cmd_full_reply(
             &a,
             t,
-            &[b"xreadgroup", b"group", b"g", b"c2", b"streams", b"orders/q0", b">"],
+            &[
+                b"xreadgroup",
+                b"group",
+                b"g",
+                b"c2",
+                b"streams",
+                b"orders/q0",
+                b">",
+            ],
             400,
         )
         .await,
@@ -193,7 +208,8 @@ async fn sigint_also_exits_cleanly() {
     let code = signal_and_wait_exit(&mut node, "INT").await;
     assert_eq!(code, 0, "SIGINT must exit 0\n{}", node.ctx());
     assert!(
-        node.stderr_tail().contains("received SIGINT, shutting down gracefully"),
+        node.stderr_tail()
+            .contains("received SIGINT, shutting down gracefully"),
         "graceful-shutdown log line missing\n{}",
         node.ctx()
     );

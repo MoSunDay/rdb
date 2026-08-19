@@ -9,8 +9,8 @@
 use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
 use crate::command::list_cmd::clamp_range;
 use crate::command::zset_util::{
-    append_score, collect_scored, lex_within, parse_lex_bound, parse_score_bound,
-    seek_from_sortable, zset_state, LexBound, ZSetState,
+    append_score, collect_scored, lex_within, parse_lex_bound, parse_score_bound, score_below_min,
+    score_past_max, seek_from_sortable, zset_state, LexBound, ZSetState,
 };
 use crate::command::Ctx;
 use crate::ds::{expire, zset_ds};
@@ -104,10 +104,10 @@ fn collect_score_window(
         &from,
         !min_incl,
         &mut |member, score| {
-            if score == min && !min_incl {
+            if score_below_min(score, min, min_incl) {
                 return true; // inside the seek, below the window
             }
-            if score > max || (score == max && !max_incl) {
+            if score_past_max(score, max, max_incl) {
                 return false; // past the window: stop
             }
             items.push((member.to_vec(), score));

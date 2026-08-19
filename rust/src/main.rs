@@ -177,14 +177,14 @@ async fn shutdown_flush_lite_offsets(shared: &Arc<state::Shared>) {
 /// listener is read-only and holds no dirty offsets).
 fn spawn_signal_shutdown(shared: Arc<state::Shared>) {
     tokio::spawn(async move {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[shutdown] cannot watch SIGTERM: {e}");
-                return;
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[shutdown] cannot watch SIGTERM: {e}");
+                    return;
+                }
+            };
         let mut interrupt =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
                 Ok(s) => s,

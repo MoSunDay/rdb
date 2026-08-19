@@ -572,19 +572,19 @@ mod tests {
             ("src".to_string(), "a".to_string()),
             ("target".to_string(), "b".to_string()),
         ]);
-        let map = BTreeMap::from([
-            ("p1".to_string(), inner.clone()),
-            ("p2".to_string(), inner),
-        ]);
+        let map = BTreeMap::from([("p1".to_string(), inner.clone()), ("p2".to_string(), inner)]);
         let first = backup_map_entries(&map);
         let retry = backup_map_entries(&map);
         // Same list, same order, sentinel last -- on every tick.
         assert_eq!(first, retry);
         assert_eq!(first.len(), 3);
-        assert_eq!(first[0], (rtypes::RaftLogEntryData {
-            key: "backup_target_map_p1".to_string(),
-            value: "a,b".to_string(),
-        }));
+        assert_eq!(
+            first[0],
+            (rtypes::RaftLogEntryData {
+                key: "backup_target_map_p1".to_string(),
+                value: "a,b".to_string(),
+            })
+        );
         assert_eq!(first.last().map(|e| e.key.as_str()), Some(BACKUP_INIT_KEY));
     }
 

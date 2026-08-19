@@ -114,23 +114,33 @@ fn zadd_nx_xx_gt_lt_flags() {
         0
     );
     assert_eq!(int_of(&call(&s, "exists", &[b"absent"])), 0);
-    // GT only raises scores (missing members are skipped), CH counts updates.
+    // GT only raises existing scores (Redis: missing members are still
+    // ADDED), CH counts updates as well as additions.
     assert_eq!(
         int_of(&call(
             &s,
             "zadd",
             &[b"k", b"GT", b"CH", b"3", b"a", b"1", b"zz"]
         )),
-        1
+        2
     );
     assert_eq!(call(&s, "zscore", &[b"k", b"a"]), b"$1\r\n3\r\n".to_vec());
+    assert_eq!(call(&s, "zscore", &[b"k", b"zz"]), b"$1\r\n1\r\n".to_vec());
     assert_eq!(int_of(&call(&s, "zadd", &[b"k", b"gt", b"2", b"a"])), 0);
-    // LT only lowers scores.
+    // LT only lowers existing scores, but still adds missing members.
     assert_eq!(
         int_of(&call(&s, "zadd", &[b"k", b"LT", b"CH", b"1", b"a"])),
         1
     );
     assert_eq!(int_of(&call(&s, "zadd", &[b"k", b"lt", b"9", b"a"])), 0);
+    assert_eq!(
+        int_of(&call(&s, "zadd", &[b"k", b"LT", b"CH", b"0.5", b"yy"])),
+        1
+    );
+    assert_eq!(
+        call(&s, "zscore", &[b"k", b"yy"]),
+        b"$3\r\n0.5\r\n".to_vec()
+    );
 }
 
 #[test]
@@ -481,4 +491,33 @@ fn zadd_ch_ignores_same_score_readds() {
     assert_eq!(call(&s, "zscore", &[b"k", b"c3"]), b"$1\r\n6\r\n".to_vec());
     // An unchanged member also stays uncounted without CH.
     assert_eq!(int_of(&call(&s, "zadd", &[b"k", b"8", b"a"])), 0);
+}
+
+/// Regression (Redis semantics): GT/LT only gate UPDATES of existing
+/// members -- NEW members are always added, plain and INCR alike.
+#[test]
+fn zadd_gt_lt_add_new_members() {
+    let (_g, s) = shared_for("127.0.0.1:40516");
+    // Plain GT/LT add missing members verbatim and count them.
+    assert_eq!(int_of(&call(&s, "zadd", &[b"k", b"GT", b"5", b"m"])), 1);
+    assert_eq!(call(&s, "zscore", &[b"k", b"m"]), b"$1\r\n5\r\n".to_vec());
+    assert_eq!(int_of(&call(&s, "zadd", &[b"k", b"LT", b"-3", b"n"])), 1);
+    assert_eq!(call(&s, "zscore", &[b"k", b"n"]), b"$2\r\n-3\r\n".to_vec());
+    // GT INCR on a missing member adds it and replies the new score.
+    assert_eq!(
+        call(&s, "zadd", &[b"k", b"GT", b"INCR", b"2.5", b"fresh"]),
+        b"$3\r\n2.5\r\n".to_vec()
+    );
+    // GT INCR on an existing member only applies when it raises.
+    assert_eq!(
+        call(&s, "zadd", &[b"k", b"GT", b"INCR", b"-1", b"m"]),
+        b"$-1\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, "zadd", &[b"k", b"GT", b"INCR", b"1", b"m"]),
+        b"$1\r\n6\r\n".to_vec()
+    );
+    // Plain GT on an existing, not-raising score stays uncounted.
+    assert_eq!(int_of(&call(&s, "zadd", &[b"k", b"GT", b"1", b"m"])), 0);
+    assert_eq!(call(&s, "zscore", &[b"k", b"m"]), b"$1\r\n6\r\n".to_vec());
 }

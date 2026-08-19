@@ -34,14 +34,20 @@ pub async fn srandmember(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = set_ds::collect_members(
+    let page = match set_ds::collect_members(
         &ctx.shared.store,
         &ctx.prefix_key,
         &ctx.args[0],
         None,
         None,
         0,
-    );
+    ) {
+        Ok(page) => page,
+        Err(_) => {
+            append_error(ctx.out, "ERR: srandmember failed");
+            return;
+        }
+    };
     let n = page.members.len();
     match count {
         None => {
@@ -134,14 +140,20 @@ pub async fn sscan(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = set_ds::collect_members(
+    let page = match set_ds::collect_members(
         &ctx.shared.store,
         &ctx.prefix_key,
         &ctx.args[0],
         from.as_deref(),
         pattern.as_deref(),
         count,
-    );
+    ) {
+        Ok(page) => page,
+        Err(_) => {
+            append_error(ctx.out, "ERR: sscan failed");
+            return;
+        }
+    };
     let cursor = match &page.next {
         None => "0".to_string(),
         Some(member) => hex::encode(member),

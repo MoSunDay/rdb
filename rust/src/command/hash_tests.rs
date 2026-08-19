@@ -145,6 +145,14 @@ fn hincrby_and_errors() {
         call(&s, "hincrby", &[b"k", b"max", b"1"]),
         b"-ERR increment or decrement would overflow\r\n".to_vec()
     );
+    // Bug fix: an empty-string field value is not an integer either.
+    call(&s, "hset", &[b"k", b"empty", b""]);
+    assert_eq!(
+        call(&s, "hincrby", &[b"k", b"empty", b"1"]),
+        b"-ERR hash value is not an integer\r\n".to_vec()
+    );
+    // Missing fields still start from 0.
+    assert_eq!(int_of(&call(&s, "hincrby", &[b"k", b"fresh", b"1"])), 1);
 }
 
 #[test]

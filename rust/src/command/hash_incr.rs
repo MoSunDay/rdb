@@ -10,12 +10,11 @@ use crate::ds::{hash_ds, latch};
 use crate::resp::codec::{append_bulk, append_error, append_int};
 
 /// Read one field as i64 (missing = 0); `Err(reply)` mirrors Redis's
-/// "hash value is not an integer".
+/// "hash value is not an integer" (an EMPTY string fails too -- bug fix).
 fn field_as_i64(ctx: &Ctx<'_>, key: &[u8], field: &[u8]) -> Result<i64, &'static str> {
     let raw = hash_ds::read_field(&ctx.shared.store, &ctx.prefix_key, key, field);
     match raw.ok().flatten() {
         None => Ok(0),
-        Some(v) if v.is_empty() => Ok(0),
         Some(v) => parse_i64(&v).ok_or("ERR hash value is not an integer"),
     }
 }
@@ -91,7 +90,7 @@ pub async fn hincrbyfloat(ctx: &mut Ctx<'_>) {
     };
     let existed = field_exists(ctx, &key, &field);
     let current = match hash_ds::read_field(&ctx.shared.store, &ctx.prefix_key, &key, &field) {
-        Ok(Some(v)) if !v.is_empty() => match parse_f64(&v) {
+        Ok(Some(v)) => match parse_f64(&v) {
             Some(n) => n,
             None => {
                 append_error(ctx.out, "ERR hash value is not a float");

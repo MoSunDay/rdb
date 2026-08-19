@@ -112,20 +112,20 @@ pub async fn config(ctx: &mut Ctx<'_>) {
     append_bulk_string(ctx.out, "no");
 }
 
-/// `GET key`: raw string first, then the enveloped STRING_TTL record
-/// (written by EXPIRE) with lazy expiry; any store error replies null bulk.
+/// `GET key`: raw string or the enveloped STRING_TTL record (written by
+/// EXPIRE) with lazy expiry; non-string keys reply WRONGTYPE (Redis);
+/// any store error resolves as missing -> null bulk.
 pub async fn get(ctx: &mut Ctx<'_>) {
     if ctx.args.len() != 1 {
         arity(ctx.out, "get");
         return;
     }
-    if let Ok(Some(val)) = store::get(&ctx.shared.store, &ctx.prefix_key, &ctx.args[0]) {
-        append_bulk(ctx.out, &val);
-        return;
-    }
-    match crate::ds::expire::read_enveloped(&ctx.shared.store, &ctx.prefix_key, &ctx.args[0]) {
-        Ok(Some((_, payload))) => append_bulk(ctx.out, &payload),
-        _ => append_null(ctx.out),
+    let now = expire::now_ms();
+    let state = keys_core::resolve_arc(&ctx.shared.store, &ctx.prefix_key, &ctx.args[0], now);
+    match old_string_value(&state) {
+        OldValue::Str(v) => append_bulk(ctx.out, &v),
+        OldValue::Missing => append_null(ctx.out),
+        OldValue::WrongType => append_error(ctx.out, hash_cmd::WRONGTYPE),
     }
 }
 

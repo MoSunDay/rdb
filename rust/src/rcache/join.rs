@@ -15,6 +15,13 @@ use crate::rcache::http::read_head;
 /// process exiting on failure, with no retry loop either.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound on the response body: the only expected bodies are the
+/// tiny "ok" / "unauthorized\n" strings, so anything larger means a
+/// hostile or broken endpoint (or a MITM) claiming a giant
+/// Content-Length or streaming without one. Without the bound the
+/// joining node buffers the body unbounded.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Go `JoinRaftCluster`: GET `/join?peerAddress=<raft-tcp-addr>&raft-token=
 /// <token>` on the join address; the body must be exactly "ok". Query
 /// values are percent-encoded: a token containing `&`, `+` or `%` would
@@ -102,6 +109,11 @@ pub async fn http_get_status(url: &str) -> Result<(u16, String), String> {
 
     match content_length.and_then(|v| v.parse::<usize>().ok()) {
         Some(n) => {
+            // A lying/giant Content-Length must be rejected on the header
+            // alone, BEFORE any body byte is buffered.
+            if n > MAX_BODY_BYTES {
+                return Err("response body too large".to_string());
+            }
             while body.len() < n {
                 let mut tmp = vec![0u8; 4096];
                 let read = tokio::time::timeout(JOIN_TIMEOUT, stream.read(&mut tmp)).await;
@@ -113,13 +125,26 @@ pub async fn http_get_status(url: &str) -> Result<(u16, String), String> {
                 }
                 body.extend_from_slice(&tmp[..got]);
             }
+            // The server may send MORE than it promised; keep only n.
             body.truncate(n);
         }
         None => {
-            tokio::time::timeout(JOIN_TIMEOUT, stream.read_to_end(&mut body))
-                .await
-                .map_err(|_| "read body timed out".to_string())?
-                .map_err(io_err)?;
+            // Bounded read-to-end: no Content-Length means the body ends
+            // at EOF, so without a cap a hostile peer streams forever.
+            loop {
+                let mut tmp = vec![0u8; 4096];
+                let read = tokio::time::timeout(JOIN_TIMEOUT, stream.read(&mut tmp)).await;
+                let got = read
+                    .map_err(|_| "read body timed out".to_string())?
+                    .map_err(io_err)?;
+                if got == 0 {
+                    break; // EOF: body complete
+                }
+                body.extend_from_slice(&tmp[..got]);
+                if body.len() > MAX_BODY_BYTES {
+                    return Err("response body too large".to_string());
+                }
+            }
         }
     };
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
@@ -223,5 +248,46 @@ mod tests {
             .unwrap();
         assert_eq!(status, 401);
         assert_eq!(body, "unauthorized\n");
+    }
+
+    #[tokio::test]
+    async fn http_get_status_rejects_lying_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            // Hostile endpoint: Content-Length ~100GB with an oversized
+            // body. Writes ignore errors: the client rejects on the
+            // header alone and may drop the socket mid-stream.
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n")
+                .await;
+            let _ = stream.write_all(&vec![b'a'; MAX_BODY_BYTES + 1]).await;
+        });
+        let err = http_get_status(&format!("http://{addr}/join?x=1"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn http_get_status_rejects_unbounded_lengthless_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            // No Content-Length (EOF-terminated body): the old
+            // read_to_end path buffered this stream without bound.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            let _ = stream.write_all(&vec![b'b'; 2 * MAX_BODY_BYTES]).await;
+        });
+        let err = http_get_status(&format!("http://{addr}/join?x=1"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
     }
 }

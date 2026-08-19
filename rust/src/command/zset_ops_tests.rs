@@ -110,6 +110,28 @@ fn zremrangebyscore_exclusive_bounds() {
     );
 }
 
+/// Regression: an INCLUSIVE zero min must reach `-0.0` members -- the
+/// physical seek starts at sortable(-0.0), not sortable(+0.0), or every
+/// negative-zero member sorts below the scan and dodges the removal.
+#[test]
+fn zremrangebyscore_inclusive_zero_min_removes_negative_zero_members() {
+    let (_g, s) = shared_for("127.0.0.1:40699");
+    call(
+        &s,
+        "zadd",
+        &[b"k", b"-0", b"neg", b"0", b"pos", b"1", b"one"],
+    );
+    assert_eq!(
+        int_of(&call(&s, "zremrangebyscore", &[b"k", b"0", b"0.5"])),
+        2,
+        "-0.0 and +0.0 members both fall under the inclusive 0 min"
+    );
+    assert_eq!(
+        bulks_of(&call(&s, "zrange", &[b"k", b"0", b"-1"])),
+        vec![b"one".to_vec()]
+    );
+}
+
 #[test]
 fn zremrangebylex_inclusive_bounds() {
     let (_g, s) = shared_for("127.0.0.1:40603");

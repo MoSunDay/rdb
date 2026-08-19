@@ -63,13 +63,19 @@ pub fn id_suffix(id: EntryId) -> Vec<u8> {
 
 /// Auto id for `*`: current time, never decreasing. When the wall clock
 /// went backwards (or repeats the last ms) the seq is bumped instead.
-pub fn auto_id(last: Option<EntryId>, now_ms: u64) -> EntryId {
+/// `None` when a strictly-greater id is impossible -- the last id sits at
+/// `<ms, u64::MAX>` (or the `<u64::MAX, u64::MAX>` ceiling) and the clock
+/// has not moved past its ms. Returning the saturated id would silently
+/// EQUAL the last id, overwrite its entry and stall `last_id` (data
+/// loss); the caller replies Redis's "exhausted the last possible ID".
+pub fn auto_id(last: Option<EntryId>, now_ms: u64) -> Option<EntryId> {
     match last {
-        Some(l) if now_ms <= l.ms => EntryId {
+        Some(l) if now_ms <= l.ms && l.seq == u64::MAX => None,
+        Some(l) if now_ms <= l.ms => Some(EntryId {
             ms: l.ms,
-            seq: l.seq.saturating_add(1),
-        },
-        _ => EntryId { ms: now_ms, seq: 0 },
+            seq: l.seq + 1,
+        }),
+        _ => Some(EntryId { ms: now_ms, seq: 0 }),
     }
 }
 
@@ -281,4 +287,39 @@ pub fn read_group(
     }
     let raw = crate::store::ops::get_physical(store, &group_key(prefix, stream, group))?;
     Ok(raw.as_deref().and_then(decode_group))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_id_bumps_seq_moves_ms_and_errors_at_saturation() {
+        let sat = EntryId {
+            ms: 100,
+            seq: u64::MAX,
+        };
+        // Same (or earlier) ms with a saturated seq: no strictly-greater
+        // id exists -- None, never the last id again (which would
+        // silently overwrite the entry and stall last_id).
+        assert_eq!(auto_id(Some(sat), 100), None);
+        assert_eq!(auto_id(Some(sat), 99), None);
+        assert_eq!(
+            auto_id(Some(MAX_ID), u64::MAX),
+            None,
+            "the absolute id ceiling is exhausted too"
+        );
+        // Same ms, seq below the ceiling: bump the seq.
+        assert_eq!(
+            auto_id(Some(EntryId { ms: 100, seq: 5 }), 100),
+            Some(EntryId { ms: 100, seq: 6 })
+        );
+        // A later ms: restart at seq 0.
+        assert_eq!(
+            auto_id(Some(EntryId { ms: 100, seq: 7 }), 101),
+            Some(EntryId { ms: 101, seq: 0 })
+        );
+        // Fresh stream (no last id): the clock position, seq 0.
+        assert_eq!(auto_id(None, 42), Some(EntryId { ms: 42, seq: 0 }));
+    }
 }

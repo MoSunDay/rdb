@@ -44,15 +44,23 @@ pub(crate) enum BlockResult {
     Failed,
 }
 
+/// Upper bound for a blocking timeout: ~100 years in ms. Far beyond any
+/// real deadline, yet small enough that `Instant::now() + ms` can never
+/// overflow (a saturated `u64::MAX` ms duration made the addition PANIC
+/// and killed the connection task).
+pub(crate) const MAX_BLOCK_MS: u64 = 3_153_600_000_000_000;
+
 /// Parse the trailing timeout (seconds, fractions allowed): non-finite
-/// or negative values are rejected; the millisecond value saturates.
-/// Shared by every blocking command (list + zset pops).
+/// or negative values are rejected; the millisecond value is clamped to
+/// [`MAX_BLOCK_MS`] (float -> int casts saturate, which would overflow
+/// `Instant` arithmetic). Shared by every blocking command (list + zset
+/// pops).
 pub(crate) fn parse_timeout(arg: &[u8]) -> Option<u64> {
     let secs = parse_f64(arg)?;
     if !secs.is_finite() || secs < 0.0 {
         return None;
     }
-    Some((secs * 1000.0) as u64) // float -> int casts saturate
+    Some(((secs * 1000.0) as u64).min(MAX_BLOCK_MS)) // cast saturates, then clamp
 }
 
 /// Core of BLPOP/BRPOP: cycle register -> latched quick path -> park.
@@ -66,8 +74,12 @@ async fn block_pop(
     block_ms: u64,
 ) -> BlockResult {
     // BLOCK 0 means "forever" (`None`): the park runs in MAX_SLICE_MS
-    // slices renewed each round. Any other timeout is a hard deadline.
-    let deadline = (block_ms > 0).then(|| Instant::now() + Duration::from_millis(block_ms));
+    // slices renewed each round. Any other timeout is a hard deadline
+    // (checked_add: even a saturated ms count must not panic; an
+    // unrepresentable deadline degrades to "block forever").
+    let deadline = (block_ms > 0)
+        .then(|| Instant::now().checked_add(Duration::from_millis(block_ms)))
+        .flatten();
     loop {
         // 1. one shared waiter under every key's root, BEFORE the read.
         let waiter = Arc::new(wait::new_waiter());
@@ -156,10 +168,7 @@ async fn block_pop(
             })
             .min(MAX_SLICE_MS);
         let parked = Arc::clone(&waiter);
-        let woke = park::park(move || {
-            wait::wait(&parked, Duration::from_millis(left_ms))
-        })
-        .await;
+        let woke = park::park(move || wait::wait(&parked, Duration::from_millis(left_ms))).await;
         for root in &roots {
             wait::unregister(&ctx.shared.wait_hub, root, &waiter);
         }

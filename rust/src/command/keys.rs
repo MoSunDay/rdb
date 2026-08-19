@@ -142,7 +142,8 @@ pub async fn pexpireat(ctx: &mut Ctx<'_>) {
     expire_common(ctx, "pexpireat", 1, true).await;
 }
 
-/// Shared TTL/PTTL body; `ms` keeps milliseconds, else floor to seconds.
+/// Shared TTL/PTTL body; `ms` keeps milliseconds, else round HALF UP to
+/// seconds like Redis's `(ttl_ms+500)/1000` (bug fix: was floored).
 async fn ttl_common(ctx: &mut Ctx<'_>, cmd: &str, ms: bool) {
     if ctx.args.len() != 1 {
         arity(ctx.out, cmd);
@@ -157,7 +158,7 @@ async fn ttl_common(ctx: &mut Ctx<'_>, cmd: &str, ms: bool) {
             if ms {
                 remaining as i64
             } else {
-                (remaining / 1_000) as i64
+                ((remaining + 500) / 1_000) as i64
             }
         }
     };
@@ -185,9 +186,9 @@ pub async fn persist(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// `SCAN cursor [MATCH pattern] [COUNT n]` (per-slot; cursor = hex of the
-/// last physical key, "0"/"" restarts). No lazy expiry mid-iteration, per
-/// Redis SCAN guarantees.
+/// `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` (per-slot; cursor =
+/// hex of the last physical key, "0"/"" restarts). No lazy expiry
+/// mid-iteration, per Redis SCAN guarantees.
 pub async fn scan(ctx: &mut Ctx<'_>) {
     if ctx.args.is_empty() {
         arity(ctx.out, "scan");
@@ -195,6 +196,7 @@ pub async fn scan(ctx: &mut Ctx<'_>) {
     }
     let cursor_start = ctx.args[0].is_empty() || ctx.args[0] == b"0";
     let mut pattern: Option<Vec<u8>> = None;
+    let mut type_filter: Option<Vec<u8>> = None;
     let mut count: usize = 10;
     let mut i = 1;
     while i < ctx.args.len() {
@@ -202,6 +204,16 @@ pub async fn scan(ctx: &mut Ctx<'_>) {
         match opt.as_slice() {
             b"MATCH" if i + 1 < ctx.args.len() => {
                 pattern = Some(ctx.args[i + 1].clone());
+                i += 2;
+            }
+            b"TYPE" if i + 1 < ctx.args.len() => {
+                // Value matches case-insensitively; unknown names are a
+                // syntax error (Redis rejects them outright).
+                if !keys_scan::is_scan_type_name(&ctx.args[i + 1]) {
+                    append_error(ctx.out, "ERR syntax error");
+                    return;
+                }
+                type_filter = Some(ctx.args[i + 1].clone());
                 i += 2;
             }
             b"COUNT" if i + 1 < ctx.args.len() => {
@@ -236,6 +248,7 @@ pub async fn scan(ctx: &mut Ctx<'_>) {
         &ctx.prefix_key,
         &from,
         pattern.as_deref(),
+        type_filter.as_deref(),
         count,
     );
     let cursor = if page.next.is_empty() {
@@ -305,7 +318,7 @@ async fn rename_common(ctx: &mut Ctx<'_>, cmd: &str, nx: bool) {
         }
         Ok(RenameOutcome::DstBlocked) => append_int(ctx.out, 0),
         Ok(RenameOutcome::SrcMissing) => append_error(ctx.out, "ERR no such key"),
-        Err(_) => append_error(ctx.out, "ERR: rename failed"),
+        Err(e) => append_error(ctx.out, &format!("ERR: rename failed: {e}")),
     }
 }
 

@@ -11,13 +11,15 @@
 //!
 //! Lazy path: reads decode the envelope and purge in place when due --
 //! Arc-holding call sites commit the purge as a detached off-worker
-//! write ([`ops::spawn_batch_write`]) so no fsync lands on the reading
-//! tokio worker; bare-`&Store` ds-layer helpers keep the inline sync.
+//! write ([`ops::spawn_revalidated_write`]) guarded by a revalidation
+//! read, so no fsync lands on the reading tokio worker and a racing
+//! writer that replaced the record cancels the stale purge;
+//! bare-`&Store` ds-layer helpers keep the inline sync.
 //! Active path: [`sample_once`] scans the index from a rotating cursor,
 //! re-reads each victim to confirm it is still expired (guards against
 //! racing writers), then range-deletes the family and the index entry.
 //! [`spawn_active_expire`] runs the loop every 100ms with Redis-style
-//! adaptive extra rounds.
+//! adaptive extra rounds, each round executing on tokio's blocking pool.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -60,17 +62,22 @@ pub fn purge_if_expired(
     now: u64,
 ) -> bool {
     match lazy_purge_batch(store, prefix, family, key, now) {
-        Some(batch) => ops::batch_write(store, batch).is_ok(),
+        Some((_, batch)) => ops::batch_write(store, batch).is_ok(),
         None => false,
     }
 }
 
 /// Lazy expiration for holders of the shared `Arc<Store>` (command-layer
 /// read paths running on tokio workers): the physical delete is committed
-/// by a DETACHED [`ops::spawn_batch_write`], so the caller never fsyncs
-/// inline. Returns the DECISION -- the envelope was due and the key is
-/// treated as gone -- NOT the write outcome; the RocksDB commit happens
-/// off-worker and is only logged if it fails.
+/// by a DETACHED [`ops::spawn_revalidated_write`], so the caller never
+/// fsyncs inline. The detached commit first re-reads the root and only
+/// lands when the envelope still carries the SAME expire the decision
+/// was based on -- a racing latched writer that rewrote the key (TTL
+/// extension, value overwrite) cancels the stale purge instead of losing
+/// its records to the content-agnostic family range deletes. Returns the
+/// DECISION -- the envelope was due and the key is treated as gone --
+/// NOT the write outcome; the RocksDB commit happens off-worker and is
+/// only logged if it fails.
 pub fn purge_if_expired_arc(
     store: &Arc<Store>,
     prefix: &[u8],
@@ -78,25 +85,39 @@ pub fn purge_if_expired_arc(
     key: &[u8],
     now: u64,
 ) -> bool {
+    let root = codec::data_key(prefix, family.0, key);
     match lazy_purge_batch(store, prefix, family, key, now) {
-        Some(batch) => {
-            ops::spawn_batch_write(Arc::clone(store), batch);
+        Some((expire, batch)) => {
+            ops::spawn_revalidated_write(Arc::clone(store), root, revalidate_expire(expire), batch);
             true
         }
         None => false,
     }
 }
 
+/// Revalidation probe for a detached purge: true only when the current
+/// root value still decodes to the SAME expire deadline the decision
+/// read -- unchanged means still due (time only moves forward), while a
+/// missing or rewritten record cancels the purge.
+fn revalidate_expire(expected: u64) -> impl Fn(Option<&[u8]>) -> bool {
+    move |current| match current {
+        Some(val) => codec::decode_envelope(val).0 == expected,
+        None => false,
+    }
+}
+
 /// Decision core shared by both lazy-purge entry points: read the family
 /// root, decode the envelope and, when it is due, build the batch wiping
-/// the whole family plus its index entry. `None` = nothing to purge.
+/// the whole family plus its index entry. `None` = nothing to purge;
+/// `Some((expire_ms, batch))` also carries the deadline the decision
+/// was based on, so detached callers can revalidate against it.
 fn lazy_purge_batch(
     store: &Store,
     prefix: &[u8],
     family: CodecFamily,
     key: &[u8],
     now: u64,
-) -> Option<WriteBatch> {
+) -> Option<(u64, WriteBatch)> {
     let root = codec::data_key(prefix, family.0, key);
     let val = match ops::get_physical(store, &root) {
         Ok(Some(v)) => v,
@@ -108,7 +129,7 @@ fn lazy_purge_batch(
     }
     let mut batch = WriteBatch::default();
     family_delete_entries(&mut batch, prefix, family, key, expire);
-    Some(batch)
+    Some((expire, batch))
 }
 
 /// Read a STRING_TTL record -> `(expire_ms, payload)`; `Ok(None)` when the
@@ -184,43 +205,55 @@ pub fn slot_prefix_len(k: &[u8]) -> Option<usize> {
 /// deletions, resuming the scan strictly after `from` (empty = head).
 /// Returns the number purged (stale index entries whose record vanished
 /// or changed count too -- they needed deleting either way) plus the
-/// scan cursor: the key the round stopped on when `budget`/SCAN_LIMIT
-/// cut it short, or EMPTY when the scan ran to the tail -- feed that
-/// back into the next call so the sampler keeps ROTATING instead of
-/// always restarting at the head (high slots would starve otherwise).
+/// scan cursor: the LAST KEY THE ROUND PROCESSED when `budget`/SCAN_LIMIT
+/// cut the round short, or EMPTY when the scan ran to the tail -- feed
+/// that back into the next call so the sampler keeps ROTATING instead
+/// of always restarting at the head (high slots would starve otherwise).
+/// The unprocessed stop key deliberately stays BEYOND the cursor: the
+/// resume is strictly-after, so a cursor ON it would skip it entirely
+/// next round.
 pub fn sample_once(store: &Store, now: u64, budget: usize, from: &[u8]) -> (usize, Vec<u8>) {
     let mut purged = 0usize;
     let mut scanned = 0usize;
     let mut cursor = from.to_vec();
     let mut stopped = false;
     let _ = ops::for_each_from(store, from, true, &mut |k, _| {
-        cursor = k.to_vec();
         scanned += 1;
-        if purged >= budget || scanned > SCAN_LIMIT {
+        if purged >= budget || scanned >= SCAN_LIMIT {
             stopped = true;
+            // This key was never processed: leave the cursor on the last
+            // key that WAS so the next round re-examines it.
             return false;
         }
-        let Some(plen) = slot_prefix_len(k) else {
-            return true;
-        };
-        if k.get(plen) != Some(&codec::KIND_EXPIRE_INDEX) {
-            return true;
-        }
-        let Some((expire, body)) = codec::decode_expire_index_key(k, plen) else {
-            return true;
-        };
-        if !is_expired(expire, now) {
-            return true; // not due; another slot may still hold due entries
-        }
-        if purge_indexed(store, &k[..plen], &body, expire, now) {
-            purged += 1;
-        }
+        process_scan_key(store, k, now, &mut purged);
+        cursor = k.to_vec();
         true
     });
     if stopped {
         (purged, cursor)
     } else {
         (purged, Vec::new()) // hit the tail: the next round wraps to the head
+    }
+}
+
+/// Handle one examined scan key for [`sample_once`]: a due index entry
+/// is confirm-and-purged (and counted); data records, non-index kinds,
+/// undecodable entries and not-yet-due deadlines are merely passed over.
+fn process_scan_key(store: &Store, k: &[u8], now: u64, purged: &mut usize) {
+    let Some(plen) = slot_prefix_len(k) else {
+        return;
+    };
+    if k.get(plen) != Some(&codec::KIND_EXPIRE_INDEX) {
+        return;
+    }
+    let Some((expire, body)) = codec::decode_expire_index_key(k, plen) else {
+        return;
+    };
+    if !is_expired(expire, now) {
+        return; // not due; another slot may still hold due entries
+    }
+    if purge_indexed(store, &k[..plen], &body, expire, now) {
+        *purged += 1;
     }
 }
 
@@ -286,7 +319,17 @@ pub fn spawn_active_expire(shared: Arc<state::Shared>) {
             let mut rounds = 0;
             loop {
                 rounds += 1;
-                let (purged, next) = sample_once(&shared.store, now_ms(), BUDGET, &cursor);
+                // A round is sync RocksDB iteration plus synced writes:
+                // park it on the blocking pool, never a tokio worker.
+                let store = Arc::clone(&shared.store);
+                let from = cursor.clone();
+                let Ok((purged, next)) = tokio::task::spawn_blocking(move || {
+                    sample_once(&store, now_ms(), BUDGET, &from)
+                })
+                .await
+                else {
+                    break; // JoinError: give up this tick's extra rounds
+                };
                 cursor = next;
                 if purged < BUDGET || rounds >= MAX_ROUNDS {
                     break;
@@ -451,6 +494,48 @@ mod tests {
         assert_eq!(read_enveloped(&store, P, b"k").unwrap(), None);
     }
 
+    /// The detached-purge probe commits only on an UNCHANGED expire
+    /// deadline: a rewritten envelope (TTL extended or cleared) or a
+    /// vanished record cancels the commit.
+    #[test]
+    fn revalidation_probe_requires_unchanged_expire() {
+        let probe = revalidate_expire(5);
+        assert!(probe(Some(&codec::encode_envelope(5, b"v"))));
+        assert!(!probe(Some(&codec::encode_envelope(
+            9_000_000_000_000,
+            b"v"
+        ))));
+        assert!(!probe(Some(&codec::encode_envelope(0, b"v"))));
+        assert!(!probe(None));
+    }
+
+    /// TOCTOU regression: a racing writer that rewrites the key with a
+    /// live far-future envelope between the purge DECISION read and the
+    /// detached commit must not lose its record to the content-agnostic
+    /// family range deletes -- the revalidation read cancels the purge.
+    #[tokio::test]
+    async fn detached_purge_cancelled_when_value_replaced() {
+        let (_dir, store) = open_tmp("race");
+        let store = Arc::new(store);
+        write_enveloped(&store, KIND_STRING_TTL, b"k", 5, b"old");
+        let far = 9_000_000_000_000u64;
+        // the decision is made on the expired envelope ...
+        assert!(purge_if_expired_arc(&store, P, STRING_FAMILY, b"k", 10));
+        // ... then the racing latched writer rewrites the key live before
+        // the detached commit can land
+        write_enveloped(&store, KIND_STRING_TTL, b"k", far, b"new");
+        // whatever the interleaving, the far-future record must survive
+        let root = codec::data_key(P, KIND_STRING_TTL, b"k");
+        for _ in 0..200 {
+            if let Some(val) = ops::get_physical(&store, &root).unwrap() {
+                assert_eq!(codec::decode_envelope(&val), (far, b"new".as_slice()));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("racing writer's far-future record was purged");
+    }
+
     #[test]
     fn sampler_cursor_resumes_after_stop() {
         let (_dir, store) = open_tmp("resume");
@@ -458,13 +543,15 @@ mod tests {
         write_enveloped_at(&store, b"10/", KIND_STRING_TTL, b"k", 100, b"v");
         write_enveloped_at(&store, b"99/", KIND_STRING_TTL, b"k", 100, b"v");
         // budget=1: the round purges the 10/ victim, then stops on the
-        // next key it touches -- the 99/ data record.
+        // next key it touches -- the 99/ data record, which stays
+        // UNPROCESSED: the cursor must sit on the last key the round
+        // actually processed (the 10/ index entry), never the stop key.
         let (purged, cursor) = sample_once(&store, 200, 1, b"");
         assert_eq!(purged, 1);
         assert_eq!(
             cursor,
-            codec::data_key(b"99/", KIND_STRING_TTL, b"k"),
-            "cursor sits on the last key the round accessed"
+            codec::expire_index_key(b"10/", 100, &codec::data_key(b"10/", KIND_STRING_TTL, b"k")),
+            "cursor sits on the last key the round PROCESSED"
         );
         // resuming after that cursor clears the 99/ victim in slot order
         let (purged2, cursor2) = sample_once(&store, 200, 1, &cursor);
@@ -472,6 +559,33 @@ mod tests {
         assert!(cursor2.is_empty(), "scan reached the tail and wrapped");
         assert_eq!(read_enveloped(&store, b"10/", b"k").unwrap(), None);
         assert_eq!(read_enveloped(&store, b"99/", b"k").unwrap(), None);
+    }
+
+    /// The stop key of a budget-cut round is re-examined -- not skipped --
+    /// by the next round: two due keys in one slot, budget=1, so round 1
+    /// halts exactly ON k2's index entry.
+    #[test]
+    fn sampler_stop_key_is_not_skipped_next_round() {
+        let (_dir, store) = open_tmp("stopkey");
+        let store = Arc::new(store);
+        write_enveloped(&store, KIND_STRING_TTL, b"k1", 100, b"v");
+        write_enveloped(&store, KIND_STRING_TTL, b"k2", 100, b"v");
+        let (purged1, cursor1) = sample_once(&store, 200, 1, b"");
+        assert_eq!(purged1, 1);
+        assert!(!cursor1.is_empty(), "budget cut the round: cursor returned");
+        // round 2 must land on k2's index entry -- the key round 1
+        // stopped on -- instead of resuming strictly after it
+        let (purged2, cursor2) = sample_once(&store, 200, 1, &cursor1);
+        assert_eq!(purged2, 1, "the stop key was re-examined, not skipped");
+        assert!(cursor2.is_empty(), "both victims gone: scan hit the tail");
+        let (purged3, _) = sample_once(&store, 200, 1, &cursor2);
+        assert_eq!(purged3, 0);
+        for key in [b"k1".as_slice(), b"k2".as_slice()] {
+            assert_eq!(
+                ops::get_physical(&store, &codec::data_key(P, KIND_STRING_TTL, key)).unwrap(),
+                None
+            );
+        }
     }
 
     #[test]

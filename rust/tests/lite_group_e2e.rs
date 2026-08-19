@@ -112,16 +112,8 @@ fn flush_and_restart_keep_non_utf8_groups_separate() {
             &[b"u/qd", format!("1-{i}").as_bytes(), b"f", &[b'v', i]],
         );
     }
-    call(
-        &shared,
-        "xgroup",
-        &[b"create", b"u/qd", b"w\x80", b"0-0"],
-    );
-    call(
-        &shared,
-        "xgroup",
-        &[b"create", b"u/qd", b"w\x81", b"0-0"],
-    );
+    call(&shared, "xgroup", &[b"create", b"u/qd", b"w\x80", b"0-0"]);
+    call(&shared, "xgroup", &[b"create", b"u/qd", b"w\x81", b"0-0"]);
     call(
         &shared,
         "xreadgroup",
@@ -165,5 +157,96 @@ fn flush_and_restart_keep_non_utf8_groups_separate() {
     assert_eq!(
         call(&restarted, "xack", &[b"u/qd", b"w\x81", b"1-1", b"1-2"]),
         b":2\r\n".to_vec()
+    );
+}
+
+/// Regression (group-op wake): XGROUP DESTROY must wake a consumer
+/// blocked in XREADGROUP `>` BLOCK so it re-checks and replies NOGROUP
+/// promptly -- before the fix it slept out its whole BLOCK timeout and
+/// only then discovered the group was gone. Driven in-process: the
+/// reader `call` runs on its own thread and parks on the park pool.
+#[test]
+fn blocked_xreadgroup_wakes_on_destroy_with_nogroup() {
+    let shared = std::sync::Arc::new(shared_at("43017").0);
+    call(&shared, "xadd", &[b"d/q0", b"1-1", b"f", b"v"]);
+    assert_eq!(
+        call(&shared, "xgroup", &[b"create", b"d/q0", b"g", b"$"]),
+        b"+OK\r\n".to_vec()
+    );
+    let reader = {
+        let s = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            call(
+                &s,
+                "xreadgroup",
+                &[
+                    b"group", b"g", b"c1", b"BLOCK", b"8000", b"streams", b"d/q0", b">",
+                ],
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300)); // let it park
+    let t0 = std::time::Instant::now();
+    assert_eq!(
+        call(&shared, "xgroup", &[b"destroy", b"d/q0", b"g"]),
+        b":1\r\n".to_vec()
+    );
+    let reply = reader.join().expect("reader thread");
+    let elapsed = t0.elapsed();
+    // Woken by the destroy (well before the 8s BLOCK), with NOGROUP --
+    // not the nil array a timeout would produce.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "reader slept {elapsed:?} past the destroy"
+    );
+    assert!(text(&reply).contains("NOGROUP"), "reply {reply:?}");
+}
+
+/// Regression (group-op wake): XGROUP SETID rewinding the delivery
+/// watermark must wake a blocked `>` consumer and replay the now
+/// deliverable entries instead of letting it park out its BLOCK.
+#[test]
+fn blocked_xreadgroup_wakes_on_setid_rewind_and_receives_entries() {
+    let shared = std::sync::Arc::new(shared_at("43018").0);
+    for i in 1..=2u8 {
+        call(
+            &shared,
+            "xadd",
+            &[b"e/q0", format!("1-{i}").as_bytes(), b"f", b"v"],
+        );
+    }
+    // Group starts at $: nothing deliverable, the reader parks.
+    assert_eq!(
+        call(&shared, "xgroup", &[b"create", b"e/q0", b"g", b"$"]),
+        b"+OK\r\n".to_vec()
+    );
+    let reader = {
+        let s = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            call(
+                &s,
+                "xreadgroup",
+                &[
+                    b"group", b"g", b"c1", b"BLOCK", b"8000", b"streams", b"e/q0", b">",
+                ],
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300)); // let it park
+    let t0 = std::time::Instant::now();
+    assert_eq!(
+        call(&shared, "xgroup", &[b"setid", b"e/q0", b"g", b"0-0"]),
+        b"+OK\r\n".to_vec()
+    );
+    let reply = reader.join().expect("reader thread");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "reader slept {elapsed:?} past the setid"
+    );
+    let r = text(&reply);
+    assert!(
+        r.contains("1-1") && r.contains("1-2") && !r.contains("*-1"),
+        "replayed entries expected, got {r}"
     );
 }

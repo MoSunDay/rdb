@@ -162,7 +162,11 @@ pub fn remove_stream(cache: &OffsetCache, stream: &[u8]) {
 }
 
 /// Snapshot + clear the dirty set (batch construction happens off-lock).
-pub fn flush_dirty(cache: &OffsetCache) -> Vec<((Vec<u8>, Vec<u8>), GroupState)> {
+/// Snapshot of dirty group states drained for one flush round:
+/// `((stream, group), state)`.
+pub type DirtySnapshot = Vec<((Vec<u8>, Vec<u8>), GroupState)>;
+
+pub fn flush_dirty(cache: &OffsetCache) -> DirtySnapshot {
     let mut write = cache.inner.write().unwrap();
     let keys: Vec<(Vec<u8>, Vec<u8>)> = write.dirty.drain().collect();
     keys.into_iter()
@@ -174,6 +178,14 @@ pub fn dirty_len(cache: &OffsetCache) -> usize {
     cache.inner.read().unwrap().dirty.len()
 }
 
+/// Peek the dirty `(stream, group)` keys WITHOUT draining (read lock):
+/// lets a flush round derive the per-stream latches to hold BEFORE the
+/// dirty set is swapped out, so the snapshot and the write are
+/// serialized against XGROUP DESTROY and other flush rounds.
+pub fn dirty_keys(cache: &OffsetCache) -> Vec<(Vec<u8>, Vec<u8>)> {
+    cache.inner.read().unwrap().dirty.iter().cloned().collect()
+}
+
 /// Re-validate a flush snapshot under the cache lock before it is
 /// written: keep only entries that are STILL clean (no newer
 /// ack/set-position re-marked them dirty after the snapshot was taken)
@@ -181,10 +193,7 @@ pub fn dirty_len(cache: &OffsetCache) -> usize {
 /// the next round, so an old-snapshot batch can never land after a
 /// newer write and drag the committed watermark backwards (which would
 /// redeliver already-acked messages after a crash).
-pub fn drop_superseded(
-    cache: &OffsetCache,
-    dirty: Vec<((Vec<u8>, Vec<u8>), GroupState)>,
-) -> Vec<((Vec<u8>, Vec<u8>), GroupState)> {
+pub fn drop_superseded(cache: &OffsetCache, dirty: DirtySnapshot) -> DirtySnapshot {
     let inner = cache.inner.read().unwrap();
     dirty
         .into_iter()
@@ -193,7 +202,7 @@ pub fn drop_superseded(
 }
 
 /// Build the flush batch: one kind-0x0E record per dirty group.
-pub fn build_flush_batch(dirty: &[((Vec<u8>, Vec<u8>), GroupState)]) -> Option<WriteBatch> {
+pub fn build_flush_batch(dirty: &DirtySnapshot) -> Option<WriteBatch> {
     if dirty.is_empty() {
         return None;
     }
@@ -249,14 +258,20 @@ mod tests {
             Some(2)
         );
         // re-ack of old ids counts nothing
-        assert_eq!(ack(&c, b"t/q0", b"g", &[EntryId { ms: 11, seq: 0 }]), Some(0));
+        assert_eq!(
+            ack(&c, b"t/q0", b"g", &[EntryId { ms: 11, seq: 0 }]),
+            Some(0)
+        );
         assert_eq!(dirty_len(&c), 1);
         let flushed = flush_dirty(&c);
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].1.committed, EntryId { ms: 12, seq: 0 });
         assert_eq!(dirty_len(&c), 0);
         // unknown group: no crash, None
-        assert_eq!(ack(&c, b"t/q0", b"nope", &[EntryId { ms: 1, seq: 0 }]), None);
+        assert_eq!(
+            ack(&c, b"t/q0", b"nope", &[EntryId { ms: 1, seq: 0 }]),
+            None
+        );
     }
 
     #[test]
@@ -312,5 +327,31 @@ mod tests {
         let round_c = flush_dirty(&c);
         remove_stream(&c, b"t/q0");
         assert!(drop_superseded(&c, round_c).is_empty(), "removed group");
+    }
+
+    #[test]
+    fn dirty_keys_peek_does_not_drain() {
+        let c = new_cache();
+        insert_new(
+            &c,
+            b"t/q0",
+            b"g",
+            GroupState {
+                created_ms: 1,
+                delivered: EntryId { ms: 10, seq: 0 },
+                committed: EntryId { ms: 10, seq: 0 },
+            },
+        );
+        // Nothing dirty yet: the peek is empty.
+        assert!(dirty_keys(&c).is_empty());
+        ack(&c, b"t/q0", b"g", &[EntryId { ms: 20, seq: 0 }]).unwrap();
+        // Peek lists the dirty (stream, group) pair without draining --
+        // the flush round derives its latch keys from this snapshot.
+        assert_eq!(dirty_keys(&c), vec![(b"t/q0".to_vec(), b"g".to_vec())]);
+        assert_eq!(dirty_len(&c), 1, "peek must not clear the dirty set");
+        // Draining via flush_dirty empties the peek too.
+        let drained = flush_dirty(&c);
+        assert_eq!(drained.len(), 1);
+        assert!(dirty_keys(&c).is_empty());
     }
 }

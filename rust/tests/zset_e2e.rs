@@ -169,9 +169,9 @@ fn zadd_gt_ch_matrix_and_zincrby() {
     e("zadd", &["m", "GT", "1", "a"], b":0\r\n");
     e("zscore", &["m", "a"], b"$1\r\n9\r\n");
     e("zadd", &["m", "GT", "CH", "9", "a"], b":0\r\n");
-    // GT skips missing members entirely.
-    e("zadd", &["m", "GT", "5", "zz"], b":0\r\n");
-    e("zscore", &["m", "zz"], b"$-1\r\n");
+    // GT still ADDS missing members (Redis semantics).
+    e("zadd", &["m", "GT", "5", "zz"], b":1\r\n");
+    e("zscore", &["m", "zz"], b"$1\r\n5\r\n");
     // ZINCRBY applies on top and formats the resulting score.
     e("zincrby", &["m", "1.5", "a"], b"$4\r\n10.5\r\n");
     e("zincrby", &["fresh", "1.5", "n"], b"$3\r\n1.5\r\n");
