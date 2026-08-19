@@ -7,8 +7,35 @@ mod common;
 
 use common::{
     all_ctx, auth_reply, cluster_init, cmd_one_shot, contains_bytes, raw_exchange, spawn_node,
-    wait_cluster_nodes_list_all, wait_leader, wait_resp_ready, TOKEN,
+    start_cluster, wait_cluster_nodes_list_all, wait_leader, wait_resp_ready, TOKEN,
 };
+use common::lite::cmd_full_reply;
+
+/// One raw HTTP/1.1 GET against a node's raft control API (/join,
+/// /depart): write the request head, read to EOF (the server closes the
+/// connection after the response).
+async fn http_get(addr: &str, target: &str) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = match tokio::net::TcpStream::connect(addr).await {
+        Ok(s) => s,
+        Err(e) => return format!("<CONN-ERR {e}>").into_bytes(),
+    };
+    let req = format!("GET {target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    if sock.write_all(req.as_bytes()).await.is_err() {
+        return b"<WRITE-ERR>".to_vec();
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(35), sock.read(&mut chunk))
+            .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    buf
+}
 
 /// The bytes of one `-MOVED <slot> <addr>` reply as `(slot, addr)`.
 fn moved_parts(reply: &[u8]) -> Vec<&[u8]> {
@@ -307,3 +334,225 @@ async fn failed_first_join_is_retried_on_restart() {
     cluster_init(&nodes[0], &binds).await;
     wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
 }
+/// Membership scenario: /depart a LIVE non-leader through the leader's
+/// control API, watch the raft configuration drop it (quorum keeps
+/// serving), then /join the still-running node back and watch full
+/// membership -- and replication to it -- return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn depart_live_follower_then_rejoin_restores_membership() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (nodes, leader) = start_cluster(dir.path(), 3).await;
+    let follower = (0..nodes.len())
+        .find(|i| *i != leader)
+        .expect("a follower exists");
+    let other = (0..nodes.len())
+        .find(|i| *i != leader && *i != follower)
+        .expect("a second follower exists");
+
+    // /depart the follower by its raft-tcp address on the leader's API:
+    // 200 + body "ok" (the Go handler quirk: errors also answer 200, so
+    // the body text is what proves success).
+    let target = format!(
+        "/depart?peerAddress={}&raft-token={}",
+        nodes[follower].raft, TOKEN
+    );
+    let resp = http_get(&nodes[leader].http, &target).await;
+    assert!(
+        contains_bytes(&resp, b"HTTP/1.1 200 OK") && contains_bytes(&resp, b"\r\n\r\nok"),
+        "depart must answer 200 + ok: {:?}\n{}",
+        String::from_utf8_lossy(&resp),
+        nodes[leader].ctx()
+    );
+
+    // The leader's latest_configuration drops the departed voter (raft
+    // metrics sync into `raft nodes` at most every 500ms).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"nodes"]).await;
+        if !contains_bytes(&r, nodes[follower].raft.as_bytes()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "departed voter still configured\nlast={r:?}\n{}",
+            nodes[leader].ctx()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Quorum (2 of 2 remaining voters) still serves control-plane writes,
+    // and the surviving follower sees them replicated.
+    assert_eq!(
+        cmd_one_shot(
+            &nodes[leader].resp,
+            TOKEN,
+            &[b"raft", b"set", b"depkey", b"depval"]
+        )
+        .await,
+        b"+OK",
+        "raft set with the departed voter gone\n{}",
+        nodes[leader].ctx()
+    );
+    let want = b"$6\r\ndepval".to_vec();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = cmd_one_shot(&nodes[other].resp, TOKEN, &[b"raft", b"get", b"depkey"]).await;
+        if r == want {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "survivor never saw depkey\nlast={r:?}\n{}",
+            nodes[other].ctx()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Re-join the STILL-RUNNING departed node: /join re-adds it as a
+    // learner (blocking until caught up) and back into the voters.
+    let target = format!(
+        "/join?peerAddress={}&raft-token={}",
+        nodes[follower].raft, TOKEN
+    );
+    let resp = http_get(&nodes[leader].http, &target).await;
+    assert!(
+        contains_bytes(&resp, b"HTTP/1.1 200 OK") && contains_bytes(&resp, b"\r\n\r\nok"),
+        "re-join must answer 200 + ok: {:?}\n{}",
+        String::from_utf8_lossy(&resp),
+        nodes[leader].ctx()
+    );
+
+    // Full membership again: every raft address back in the leader's
+    // configuration.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"nodes"]).await;
+        let all = nodes
+            .iter()
+            .all(|n| contains_bytes(&r, n.raft.as_bytes()));
+        if all {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rejoined voter not back in the configuration\nlast={r:?}\n{}",
+            nodes[leader].ctx()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // The rejoined voter receives new writes again.
+    assert_eq!(
+        cmd_one_shot(
+            &nodes[leader].resp,
+            TOKEN,
+            &[b"raft", b"set", b"rejoinkey", b"rejoinval"]
+        )
+        .await,
+        b"+OK",
+        "raft set after rejoin\n{}",
+        nodes[leader].ctx()
+    );
+    let want = b"$9\r\nrejoinval".to_vec();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = cmd_one_shot(&nodes[follower].resp, TOKEN, &[b"raft", b"get", b"rejoinkey"]).await;
+        if r == want {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rejoined follower never saw rejoinkey\nlast={r:?}\n{}",
+            nodes[follower].ctx()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// MIGRATE task/list over a REAL raft: a leader-written task replicates
+/// to the FSM key `migrate_task` and lists back with underscores turned
+/// into spaces on every node; error paths keep the Go quirk of an
+/// ERROR-reply usage message, and a follower's task apply fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migrate_task_list_over_real_raft_and_error_paths() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (nodes, leader) = start_cluster(dir.path(), 3).await;
+    let follower = (0..nodes.len())
+        .find(|i| *i != leader)
+        .expect("a follower exists");
+
+    // No task yet: Go strings.Split quirk -- one EMPTY item, not zero.
+    assert_eq!(
+        cmd_full_reply(&nodes[leader].resp, TOKEN, &[b"migrate", b"list"], 400).await,
+        b"*1\r\n$0\r\n\r\n".to_vec(),
+        "empty task lists as one empty item\n{}",
+        nodes[leader].ctx()
+    );
+
+    // Usage / arity / unknown subcommand: the helper text is an ERROR.
+    for args in [
+        vec![b"migrate".as_slice()],
+        vec![b"migrate", b"task", b"a", b"b"],
+        vec![b"migrate", b"bogus", b"x"],
+        vec![b"migrate", b"help"],
+    ] {
+        let r = cmd_one_shot(&nodes[leader].resp, TOKEN, &args).await;
+        assert_eq!(
+            r,
+            b"-migrate [ list | task ]".to_vec(),
+            "{args:?}\n{}",
+            nodes[leader].ctx()
+        );
+    }
+
+    // A follower cannot apply: hashicorp's "not leader" surfaces as the
+    // Go "Raft Apply failed" error.
+    assert_eq!(
+        cmd_one_shot(
+            &nodes[follower].resp,
+            TOKEN,
+            &[b"migrate", b"task", b"no", b"no", b"no"]
+        )
+        .await,
+        b"-Raft Apply failed".to_vec(),
+        "migrate task on a follower\n{}",
+        nodes[follower].ctx()
+    );
+
+    // Leader write: MIGRATE task src dst count -> +OK, replicated.
+    assert_eq!(
+        cmd_one_shot(
+            &nodes[leader].resp,
+            TOKEN,
+            &[b"migrate", b"task", b"alpha", b"beta", b"gamma"]
+        )
+        .await,
+        b"+OK",
+        "migrate task on the leader\n{}",
+        nodes[leader].ctx()
+    );
+    let want = b"*1\r\n$16\r\nalpha beta gamma\r\n".to_vec();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = cmd_full_reply(&nodes[follower].resp, TOKEN, &[b"migrate", b"list"], 400).await;
+        if r == want {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "follower never listed the replicated task\nlast={r:?}\n{}",
+            nodes[follower].ctx()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // The leader lists the same task (underscores -> spaces).
+    assert_eq!(
+        cmd_full_reply(&nodes[leader].resp, TOKEN, &[b"migrate", b"list"], 400).await,
+        want,
+        "leader lists the task\n{}",
+        nodes[leader].ctx()
+    );
+}
+
