@@ -19,6 +19,9 @@ prometheus = "0.13"
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 futures = "0.3"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Only used for TCP keepalive on raft sockets; already in the tree via tokio.
+# The "all" feature unlocks `TcpKeepalive::with_retries` (TCP_KEEPCNT).
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tempfile = "3"

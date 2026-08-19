@@ -10,11 +10,18 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 
-use crate::rcache::transport::{read_frame, write_frame, InMsg, OutMsg};
+use crate::rcache::transport::{apply_tcp_keepalive, read_frame, write_frame, InMsg, OutMsg};
 use crate::rcache::RdbRaft;
+
+/// How long an accepted connection may sit with no inbound frame before
+/// it is closed: raft peers heartbeat far more often, so silence past
+/// this means the peer is gone or wedged — closing lets it reconnect.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bind `addr` (a RaftTCPAddress like `127.0.0.1:32681`) and serve raft
 /// RPCs forever; returns only when binding fails.
@@ -32,8 +39,11 @@ pub async fn serve_on(listener: TcpListener, raft: Arc<RdbRaft>) -> io::Result<(
                 let raft = raft.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(stream, raft).await {
-                        // Peer closed the connection: routine, stay quiet.
-                        if e.kind() != io::ErrorKind::UnexpectedEof {
+                        // Peer closed the connection or went idle: both
+                        // routine, stay quiet.
+                        if e.kind() != io::ErrorKind::UnexpectedEof
+                            && e.kind() != io::ErrorKind::TimedOut
+                        {
                             eprintln!("rcache raft rpc: connection {peer} failed: {e}");
                         }
                     }
@@ -45,10 +55,21 @@ pub async fn serve_on(listener: TcpListener, raft: Arc<RdbRaft>) -> io::Result<(
 }
 
 /// One connection: frame in -> dispatch -> frame out, until the peer
-/// disconnects or the socket breaks.
+/// disconnects or the socket breaks. The socket gets TCP keepalive (dead
+/// peer detection by the OS) and every frame read an idle deadline: a
+/// silently-stuck peer holds no connection task forever.
 async fn handle_conn(mut stream: TcpStream, raft: Arc<RdbRaft>) -> io::Result<()> {
+    apply_tcp_keepalive(&stream);
     loop {
-        let frame = read_frame(&mut stream).await?;
+        let frame = match timeout(IDLE_READ_TIMEOUT, read_frame(&mut stream)).await {
+            Ok(res) => res?,
+            Err(_elapsed) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no frame for {IDLE_READ_TIMEOUT:?}; closing"),
+                ));
+            }
+        };
         let msg: InMsg = serde_json::from_slice(&frame).map_err(|e| {
             eprintln!("rcache raft rpc: dropping malformed frame: {e}");
             io::Error::new(io::ErrorKind::InvalidData, e)

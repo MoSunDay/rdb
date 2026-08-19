@@ -31,15 +31,43 @@ pub(super) fn snapshot_file_name(meta: &Meta) -> String {
     format!("snap-{sanitized}.json")
 }
 
-/// Write `data` to `path` DURABLY: fsync the file, then the parent
-/// directory so the file's directory entry survives a crash — callers
-/// persist a meta record pointing at this file and must never observe
-/// the meta outliving the file it names.
-fn write_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut file = File::create(path)?;
+/// Sibling staging path for `path`: `<final>.tmp` in the same directory
+/// (rename must not cross filesystems to stay atomic).
+fn tmp_sibling(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().map(ToOwned::to_owned).unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// Write `data` to `tmp`, fsync it, then rename it over `path` — the
+/// atomic same-directory replace step of [`write_durably`].
+fn stage_and_rename(tmp: &Path, path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut file = File::create(tmp)?;
     file.write_all(data)?;
     file.sync_all()?;
     drop(file);
+    fs::rename(tmp, path)
+}
+
+/// Write `data` to `path` DURABLY and ATOMICALLY: the bytes first land in
+/// a fsynced sibling `<final>.tmp`, which is then renamed over `path` and
+/// the parent directory fsynced so the new directory entry survives a
+/// crash — callers persist a meta record pointing at this file and must
+/// never observe the meta outliving the file it names. Truncating the
+/// live file in place instead (`File::create(path)`) would destroy the
+/// previous good snapshot mid-write — a crash or a re-delivery of the
+/// same install-snapshot meta would then leave no loadable snapshot and
+/// crash-loop the node. A `.tmp` left behind by a crash between the write
+/// and the rename is harmless: `load_snapshot` reads only the exact final
+/// name and the retention sweep in [`LogStore::save_snapshot`] deletes
+/// every other file on the next save.
+fn write_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = tmp_sibling(path);
+    if let Err(e) = stage_and_rename(&tmp, path, data) {
+        // Leave no staging residue behind on failure.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Some(dir) = path.parent() {
         File::open(dir)?.sync_all()?;
     }
@@ -78,7 +106,9 @@ impl LogStore {
         self.flush(ErrorSubject::Snapshot(Some(sig)), ErrorVerb::Write)?;
 
         // (3) retention 1, like Go NewFileSnapshotStore(dir, 1, ...):
-        // with the new meta durable, older files are unreferenced.
+        // with the new meta durable, older files are unreferenced. This
+        // sweep also removes any `<final>.tmp` left behind by a crash in
+        // write_durably (it never matches the current file name).
         for entry in fs::read_dir(&self.snapshot_dir).map_err(|e| err(ErrorVerb::Read, &e))? {
             let entry = entry.map_err(|e| err(ErrorVerb::Read, &e))?;
             if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
@@ -161,5 +191,40 @@ mod tests {
         let path = dir.path().join("snap-x.json");
         write_durably(&path, br#"{"k":"v"}"#).unwrap();
         assert_eq!(fs::read(&path).unwrap(), br#"{"k":"v"}"#.to_vec());
+    }
+
+    /// `write_durably` must replace the file via rename (never truncate
+    /// in place): a second, SHORTER write leaves exactly the new bytes —
+    /// an in-place truncate would too, but combined with the rename the
+    /// staging file is gone — and no `<final>.tmp` residue remains in the
+    /// directory after either write.
+    #[test]
+    fn write_durably_replaces_via_rename_without_tmp_residue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("snap-x.json");
+        write_durably(&path, b"first-version-long").unwrap();
+        write_durably(&path, b"2").unwrap();
+        // Full replacement, not a truncate-and-overwrite partial write.
+        assert_eq!(fs::read(&path).unwrap(), b"2".to_vec());
+        let mut names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["snap-x.json".to_string()]);
+    }
+
+    /// A staging failure must leave the previous good file untouched: a
+    /// crash mid-write must never destroy the old snapshot (occupy the
+    /// `<final>.tmp` staging name with a directory so creating it fails).
+    #[test]
+    fn write_durably_failure_keeps_old_file_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("snap-x.json");
+        write_durably(&path, b"good").unwrap();
+        fs::create_dir(dir.path().join("snap-x.json.tmp")).unwrap();
+        assert!(write_durably(&path, b"bad").is_err());
+        // The old snapshot survived the failed re-write byte-for-byte.
+        assert_eq!(fs::read(&path).unwrap(), b"good".to_vec());
     }
 }
