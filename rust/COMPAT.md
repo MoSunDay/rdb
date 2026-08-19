@@ -180,6 +180,15 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     match the set's (`ERR dimension mismatch`).
   - VSIM ties break by element byte order ascending (Redis breaks by internal HNSW order);
     `COUNT`/`WITHSCORES`/`WITHATTRIBS` parse in any order, `VALUES` swallows the argument tail.
+- **RESP input hardening / connection hygiene** (the Go archive had none of these): a single
+  `$N` bulk payload is capped at 512MiB (Redis `proto-max-bulk-len` parity; the header alone
+  errors with `ERR Protocol error: invalid bulk length`, connection closed); the cumulative
+  per-connection read buffer is capped at 1GB (`ERR Protocol error: too big cumulative
+  request`, closed); unauthenticated connections get a 30s read deadline
+  (`ERR unauthenticated connection timeout`, closed — once authenticated reads are unbounded);
+  and a handler panic, after its unchanged `fatal error: <panic>` reply, now CLOSES the
+  connection instead of leaving a possibly-desynced one open; the AUTH token is compared in
+  constant time.
 
 ## Runtime verification (this tree)
 
