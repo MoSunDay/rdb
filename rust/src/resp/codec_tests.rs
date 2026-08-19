@@ -84,6 +84,28 @@ fn bulk_errors() {
 }
 
 #[test]
+fn bulk_length_is_capped() {
+    // Redis `proto-max-bulk-len` parity: 512MiB exactly is still valid, so
+    // the header alone (no payload) waits as Incomplete, not an error.
+    assert!(matches!(
+        parse_command(b"*2\r\n$3\r\nSET\r\n$536870912\r\n"),
+        ParseOutcome::Incomplete
+    ));
+    // One past the cap errors on the HEADER alone, before any payload.
+    assert_eq!(
+        err_msg(b"*2\r\n$3\r\nSET\r\n$536870913\r\n"),
+        "invalid bulk length"
+    );
+    // A bare huge count digit-prefixed header errors the same way.
+    assert_eq!(err_msg(b"*1\r\n$99999999999\r\n"), "invalid bulk length");
+    // Negative bulk lengths are unaffected (still "invalid bulk length").
+    assert_eq!(
+        err_msg(b"*2\r\n$3\r\nSET\r\n$-1\r\n"),
+        "invalid bulk length"
+    );
+}
+
+#[test]
 fn dollar_first_byte_is_invalid_message() {
     assert_eq!(err_msg(b"$3\r\nfoo\r\n"), "invalid message");
 }

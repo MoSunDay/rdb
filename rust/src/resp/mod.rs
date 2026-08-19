@@ -9,6 +9,7 @@ pub mod codec;
 pub mod conn;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::state;
 
@@ -28,7 +29,8 @@ pub fn bind(addr: &str) -> Result<tokio::net::TcpListener, String> {
 }
 
 /// Accept loop (Go redcon `ListenAndServe`): one task per connection.
-/// Accept errors are skipped, matching redcon's silent retry.
+/// Accept errors are skipped, matching redcon's silent retry, but with a
+/// 10ms backoff so an EMFILE-style error storm cannot busy-spin the loop.
 pub async fn serve(listener: tokio::net::TcpListener, shared: Arc<state::Shared>) -> ! {
     loop {
         match listener.accept().await {
@@ -36,7 +38,10 @@ pub async fn serve(listener: tokio::net::TcpListener, shared: Arc<state::Shared>
                 let shared = shared.clone();
                 tokio::spawn(conn::handle_conn(sock, shared));
             }
-            Err(_) => continue,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
         }
     }
 }
