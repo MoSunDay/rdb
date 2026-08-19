@@ -67,6 +67,9 @@ pub fn is_scan_type_name(name: &[u8]) -> bool {
 /// finished. The cursor is exclusive: callers pass the previous page's
 /// `next` back in. Only RETURNED keys count towards `count`, so a TYPE
 /// filter may examine many records per page and still return few.
+/// Returns Err when the underlying iterator fails -- callers must NOT
+/// turn that into a "finished" (empty) cursor, which would silently
+/// truncate a client's iteration.
 pub struct ScanPage {
     pub keys: Vec<Vec<u8>>,
     pub next: Vec<u8>,
@@ -79,7 +82,7 @@ pub fn collect_user_keys(
     pattern: Option<&[u8]>,
     type_filter: Option<&[u8]>,
     count: usize,
-) -> ScanPage {
+) -> Result<ScanPage, String> {
     // Clamp a foreign cursor into this slot (SCAN is per-slot here).
     let (start, excl) = if from < prefix {
         (prefix.to_vec(), false)
@@ -88,7 +91,7 @@ pub fn collect_user_keys(
     };
     let mut keys: Vec<Vec<u8>> = Vec::new();
     let mut resume: Option<Vec<u8>> = None;
-    let _ = ops::for_each_from(store, &start, excl, &mut |k, _| {
+    ops::for_each_from(store, &start, excl, &mut |k, _| {
         if !k.starts_with(prefix) {
             return false; // left the slot: done
         }
@@ -104,39 +107,48 @@ pub fn collect_user_keys(
             }
         }
         true
-    });
-    ScanPage {
+    })?;
+    Ok(ScanPage {
         keys,
         next: resume.unwrap_or_default(),
-    }
+    })
 }
 
 /// Every user key in the slot (KEYS; unbounded count, no type filter).
-pub fn all_user_keys(store: &Store, prefix: &[u8], pattern: Option<&[u8]>) -> Vec<Vec<u8>> {
-    collect_user_keys(store, prefix, prefix, pattern, None, usize::MAX).keys
+/// Err on storage failure -- KEYS must not reply a partial key list.
+pub fn all_user_keys(
+    store: &Store,
+    prefix: &[u8],
+    pattern: Option<&[u8]>,
+) -> Result<Vec<Vec<u8>>, String> {
+    Ok(collect_user_keys(store, prefix, prefix, pattern, None, usize::MAX)?.keys)
 }
 
 /// RANDOMKEY backend: the first user key at/after a uniformly random slot
 /// prefix, wrapping once to the database start when the tail is empty.
-pub fn random_user_key(store: &Store) -> Option<Vec<u8>> {
+/// Err on storage failure (a miss must mean "database empty", not "read
+/// failed").
+pub fn random_user_key(store: &Store) -> Result<Option<Vec<u8>>, String> {
     let slot = crate::utils::rand_u64() % 16_384;
     let from = format!("{slot}/").into_bytes();
-    first_user_key_from(store, &from)
-        .or_else(|| first_user_key_from(store, b""))
-        .and_then(|k| user_key_of(&k))
+    let physical = match first_user_key_from(store, &from)? {
+        Some(k) => Some(k),
+        None => first_user_key_from(store, b"")?,
+    };
+    Ok(physical.and_then(|k| user_key_of(&k)))
 }
 
-fn first_user_key_from(store: &Store, from: &[u8]) -> Option<Vec<u8>> {
+fn first_user_key_from(store: &Store, from: &[u8]) -> Result<Option<Vec<u8>>, String> {
     let mut found: Option<Vec<u8>> = None;
-    let _ = ops::for_each_from(store, from, false, &mut |k, _| {
+    ops::for_each_from(store, from, false, &mut |k, _| {
         if user_key_of(k).is_some() {
             found = Some(k.to_vec());
             false
         } else {
             true
         }
-    });
-    found
+    })?;
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -178,12 +190,12 @@ mod tests {
         for i in 0..5u8 {
             put_raw(&shared, format!("k{}", i).as_bytes(), b"v");
         }
-        let p1 = collect_user_keys(&shared.store, P, P, None, None, 2);
+        let p1 = collect_user_keys(&shared.store, P, P, None, None, 2).expect("page 1");
         assert_eq!(p1.keys, vec![b"k0".to_vec(), b"k1".to_vec()]);
         assert!(!p1.next.is_empty());
-        let p2 = collect_user_keys(&shared.store, P, &p1.next, None, None, 2);
+        let p2 = collect_user_keys(&shared.store, P, &p1.next, None, None, 2).expect("page 2");
         assert_eq!(p2.keys, vec![b"k2".to_vec(), b"k3".to_vec()]);
-        let p3 = collect_user_keys(&shared.store, P, &p2.next, None, None, 2);
+        let p3 = collect_user_keys(&shared.store, P, &p2.next, None, None, 2).expect("page 3");
         assert_eq!(p3.keys, vec![b"k4".to_vec()]);
         assert!(p3.next.is_empty(), "iteration finished");
     }
@@ -201,13 +213,13 @@ mod tests {
             b
         })
         .expect("batch");
-        let all = all_user_keys(&shared.store, P, None);
+        let all = all_user_keys(&shared.store, P, None).expect("all keys");
         // Physical order: typed META records (kind byte < 'u') sort before
         // the raw string "user".
         assert_eq!(all, vec![b"z".to_vec(), b"user".to_vec()]);
-        let only_u = all_user_keys(&shared.store, P, Some(b"u*"));
+        let only_u = all_user_keys(&shared.store, P, Some(b"u*")).expect("u* keys");
         assert_eq!(only_u, vec![b"user".to_vec()]);
-        let only_z = all_user_keys(&shared.store, P, Some(b"z"));
+        let only_z = all_user_keys(&shared.store, P, Some(b"z")).expect("z keys");
         assert_eq!(only_z, vec![b"z".to_vec()]);
     }
 
@@ -224,11 +236,14 @@ mod tests {
         .expect("batch");
         // Raw strings and META records both type-filter; the value is
         // case-insensitive and unfiltered scans still see everything.
-        let strings = collect_user_keys(&shared.store, P, P, None, Some(b"string"), 10);
+        let strings =
+            collect_user_keys(&shared.store, P, P, None, Some(b"string"), 10).expect("string page");
         assert_eq!(strings.keys, vec![b"str".to_vec()]);
-        let zsets = collect_user_keys(&shared.store, P, P, None, Some(b"ZSET"), 10);
+        let zsets =
+            collect_user_keys(&shared.store, P, P, None, Some(b"ZSET"), 10).expect("zset page");
         assert_eq!(zsets.keys, vec![b"z".to_vec()]);
-        let none = collect_user_keys(&shared.store, P, P, None, Some(b"hash"), 10);
+        let none =
+            collect_user_keys(&shared.store, P, P, None, Some(b"hash"), 10).expect("hash page");
         assert!(none.keys.is_empty() && none.next.is_empty());
         // Known names accepted, unknown ones rejected (SCAN TYPE syntax).
         assert!(is_scan_type_name(b"hash") && is_scan_type_name(b"rejson-rl"));
@@ -239,11 +254,30 @@ mod tests {
     fn random_user_key_wraps_to_some_key() {
         let (_guard, shared) = shared();
         // Empty database: nothing anywhere.
-        assert!(random_user_key(&shared.store).is_none());
+        assert_eq!(random_user_key(&shared.store).expect("random"), None);
         put_raw(&shared, b"only", b"v");
         // With a single key, any start slot must wrap around to it.
         for _ in 0..32 {
-            assert_eq!(random_user_key(&shared.store), Some(b"only".to_vec()));
+            assert_eq!(
+                random_user_key(&shared.store).expect("random"),
+                Some(b"only".to_vec())
+            );
         }
+    }
+
+    /// The storage backends are `Result`-typed: "no data" (empty page,
+    /// empty key list, no random key) is always an `Ok` variant, so a
+    /// caller can map `Ok(None)`/`Ok(empty)` to a normal reply and any
+    /// `Err` to `-ERR` without ambiguity. Storage iterator failures
+    /// cannot be forced in-process here; the plumbing is asserted by
+    /// these signatures plus the `.expect` unwraps above.
+    #[test]
+    fn empty_results_are_ok_not_fabricated() {
+        let (_guard, shared) = shared();
+        let page = collect_user_keys(&shared.store, P, P, None, None, 10).expect("empty scan page");
+        assert!(page.keys.is_empty() && page.next.is_empty());
+        let all = all_user_keys(&shared.store, P, None).expect("empty key list");
+        assert!(all.is_empty());
+        assert_eq!(random_user_key(&shared.store).expect("no random key"), None);
     }
 }

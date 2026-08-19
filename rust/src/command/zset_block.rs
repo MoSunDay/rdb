@@ -36,14 +36,16 @@ enum ZBlockResult {
     Timeout,
     /// A key holds a non-zset value; the caller replies WRONGTYPE.
     WrongType,
-    /// The commit failed and the error reply is already in `out`.
+    /// A read or the commit failed; the error reply is already in `out`.
     Failed,
 }
 
 /// Pop ONE extreme member of `key` (first record for MIN, last for
 /// MAX) under the caller-held latch; `None` when the zset drained
 /// between the state read and the scan (practically unreachable) --
-/// the caller then keeps blocking.
+/// the caller then keeps blocking. A FAILED scan replies -ERR here and
+/// reports `Failed`: an unreadable index must reach the waiting client,
+/// never pose as an empty zset (which would block on in silence).
 async fn quick_pop(
     ctx: &mut Ctx<'_>,
     key: &[u8],
@@ -53,7 +55,7 @@ async fn quick_pop(
     cmd: &str,
 ) -> Option<ZBlockResult> {
     let mut chosen: Option<(Vec<u8>, f64)> = None;
-    let _ = zset_ds::for_each_scored(
+    if zset_ds::for_each_scored(
         &ctx.shared.store,
         &ctx.prefix_key,
         key,
@@ -63,7 +65,12 @@ async fn quick_pop(
             chosen = Some((member.to_vec(), score));
             max // MIN stops at the first record; MAX scans on, last wins
         },
-    );
+    )
+    .is_err()
+    {
+        append_error(ctx.out, &format!("ERR: {cmd} failed"));
+        return Some(ZBlockResult::Failed);
+    }
     let (member, score) = chosen?;
     let mut batch = WriteBatch::default();
     zset_ds::del_member(&mut batch, &ctx.prefix_key, key, &member);

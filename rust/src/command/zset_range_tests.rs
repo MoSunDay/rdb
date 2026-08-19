@@ -310,3 +310,22 @@ fn zrangebyscore_exclusive_bounds_and_signed_zero() {
         ]
     );
 }
+
+/// Every ZRANGE-family window helper replies an EMPTY array for a
+/// missing key -- the arm sitting next to the scan-error path, which
+/// must reply -ERR instead. Locks the missing-key bytes so the error
+/// plumbing can never bleed into them.
+#[test]
+fn zrange_family_missing_key_replies_empty_array() {
+    let (_g, s) = shared_for("127.0.0.1:40537");
+    let empty = b"*0\r\n".to_vec();
+    assert_eq!(call(&s, "zrange", &[b"none", b"-", b"+", b"BYLEX"]), empty);
+    assert_eq!(
+        call(&s, "zrange", &[b"none", b"1", b"2", b"BYSCORE"]),
+        empty
+    );
+    assert_eq!(call(&s, "zrevrangebyscore", &[b"none", b"2", b"1"]), empty);
+    assert_eq!(call(&s, "zrangebylex", &[b"none", b"-", b"+"]), empty);
+    assert_eq!(call(&s, "zrevrangebylex", &[b"none", b"+", b"-"]), empty);
+    assert_eq!(call(&s, "zrange", &[b"none", b"0", b"-1", b"REV"]), empty);
+}

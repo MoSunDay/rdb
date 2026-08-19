@@ -396,3 +396,33 @@ fn smove_semantics_and_wrongtype() {
     assert_eq!(members(&s, src), vec![b"b".to_vec()]);
     assert_eq!(members(&s, dst), vec![b"a".to_vec(), b"c".to_vec()]);
 }
+
+/// Cardinality lock: every has_member consumer (SADD dedup, SREM, SMOVE)
+/// must keep SCARD exact. A storage error misread as "member absent"
+/// would re-add an existing member and drift the meta count permanently
+/// (read errors are not forceable in-process; this pins the success-path
+/// arithmetic).
+#[test]
+fn set_cardinality_stays_exact_across_writes() {
+    let (_g, s) = shared_for("127.0.0.1:40321");
+    let key = b"{g}k".as_slice();
+    assert_eq!(int_of(&call(&s, "sadd", &[key, b"a", b"b"])), 2);
+    assert_eq!(int_of(&call(&s, "sadd", &[key, b"a", b"b", b"c"])), 1);
+    assert_eq!(int_of(&call(&s, "scard", &[key])), 3);
+    // Re-adding existing members never grows the cardinality.
+    for _ in 0..5 {
+        assert_eq!(int_of(&call(&s, "sadd", &[key, b"a", b"b", b"c"])), 0);
+    }
+    assert_eq!(int_of(&call(&s, "scard", &[key])), 3);
+    // SREM over a mix of present and absent members is exact.
+    assert_eq!(int_of(&call(&s, "srem", &[key, b"zz", b"a"])), 1);
+    assert_eq!(int_of(&call(&s, "scard", &[key])), 2);
+    // Round-trip SMOVE keeps both cardinalities exact.
+    assert_eq!(int_of(&call(&s, "smove", &[key, b"{g}dst", b"b"])), 1);
+    assert_eq!(int_of(&call(&s, "scard", &[key])), 1);
+    assert_eq!(int_of(&call(&s, "scard", &[b"{g}dst"])), 1);
+    assert_eq!(int_of(&call(&s, "smove", &[b"{g}dst", key, b"b"])), 1);
+    assert_eq!(int_of(&call(&s, "scard", &[key])), 2);
+    assert_eq!(int_of(&call(&s, "exists", &[b"{g}dst"])), 0);
+    assert_eq!(members(&s, key), vec![b"b".to_vec(), b"c".to_vec()]);
+}

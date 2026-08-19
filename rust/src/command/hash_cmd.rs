@@ -72,11 +72,10 @@ pub(crate) fn write_meta_of(ctx: &mut Ctx<'_>, key: &[u8]) -> Option<(u64, u64)>
     }
 }
 
-pub(crate) fn field_exists(ctx: &Ctx<'_>, key: &[u8], field: &[u8]) -> bool {
-    hash_ds::read_field(&ctx.shared.store, &ctx.prefix_key, key, field)
-        .ok()
-        .flatten()
-        .is_some()
+/// Field presence; `Err` propagates the storage read failure so write
+/// paths can abort instead of mistaking it for "field absent".
+pub(crate) fn field_exists(ctx: &Ctx<'_>, key: &[u8], field: &[u8]) -> Result<bool, String> {
+    hash_ds::read_field(&ctx.shared.store, &ctx.prefix_key, key, field).map(|v| v.is_some())
 }
 
 /// Commit one mutation: field puts/deletes plus the meta record (or a
@@ -130,7 +129,14 @@ pub async fn hset(ctx: &mut Ctx<'_>) {
     };
     let mut fresh: Vec<Vec<u8>> = Vec::new(); // fields created by THIS call
     for (f, _) in &puts {
-        if !fresh.contains(f) && !field_exists(ctx, &key, f) {
+        let present = match field_exists(ctx, &key, f) {
+            Ok(p) => p,
+            Err(_) => {
+                append_error(ctx.out, "ERR: hset failed");
+                return;
+            }
+        };
+        if !fresh.contains(f) && !present {
             fresh.push(f.clone());
         }
     }
@@ -162,9 +168,16 @@ pub async fn hsetnx(ctx: &mut Ctx<'_>) {
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
-    if field_exists(ctx, &key, &field) {
-        append_int(ctx.out, 0);
-        return;
+    match field_exists(ctx, &key, &field) {
+        Ok(true) => {
+            append_int(ctx.out, 0);
+            return;
+        }
+        Ok(false) => {}
+        Err(_) => {
+            append_error(ctx.out, "ERR: hsetnx failed");
+            return;
+        }
     }
     let put = (field, value);
     if commit(ctx, &key, expire_ms, base + 1, &[put], &[], "hsetnx")
@@ -242,7 +255,14 @@ pub async fn hdel(ctx: &mut Ctx<'_>) {
     }
     let mut gone: Vec<Vec<u8>> = Vec::new();
     for field in &ctx.args[1..] {
-        if !gone.contains(field) && field_exists(ctx, &key, field) {
+        let present = match field_exists(ctx, &key, field) {
+            Ok(p) => p,
+            Err(_) => {
+                append_error(ctx.out, "ERR: hdel failed");
+                return;
+            }
+        };
+        if !gone.contains(field) && present {
             gone.push(field.clone());
         }
     }
@@ -280,7 +300,13 @@ pub async fn hexists(ctx: &mut Ctx<'_>) {
             return;
         }
         HashState::Missing => false,
-        HashState::Hash { .. } => field_exists(ctx, &ctx.args[0], &ctx.args[1]),
+        HashState::Hash { .. } => match field_exists(ctx, &ctx.args[0], &ctx.args[1]) {
+            Ok(p) => p,
+            Err(_) => {
+                append_error(ctx.out, "ERR: hexists failed");
+                return;
+            }
+        },
     };
     append_int(ctx.out, i64::from(answer));
 }
@@ -297,16 +323,19 @@ pub async fn hstrlen(ctx: &mut Ctx<'_>) {
             return;
         }
         HashState::Missing => 0,
-        HashState::Hash { .. } => hash_ds::read_field(
+        HashState::Hash { .. } => match hash_ds::read_field(
             &ctx.shared.store,
             &ctx.prefix_key,
             &ctx.args[0],
             &ctx.args[1],
-        )
-        .ok()
-        .flatten()
-        .map(|v| v.len())
-        .unwrap_or(0),
+        ) {
+            Ok(Some(v)) => v.len(),
+            Ok(None) => 0,
+            Err(_) => {
+                append_error(ctx.out, "ERR: hstrlen failed");
+                return;
+            }
+        },
     };
     append_int(ctx.out, len as i64);
 }

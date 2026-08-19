@@ -73,8 +73,15 @@ fn groups_info(ctx: &mut Ctx<'_>, stream: &[u8], prefix: &[u8]) {
 /// `XINFO TOPICS <parent>`: Lite extension listing `[child, length]` pairs.
 fn topics_info(ctx: &mut Ctx<'_>, parent: &[u8]) {
     let prefix = hash::slot_with_prefix(parent).1;
-    let children =
-        select::discover_children(&ctx.shared.store, &prefix, parent, select::DEFAULT_LIMIT);
+    let children = match select::discover_children(
+        &ctx.shared.store,
+        &prefix,
+        parent,
+        select::DEFAULT_LIMIT,
+    ) {
+        Ok(c) => c,
+        Err(e) => return resp::append_error(ctx.out, &format!("ERR: xinfo failed: {e}")),
+    };
     resp::append_array(ctx.out, children.len() * 2);
     for child in children {
         let mut stream = parent.to_vec();
@@ -191,7 +198,11 @@ pub async fn xpick(ctx: &mut Ctx<'_>) {
     }
     let prefix = hash::slot_with_prefix(&parent).1;
     let children =
-        select::discover_children(&ctx.shared.store, &prefix, &parent, select::DEFAULT_LIMIT);
+        match select::discover_children(&ctx.shared.store, &prefix, &parent, select::DEFAULT_LIMIT)
+        {
+            Ok(c) => c,
+            Err(e) => return resp::append_error(ctx.out, &format!("ERR: xpick failed: {e}")),
+        };
     let child = match strategy {
         select::Strategy::RoundRobin => {
             select::pick_round_robin(&ctx.shared.lite.picks, &parent, &children)

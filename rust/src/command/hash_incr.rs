@@ -49,7 +49,14 @@ pub async fn hincrby(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, "ERR increment or decrement would overflow");
         return;
     };
-    let created = current == 0 && !field_exists(ctx, &key, &field);
+    let existed = match field_exists(ctx, &key, &field) {
+        Ok(p) => p,
+        Err(_) => {
+            append_error(ctx.out, "ERR: hincrby failed");
+            return;
+        }
+    };
+    let created = current == 0 && !existed;
     let put = (field, new.to_string().into_bytes());
     if commit(
         ctx,
@@ -88,7 +95,13 @@ pub async fn hincrbyfloat(ctx: &mut Ctx<'_>) {
     let Some((expire_ms, base)) = write_meta_of(ctx, &key) else {
         return;
     };
-    let existed = field_exists(ctx, &key, &field);
+    let existed = match field_exists(ctx, &key, &field) {
+        Ok(p) => p,
+        Err(_) => {
+            append_error(ctx.out, "ERR: hincrbyfloat failed");
+            return;
+        }
+    };
     let current = match hash_ds::read_field(&ctx.shared.store, &ctx.prefix_key, &key, &field) {
         Ok(Some(v)) => match parse_f64(&v) {
             Some(n) => n,
