@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::hash;
 use crate::monitor;
 use crate::state;
 use crate::store::ops;
@@ -106,13 +107,41 @@ pub fn new_runtime() -> Runtime {
 /// superseded by a newer ack since the snapshot stay dirty and ride the
 /// next round, so a late old batch can never lower the committed watermark
 /// already on disk -- then one async batched fsync.
+///
+/// The whole round runs under the per-stream latches of every dirty
+/// stream (derived from the parent part of the stream name -- the bytes
+/// before the first `/`, or the whole name), acquired in byte-sorted KEY
+/// order like the RENAME convention and held across the awaited write:
+/// without them, the background round and the shutdown flush could
+/// commit out of order and regress the on-disk watermark, and a round
+/// that passed `drop_superseded` could still land after XGROUP DESTROY's
+/// commit and resurrect the destroyed group record.
 pub async fn flush_offsets_once(shared: &Arc<state::Shared>) -> Result<(), String> {
+    // Distinct latch keys of the dirty streams, byte-sorted (deadlock
+    // avoidance when two rounds overlap on several streams).
+    let mut latch_keys: Vec<Vec<u8>> = offset::dirty_keys(&shared.lite.offsets)
+        .into_iter()
+        .map(|(stream, _)| {
+            let parent = match stream.iter().position(|&b| b == b'/') {
+                Some(i) => &stream[..i],
+                None => &stream[..],
+            };
+            model::meta_key(&hash::slot_with_prefix(parent).1, &stream)
+        })
+        .collect();
+    latch_keys.sort();
+    latch_keys.dedup();
+    let mut guards = Vec::with_capacity(latch_keys.len());
+    for key in &latch_keys {
+        guards.push(crate::ds::latch::lock(&shared.latch, key).await);
+    }
     let dirty = offset::flush_dirty(&shared.lite.offsets);
     let dirty = offset::drop_superseded(&shared.lite.offsets, dirty);
     monitor::set_lite_offset_dirty(&shared.monitor, dirty.len() as f64);
     if let Some(batch) = offset::build_flush_batch(&dirty) {
         ops::batch_write_async(Arc::clone(&shared.store), batch).await?;
     }
+    drop(guards);
     Ok(())
 }
 

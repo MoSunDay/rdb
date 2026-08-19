@@ -185,13 +185,17 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     `COUNT`/`WITHSCORES`/`WITHATTRIBS` parse in any order, `VALUES` swallows the argument tail.
 - **RESP input hardening / connection hygiene** (the Go archive had none of these): a single
   `$N` bulk payload is capped at 512MiB (Redis `proto-max-bulk-len` parity; the header alone
-  errors with `ERR Protocol error: invalid bulk length`, connection closed); the cumulative
-  per-connection read buffer is capped at 1GB (`ERR Protocol error: too big cumulative
-  request`, closed); unauthenticated connections get a 30s read deadline
+  errors with `ERR Protocol error: invalid bulk length`, connection closed); a `*N` multibulk
+  header preallocates at most 16 argument slots regardless of `N` (an eager giant `Vec` per
+  parse retry was a dribble-amplified allocation DoS); the cumulative per-connection read
+  buffer is capped at 1GB for AUTHENTICATED connections — an unauthenticated one is cut off
+  at 64KB (`ERR Protocol error: too big cumulative request`, closed) and its 30s deadline is
+  CUMULATIVE since first byte, so byte-dribbling cannot outlive it
   (`ERR unauthenticated connection timeout`, closed — once authenticated reads are unbounded);
-  and a handler panic, after its unchanged `fatal error: <panic>` reply, now CLOSES the
-  connection instead of leaving a possibly-desynced one open; the AUTH token is compared in
-  constant time.
+  pipelined reply buffering is flushed to the socket at 64KB thresholds instead of growing
+  until the pipeline drains; and a handler panic, after its unchanged `fatal error: <panic>`
+  reply, now CLOSES the connection instead of leaving a possibly-desynced one open; the AUTH
+  token is compared in constant time.
 - **Ops-plane hardening** (none of these existed in the Go archive):
   - startup REFUSES an empty `raft_token` (`exit(1)` before binding) — an accidental no-auth
     cluster is a deployment error, not a supported mode (all `config/` files carry a token);

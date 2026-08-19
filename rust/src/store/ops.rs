@@ -68,6 +68,37 @@ pub fn spawn_batch_write(store: Arc<Store>, batch: WriteBatch) {
     });
 }
 
+/// Detached batch write guarded by a revalidation read: the commit only
+/// lands when `probe(&current_root_value)` returns true, so a racing
+/// writer that replaced the record between decision and commit cancels
+/// a stale purge instead of deleting the newcomer's data. A failed
+/// revalidation read also cancels the commit (fail-safe: never purge on
+/// an unknown state); both failures only log.
+pub fn spawn_revalidated_write<F>(store: Arc<Store>, root: Vec<u8>, probe: F, batch: WriteBatch)
+where
+    F: FnOnce(Option<&[u8]>) -> bool + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let current = match store.db.get(&root) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("rdb: revalidation read failed: {e}");
+                return;
+            }
+        };
+        let keep = match current.as_deref() {
+            Some(val) => probe(Some(val)),
+            None => probe(None),
+        };
+        if !keep {
+            return;
+        }
+        if let Err(e) = store.db.write_opt(batch, &sync_write_opts()) {
+            eprintln!("rdb: detached batch write failed: {e}");
+        }
+    });
+}
+
 /// Async twin of [`delete_range`].
 pub async fn delete_range_async(
     store: Arc<Store>,
@@ -392,9 +423,15 @@ mod tests {
         );
         assert_eq!(seen, 1);
         // starting past every key also exhausts cleanly
-        assert_eq!(for_each_from(&store, b"99/", false, &mut |_, _| true), Ok(()));
+        assert_eq!(
+            for_each_from(&store, b"99/", false, &mut |_, _| true),
+            Ok(())
+        );
         // exclusive start on the last key visits nothing
-        assert_eq!(for_each_from(&store, b"70/a", true, &mut |_, _| true), Ok(()));
+        assert_eq!(
+            for_each_from(&store, b"70/a", true, &mut |_, _| true),
+            Ok(())
+        );
     }
 
     #[test]

@@ -117,7 +117,12 @@ mod tests {
         let mut jobs = Vec::new();
         for _ in 0..64 {
             let b = Arc::clone(&barrier);
-            jobs.push(tokio::spawn(async move { park(move || { b.wait(); }).await }));
+            jobs.push(tokio::spawn(async move {
+                park(move || {
+                    b.wait();
+                })
+                .await
+            }));
         }
         for j in jobs {
             assert_eq!(j.await.expect("park task"), Some(()));

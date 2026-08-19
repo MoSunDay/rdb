@@ -175,6 +175,40 @@ fn multibulk_count_is_capped() {
 }
 
 #[test]
+fn huge_multibulk_header_is_incomplete_without_giant_prealloc() {
+    // `*1048576\r\n` alone sits exactly at the count cap: no error, just
+    // Incomplete. Repeated parses (the Incomplete-retry path a dribbling
+    // client exercises) must stay cheap -- with the unclamped
+    // Vec::with_capacity(count) each attempt eagerly allocated ~24MB and
+    // freed it; with the ARGS_PREALLOC_CAP clamp this loop is trivial.
+    for _ in 0..100 {
+        assert!(matches!(
+            parse_command(b"*1048576\r\n"),
+            ParseOutcome::Incomplete
+        ));
+    }
+    // Parity guard: with the clamp in place, real commands still parse
+    // byte-identically (args + consumed unchanged).
+    let buf = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+    let (args, consumed) = complete(buf);
+    assert_eq!(s(&args), ["SET", "foo", "bar"]);
+    assert_eq!(consumed, buf.len());
+    // A count just above the clamp also parses correctly once the full
+    // payload arrives (the Vec grew past the initial capacity).
+    let mut big = b"*20\r\n".to_vec();
+    for i in 0..20 {
+        let arg = format!("a{i}");
+        big.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        big.extend_from_slice(arg.as_bytes());
+        big.extend_from_slice(b"\r\n");
+    }
+    let (args, consumed) = complete(&big);
+    assert_eq!(args.len(), 20);
+    assert_eq!(s(&args)[19], "a19");
+    assert_eq!(consumed, big.len());
+}
+
+#[test]
 fn writers_byte_exact() {
     let mut buf = Vec::new();
     append_string(&mut buf, "OK");

@@ -88,6 +88,38 @@ pub(crate) fn seek_from_sortable(min: f64, incl: bool) -> u64 {
     }
 }
 
+/// Sortable key with the two zeros collapsed onto +0.0's: INCLUSIVE
+/// bounds compare the zeros numerically equal (IEEE), so an inclusive
+/// zero bound covers both signs.
+fn incl_sortable(score: f64) -> u64 {
+    if score == 0.0 {
+        zset_ds::score_sortable(0.0)
+    } else {
+        zset_ds::score_sortable(score)
+    }
+}
+
+/// Window-bound comparisons in SORTABLE score order: for EXCLUSIVE
+/// bounds -0.0 sorts strictly before +0.0 (unlike IEEE equality, which
+/// collapses them), so `(-0.0` keeps +0.0 members while `(0.0` drops
+/// both zeros; inclusive bounds keep the numeric equality.
+pub(crate) fn score_below_min(score: f64, min: f64, min_incl: bool) -> bool {
+    if min_incl {
+        incl_sortable(score) < incl_sortable(min)
+    } else {
+        zset_ds::score_sortable(score) <= zset_ds::score_sortable(min)
+    }
+}
+
+/// Max-side twin of [`score_below_min`].
+pub(crate) fn score_past_max(score: f64, max: f64, max_incl: bool) -> bool {
+    if max_incl {
+        incl_sortable(score) > incl_sortable(max)
+    } else {
+        zset_ds::score_sortable(score) >= zset_ds::score_sortable(max)
+    }
+}
+
 /// Append one score as a bulk string: f64's shortest roundtrip repr
 /// (`3.5`, `inf`, ...); Redis prints %.17g, both roundtrip to the same
 /// value (see `hash_incr::hincrbyfloat`).

@@ -10,7 +10,8 @@ use rocksdb::WriteBatch;
 use crate::command::hash_cmd::{arity, parse_i64};
 use crate::command::list_cmd::clamp_range;
 use crate::command::zset_util::{
-    collect_scored, commit_zset, lex_within, parse_lex_bound, parse_score_bound, write_meta_of,
+    collect_scored, commit_zset, lex_within, parse_lex_bound, parse_score_bound, score_below_min,
+    score_past_max, seek_from_sortable, write_meta_of,
 };
 use crate::command::{keys_core, Ctx};
 use crate::ds::{latch, zset_ds};
@@ -122,7 +123,9 @@ pub async fn zremrangebyscore(ctx: &mut Ctx<'_>) {
         return;
     }
     // Seek to the min bound's sortable prefix, filter to the window.
-    let from = zset_ds::score_sortable(min).to_be_bytes();
+    // An INCLUSIVE zero min must seek at sortable(-0.0): -0.0 members
+    // sort below sortable(+0.0) and would silently dodge the removal.
+    let from = seek_from_sortable(min, min_incl).to_be_bytes();
     let mut window: Vec<(Vec<u8>, f64)> = Vec::new();
     let _ = zset_ds::for_each_scored(
         &ctx.shared.store,
@@ -131,10 +134,10 @@ pub async fn zremrangebyscore(ctx: &mut Ctx<'_>) {
         &from,
         !min_incl,
         &mut |member, score| {
-            if score == min && !min_incl {
+            if score_below_min(score, min, min_incl) {
                 return true; // inside the seek, below the window
             }
-            if score > max || (score == max && !max_incl) {
+            if score_past_max(score, max, max_incl) {
                 return false; // past the window: stop
             }
             window.push((member.to_vec(), score));

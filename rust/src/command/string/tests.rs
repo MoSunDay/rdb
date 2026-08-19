@@ -270,3 +270,34 @@ fn mset_crossslot_writes_nothing() {
         b"*2\r\n$1\r\n1\r\n$1\r\n2\r\n"
     );
 }
+
+#[test]
+fn get_wrongtype_on_non_string_key() {
+    let (_guard, shared) = shared_for("127.0.0.1:40120");
+    // Bug fix: GET used to answer null bulk for keys holding other types.
+    assert_eq!(
+        call(
+            &shared,
+            |ctx| Box::pin(crate::command::hash_cmd::hset(ctx)),
+            &[b"{t}h", b"f", b"v"]
+        ),
+        b":1\r\n"
+    );
+    assert_eq!(
+        call(&shared, |ctx| Box::pin(get(ctx)), &[b"{t}h"]),
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+    );
+    // Plain strings and missing keys keep their replies.
+    assert_eq!(
+        call(&shared, |ctx| Box::pin(set(ctx)), &[b"{t}s", b"v"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        call(&shared, |ctx| Box::pin(get(ctx)), &[b"{t}s"]),
+        b"$1\r\nv\r\n"
+    );
+    assert_eq!(
+        call(&shared, |ctx| Box::pin(get(ctx)), &[b"{t}none"]),
+        b"$-1\r\n"
+    );
+}

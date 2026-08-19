@@ -1,8 +1,8 @@
 //! Consuming side: XREAD / XREADGROUP (+ XLEN). Blocking reads park on
 //! the shared WaitHub via the dedicated park pool (the hub is a sync
 //! Condvar, run off tokio's shared blocking threads);
-//! XADD notifies the stream's meta key after its batch commits. XACK
-//! lives in [`ack`].
+//! XADD notifies both the stream's and its parent topic's meta keys
+//! after its batch commits. XACK lives in [`ack`].
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,6 +68,13 @@ fn nil_array(out: &mut Vec<u8>) {
 /// slices and oversized BLOCK values are never clamped to one capped
 /// deadline. Registering the waiter BEFORE the final read closes the
 /// lost-notify window against XADD.
+///
+/// A SIGNALLED park that still finds no entries returns
+/// `Some(Ok(vec![]))` -- "woke, nothing new" -- instead of re-parking:
+/// the signal may come from a group op (XGROUP DESTROY / SETID also
+/// notify the stream's meta key), and the XREADGROUP caller must
+/// re-validate the group (NOGROUP, rewound watermarks) rather than sleep
+/// out its BLOCK. Plain XREAD treats the empty wake as a re-park.
 async fn wait_entries(
     ctx: &mut Ctx<'_>,
     prefix: &[u8],
@@ -112,8 +119,13 @@ async fn wait_entries(
         let woke = park::park(move || wait::wait(&w, slice)).await;
         wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
         match woke.unwrap_or(WaitOutcome::Timeout) {
+            // Budget spent: nil (the caller maps None to the nil reply).
             WaitOutcome::Timeout if end.is_some_and(|t| Instant::now() >= t) => return None,
-            _ => {} // signaled, spurious, or slice edge with budget left: re-read
+            // Signalled with budget left but no entries landed: hand the
+            // wake back for caller-side re-validation (see above).
+            WaitOutcome::Signaled => return Some(Ok(Vec::new())),
+            // Spurious wake or a slice edge with budget left: re-read.
+            WaitOutcome::Timeout => {}
         }
     }
 }
@@ -126,6 +138,27 @@ fn append_read_reply(out: &mut Vec<u8>, stream: &[u8], entries: &[Entry]) {
     for e in entries {
         entries::append_entry_frame(out, e);
     }
+}
+
+/// Remaining BLOCK budget handed to one `wait_entries` round in
+/// XREADGROUP's loop. `None` means the deadline already passed — the
+/// caller replies nil now instead of parking. `Some(ms)` is clamped to
+/// at least 1: a sub-millisecond remainder truncated to 0 would be read
+/// by `wait_entries` as BLOCK 0 ("wait forever"), hanging a bounded
+/// read past its deadline. (`None` as `end` is the forever sentinel and
+/// passes the raw `block_ms` through.)
+fn remaining_ms(end: Option<Instant>, block_ms: u64) -> Option<u64> {
+    let t = match end {
+        // No deadline (BLOCK 0 / oversized): the caller's forever
+        // sentinel passes through untouched.
+        None => return Some(block_ms),
+        Some(t) => t,
+    };
+    let now = Instant::now();
+    if now >= t {
+        return None;
+    }
+    Some(((t - now).as_millis() as u64).max(1))
 }
 
 /// `XREAD [COUNT n] [BLOCK ms] STREAMS <stream> <id|$>` -- v1 single stream
@@ -175,14 +208,40 @@ pub async fn xread(ctx: &mut Ctx<'_>) {
                 }
             }
         }
-        Some(ms) => match wait_entries(ctx, &prefix, &stream, after, opts.count, ms).await {
-            None => nil_array(ctx.out),
-            Some(Err(e)) => resp::append_error(ctx.out, &format!("ERR: xread failed: {e}")),
-            Some(Ok(v)) => {
-                monitor::observe_lite_message(&ctx.shared.monitor, "read", v.len() as u64);
-                append_read_reply(ctx.out, &stream, &v)
+        Some(ms) => {
+            // Absolute deadline computed once so a signaled re-park
+            // cannot reset the caller's BLOCK budget.
+            let end = if ms == 0 {
+                None
+            } else {
+                Instant::now().checked_add(Duration::from_millis(ms))
+            };
+            loop {
+                let Some(budget) = remaining_ms(end, ms) else {
+                    nil_array(ctx.out);
+                    break;
+                };
+                match wait_entries(ctx, &prefix, &stream, after, opts.count, budget).await {
+                    None => {
+                        nil_array(ctx.out);
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        resp::append_error(ctx.out, &format!("ERR: xread failed: {e}"));
+                        break;
+                    }
+                    // An empty signaled wake (e.g. a group op notified the
+                    // stream's meta key): nothing new for a plain XREAD,
+                    // keep waiting for the remaining budget.
+                    Some(Ok(v)) if v.is_empty() => continue,
+                    Some(Ok(v)) => {
+                        monitor::observe_lite_message(&ctx.shared.monitor, "read", v.len() as u64);
+                        append_read_reply(ctx.out, &stream, &v);
+                        break;
+                    }
+                }
             }
-        },
+        }
     }
 }
 
@@ -258,10 +317,16 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
                 "ERR Invalid stream ID specified as stream command argument",
             );
         };
-        if offset::load(&ctx.shared.lite.offsets, &ctx.shared.store, &prefix, &stream, &group)
-            .ok()
-            .flatten()
-            .is_none()
+        if offset::load(
+            &ctx.shared.lite.offsets,
+            &ctx.shared.store,
+            &prefix,
+            &stream,
+            &group,
+        )
+        .ok()
+        .flatten()
+        .is_none()
         {
             return nogroup(ctx.out, &stream, &group);
         }
@@ -294,10 +359,15 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
     loop {
         {
             let _guard = crate::ds::latch::lock(&ctx.shared.latch, &wake).await;
-            let Some(st) =
-                offset::load(&ctx.shared.lite.offsets, &ctx.shared.store, &prefix, &stream, &group)
-                    .ok()
-                    .flatten() else {
+            let Some(st) = offset::load(
+                &ctx.shared.lite.offsets,
+                &ctx.shared.store,
+                &prefix,
+                &stream,
+                &group,
+            )
+            .ok()
+            .flatten() else {
                 return nogroup(ctx.out, &stream, &group);
             };
             after_snapshot = st.delivered;
@@ -326,23 +396,56 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
         };
         // Budget still left to hand to wait_entries; 0 reaches it only
         // for BLOCK 0 (forever): a bounded wait whose expiry has passed
-        // returns nil inside the match below instead.
-        let left = match end {
-            None => block_ms,
-            Some(t) => {
-                let now = Instant::now();
-                if now >= t {
-                    return nil_array(ctx.out);
-                }
-                (t - now).as_millis() as u64
-            }
+        // returns nil here, and a sub-millisecond remainder is clamped
+        // to 1ms inside remaining_ms so it can never become "forever".
+        let Some(left) = remaining_ms(end, block_ms) else {
+            return nil_array(ctx.out);
         };
         match wait_entries(ctx, &prefix, &stream, after_snapshot, opts.count, left).await {
             None => return nil_array(ctx.out),
             Some(Err(e)) => {
                 return resp::append_error(ctx.out, &format!("ERR: xreadgroup failed: {e}"))
             }
-            Some(Ok(_)) => continue, // data landed: the latched quick path picks it up
+            // Data landed (latched quick path picks it up) OR a group op
+            // signalled the meta key (DESTROY -> NOGROUP re-check, SETID
+            // rewind -> replay): the loop head re-validates both.
+            Some(Ok(_)) => continue,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remaining_ms_passes_forever_sentinel_and_rejects_expired() {
+        // No deadline (BLOCK 0 / oversized): the raw block_ms sentinel
+        // goes through untouched.
+        assert_eq!(remaining_ms(None, 7000), Some(7000));
+        // An already-passed deadline: park nothing, reply nil now.
+        assert_eq!(
+            remaining_ms(Some(Instant::now() - Duration::from_millis(1)), 5),
+            None
+        );
+        // A live deadline: (nearly) all of the remaining milliseconds
+        // (a tick may elapse between building the deadline and the
+        // measurement, so assert a small window, not exact equality).
+        let got = remaining_ms(Some(Instant::now() + Duration::from_millis(10)), 5);
+        assert!(
+            matches!(got, Some(ms) if (8..=10).contains(&ms)),
+            "expected ~10ms, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn remaining_ms_clamps_sub_millisecond_remainder_to_one() {
+        // Regression: 0 < remaining < 1ms truncated to 0, which
+        // wait_entries reads as BLOCK 0 = wait FOREVER; a bounded
+        // XREADGROUP could hang past its deadline until an append woke
+        // it. The remainder must clamp up to 1ms so the timeout fires.
+        let sub = Instant::now() + Duration::from_micros(400);
+        let got = remaining_ms(Some(sub), 5);
+        assert_eq!(got, Some(1), "sub-millisecond budget must be 1ms, not 0");
     }
 }

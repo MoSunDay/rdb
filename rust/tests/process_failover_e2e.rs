@@ -235,18 +235,18 @@ async fn kill9_restart_preserves_all_seven_families() {
         node.ctx()
     );
     assert_eq!(
-        cmd_one_shot(
-            &r,
-            t,
-            &[b"json.set", b"f:json", b"$", b"{\"j\":1}"]
-        )
-        .await,
+        cmd_one_shot(&r, t, &[b"json.set", b"f:json", b"$", b"{\"j\":1}"]).await,
         b"+OK",
         "json.set\n{}",
         node.ctx()
     );
     assert_eq!(
-        cmd_one_shot(&r, t, &[b"vadd", b"f:vec", b"VALUES", b"2", b"v elem", b"1", b"0"]).await,
+        cmd_one_shot(
+            &r,
+            t,
+            &[b"vadd", b"f:vec", b"VALUES", b"2", b"v elem", b"1", b"0"]
+        )
+        .await,
         b":1",
         "vadd\n{}",
         node.ctx()

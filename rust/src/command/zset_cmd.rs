@@ -149,12 +149,12 @@ pub async fn zadd(ctx: &mut Ctx<'_>) {
             continue; // XX never creates members
         }
         if gt || lt {
-            // GT/LT only update existing members, strictly better scores.
-            match old {
-                None => continue,
-                Some(prev) if gt && *score <= prev => continue,
-                Some(prev) if lt && *score >= prev => continue,
-                _ => {}
+            // GT/LT only conditionally UPDATE existing members (strictly
+            // better scores); NEW members are always added (Redis).
+            if let Some(prev) = old {
+                if (gt && *score <= prev) || (lt && *score >= prev) {
+                    continue;
+                }
             }
         }
         match old {
@@ -217,8 +217,8 @@ async fn zadd_incr(
             return;
         }
     };
-    if (nx && old.is_some()) || (xx && old.is_none()) || ((gt || lt) && old.is_none()) {
-        append_null(ctx.out); // GT/LT never create members, INCR honours that
+    if (nx && old.is_some()) || (xx && old.is_none()) {
+        append_null(ctx.out);
         return;
     }
     // A MISSING member takes delta verbatim: `0.0 + (-0.0)` collapses

@@ -5,11 +5,11 @@
 
 mod common;
 
+use common::lite::cmd_full_reply;
 use common::{
     all_ctx, auth_reply, cluster_init, cmd_one_shot, contains_bytes, raw_exchange, spawn_node,
     start_cluster, wait_cluster_nodes_list_all, wait_leader, wait_resp_ready, TOKEN,
 };
-use common::lite::cmd_full_reply;
 
 /// One raw HTTP/1.1 GET against a node's raft control API (/join,
 /// /depart): write the request head, read to EOF (the server closes the
@@ -27,8 +27,7 @@ async fn http_get(addr: &str, target: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(35), sock.read(&mut chunk))
-            .await
+        match tokio::time::timeout(std::time::Duration::from_secs(35), sock.read(&mut chunk)).await
         {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
@@ -428,9 +427,7 @@ async fn depart_live_follower_then_rejoin_restores_membership() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let r = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"nodes"]).await;
-        let all = nodes
-            .iter()
-            .all(|n| contains_bytes(&r, n.raft.as_bytes()));
+        let all = nodes.iter().all(|n| contains_bytes(&r, n.raft.as_bytes()));
         if all {
             break;
         }
@@ -457,7 +454,12 @@ async fn depart_live_follower_then_rejoin_restores_membership() {
     let want = b"$9\r\nrejoinval".to_vec();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let r = cmd_one_shot(&nodes[follower].resp, TOKEN, &[b"raft", b"get", b"rejoinkey"]).await;
+        let r = cmd_one_shot(
+            &nodes[follower].resp,
+            TOKEN,
+            &[b"raft", b"get", b"rejoinkey"],
+        )
+        .await;
         if r == want {
             break;
         }
@@ -555,4 +557,3 @@ async fn migrate_task_list_over_real_raft_and_error_paths() {
         nodes[leader].ctx()
     );
 }
-

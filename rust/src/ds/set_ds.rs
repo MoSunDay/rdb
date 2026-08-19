@@ -98,7 +98,9 @@ pub struct MemberPage {
 }
 
 /// Collect up to `count` members (0 = unbounded), optionally glob-filtered,
-/// starting strictly after `from_member` (None = first member).
+/// starting strictly after `from_member` (None = first member). `Err` =
+/// the scan aborted on a store error; callers must NOT report the
+/// partial page as the full member set.
 pub fn collect_members(
     store: &Store,
     prefix: &[u8],
@@ -106,7 +108,7 @@ pub fn collect_members(
     from_member: Option<&[u8]>,
     pattern: Option<&[u8]>,
     count: usize,
-) -> MemberPage {
+) -> Result<MemberPage, String> {
     let (lower, upper) = members_range(prefix, key);
     let (start, excl_start) = match from_member {
         Some(m) => (codec::elem_key(prefix, KIND_SET_MEMBER, key, m), true),
@@ -115,7 +117,7 @@ pub fn collect_members(
     let mut members: Vec<Vec<u8>> = Vec::new();
     let mut resume: Option<Vec<u8>> = None;
     let base = lower.len();
-    let _ = ops::for_each_from(store, &start, excl_start, &mut |k, _| {
+    ops::for_each_from(store, &start, excl_start, &mut |k, _| {
         if k >= upper.as_slice() {
             return false; // left this set's member window
         }
@@ -129,11 +131,11 @@ pub fn collect_members(
             }
         }
         true
-    });
-    MemberPage {
+    })?;
+    Ok(MemberPage {
         members,
         next: resume,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -188,7 +190,7 @@ mod tests {
         let (_dir, store) = open_tmp();
         write_set(&store, b"s1", 0, &[b"a", b"z"]);
         write_set(&store, b"s1x", 0, &[b"leak"]);
-        let page = collect_members(&store, P, b"s1", None, None, 0);
+        let page = collect_members(&store, P, b"s1", None, None, 0).unwrap();
         assert_eq!(page.members, vec![b"a".to_vec(), b"z".to_vec()]);
         assert!(page.next.is_none());
     }
@@ -197,16 +199,30 @@ mod tests {
     fn collect_pages_filter_and_resume() {
         let (_dir, store) = open_tmp();
         write_set(&store, b"s", 0, &[b"m1", b"m2", b"n3"]);
-        let p1 = collect_members(&store, P, b"s", None, Some(b"m?"), 1);
+        let p1 = collect_members(&store, P, b"s", None, Some(b"m?"), 1).unwrap();
         assert_eq!(p1.members, vec![b"m1".to_vec()]);
         assert_eq!(p1.next, Some(b"m1".to_vec()));
-        let p2 = collect_members(&store, P, b"s", p1.next.as_deref(), Some(b"m?"), 1);
+        let p2 = collect_members(&store, P, b"s", p1.next.as_deref(), Some(b"m?"), 1).unwrap();
         assert_eq!(p2.members, vec![b"m2".to_vec()]);
-        let p3 = collect_members(&store, P, b"s", Some(b"n3"), None, 5);
+        let p3 = collect_members(&store, P, b"s", Some(b"n3"), None, 5).unwrap();
         assert!(p3.members.is_empty() && p3.next.is_none());
         assert!(collect_members(&store, P, b"gone", None, None, 0)
+            .unwrap()
             .members
             .is_empty());
+    }
+
+    /// collect_members reports store errors instead of a silent partial
+    /// page: the success path is an Ok page (signature/propagation
+    /// regression -- forcing a real iterator error is impractical).
+    #[test]
+    fn collect_members_ok_carries_the_full_page() {
+        let (_dir, store) = open_tmp();
+        write_set(&store, b"s", 0, &[b"a", b"b", b"c"]);
+        let page =
+            collect_members(&store, P, b"s", None, None, 2).expect("healthy store cannot fail");
+        assert_eq!(page.members, vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(page.next, Some(b"b".to_vec()), "page stopped at its limit");
     }
 
     #[test]
@@ -216,18 +232,18 @@ mod tests {
         // A page cutting exactly AT the empty member carries Some(b""),
         // not the finished sentinel — otherwise SCAN would misreport done
         // with members remaining.
-        let p1 = collect_members(&store, P, b"s", None, None, 1);
+        let p1 = collect_members(&store, P, b"s", None, None, 1).unwrap();
         assert_eq!(p1.members, vec![b"".to_vec()]);
         assert_eq!(p1.next, Some(Vec::new()));
         // Some(b"") resumes strictly after "": the rest still flows.
-        let p2 = collect_members(&store, P, b"s", p1.next.as_deref(), None, 1);
+        let p2 = collect_members(&store, P, b"s", p1.next.as_deref(), None, 1).unwrap();
         assert_eq!(p2.members, vec![b"a".to_vec()]);
         assert_eq!(p2.next, Some(b"a".to_vec()));
-        let p3 = collect_members(&store, P, b"s", p2.next.as_deref(), None, 5);
+        let p3 = collect_members(&store, P, b"s", p2.next.as_deref(), None, 5).unwrap();
         assert_eq!(p3.members, vec![b"b".to_vec()]);
         assert_eq!(p3.next, None, "true end only after the last member");
         // Unbounded read: one page, cursor None.
-        let all = collect_members(&store, P, b"s", None, None, 0);
+        let all = collect_members(&store, P, b"s", None, None, 0).unwrap();
         assert_eq!(all.members, vec![Vec::new(), b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(all.next, None);
     }

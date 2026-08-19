@@ -271,3 +271,25 @@ async fn oversized_bulk_header_gets_protocol_error_and_close() {
     .await;
     assert_eof(&mut s).await;
 }
+
+#[tokio::test]
+async fn preauth_garbage_over_64kb_gets_too_big_error_and_close() {
+    let shared = Arc::new(test_shared(test_config(), "preauth-cap"));
+    let listener = resp::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(resp::serve(listener, shared));
+
+    let mut s = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
+        .await
+        .expect("connect timeout")
+        .expect("connect");
+    // 66KB of newline-free junk with NO AUTH: nothing parses (telnet
+    // lines need '\n'), so the buffer accumulates past the 64KB PRE-AUTH
+    // cap (not the 1GB authenticated cap), which replies with the same
+    // "too big cumulative request" text and closes. 66KB is fully
+    // consumed by the server, so the close is a clean FIN, not an RST.
+    s.write_all(&vec![b'x'; 66 * 1024]).await.expect("write");
+    let expect: &[u8] = b"-ERR Protocol error: too big cumulative request\r\n";
+    assert_eq!(read_n(&mut s, expect.len()).await, expect);
+    assert_eof(&mut s).await;
+}
