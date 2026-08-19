@@ -41,6 +41,24 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// small KV snapshots), so this only guards against corrupt length fields.
 const MAX_FRAME_BYTES: u32 = 256 * 1024 * 1024;
 
+/// Body bytes read per step: a lying (but under-cap) length header then
+/// costs only the bytes actually streamed before the short read trips,
+/// never one giant up-front allocation.
+const READ_CHUNK_BYTES: usize = 256 * 1024;
+
+/// TCP keepalive profile for raft sockets: after 60s idle, probe every
+/// 10s up to 3 times — a silently-dead peer (cable pull, NAT/VM drop) is
+/// detected within ~90s by the OS instead of pinning the socket until
+/// the RPC deadline notices. Errors are ignored: keepalive is an
+/// optimization, the deadline is the bound.
+pub fn apply_tcp_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
 /// Deterministic raft node id of a RaftTCPAddress: the first 16 hex chars
 /// of `utils.MD5With40(addr)` parsed as a u64 (Go uses the raw address
 /// string as `raft.ServerID`; openraft needs a numeric id instead).
@@ -81,7 +99,11 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> io
     w.flush().await
 }
 
-/// Read one length-prefixed frame.
+/// Read one length-prefixed frame. The declared length is first checked
+/// against [`MAX_FRAME_BYTES`]; the body is then read in
+/// [`READ_CHUNK_BYTES`] steps through the buffer's spare capacity, so the
+/// wire format (u32 big-endian length + payload) is unchanged while a
+/// corrupt-but-under-cap header never triggers a giant single allocation.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
@@ -92,8 +114,21 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<u8>> 
             format!("frame of {len} bytes exceeds the {MAX_FRAME_BYTES} byte limit"),
         ));
     }
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).await?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut remaining = len as usize;
+    while remaining > 0 {
+        buf.reserve(remaining.min(READ_CHUNK_BYTES));
+        // `Vec<u8>` doubles as its own read buffer here (bytes::BufMut):
+        // the vec's len advances with every read, no second copy.
+        let n = r.read_buf(&mut buf).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("frame body truncated: {} of {len} bytes", len as usize - remaining),
+            ));
+        }
+        remaining -= n;
+    }
     Ok(buf)
 }
 
@@ -134,16 +169,29 @@ pub struct Connection {
 
 impl Connection {
     /// Send one request frame and await the response frame, bounded by
-    /// [`RPC_TIMEOUT`] (Go: 10s stream deadline per RPC).
+    /// [`RPC_TIMEOUT`] (Go: 10s stream deadline per RPC). The dial is
+    /// part of the budget: a blackholed peer fails fast as
+    /// `Unreachable` instead of hanging past the deadline semantics.
     async fn call<E: std::error::Error>(
         &mut self,
         msg: &InMsg,
         action: RPCTypes,
     ) -> Result<OutMsg, typ::RPCError<E>> {
-        if let Err(e) = self.ensure_connected().await {
+        match timeout(RPC_TIMEOUT, self.ensure_connected()).await {
+            Err(_elapsed) => {
+                // Cancelling the connect future dropped the half-open
+                // socket; surface as Unreachable so openraft backs off.
+                self.drop_stream();
+                let e = io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {} timed out after {:?}", self.addr, RPC_TIMEOUT),
+                );
+                return Err(RPCError::Unreachable(Unreachable::new(&e)));
+            }
             // The peer cannot be reached at all: advise openraft to back
             // off instead of retrying immediately.
-            return Err(RPCError::Unreachable(Unreachable::new(&e)));
+            Ok(Err(e)) => return Err(RPCError::Unreachable(Unreachable::new(&e))),
+            Ok(Ok(())) => {}
         }
         let stream = self
             .stream
@@ -184,10 +232,14 @@ impl Connection {
         }
     }
 
+    /// Connect (bounded by the caller's [`RPC_TIMEOUT`]) unless a live
+    /// stream is already held; nodelay for latency, keepalive to notice
+    /// silently-dead peers (see [`apply_tcp_keepalive`]).
     async fn ensure_connected(&mut self) -> io::Result<()> {
         if self.stream.is_none() {
             let stream = TcpStream::connect(&self.addr).await?;
             stream.set_nodelay(true).ok();
+            apply_tcp_keepalive(&stream);
             self.stream = Some(stream);
         }
         Ok(())
@@ -318,6 +370,33 @@ mod tests {
         let mut cur = std::io::Cursor::new(buf);
         let err = read_frame(&mut cur).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A frame larger than one read chunk (600 KiB > 256 KiB) must be
+    /// reassembled byte-identically across several chunked reads.
+    #[tokio::test]
+    async fn large_frame_roundtrips_across_chunks() {
+        let (mut client, mut server) = tokio::io::duplex(READ_CHUNK_BYTES);
+        let payload: Vec<u8> = (0..600_000).map(|i| (i % 251) as u8).collect();
+        let p = payload.clone();
+        let writer = tokio::spawn(async move { write_frame(&mut client, &p).await });
+        let got = read_frame(&mut server).await.unwrap();
+        writer.await.unwrap().unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(got, payload);
+    }
+
+    /// A lying-but-under-cap length header streams fewer bytes than it
+    /// declares: the chunked reader must stop at EOF with
+    /// UnexpectedEof (the kind service.rs treats as routine), not hang
+    /// or allocate the full lie.
+    #[tokio::test]
+    async fn truncated_body_under_cap_errors_with_unexpected_eof() {
+        let mut buf = 1_000_000u32.to_be_bytes().to_vec();
+        buf.extend_from_slice(b"only a few real bytes");
+        let mut cur = std::io::Cursor::new(buf);
+        let err = read_frame(&mut cur).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     /// A request and a response (both Ok and Err) must survive the wire

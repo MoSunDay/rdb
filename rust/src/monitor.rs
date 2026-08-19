@@ -7,6 +7,7 @@
 //! are intentionally not reproduced.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use prometheus::{
     CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
@@ -122,7 +123,7 @@ pub fn encode(c: &Collector) -> Result<String, String> {
 /// Tiny HTTP/1.1 endpoint: GET /metrics -> 200 + text body, anything else 404.
 /// One request per connection (scrapers are fine with that).
 pub async fn serve(addr: &str, collector: Arc<Collector>) -> Result<(), String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind(addr)
@@ -131,19 +132,22 @@ pub async fn serve(addr: &str, collector: Arc<Collector>) -> Result<(), String> 
     loop {
         let (mut sock, _) = match listener.accept().await {
             Ok(x) => x,
-            Err(_) => continue,
+            Err(_) => {
+                // Transient accept failures (EMFILE &c) must not spin the
+                // loop hot: back off briefly before retrying.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
         };
         let collector = collector.clone();
         tokio::spawn(async move {
-            let mut head = Vec::new();
-            let mut chunk = [0u8; 1024];
-            // Read until end of request head (or give up on oversized input).
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 8192 {
-                match sock.read(&mut chunk).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => head.extend_from_slice(&chunk[..n]),
-                }
-            }
+            // A client that connects but never finishes its request head
+            // must not pin the task: bound the head read and just close.
+            let head =
+                match tokio::time::timeout(Duration::from_secs(5), read_head(&mut sock)).await {
+                    Ok(Some(head)) => head,
+                    Ok(None) | Err(_) => return,
+                };
             let first_line = head.split(|b| *b == b'\n').next().unwrap_or_default();
             let is_metrics = first_line
                 .split(|b| *b == b' ')
@@ -170,6 +174,23 @@ pub async fn serve(addr: &str, collector: Arc<Collector>) -> Result<(), String> 
             let _ = sock.shutdown().await;
         });
     }
+}
+
+/// Accumulate the request head until `\r\n\r\n` (or the 8 KiB cap);
+/// `Ok(None)` when the peer hangs up or the socket errors first.
+async fn read_head(sock: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    // Read until end of request head (or give up on oversized input).
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 8192 {
+        match sock.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => head.extend_from_slice(&chunk[..n]),
+        }
+    }
+    Some(head)
 }
 
 #[cfg(test)]
