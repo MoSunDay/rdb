@@ -19,11 +19,20 @@ fn protocol_error(msg: &str) -> ParseOutcome {
     }
 }
 
-/// Upper bound on a `*N` multibulk header: the count drives eager
-/// preallocation (`Vec::with_capacity`) before any payload arrives, so a
-/// garbage/huge header must error instead of attempting a giant (or
-/// overflowing) allocation. 1M elements is far beyond any real command.
+/// Upper bound on a `*N` multibulk header: the count drives the argument
+/// Vec's growth and (pre-clamp) its eager preallocation, so a garbage or
+/// huge header must error instead of accepting an absurd element count.
+/// 1M elements is far beyond any real command.
 const MAX_MULTIBULK_COUNT: i64 = 1_048_576;
+
+/// Clamp on the eager initial argument allocation in `parse_multibulk`:
+/// `Vec::with_capacity(count)` runs on the `*N` header BEFORE any payload
+/// arrives, so an unclamped `*1048576\r\n` would allocate ~24MB per PARSE
+/// ATTEMPT -- and parse_command re-runs on every Incomplete retry while
+/// the client dribbles frames, repeatedly allocating/freeing it (amplified
+/// DoS). The Vec grows naturally as complete bulk args arrive, so the
+/// clamp only delays allocation; `MAX_MULTIBULK_COUNT` validation stays.
+const ARGS_PREALLOC_CAP: usize = 16;
 
 /// Upper bound on a single `$N` bulk payload, mirroring Redis
 /// `proto-max-bulk-len` (512MiB). Checked on the header alone, before any
@@ -87,7 +96,11 @@ fn parse_multibulk(buf: &[u8]) -> ParseOutcome {
                     consumed: i,
                 };
             }
-            let mut args: Vec<Vec<u8>> = Vec::with_capacity(count);
+            // Preallocation is clamped (ARGS_PREALLOC_CAP): the header
+            // count is untrusted until its payload arrives, so only a
+            // small initial capacity is bought eagerly and the Vec grows
+            // as complete bulk args land.
+            let mut args: Vec<Vec<u8>> = Vec::with_capacity(count.min(ARGS_PREALLOC_CAP));
             while args.len() < count {
                 if i == buf.len() {
                     return ParseOutcome::Incomplete;

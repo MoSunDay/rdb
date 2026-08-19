@@ -182,6 +182,10 @@ async fn destroy(ctx: &mut Ctx<'_>) {
         if let Err(e) = ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
             return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
         }
+        // A consumer blocked in XREADGROUP on this stream must not park
+        // out its BLOCK timeout: wake it so its re-check observes the
+        // missing group and replies NOGROUP (CREATE above does the same).
+        wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
     }
     offset::remove_group(&ctx.shared.lite.offsets, &stream, &group);
     resp::append_int(ctx.out, i64::from(existed));
@@ -232,6 +236,10 @@ async fn setid(ctx: &mut Ctx<'_>) {
     if let Err(e) = ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
         return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
     }
+    // The delivery watermark may have moved (a rewind makes previously
+    // consumed entries deliverable again): wake blocked `>` readers so
+    // they re-check instead of sleeping out their BLOCK timeout.
+    wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
     offset::set_position(&ctx.shared.lite.offsets, &stream, &group, id);
     resp::append_string(ctx.out, "OK");
 }

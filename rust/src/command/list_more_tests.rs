@@ -81,6 +81,20 @@ fn lpos_rank_count_maxlen() {
         call(&s, "lpos", &[b"k", b"x", b"MAXLEN", b"-1"]),
         b"-ERR MAXLEN can't be negative\r\n".to_vec()
     );
+    // Bug fix: garbage option values are Redis's integer error, not a
+    // silent i64::MIN that skewered the scan.
+    assert_eq!(
+        call(&s, "lpos", &[b"k", b"x", b"RANK", b"abc"]),
+        b"-ERR value is not an integer or out of range\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, "lpos", &[b"k", b"x", b"COUNT", b"xyz"]),
+        b"-ERR value is not an integer or out of range\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, "lpos", &[b"k", b"x", b"MAXLEN", b"1.5"]),
+        b"-ERR value is not an integer or out of range\r\n".to_vec()
+    );
     assert_eq!(
         call(&s, "lpos", &[b"k", b"x", b"RANK"]),
         b"-ERR syntax error\r\n".to_vec()
@@ -303,4 +317,24 @@ fn blmove_wrongtype_dst_precheck_keeps_src() {
         &[b"{g}str", b"{g}dst", b"LEFT", b"LEFT", b"0.1"]
     )
     .starts_with(b"-WRONGTYPE"));
+}
+
+/// Regression: huge timeout values clamp to MAX_BLOCK_MS (~100 years)
+/// instead of saturating to u64::MAX, whose Instant addition PANICKED
+/// and killed the connection task (BLPOP key 1e300).
+#[test]
+fn parse_timeout_clamps_huge_values() {
+    use crate::command::list_block::{parse_timeout, MAX_BLOCK_MS};
+    assert_eq!(parse_timeout(b"1e300"), Some(MAX_BLOCK_MS));
+    assert_eq!(parse_timeout(b"1"), Some(1000));
+    assert_eq!(parse_timeout(b"0.1"), Some(100));
+    assert_eq!(parse_timeout(b"0"), Some(0));
+    assert_eq!(parse_timeout(b"-1"), None);
+    assert_eq!(parse_timeout(b"abc"), None);
+    assert_eq!(parse_timeout(b"inf"), None);
+    // The clamped deadline must stay representable (checked_add never
+    // degrades to "block forever" for the clamp itself).
+    assert!(std::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(MAX_BLOCK_MS))
+        .is_some());
 }

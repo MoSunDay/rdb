@@ -63,8 +63,10 @@ pub fn read_members(store: &Store, prefix: &[u8], key: &[u8], now: u64) -> Membe
         KeyState::RawString { .. } => MembersRead::WrongType,
         KeyState::Enveloped { kind, .. } if kind != KIND_SET_META => MembersRead::WrongType,
         KeyState::Enveloped { .. } => {
-            let page = set_ds::collect_members(store, prefix, key, None, None, 0);
-            MembersRead::Members(page.members.into_iter().collect())
+            match set_ds::collect_members(store, prefix, key, None, None, 0) {
+                Ok(page) => MembersRead::Members(page.members.into_iter().collect()),
+                Err(e) => MembersRead::Failed(e),
+            }
         }
     }
 }

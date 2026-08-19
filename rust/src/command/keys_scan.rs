@@ -11,27 +11,62 @@ use crate::ds::codec;
 use crate::ds::expire;
 use crate::store::{ops, Store};
 
-/// If `physical` is a whole user key, return the user key; internal record
-/// kinds and expire-index entries yield `None`. The slot-prefix length is
-/// derived from the physical key itself, so this also works for scans that
-/// cross slots (RANDOMKEY).
-pub fn user_key_of(physical: &[u8]) -> Option<Vec<u8>> {
+/// A whole user key plus its TYPE name: raw legacy records and the
+/// STRING_TTL envelope are both "string", typed META records map via
+/// `ds::type_name`. Internal records (elements, expire index) yield
+/// `None`.
+fn user_entry_of(physical: &[u8]) -> Option<(Vec<u8>, &'static str)> {
     let plen = expire::slot_prefix_len(physical)?;
     let after = physical.get(plen..)?;
     match codec::classify(after) {
-        codec::Classification::Raw => Some(after.to_vec()),
+        codec::Classification::Raw => Some((after.to_vec(), "string")),
         codec::Classification::Typed(kind) if kind == codec::KIND_EXPIRE_INDEX => None,
         codec::Classification::Typed(kind) if codec::is_user_key_kind(kind) => {
-            codec::decode_data_key(physical, plen).map(|(_, key, _)| key)
+            codec::decode_data_key(physical, plen)
+                .map(|(_, key, _)| (key, crate::ds::type_name(kind)))
         }
         codec::Classification::Typed(_) => None,
     }
 }
 
+/// If `physical` is a whole user key, return the user key; internal record
+/// kinds and expire-index entries yield `None`. The slot-prefix length is
+/// derived from the physical key itself, so this also works for scans that
+/// cross slots (RANDOMKEY).
+pub fn user_key_of(physical: &[u8]) -> Option<Vec<u8>> {
+    user_entry_of(physical).map(|(key, _)| key)
+}
+
+/// Case-insensitive ASCII equality for type names (Redis matches
+/// `TYPE ReJSON-RL` case-insensitively).
+fn type_name_is(name: &[u8], want: &str) -> bool {
+    crate::command::zset_util::eq_ignore_case(name, want.as_bytes())
+}
+
+/// Is `name` a type name `SCAN TYPE` accepts? The set is exactly what
+/// `ds::type_name` can answer for a real key ("none" is not a type).
+pub fn is_scan_type_name(name: &[u8]) -> bool {
+    [
+        "string",
+        "list",
+        "set",
+        "zset",
+        "hash",
+        "stream",
+        "ReJSON-RL",
+        "vectorset",
+    ]
+    .iter()
+    .any(|t| type_name_is(name, t))
+}
+
 /// One SCAN page inside `prefix`: up to `count` user keys (optionally
-/// glob-filtered) starting after `from`. `next` is the resume cursor (the
-/// last physical key visited); empty = iteration finished. The cursor is
-/// exclusive: callers pass the previous page's `next` back in.
+/// glob-filtered by `pattern` and/or type-filtered by `type_filter`,
+/// compared AFTER the pattern match) starting after `from`. `next` is the
+/// resume cursor (the last physical key visited); empty = iteration
+/// finished. The cursor is exclusive: callers pass the previous page's
+/// `next` back in. Only RETURNED keys count towards `count`, so a TYPE
+/// filter may examine many records per page and still return few.
 pub struct ScanPage {
     pub keys: Vec<Vec<u8>>,
     pub next: Vec<u8>,
@@ -42,6 +77,7 @@ pub fn collect_user_keys(
     prefix: &[u8],
     from: &[u8],
     pattern: Option<&[u8]>,
+    type_filter: Option<&[u8]>,
     count: usize,
 ) -> ScanPage {
     // Clamp a foreign cursor into this slot (SCAN is per-slot here).
@@ -56,8 +92,10 @@ pub fn collect_user_keys(
         if !k.starts_with(prefix) {
             return false; // left the slot: done
         }
-        if let Some(user) = user_key_of(k) {
-            if pattern.is_none_or(|p| crate::utils::glob_match(p, &user)) {
+        if let Some((user, type_name)) = user_entry_of(k) {
+            let pattern_ok = pattern.is_none_or(|p| crate::utils::glob_match(p, &user));
+            let type_ok = type_filter.is_none_or(|t| type_name_is(t, type_name));
+            if pattern_ok && type_ok {
                 keys.push(user);
                 if keys.len() >= count {
                     resume = Some(k.to_vec());
@@ -73,9 +111,9 @@ pub fn collect_user_keys(
     }
 }
 
-/// Every user key in the slot (KEYS; unbounded count).
+/// Every user key in the slot (KEYS; unbounded count, no type filter).
 pub fn all_user_keys(store: &Store, prefix: &[u8], pattern: Option<&[u8]>) -> Vec<Vec<u8>> {
-    collect_user_keys(store, prefix, prefix, pattern, usize::MAX).keys
+    collect_user_keys(store, prefix, prefix, pattern, None, usize::MAX).keys
 }
 
 /// RANDOMKEY backend: the first user key at/after a uniformly random slot
@@ -140,12 +178,12 @@ mod tests {
         for i in 0..5u8 {
             put_raw(&shared, format!("k{}", i).as_bytes(), b"v");
         }
-        let p1 = collect_user_keys(&shared.store, P, P, None, 2);
+        let p1 = collect_user_keys(&shared.store, P, P, None, None, 2);
         assert_eq!(p1.keys, vec![b"k0".to_vec(), b"k1".to_vec()]);
         assert!(!p1.next.is_empty());
-        let p2 = collect_user_keys(&shared.store, P, &p1.next, None, 2);
+        let p2 = collect_user_keys(&shared.store, P, &p1.next, None, None, 2);
         assert_eq!(p2.keys, vec![b"k2".to_vec(), b"k3".to_vec()]);
-        let p3 = collect_user_keys(&shared.store, P, &p2.next, None, 2);
+        let p3 = collect_user_keys(&shared.store, P, &p2.next, None, None, 2);
         assert_eq!(p3.keys, vec![b"k4".to_vec()]);
         assert!(p3.next.is_empty(), "iteration finished");
     }
@@ -171,6 +209,30 @@ mod tests {
         assert_eq!(only_u, vec![b"user".to_vec()]);
         let only_z = all_user_keys(&shared.store, P, Some(b"z"));
         assert_eq!(only_z, vec![b"z".to_vec()]);
+    }
+
+    #[test]
+    fn collect_user_keys_filters_by_type() {
+        let (_guard, shared) = shared();
+        put_raw(&shared, b"str", b"v");
+        let meta = codec::data_key(P, codec::KIND_ZSET_META, b"z");
+        crate::store::ops::batch_write(&shared.store, {
+            let mut b = rocksdb::WriteBatch::default();
+            b.put(&meta, codec::encode_envelope(0, b"m"));
+            b
+        })
+        .expect("batch");
+        // Raw strings and META records both type-filter; the value is
+        // case-insensitive and unfiltered scans still see everything.
+        let strings = collect_user_keys(&shared.store, P, P, None, Some(b"string"), 10);
+        assert_eq!(strings.keys, vec![b"str".to_vec()]);
+        let zsets = collect_user_keys(&shared.store, P, P, None, Some(b"ZSET"), 10);
+        assert_eq!(zsets.keys, vec![b"z".to_vec()]);
+        let none = collect_user_keys(&shared.store, P, P, None, Some(b"hash"), 10);
+        assert!(none.keys.is_empty() && none.next.is_empty());
+        // Known names accepted, unknown ones rejected (SCAN TYPE syntax).
+        assert!(is_scan_type_name(b"hash") && is_scan_type_name(b"rejson-rl"));
+        assert!(!is_scan_type_name(b"bogus") && !is_scan_type_name(b"none"));
     }
 
     #[test]

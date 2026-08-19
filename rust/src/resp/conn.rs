@@ -36,15 +36,40 @@ use crate::state;
 
 /// Cumulative per-connection read-buffer cap: a client that streams
 /// incomplete-but-valid data forever would grow `buf` without bound.
+/// Applies only to AUTHENTICATED connections; pre-auth traffic gets the
+/// far tighter [`PREAUTH_MAX_BUF`].
 const MAX_CONN_BUF: usize = 1024 * 1024 * 1024; // 1GB
 
-/// Pre-auth read window: an unauthenticated connection that sends nothing
-/// usable for this long is dropped (authenticated reads are unbounded).
+/// Pre-auth read-buffer cap: before AUTH succeeds, an unverified client
+/// may hold at most this much unparsed junk (the 1GB [`MAX_CONN_BUF`] is
+/// reserved for authenticated traffic). Without it a stranger pins ~1GB
+/// of memory per connection just by connecting and streaming garbage.
+const PREAUTH_MAX_BUF: usize = 64 * 1024;
+
+/// Reply-buffer flush threshold: while draining a huge pipeline the
+/// replies for earlier commands must not ALL be buffered until the batch
+/// ends -- an N-command pipeline would hold every reply in memory before
+/// the first socket write. Once `out` crosses this, it is flushed
+/// mid-drain (before the next parse iteration).
+const OUT_FLUSH_THRESHOLD: usize = 64 * 1024;
+
+/// Pre-auth read window, CUMULATIVE since connect: an unauthenticated
+/// connection that has not produced a usable AUTH within this long is
+/// dropped (authenticated reads are unbounded). A per-read timeout would
+/// not do: a client dribbling one byte every few seconds resets each
+/// read and holds its slot forever. Reads that produce a complete AUTH
+/// reset nothing here -- once AUTH succeeds the deadline (and the caps)
+/// lift for the rest of the connection.
 const PREAUTH_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Pure helper: has the cumulative buffer grown past the cap?
 fn exceeds_conn_cap(len: usize) -> bool {
     len > MAX_CONN_BUF
+}
+
+/// Pure helper: has the PRE-AUTH buffer grown past the tighter cap?
+fn exceeds_preauth_cap(len: usize) -> bool {
+    len > PREAUTH_MAX_BUF
 }
 
 /// Pure decision for the pre-auth read timeout: only an unauthenticated
@@ -72,6 +97,10 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
     let mut out: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     let mut authed = false;
+    // ONE cumulative pre-auth clock, started at connect: every
+    // unauthenticated read below shares it, so slow-dribble clients
+    // cannot reset the deadline per read. Meaningless once authed.
+    let preauth_started = std::time::Instant::now();
 
     loop {
         let n = if authed {
@@ -80,24 +109,38 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
                 Ok(n) => n,
             }
         } else {
-            // Unauthenticated reads are bounded by PREAUTH_DEADLINE so an
-            // idle pre-auth client cannot hold a slot forever.
-            let started = std::time::Instant::now();
-            match tokio::time::timeout(PREAUTH_DEADLINE, rd.read(&mut chunk)).await {
+            // Unauthenticated reads are bounded by a deadline that is
+            // CUMULATIVE since connect (timeout_at with a moment already
+            // in the past fires immediately), so an idle or slow-dribble
+            // pre-auth client cannot hold a slot forever.
+            match tokio::time::timeout_at(
+                (preauth_started + PREAUTH_DEADLINE).into(),
+                rd.read(&mut chunk),
+            )
+            .await
+            {
                 Ok(Ok(0)) | Ok(Err(_)) => return,
                 Ok(Ok(n)) => n,
-                Err(_) if preauth_expired(authed, started.elapsed()) => {
+                Err(_) if preauth_expired(authed, preauth_started.elapsed()) => {
                     codec::append_error(&mut out, "ERR unauthenticated connection timeout");
                     let _ = wr.write_all(&out).await;
                     return;
                 }
-                // Defensive only: the timeout never fires before the full
-                // deadline has elapsed since `started`.
+                // Defensive only: timeout_at never fires before the full
+                // deadline has elapsed since connect.
                 Err(_) => return,
             }
         };
         buf.extend_from_slice(&chunk[..n]);
-        if exceeds_conn_cap(buf.len()) {
+        // The cap tracks trust: authenticated traffic keeps the 1GB
+        // cumulative limit, an unverified connection only 64KB (a token
+        // and a command name are all it may legitimately send).
+        let over_cap = if authed {
+            exceeds_conn_cap(buf.len())
+        } else {
+            exceeds_preauth_cap(buf.len())
+        };
+        if over_cap {
             codec::append_error(&mut out, "ERR Protocol error: too big cumulative request");
             let _ = wr.write_all(&out).await;
             return;
@@ -134,6 +177,17 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
                     process_command(&shared, args, &mut authed, &mut out, &mut close).await;
                     if close {
                         break;
+                    }
+                    // Bound `out` while draining a huge pipeline: flush
+                    // the buffered replies once they cross the threshold,
+                    // instead of holding the whole batch in memory. The
+                    // close path breaks above and still gets its final
+                    // flush (reply-then-close) below.
+                    if out.len() >= OUT_FLUSH_THRESHOLD {
+                        if wr.write_all(&out).await.is_err() {
+                            return;
+                        }
+                        out.clear();
                     }
                 }
             }
@@ -323,8 +377,22 @@ mod tests {
     }
 
     #[test]
+    fn exceeds_preauth_cap_boundary() {
+        assert!(!exceeds_preauth_cap(0));
+        // 64KB of pre-auth junk is still tolerable; one byte past it is
+        // not -- the unauthenticated cap is 1024x tighter than the 1GB
+        // authenticated one.
+        assert!(!exceeds_preauth_cap(64 * 1024));
+        assert!(exceeds_preauth_cap(64 * 1024 + 1));
+        // Cross-check: far below the authenticated cap.
+        assert!(!exceeds_conn_cap(PREAUTH_MAX_BUF + 1));
+    }
+
+    #[test]
     fn preauth_expired_only_for_stalled_unauthenticated_reads() {
+        // Authenticated connections NEVER expire, however long the read.
         assert!(!preauth_expired(true, Duration::from_secs(1000)));
+        assert!(!preauth_expired(true, Duration::from_secs(3600)));
         assert!(!preauth_expired(false, Duration::from_secs(29)));
         assert!(preauth_expired(false, Duration::from_secs(30)));
         assert!(preauth_expired(false, Duration::from_secs(31)));

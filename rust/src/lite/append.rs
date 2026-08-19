@@ -77,10 +77,19 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
         ),
         Ok(MetaRead::Live(m)) => (m, false),
     };
-    let id = if id_arg == b"*" {
-        model::auto_id((!fresh).then_some(meta.last_id()), now)
-    } else {
-        match model::parse_id(id_arg) {
+    let id =
+        if id_arg == b"*" {
+            match model::auto_id((!fresh).then_some(meta.last_id()), now) {
+                // Saturated last id: a generated id would equal the last one,
+                // silently overwriting its entry (Redis rejects the add).
+                None => return resp::append_error(
+                    ctx.out,
+                    "ERR The stream has exhausted the last possible ID, unable to add more items",
+                ),
+                Some(id) => id,
+            }
+        } else {
+            match model::parse_id(id_arg) {
             None => {
                 return resp::append_error(
                     ctx.out,
@@ -93,7 +102,7 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
             ),
             Some(id) => id,
         }
-    };
+        };
 
     let mut next = meta.clone();
     next.last_ms = id.ms;
@@ -143,7 +152,15 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     }
     stat_bump(&ctx.shared.lite.stats.messages, 1);
     monitor::observe_lite_message(&ctx.shared.monitor, "add", 1);
+    // Wake EVERY hub key a blocked reader could be parked on for this
+    // append (both use the parent-derived slot prefix, so they agree):
+    // the appended child stream's meta key (where XREAD/XREADGROUP on
+    // `parent/child` park, via read::wait_entries) AND the bare parent
+    // topic's key. Notifying only the child key left anything parked at
+    // the parent level asleep until its BLOCK timeout even though data
+    // had landed. notify on a key with no waiter is a no-op.
     wait::notify(&ctx.shared.wait_hub, &mkey);
+    wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &parent));
 
     let id_str = model::format_id(id);
     if auto {

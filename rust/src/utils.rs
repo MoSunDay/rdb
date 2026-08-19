@@ -289,7 +289,7 @@ mod tests {
         assert!(glob_match(b"*zz", &key));
         assert!(!glob_match(b"*zq", &key));
         // Literal-free deep pattern against deep key.
-        let stars: Vec<u8> = std::iter::repeat(b'*').take(1000).collect();
+        let stars: Vec<u8> = std::iter::repeat_n(b'*', 1000).collect();
         assert!(glob_match(&stars, &key));
     }
 
@@ -297,7 +297,7 @@ mod tests {
     fn glob_match_pathological_multi_star_is_polynomial() {
         // Regression: multiple `*` used to branch exponentially. Bound the
         // work so a hang shows up as a timeout rather than a silent pass.
-        let s: Vec<u8> = std::iter::repeat(b'a').take(4096).collect();
+        let s: Vec<u8> = std::iter::repeat_n(b'a', 4096).collect();
         for pat in [
             &b"*a*a*a*a*a*a*a*a*b"[..],
             &b"*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b!"[..],

@@ -270,8 +270,16 @@ fn brpop_immediate_tail_hit_and_timeout() {
     // (and multi-key crossing slots is CROSSSLOT, like BLPOP).
     e("rpush", &["{b}one", "x"], b":1\r\n");
     e("rpush", &["{b}two", "y"], b":1\r\n");
-    e("brpop", &["{b}one", "{b}two", "0.1"], &arr(&["{b}one", "x"]));
-    e("brpop", &["{b}one", "{b}two", "0.1"], &arr(&["{b}two", "y"]));
+    e(
+        "brpop",
+        &["{b}one", "{b}two", "0.1"],
+        &arr(&["{b}one", "x"]),
+    );
+    e(
+        "brpop",
+        &["{b}one", "{b}two", "0.1"],
+        &arr(&["{b}two", "y"]),
+    );
     e(
         "brpop",
         &["{b}one", "far", "0.1"],

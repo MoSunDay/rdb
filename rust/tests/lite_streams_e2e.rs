@@ -236,3 +236,90 @@ fn xadd_huge_id_with_idle_is_rejected_not_wrapped() {
     ))
     .contains("ERR Invalid stream ID"));
 }
+
+/// Regression (auto-id saturation): with the last id at `<ms, u64::MAX>`
+/// (seeded here via the absolute ceiling `<u64::MAX, u64::MAX>`), XADD `*`
+/// can no longer generate a strictly-greater id. It must reply Redis's
+/// exhaustion error, write NOTHING (the old entry stays, no silent
+/// overwrite), and keep `last_id`/XLEN intact.
+#[test]
+fn xadd_auto_id_at_ceiling_errors_instead_of_reusing_last_id() {
+    let (shared, _dir) = shared_at("43016");
+    const MAX: &str = "18446744073709551615";
+    let ceiling = format!("{MAX}-{MAX}");
+    // Seed the last id at the ceiling via an explicit id (legal on a
+    // fresh stream: greater than the implicit 0-0).
+    assert_eq!(
+        call(&shared, "xadd", &[b"c/q0", ceiling.as_bytes(), b"f", b"v"]),
+        format!("${}\r\n{ceiling}\r\n", ceiling.len()).into_bytes()
+    );
+    // Auto-id would saturate and EQUAL the ceiling id: rejected verbatim.
+    assert_eq!(
+        call(&shared, "xadd", &[b"c/q0", b"*", b"f", b"v"]),
+        b"-ERR The stream has exhausted the last possible ID, unable to add more items\r\n"
+            .to_vec()
+    );
+    // The failed add wrote nothing: still one entry, same last id.
+    assert_eq!(call(&shared, "xlen", &[b"c/q0"]), b":1\r\n".to_vec());
+    assert!(text(&call(&shared, "xrange", &[b"c/q0", b"+", b"+"])).contains(&ceiling));
+    // An explicit id still strictly greater does not exist; one BELOW the
+    // ceiling keeps the old equal-or-smaller rejection.
+    assert!(text(&call(&shared, "xadd", &[b"c/q0", b"1-1", b"f", b"v"]))
+        .contains("equal or smaller than the stream last item"));
+}
+
+/// Regression (XADD broadcast wake): XADD must notify every WaitHub key
+/// a blocked reader could be parked on for the append -- the appended
+/// child stream's meta key AND the parent topic's key (both derive
+/// their slot prefix from the parent name). A reader blocked on the
+/// child must be woken by a bare-parent `XADD parent *` too, promptly,
+/// well before its BLOCK timeout.
+#[test]
+fn xadd_wakes_blocked_reader_and_parent_key_waiters() {
+    use rdb::ds::wait::{self, WaitOutcome};
+
+    let shared = std::sync::Arc::new(shared_at("43019").0);
+    call(&shared, "xadd", &[b"w/q0", b"1-1", b"f", b"seed"]);
+    // (a) A real blocked reader on the child stream, woken by a
+    // BARE-PARENT XADD whose auto-pick lands on that same queue.
+    let reader = {
+        let s = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            call(&s, "xread", &[b"BLOCK", b"8000", b"streams", b"w/q0", b"$"])
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300)); // let it park
+    let t0 = std::time::Instant::now();
+    let r = text(&call(&shared, "xadd", &[b"w", b"*", b"f", b"wake"]));
+    assert!(r.contains("w/q0"), "auto-pick must land on q0: {r}");
+    let reply = reader.join().expect("reader thread");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "reader slept {elapsed:?} past the xadd"
+    );
+    let got = text(&reply);
+    assert!(
+        got.contains("wake") && !got.contains("*-1"),
+        "blocked reader must get the entry, got {got}"
+    );
+    // (b) Direct WaitHub view of the broadcast: waiters parked on the
+    // child meta key AND on the bare-parent topic key are both signaled
+    // by one explicit `parent/child` XADD (no-op when nobody listens).
+    // (Separate stream: part (a)'s auto id sits at wall-clock ms, far
+    // above any small explicit id.)
+    call(&shared, "xadd", &[b"w2/q0", b"1-1", b"f", b"seed"]);
+    let prefix = rdb::hash::slot_with_prefix(b"w2").1;
+    let child_key = rdb::lite::model::meta_key(&prefix, b"w2/q0");
+    let parent_key = rdb::lite::model::meta_key(&prefix, b"w2");
+    let on_child = wait::register(&shared.wait_hub, &child_key);
+    let on_parent = wait::register(&shared.wait_hub, &parent_key);
+    assert!(text(&call(&shared, "xadd", &[b"w2/q0", b"9-9", b"f", b"v"])).contains("9-9"));
+    let soon = std::time::Duration::from_millis(100);
+    assert_eq!(wait::wait(&on_child, soon), WaitOutcome::Signaled);
+    assert_eq!(
+        wait::wait(&on_parent, soon),
+        WaitOutcome::Signaled,
+        "the parent topic key must be notified too"
+    );
+}

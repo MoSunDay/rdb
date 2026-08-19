@@ -147,14 +147,24 @@ pub async fn lpos(ctx: &mut Ctx<'_>) {
                 return;
             }
         };
-        match ctx.args[i].to_ascii_uppercase().as_slice() {
-            b"RANK" => rank = parse_i64(value).unwrap_or(i64::MIN),
-            b"COUNT" => count_opt = Some(parse_i64(value).unwrap_or(i64::MIN)),
-            b"MAXLEN" => maxlen = parse_i64(value).unwrap_or(i64::MIN),
+        let keyword = ctx.args[i].to_ascii_uppercase();
+        // RANK/COUNT/MAXLEN values parse strictly: garbage is Redis's
+        // integer error, not a silent i64::MIN (bug fix).
+        let parsed = match keyword.as_slice() {
+            b"RANK" | b"COUNT" | b"MAXLEN" => parse_i64(value),
             _ => {
                 append_error(ctx.out, "ERR syntax error");
                 return;
             }
+        };
+        let Some(v) = parsed else {
+            append_error(ctx.out, "ERR value is not an integer or out of range");
+            return;
+        };
+        match keyword.as_slice() {
+            b"RANK" => rank = v,
+            b"COUNT" => count_opt = Some(v),
+            _ => maxlen = v,
         }
         i += 2;
     }

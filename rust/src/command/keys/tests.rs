@@ -205,6 +205,27 @@ fn expire_in_past_deletes_and_expireat_absolute() {
 }
 
 #[test]
+fn ttl_rounds_half_up_like_redis() {
+    let (_g, s) = shared_for("127.0.0.1:40231");
+    set_raw(&s, b"k", b"v");
+    // Bug fix: TTL used to floor the remaining ms; Redis rounds half up
+    // ((ttl_ms+500)/1000). ~14.9s left must answer 15, not 14; ~15.9s
+    // must answer 16. Margins are wide enough for scheduler jitter.
+    assert_eq!(
+        call(&s, |c| Box::pin(pexpire(c)), &[b"k", b"14900"]),
+        b":1\r\n".to_vec()
+    );
+    assert_eq!(call(&s, |c| Box::pin(ttl(c)), &[b"k"]), b":15\r\n".to_vec());
+    let ms = int_of(&call(&s, |c| Box::pin(pttl(c)), &[b"k"]));
+    assert!((14_800..=14_900).contains(&ms), "pttl {ms}");
+    assert_eq!(
+        call(&s, |c| Box::pin(pexpire(c)), &[b"k", b"15900"]),
+        b":1\r\n".to_vec()
+    );
+    assert_eq!(call(&s, |c| Box::pin(ttl(c)), &[b"k"]), b":16\r\n".to_vec());
+}
+
+#[test]
 fn scan_pages_match_count_and_errors() {
     let (_g, s) = shared_for("127.0.0.1:40205");
     for i in 0..5u8 {
@@ -339,6 +360,117 @@ fn rename_moves_raw_and_ttl_records() {
     );
 }
 
+/// RENAME of a typed family moves EVERY record: meta, each field and the
+/// expire index entry (guards the scan-error propagation refactor in
+/// `keys_core::move_family` -- a partial record set must never commit).
+#[test]
+fn rename_moves_whole_typed_family() {
+    let (_g, s) = shared_for("127.0.0.1:40208");
+    // build a real 3-field hash, then give it a TTL
+    assert_eq!(
+        call(
+            &s,
+            |c| Box::pin(crate::command::hash_cmd::hset(c)),
+            &[b"{r}h", b"f1", b"v1", b"f2", b"v2", b"f3", b"v3"]
+        ),
+        b":3\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(pexpire(c)), &[b"{r}h", b"60000"]),
+        b":1\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(rename(c)), &[b"{r}h", b"{r}h2"]),
+        b"+OK\r\n".to_vec()
+    );
+    // all three fields + values travelled, in physical order
+    assert_eq!(
+        call(
+            &s,
+            |c| Box::pin(crate::command::hash_scan::hgetall(c)),
+            &[b"{r}h2"]
+        ),
+        b"*6\r\n$2\r\nf1\r\n$2\r\nv1\r\n$2\r\nf2\r\n$2\r\nv2\r\n$2\r\nf3\r\n$2\r\nv3\r\n".to_vec()
+    );
+    assert_eq!(
+        call(
+            &s,
+            |c| Box::pin(crate::command::hash_cmd::hget(c)),
+            &[b"{r}h2", b"f2"]
+        ),
+        b"$2\r\nv2\r\n".to_vec()
+    );
+    // the TTL moved with the family; the source family is fully gone
+    let ms = int_of(&call(&s, |c| Box::pin(pttl(c)), &[b"{r}h2"]));
+    assert!(ms > 0 && ms <= 60_000, "pttl {ms}");
+    assert_eq!(
+        call(&s, |c| Box::pin(crate::command::keys::type_(c)), &[b"{r}h"]),
+        b"+none\r\n".to_vec()
+    );
+    assert_eq!(
+        call(
+            &s,
+            |c| Box::pin(crate::command::hash_scan::hgetall(c)),
+            &[b"{r}h"]
+        ),
+        b"*0\r\n".to_vec()
+    );
+    // the expire index entry moved with the root: it points at dst now
+    let meta_src = crate::ds::codec::data_key(PREFIX, crate::ds::codec::KIND_HASH_META, b"{r}h");
+    let meta_dst = crate::ds::codec::data_key(PREFIX, crate::ds::codec::KIND_HASH_META, b"{r}h2");
+    let dst_expire = expire_at(&s, &meta_dst);
+    assert!(dst_expire > 0, "TTL envelope moved with the family");
+    assert!(crate::store::ops::get_physical(
+        &s.store,
+        &crate::ds::codec::expire_index_key(PREFIX, dst_expire, &meta_dst)
+    )
+    .unwrap()
+    .is_some());
+    assert_eq!(
+        crate::store::ops::get_physical(&s.store, &meta_src).unwrap(),
+        None,
+        "src meta gone"
+    );
+    // renaming over an existing typed family replaces it wholesale
+    assert_eq!(
+        call(
+            &s,
+            |c| Box::pin(crate::command::hash_cmd::hset(c)),
+            &[b"{r}z", b"g", b"w"]
+        ),
+        b":1\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(rename(c)), &[b"{r}h2", b"{r}z"]),
+        b"+OK\r\n".to_vec()
+    );
+    assert_eq!(
+        call(
+            &s,
+            |c| Box::pin(crate::command::hash_cmd::hget(c)),
+            &[b"{r}z", b"f1"]
+        ),
+        b"$2\r\nv1\r\n".to_vec()
+    );
+    assert_eq!(
+        call(
+            &s,
+            |c| Box::pin(crate::command::hash_cmd::hget(c)),
+            &[b"{r}z", b"g"]
+        ),
+        b"$-1\r\n".to_vec(),
+        "the overwritten dst family's own field is gone"
+    );
+}
+
+/// Expire deadline currently encoded in a root record's envelope.
+fn expire_at(shared: &Shared, root: &[u8]) -> u64 {
+    let val = crate::store::ops::get_physical(&shared.store, root)
+        .expect("root read")
+        .expect("root exists");
+    crate::ds::codec::decode_envelope(&val).0
+}
+
 #[test]
 fn arity_errors_for_every_handler() {
     let (_g, s) = shared_for("127.0.0.1:40208");
@@ -434,5 +566,55 @@ fn rename_crossslot_dst_not_created() {
     assert_eq!(
         call(&s, |c| Box::pin(exists(c)), &[b"{r}dst"]),
         b":1\r\n".to_vec()
+    );
+}
+
+/// Bug fix/feature: SCAN's Redis `TYPE <type>` filter -- filtering after
+/// the pattern match, only returned keys counting towards COUNT.
+#[test]
+fn scan_type_filter_and_syntax_errors() {
+    let (_g, s) = shared_for("127.0.0.1:40233");
+    set_raw(&s, b"str", b"v");
+    call(
+        &s,
+        |c| Box::pin(crate::command::hash_cmd::hset(c)),
+        &[b"h", b"f", b"v"],
+    );
+    call(
+        &s,
+        |c| Box::pin(crate::command::zset_cmd::zadd(c)),
+        &[b"z", b"1", b"m"],
+    );
+    let keys_of = |args: &[&[u8]]| -> Vec<Vec<u8>> {
+        let reply = call(&s, |c| Box::pin(scan(c)), args);
+        let page = test_reader::parse(&reply);
+        match &page[1] {
+            Frame::Array(ks) => ks.iter().map(test_reader::bulk).collect(),
+            _ => panic!("key array"),
+        }
+    };
+    // A large COUNT page returns ONLY the requested type's key.
+    assert_eq!(
+        keys_of(&[b"0", b"COUNT", b"100", b"TYPE", b"hash"]),
+        vec![b"h".to_vec()]
+    );
+    assert_eq!(
+        keys_of(&[b"0", b"COUNT", b"100", b"TYPE", b"string"]),
+        vec![b"str".to_vec()]
+    );
+    assert_eq!(
+        keys_of(&[b"0", b"COUNT", b"100", b"TYPE", b"ZSET"]),
+        vec![b"z".to_vec()]
+    );
+    // The keyword and value are case-insensitive; unknown names and a
+    // missing value are syntax errors (Redis rejects them outright).
+    assert_eq!(keys_of(&[b"0", b"type", b"hash"]), vec![b"h".to_vec()]);
+    assert_eq!(
+        call(&s, |c| Box::pin(scan(c)), &[b"0", b"TYPE", b"bogus"]),
+        b"-ERR syntax error\r\n".to_vec()
+    );
+    assert_eq!(
+        call(&s, |c| Box::pin(scan(c)), &[b"0", b"TYPE"]),
+        b"-ERR syntax error\r\n".to_vec()
     );
 }

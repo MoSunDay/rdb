@@ -12,6 +12,25 @@ use crate::resp::codec::{
 };
 use crate::utils::rand_u64;
 
+/// Whole-key field read shared by HGETALL/HKEYS/HVALS/HRANDFIELD: one
+/// unbounded collect; a store error replies `ERR: <cmd> failed`.
+fn whole_hash(ctx: &mut Ctx<'_>, cmd: &str) -> Option<hash_ds::FieldPage> {
+    match hash_ds::collect_fields(
+        &ctx.shared.store,
+        &ctx.prefix_key,
+        &ctx.args[0],
+        None,
+        None,
+        0,
+    ) {
+        Ok(page) => Some(page),
+        Err(_) => {
+            append_error(ctx.out, &format!("ERR: {cmd} failed"));
+            None
+        }
+    }
+}
+
 /// HGETALL key -> flat [f1, v1, ...] (missing key -> empty array).
 pub async fn hgetall(ctx: &mut Ctx<'_>) {
     if ctx.args.len() != 1 {
@@ -22,14 +41,9 @@ pub async fn hgetall(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = hash_ds::collect_fields(
-        &ctx.shared.store,
-        &ctx.prefix_key,
-        &ctx.args[0],
-        None,
-        None,
-        0,
-    );
+    let Some(page) = whole_hash(ctx, "hgetall") else {
+        return;
+    };
     append_array(ctx.out, page.fields.len() * 2);
     for (f, v) in &page.fields {
         append_bulk(ctx.out, f);
@@ -47,14 +61,9 @@ pub async fn hkeys(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = hash_ds::collect_fields(
-        &ctx.shared.store,
-        &ctx.prefix_key,
-        &ctx.args[0],
-        None,
-        None,
-        0,
-    );
+    let Some(page) = whole_hash(ctx, "hkeys") else {
+        return;
+    };
     append_array(ctx.out, page.fields.len());
     for (f, _) in &page.fields {
         append_bulk(ctx.out, f);
@@ -71,14 +80,9 @@ pub async fn hvals(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = hash_ds::collect_fields(
-        &ctx.shared.store,
-        &ctx.prefix_key,
-        &ctx.args[0],
-        None,
-        None,
-        0,
-    );
+    let Some(page) = whole_hash(ctx, "hvals") else {
+        return;
+    };
     append_array(ctx.out, page.fields.len());
     for (_, v) in &page.fields {
         append_bulk(ctx.out, v);
@@ -148,14 +152,20 @@ pub async fn hscan(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = hash_ds::collect_fields(
+    let page = match hash_ds::collect_fields(
         &ctx.shared.store,
         &ctx.prefix_key,
         &ctx.args[0],
         from.as_deref(),
         pattern.as_deref(),
         count,
-    );
+    ) {
+        Ok(page) => page,
+        Err(_) => {
+            append_error(ctx.out, "ERR: hscan failed");
+            return;
+        }
+    };
     let cursor = match &page.next {
         None => "0".to_string(),
         Some(field) => hex::encode(field),
@@ -207,14 +217,9 @@ pub async fn hrandfield(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = hash_ds::collect_fields(
-        &ctx.shared.store,
-        &ctx.prefix_key,
-        &ctx.args[0],
-        None,
-        None,
-        0,
-    );
+    let Some(page) = whole_hash(ctx, "hrandfield") else {
+        return;
+    };
     match count {
         None => match pick_one(&page.fields) {
             Some(idx) => append_bulk(ctx.out, &page.fields[idx].0),

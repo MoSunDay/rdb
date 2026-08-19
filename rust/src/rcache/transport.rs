@@ -124,7 +124,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<u8>> 
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("frame body truncated: {} of {len} bytes", len as usize - remaining),
+                format!(
+                    "frame body truncated: {} of {len} bytes",
+                    len as usize - remaining
+                ),
             ));
         }
         remaining -= n;

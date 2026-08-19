@@ -207,17 +207,17 @@ fn rename_crossslot_rejected_and_same_slot_moves_ttl() {
         call(&shared, "rename", &[b"{a}src", b"{b}dst"]),
         b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
     );
-    assert_eq!(
-        call(&shared, "get", &[b"{a}src"]),
-        b"$1\r\nv\r\n".to_vec()
-    );
+    assert_eq!(call(&shared, "get", &[b"{a}src"]), b"$1\r\nv\r\n".to_vec());
     let ms = String::from_utf8(call(&shared, "pttl", &[b"{a}src"]))
         .unwrap()
         .trim_start_matches(':')
         .trim_end()
         .parse::<i64>()
         .unwrap();
-    assert!(ms > 0 && ms <= 60_000, "source ttl survived the refusal: {ms}");
+    assert!(
+        ms > 0 && ms <= 60_000,
+        "source ttl survived the refusal: {ms}"
+    );
     assert_eq!(call(&shared, "exists", &[b"{b}dst"]), b":0\r\n".to_vec());
     // RENAMENX runs through the same guard.
     assert_eq!(

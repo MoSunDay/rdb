@@ -103,14 +103,17 @@ pub fn resolve_arc(store: &Arc<Store>, prefix: &[u8], key: &[u8], now: u64) -> K
     })
 }
 
-/// Core of [`resolve`]/[`resolve_arc`]; `purge(prefix, family, key, now)`
-/// decides how a due record's delete is committed.
+/// `purge(prefix, family, key, now)` decides how a due record's delete is committed.
+pub type PurgeFn<'a> = &'a dyn Fn(&[u8], codec::CodecFamily, &[u8], u64) -> bool;
+
+/// Core of [`resolve`]/[`resolve_arc`]; [`PurgeFn`] decides how a due
+/// record's delete is committed.
 fn resolve_with(
     store: &Store,
     prefix: &[u8],
     key: &[u8],
     now: u64,
-    purge: &dyn Fn(&[u8], codec::CodecFamily, &[u8], u64) -> bool,
+    purge: PurgeFn<'_>,
 ) -> KeyState {
     let raw = codec::string_key(prefix, key);
     if let Ok(Some(value)) = ops::get_physical(store, &raw) {
@@ -313,11 +316,13 @@ pub async fn rename_key(
     if src == dst {
         // Same key: a plain existence check (the two latch locks would
         // otherwise self-deadlock on one latch cell).
-        return Ok(if resolve_arc(&shared.store, prefix, src, now).is_present() {
-            RenameOutcome::Moved
-        } else {
-            RenameOutcome::SrcMissing
-        });
+        return Ok(
+            if resolve_arc(&shared.store, prefix, src, now).is_present() {
+                RenameOutcome::Moved
+            } else {
+                RenameOutcome::SrcMissing
+            },
+        );
     }
     let (ka, kb) = {
         let ka = latch_key(prefix, src);
@@ -356,7 +361,7 @@ pub async fn rename_key(
                 src,
                 dst,
                 *expire_ms,
-            );
+            )?;
         }
         KeyState::Missing => unreachable!("checked above"),
     }
@@ -367,6 +372,8 @@ pub async fn rename_key(
 
 /// Copy every record of `src`'s family to `dst` (rewriting the user key
 /// in each physical key), delete the src ranges, move the index entry.
+/// `Err` = the source scan failed: a partial record set must NEVER be
+/// committed, or RENAME would silently drop the unread records.
 fn move_family(
     batch: &mut WriteBatch,
     store: &Store,
@@ -375,20 +382,20 @@ fn move_family(
     src: &[u8],
     dst: &[u8],
     expire_ms: u64,
-) {
+) -> Result<(), String> {
     let family = codec::family_of(kind).unwrap_or(codec::STRING_FAMILY);
     // Per-kind ranges (see codec::family_delete_ranges): collect and
     // delete each, so other keys' records never enter the move.
     let ranges = codec::family_delete_ranges(prefix, family, src);
     let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for (lower, upper) in &ranges {
-        let _ = ops::for_each_from(store, lower, false, &mut |k, v| {
+        ops::for_each_from(store, lower, false, &mut |k, v| {
             if k >= upper.as_slice() {
                 return false;
             }
             records.push((k.to_vec(), v.to_vec()));
             true
-        });
+        })?;
     }
     let plen = expire::slot_prefix_len(&ranges[0].0).unwrap_or(prefix.len());
     for (k, v) in records {
@@ -408,4 +415,5 @@ fn move_family(
     if expire_ms > 0 {
         batch.delete(codec::expire_index_key(prefix, expire_ms, &src_root));
     }
+    Ok(())
 }

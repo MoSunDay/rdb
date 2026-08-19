@@ -161,14 +161,20 @@ pub async fn smembers(ctx: &mut Ctx<'_>) {
         append_error(ctx.out, WRONGTYPE);
         return;
     }
-    let page = set_ds::collect_members(
+    let page = match set_ds::collect_members(
         &ctx.shared.store,
         &ctx.prefix_key,
         &ctx.args[0],
         None,
         None,
         0,
-    );
+    ) {
+        Ok(page) => page,
+        Err(_) => {
+            append_error(ctx.out, "ERR: smembers failed");
+            return;
+        }
+    };
     append_array(ctx.out, page.members.len());
     for m in &page.members {
         append_bulk(ctx.out, m);
@@ -261,7 +267,14 @@ pub async fn spop(ctx: &mut Ctx<'_>) {
         }
         return;
     }
-    let page = set_ds::collect_members(&ctx.shared.store, &ctx.prefix_key, &key, None, None, 0);
+    let page =
+        match set_ds::collect_members(&ctx.shared.store, &ctx.prefix_key, &key, None, None, 0) {
+            Ok(page) => page,
+            Err(_) => {
+                append_error(ctx.out, "ERR: spop failed");
+                return;
+            }
+        };
     let want = match count {
         None => 1,
         Some(n) => (n as u64).min(page.members.len() as u64),

@@ -8,8 +8,8 @@
 
 use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
 use crate::command::zset_util::{
-    append_score, collect_scored, eq_ignore_case, parse_score_bound, seek_from_sortable,
-    zset_state, ZSetState,
+    append_score, collect_scored, eq_ignore_case, parse_score_bound, score_below_min,
+    score_past_max, seek_from_sortable, zset_state, ZSetState,
 };
 use crate::command::Ctx;
 use crate::ds::{expire, zset_ds};
@@ -132,10 +132,10 @@ pub async fn zcount(ctx: &mut Ctx<'_>) {
                 &from,
                 !min_incl,
                 &mut |_, score| {
-                    if score == min && !min_incl {
+                    if score_below_min(score, min, min_incl) {
                         return true; // inside the seek, below the window
                     }
-                    if score > max || (score == max && !max_incl) {
+                    if score_past_max(score, max, max_incl) {
                         return false; // past the window: stop
                     }
                     n += 1;

@@ -90,8 +90,12 @@ async fn block_pop(
     block_ms: u64,
 ) -> ZBlockResult {
     // BLOCK 0 means "forever" (`None`): the park runs in MAX_SLICE_MS
-    // slices renewed each round. Any other timeout is a hard deadline.
-    let deadline = (block_ms > 0).then(|| Instant::now() + Duration::from_millis(block_ms));
+    // slices renewed each round. Any other timeout is a hard deadline
+    // (checked_add: even a saturated ms count must not panic; an
+    // unrepresentable deadline degrades to "block forever").
+    let deadline = (block_ms > 0)
+        .then(|| Instant::now().checked_add(Duration::from_millis(block_ms)))
+        .flatten();
     loop {
         // 1. one shared waiter under every key's root, BEFORE the read.
         let waiter = Arc::new(wait::new_waiter());
@@ -144,10 +148,7 @@ async fn block_pop(
             })
             .min(MAX_SLICE_MS);
         let parked = Arc::clone(&waiter);
-        let woke = park::park(move || {
-            wait::wait(&parked, Duration::from_millis(left_ms))
-        })
-        .await;
+        let woke = park::park(move || wait::wait(&parked, Duration::from_millis(left_ms))).await;
         for root in &roots {
             wait::unregister(&ctx.shared.wait_hub, root, &waiter);
         }
