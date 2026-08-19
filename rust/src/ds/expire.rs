@@ -9,7 +9,10 @@
 //! slot prefix precedes 0xFD), so the sampler walks one ordered window per
 //! slot rather than one global window -- accepted, documented.
 //!
-//! Lazy path: reads decode the envelope and purge in place when due.
+//! Lazy path: reads decode the envelope and purge in place when due --
+//! Arc-holding call sites commit the purge as a detached off-worker
+//! write ([`ops::spawn_batch_write`]) so no fsync lands on the reading
+//! tokio worker; bare-`&Store` ds-layer helpers keep the inline sync.
 //! Active path: [`sample_once`] scans the index from a rotating cursor,
 //! re-reads each victim to confirm it is still expired (guards against
 //! racing writers), then range-deletes the family and the index entry.
@@ -46,6 +49,9 @@ pub fn now_ms() -> u64 {
 /// Lazy expiration: read the family root record of `key`, and if its
 /// envelope says the key is due, wipe the whole family plus its index
 /// entry. Returns whether a purge happened.
+///
+/// Sync variant for callers that only hold a bare `&Store` (ds-layer
+/// resolve helpers): the delete commits with an INLINE synced write.
 pub fn purge_if_expired(
     store: &Store,
     prefix: &[u8],
@@ -53,24 +59,64 @@ pub fn purge_if_expired(
     key: &[u8],
     now: u64,
 ) -> bool {
+    match lazy_purge_batch(store, prefix, family, key, now) {
+        Some(batch) => ops::batch_write(store, batch).is_ok(),
+        None => false,
+    }
+}
+
+/// Lazy expiration for holders of the shared `Arc<Store>` (command-layer
+/// read paths running on tokio workers): the physical delete is committed
+/// by a DETACHED [`ops::spawn_batch_write`], so the caller never fsyncs
+/// inline. Returns the DECISION -- the envelope was due and the key is
+/// treated as gone -- NOT the write outcome; the RocksDB commit happens
+/// off-worker and is only logged if it fails.
+pub fn purge_if_expired_arc(
+    store: &Arc<Store>,
+    prefix: &[u8],
+    family: CodecFamily,
+    key: &[u8],
+    now: u64,
+) -> bool {
+    match lazy_purge_batch(store, prefix, family, key, now) {
+        Some(batch) => {
+            ops::spawn_batch_write(Arc::clone(store), batch);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Decision core shared by both lazy-purge entry points: read the family
+/// root, decode the envelope and, when it is due, build the batch wiping
+/// the whole family plus its index entry. `None` = nothing to purge.
+fn lazy_purge_batch(
+    store: &Store,
+    prefix: &[u8],
+    family: CodecFamily,
+    key: &[u8],
+    now: u64,
+) -> Option<WriteBatch> {
     let root = codec::data_key(prefix, family.0, key);
     let val = match ops::get_physical(store, &root) {
         Ok(Some(v)) => v,
-        _ => return false,
+        _ => return None,
     };
     let (expire, _) = codec::decode_envelope(&val);
     if !is_expired(expire, now) {
-        return false;
+        return None;
     }
     let mut batch = WriteBatch::default();
     family_delete_entries(&mut batch, prefix, family, key, expire);
-    ops::batch_write(store, batch).is_ok()
+    Some(batch)
 }
 
 /// Read a STRING_TTL record -> `(expire_ms, payload)`; `Ok(None)` when the
-/// key is missing or was just lazely purged.
+/// key is missing or was just lazely purged. Takes the shared
+/// `Arc<Store>` so an expired record's purge is a DETACHED write (no
+/// inline fsync on the reading worker).
 pub fn read_enveloped(
-    store: &Store,
+    store: &Arc<Store>,
     prefix: &[u8],
     key: &[u8],
 ) -> Result<Option<(u64, Vec<u8>)>, String> {
@@ -80,7 +126,7 @@ pub fn read_enveloped(
     };
     let (expire, payload) = codec::decode_envelope(&val);
     if is_expired(expire, now_ms()) {
-        purge_if_expired(store, prefix, codec::STRING_FAMILY, key, now_ms());
+        purge_if_expired_arc(store, prefix, codec::STRING_FAMILY, key, now_ms());
         return Ok(None);
     }
     Ok(Some((expire, payload.to_vec())))
@@ -180,7 +226,9 @@ pub fn sample_once(store: &Store, now: u64, budget: usize, from: &[u8]) -> (usiz
 
 /// Re-read the indexed record, then purge it (record + index) if it is
 /// still expired, or drop just the stale index entry if the record
-/// vanished or changed its TTL.
+/// vanished or changed its TTL. Stays sync: it only ever runs inside
+/// [`sample_once`], which the active-expire loop executes on tokio's
+/// blocking pool, so the synced `batch_write` never lands on a worker.
 fn purge_indexed(store: &Store, prefix: &[u8], body: &[u8], expire: u64, now: u64) -> bool {
     let index_key = {
         let mut k = prefix.to_vec();
@@ -292,6 +340,7 @@ mod tests {
     #[test]
     fn read_enveloped_missing_and_live() {
         let (_dir, store) = open_tmp("read");
+        let store = Arc::new(store);
         assert_eq!(read_enveloped(&store, P, b"k").unwrap(), None);
         write_enveloped(&store, KIND_STRING_TTL, b"k", 9_000_000_000_000, b"val");
         let (expire, payload) = read_enveloped(&store, P, b"k").unwrap().unwrap();
@@ -302,6 +351,7 @@ mod tests {
     #[test]
     fn sampler_purges_due_entries_only() {
         let (_dir, store) = open_tmp("sample");
+        let store = Arc::new(store);
         write_enveloped(&store, KIND_STRING_TTL, b"due", 100, b"v");
         write_enveloped(&store, KIND_STRING_TTL, b"later", 9_000_000_000_000, b"v");
         write_enveloped(&store, KIND_HASH_META, b"h", 50, b"meta");
@@ -326,6 +376,7 @@ mod tests {
     #[test]
     fn ttl_removed_cleans_index() {
         let (_dir, store) = open_tmp("ttlrm");
+        let store = Arc::new(store);
         write_enveloped(&store, KIND_STRING_TTL, b"k", 111, b"v");
         let root = codec::data_key(P, KIND_STRING_TTL, b"k");
         let mut batch = WriteBatch::default();
@@ -354,9 +405,56 @@ mod tests {
         assert_eq!(sample_once(&store, 10, 10, b"").0, 1);
     }
 
+    /// Bounded sleep-poll helper: returns once `gone(store, keys)` holds
+    /// for every key, panicking after ~2s if a detached write never lands.
+    fn wait_until_gone(store: &Arc<Store>, keys: &[Vec<u8>]) {
+        for _ in 0..200 {
+            if keys
+                .iter()
+                .all(|k| ops::get_physical(store, k).unwrap().is_none())
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("detached purge write never landed");
+    }
+
+    /// The Arc lazy-purge entry point commits via a detached off-worker
+    /// write: the DECISION returns immediately and the physical records
+    /// (family root + index entry) vanish shortly after.
+    #[tokio::test]
+    async fn purge_if_expired_arc_detached_write_lands() {
+        let (_dir, store) = open_tmp("detach");
+        let store = Arc::new(store);
+        write_enveloped(&store, KIND_STRING_TTL, b"k", 5, b"v");
+        let root = codec::data_key(P, KIND_STRING_TTL, b"k");
+        let idx = codec::expire_index_key(P, 5, &root);
+        // decision is reported at once; the physical commit is detached, so
+        // an immediately repeated read may still see the due record and
+        // re-decide (idempotent) -- only a landed write settles it
+        assert!(purge_if_expired_arc(&store, P, STRING_FAMILY, b"k", 10));
+        wait_until_gone(&store, &[root, idx]);
+        assert!(!purge_if_expired_arc(&store, P, STRING_FAMILY, b"k", 10));
+        // nothing left for the sampler to sweep
+        assert_eq!(sample_once(&store, 10, 10, b"").0, 0);
+    }
+
+    /// read_enveloped's inline purge rides the same detached path.
+    #[tokio::test]
+    async fn read_enveloped_detached_purge_lands() {
+        let (_dir, store) = open_tmp("readdet");
+        let store = Arc::new(store);
+        write_enveloped(&store, KIND_STRING_TTL, b"k", 5, b"v");
+        assert_eq!(read_enveloped(&store, P, b"k").unwrap(), None);
+        wait_until_gone(&store, &[codec::data_key(P, KIND_STRING_TTL, b"k")]);
+        assert_eq!(read_enveloped(&store, P, b"k").unwrap(), None);
+    }
+
     #[test]
     fn sampler_cursor_resumes_after_stop() {
         let (_dir, store) = open_tmp("resume");
+        let store = Arc::new(store);
         write_enveloped_at(&store, b"10/", KIND_STRING_TTL, b"k", 100, b"v");
         write_enveloped_at(&store, b"99/", KIND_STRING_TTL, b"k", 100, b"v");
         // budget=1: the round purges the 10/ victim, then stops on the
@@ -379,6 +477,7 @@ mod tests {
     #[test]
     fn sampler_cursor_wraps_after_tail() {
         let (_dir, store) = open_tmp("wrap");
+        let store = Arc::new(store);
         write_enveloped_at(&store, b"99/", KIND_STRING_TTL, b"tail", 100, b"v");
         let (purged, cursor) = sample_once(&store, 200, 10, b"");
         assert_eq!(purged, 1);
@@ -399,6 +498,7 @@ mod tests {
     #[test]
     fn sampler_reaches_keys_past_scan_limit() {
         let (_dir, store) = open_tmp("limit");
+        let store = Arc::new(store);
         // >SCAN_LIMIT live records at slot 10/ push the cursor forward one
         // SCAN_LIMIT-window per round (written in one batch to keep the
         // test off the fsync path).
