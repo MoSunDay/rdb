@@ -85,7 +85,33 @@ pub fn latch_key(prefix: &[u8], key: &[u8]) -> Vec<u8> {
 }
 
 /// Look one key up in both storage shapes, lazily purging expired records.
+/// Sync purge variant for callers that only hold a bare `&Store` (the
+/// ds-layer resolve helpers): the purge commits with an inline synced
+/// write.
 pub fn resolve(store: &Store, prefix: &[u8], key: &[u8], now: u64) -> KeyState {
+    resolve_with(store, prefix, key, now, &|p, family, k, n| {
+        expire::purge_if_expired(store, p, family, k, n)
+    })
+}
+
+/// Same lookup for holders of the shared `Arc<Store>` (command-layer
+/// read paths on tokio workers): a due envelope purges via a DETACHED
+/// off-worker write, so the resolver never fsyncs inline.
+pub fn resolve_arc(store: &Arc<Store>, prefix: &[u8], key: &[u8], now: u64) -> KeyState {
+    resolve_with(store, prefix, key, now, &|p, family, k, n| {
+        expire::purge_if_expired_arc(store, p, family, k, n)
+    })
+}
+
+/// Core of [`resolve`]/[`resolve_arc`]; `purge(prefix, family, key, now)`
+/// decides how a due record's delete is committed.
+fn resolve_with(
+    store: &Store,
+    prefix: &[u8],
+    key: &[u8],
+    now: u64,
+    purge: &dyn Fn(&[u8], codec::CodecFamily, &[u8], u64) -> bool,
+) -> KeyState {
     let raw = codec::string_key(prefix, key);
     if let Ok(Some(value)) = ops::get_physical(store, &raw) {
         return KeyState::RawString { value };
@@ -98,7 +124,7 @@ pub fn resolve(store: &Store, prefix: &[u8], key: &[u8], now: u64) -> KeyState {
         let (expire_ms, payload) = codec::decode_envelope(&value);
         if expire::is_expired(expire_ms, now) {
             if let Some(family) = codec::family_of(*kind) {
-                let _ = expire::purge_if_expired(store, prefix, family, key, now);
+                let _ = purge(prefix, family, key, now);
             }
             return KeyState::Missing;
         }
@@ -135,7 +161,7 @@ pub async fn delete_records(
     key: &[u8],
     now: u64,
 ) -> Result<bool, String> {
-    match resolve(&shared.store, prefix, key, now) {
+    match resolve_arc(&shared.store, prefix, key, now) {
         KeyState::Missing => Ok(false),
         KeyState::RawString { .. } => {
             // Fast path: one bare record, atomic single delete — but
@@ -171,7 +197,7 @@ pub async fn apply_ttl(
     now: u64,
 ) -> Result<bool, String> {
     let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
-    let state = resolve(&shared.store, prefix, key, now);
+    let state = resolve_arc(&shared.store, prefix, key, now);
     if !state.is_present() {
         return Ok(false);
     }
@@ -212,7 +238,7 @@ pub async fn persist_key(
     now: u64,
 ) -> Result<bool, String> {
     let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
-    let state = resolve(&shared.store, prefix, key, now);
+    let state = resolve_arc(&shared.store, prefix, key, now);
     match state {
         KeyState::Missing | KeyState::RawString { .. } => Ok(false),
         KeyState::Enveloped { expire_ms: 0, .. } => Ok(false),
@@ -287,7 +313,7 @@ pub async fn rename_key(
     if src == dst {
         // Same key: a plain existence check (the two latch locks would
         // otherwise self-deadlock on one latch cell).
-        return Ok(if resolve(&shared.store, prefix, src, now).is_present() {
+        return Ok(if resolve_arc(&shared.store, prefix, src, now).is_present() {
             RenameOutcome::Moved
         } else {
             RenameOutcome::SrcMissing
@@ -304,11 +330,11 @@ pub async fn rename_key(
     };
     let _ga = latch::lock(&shared.latch, &ka).await;
     let _gb = latch::lock(&shared.latch, &kb).await;
-    let src_state = resolve(&shared.store, prefix, src, now);
+    let src_state = resolve_arc(&shared.store, prefix, src, now);
     if !src_state.is_present() {
         return Ok(RenameOutcome::SrcMissing);
     }
-    let dst_state = resolve(&shared.store, prefix, dst, now);
+    let dst_state = resolve_arc(&shared.store, prefix, dst, now);
     if nx && dst_state.is_present() {
         return Ok(RenameOutcome::DstBlocked);
     }
