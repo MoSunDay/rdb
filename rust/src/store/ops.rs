@@ -55,6 +55,19 @@ pub async fn batch_write_async(store: Arc<Store>, batch: WriteBatch) -> Result<(
     .map_err(|e| e.to_string())?
 }
 
+/// Fire-and-forget twin of [`batch_write`]: commit off-worker and DROP
+/// the result (failures only log). Lazy-expiry purges use this so a read
+/// running on a tokio worker never performs an inline RocksDB fsync --
+/// the purge DECISION is already made, so the caller does not wait for
+/// the write to land.
+pub fn spawn_batch_write(store: Arc<Store>, batch: WriteBatch) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = store.db.write_opt(batch, &sync_write_opts()) {
+            eprintln!("rdb: detached batch write failed: {e}");
+        }
+    });
+}
+
 /// Async twin of [`delete_range`].
 pub async fn delete_range_async(
     store: Arc<Store>,
@@ -184,16 +197,29 @@ fn forward_iter<'a>(
 
 /// Ordered scan from `from`; the callback returns `false` to stop early.
 /// `excl_from` skips a leading key equal to `from` (cursor resume).
-/// Iteration errors abort the scan and surface as `Err`.
+/// Iteration errors abort the scan and surface as `Err` -- the raw
+/// RocksDB iterator is consumed item-by-item (NOT via `forward_iter`,
+/// whose `map_while(Result::ok)` would swallow an error into a silent
+/// early stop and report `Ok`).
 pub fn for_each_from(
     store: &Store,
     from: &[u8],
     excl_from: bool,
     f: &mut dyn FnMut(&[u8], &[u8]) -> bool,
 ) -> Result<(), String> {
-    for (i, (k, v)) in forward_iter(store, from, None).enumerate() {
-        if excl_from && i == 0 && k == from {
-            continue;
+    let mut ropts = ReadOptions::default();
+    ropts.set_iterate_lower_bound(from.to_vec());
+    let mut iter = store
+        .db
+        .iterator_opt(IteratorMode::From(from, Direction::Forward), ropts);
+    let mut skip_leading = excl_from;
+    for item in &mut iter {
+        let (k, v) = item.map_err(|e| e.to_string())?;
+        if skip_leading {
+            skip_leading = false;
+            if k.as_ref() == from {
+                continue;
+            }
         }
         if !f(&k, &v) {
             break;
@@ -343,6 +369,32 @@ mod tests {
         })
         .unwrap();
         assert_eq!(resumed, vec![b"70/b".to_vec(), b"70/c".to_vec()]);
+    }
+
+    /// D9: reaching the range tail is a clean `Ok(())` -- the raw iterator
+    /// is consumed as `Result` items now, so a mid-scan RocksDB error
+    /// propagates as `Err` instead of silently truncating the scan (a
+    /// store error cannot be injected cheaply here; the Err-shaped
+    /// contract is exercised by the `Result<(), String>` signature and
+    /// every caller already treats it as fallible).
+    #[test]
+    fn for_each_from_exhaustion_is_clean_ok() {
+        let (_dir, store) = open_tmp();
+        rocksdb::set(&store, b"70/", b"a", b"1").unwrap();
+        // full traversal ends Ok at the tail
+        let mut seen = 0;
+        assert_eq!(
+            for_each_from(&store, b"70/", false, &mut |_, _| {
+                seen += 1;
+                true
+            }),
+            Ok(())
+        );
+        assert_eq!(seen, 1);
+        // starting past every key also exhausts cleanly
+        assert_eq!(for_each_from(&store, b"99/", false, &mut |_, _| true), Ok(()));
+        // exclusive start on the last key visits nothing
+        assert_eq!(for_each_from(&store, b"70/a", true, &mut |_, _| true), Ok(()));
     }
 
     #[test]

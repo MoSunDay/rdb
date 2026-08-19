@@ -160,7 +160,7 @@ pub async fn set(ctx: &mut Ctx<'_>) {
         &keys_core::latch_key(&ctx.prefix_key, &key),
     )
     .await;
-    let state = keys_core::resolve(&ctx.shared.store, &ctx.prefix_key, &key, now);
+    let state = keys_core::resolve_arc(&ctx.shared.store, &ctx.prefix_key, &key, now);
 
     let old = old_string_value(&state);
     if matches!(old, OldValue::WrongType) && opts.get {
