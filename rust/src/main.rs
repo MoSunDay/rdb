@@ -154,6 +154,54 @@ fn spawn_raft_stats(raft: Arc<RwLock<state::RaftState>>, collector: Arc<monitor:
     });
 }
 
+/// E1: bounded one-shot flush of the Lite group-offset watermarks. Runs
+/// exactly one round of the 200ms background loop (see
+/// `lite::flush_offsets_once`), so the committed watermark is durably on
+/// disk before the process exits. Bounded: a hung flush gives up after 5s
+/// and the caller still exits 0.
+async fn shutdown_flush_lite_offsets(shared: &Arc<state::Shared>) {
+    const BOUND: Duration = Duration::from_secs(5);
+    match tokio::time::timeout(BOUND, rdb::lite::flush_offsets_once(shared)).await {
+        Ok(Ok(())) => eprintln!("[shutdown] lite offset flush done"),
+        Ok(Err(e)) => eprintln!("[shutdown] lite offset flush failed: {e}"),
+        Err(_) => eprintln!("[shutdown] lite offset flush timed out after 5s, giving up"),
+    }
+}
+
+/// E1: SIGTERM/SIGINT watcher. On the FIRST signal: log one line, flush
+/// the Lite offsets (bounded), exit 0. Stopping accepts: there is no
+/// accept-loop cancellation handle (`resp::serve` owns the listener inside
+/// its own task and never returns), so the accept loops -- and every other
+/// spawned task -- die with the process; the OS closes the sockets on
+/// exit. Only the normal listener's Lite runtime is flushed (the backup
+/// listener is read-only and holds no dirty offsets).
+fn spawn_signal_shutdown(shared: Arc<state::Shared>) {
+    tokio::spawn(async move {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[shutdown] cannot watch SIGTERM: {e}");
+                return;
+            }
+        };
+        let mut interrupt =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[shutdown] cannot watch SIGINT: {e}");
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = term.recv() => eprintln!("received SIGTERM, shutting down gracefully"),
+            _ = interrupt.recv() => eprintln!("received SIGINT, shutting down gracefully"),
+        }
+        shutdown_flush_lite_offsets(&shared).await;
+        std::process::exit(0);
+    });
+}
+
 fn main() {
     // RDB_CURRENT_THREAD=1: diagnostics-only single-threaded runtime.
     let mut builder = if std::env::var("RDB_CURRENT_THREAD").is_ok() {
@@ -418,6 +466,9 @@ async fn do_main() {
             std::process::exit(1);
         }
     };
+    // E1: install signal handling AFTER every listener/task is up; the
+    // watcher flushes the Lite offsets and exits 0 (see spawn_signal_shutdown).
+    spawn_signal_shutdown(Arc::clone(&shared));
     resp::serve(listener, shared).await // -> !, never returns
 }
 
