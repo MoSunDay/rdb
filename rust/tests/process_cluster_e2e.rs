@@ -235,3 +235,75 @@ async fn drill_py_scenario_again_three_real_processes() {
         nodes[leader].ctx()
     );
 }
+
+/// D7b regression: the join decision must follow PERSISTED RAFT STATE,
+/// not data-dir existence. A first join against a dead join address dies
+/// fatally (Go parity), but by then the process has already created the
+/// raft data dir with its RocksDB CURRENT marker. With the old
+/// dir-existence decision the retry silently skipped joining and the
+/// node stayed a lone uninitialized follower forever; with
+/// `Raft::is_initialized()` it joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_first_join_is_retried_on_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Lone leader first: the joiner needs a live cluster to retry into.
+    let mut nodes = vec![spawn_node(dir.path(), 0, true, None)];
+    wait_resp_ready(&mut nodes[0], 30).await;
+    assert_eq!(
+        wait_leader(&nodes, 60).await,
+        0,
+        "bootstrapped node0 must lead\n{}",
+        all_ctx(&nodes)
+    );
+
+    // First attempt: RAFT_JOIN_ADDR points at a dead port (instant
+    // refusal). The join fails and the process exits(1) -- AFTER
+    // new_raft_node already created the raft dir + RocksDB CURRENT.
+    let mut joiner = spawn_node(dir.path(), 1, false, Some("127.0.0.1:1"));
+    let status = joiner.child.wait().expect("joiner must exit");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "failed join is fatal (Go parity)\n{}",
+        joiner.ctx()
+    );
+    let raft_dir = joiner.dir.join(&joiner.resp).join("raft");
+    assert!(
+        raft_dir.join("CURRENT").is_file(),
+        "precondition: the failed attempt already left a created raft dir with a CURRENT marker\n{}",
+        joiner.ctx()
+    );
+
+    // Retry: SAME config path + data dir, now against the LIVE leader.
+    // (common::spawn_child is private, so the respawn is spelled out.)
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&joiner.stderr_path)
+        .expect("open stderr log");
+    joiner.child = std::process::Command::new(env!("CARGO_BIN_EXE_rdb"))
+        .arg("-config")
+        .arg(&joiner.config_path)
+        .env_remove("RAFT_BOOTSTRAP")
+        .env_remove("RDB_BEACON")
+        .env_remove("RDB_DEBUG_REPL")
+        .env_remove("RUST_LOG")
+        .env("RAFT_JOIN_ADDR", &nodes[0].http)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .expect("respawn joiner");
+
+    // RESP binds LAST: readiness proves the join RPC succeeded this time.
+    wait_resp_ready(&mut joiner, 30).await;
+    nodes.push(joiner);
+
+    // And the joiner must be a real member: init from the leader lists
+    // every bind on EVERY node; a node that skipped joining never sees
+    // the instances value and stays "cluster not ready".
+    let binds: Vec<String> = nodes.iter().map(|n| n.resp.clone()).collect();
+    cluster_init(&nodes[0], &binds).await;
+    wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
+}
