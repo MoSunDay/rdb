@@ -117,7 +117,9 @@ async fn pop(ctx: &mut Ctx<'_>, max: bool, cmd: &str) {
         return;
     }
     let mut window: VecDeque<(Vec<u8>, f64)> = VecDeque::new();
-    let _ = zset_ds::for_each_scored(
+    // A failed scan aborts BEFORE any batch is built: a partial pop
+    // must never mutate storage.
+    if zset_ds::for_each_scored(
         &ctx.shared.store,
         &ctx.prefix_key,
         &key,
@@ -134,7 +136,12 @@ async fn pop(ctx: &mut Ctx<'_>, max: bool, cmd: &str) {
                 (window.len() as u64) < n // stop once n are in hand
             }
         },
-    );
+    )
+    .is_err()
+    {
+        append_error(ctx.out, &format!("ERR: {cmd} failed"));
+        return;
+    }
     let mut batch = WriteBatch::default();
     for (member, score) in &window {
         zset_ds::del_member(&mut batch, &ctx.prefix_key, &key, member);

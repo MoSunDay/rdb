@@ -43,7 +43,10 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
         TopicName::Stream(p, c) => (p.clone(), c.clone(), false),
         TopicName::Parent(p) => {
             let prefix0 = hash::slot_with_prefix(p).1;
-            let kids = select::discover_children(&ctx.shared.store, &prefix0, p, 64);
+            let kids = match select::discover_children(&ctx.shared.store, &prefix0, p, 64) {
+                Ok(k) => k,
+                Err(e) => return resp::append_error(ctx.out, &format!("ERR: xadd failed: {e}")),
+            };
             let c = select::pick_round_robin(&ctx.shared.lite.picks, p, &kids);
             (p.clone(), c, true)
         }

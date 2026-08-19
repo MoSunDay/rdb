@@ -88,16 +88,16 @@ fn emit(out: &mut Vec<u8>, items: &[(Vec<u8>, f64)], withscores: bool, limit: Op
 /// All members with scores in `[min, max]` (each bound honoring its
 /// inclusivity), ascending: the scan seeks the min bound's sortable
 /// prefix (an inclusive zero starts at -0.0 so both zeros match) and
-/// stops as soon as scores pass the max bound.
+/// stops as soon as scores pass the max bound. `Err` = the scan failed.
 fn collect_score_window(
     ctx: &Ctx<'_>,
     key: &[u8],
     (min, min_incl): (f64, bool),
     (max, max_incl): (f64, bool),
-) -> Vec<(Vec<u8>, f64)> {
+) -> Result<Vec<(Vec<u8>, f64)>, String> {
     let mut items = Vec::new();
     let from = seek_from_sortable(min, min_incl).to_be_bytes();
-    let _ = zset_ds::for_each_scored(
+    zset_ds::for_each_scored(
         &ctx.shared.store,
         &ctx.prefix_key,
         key,
@@ -113,56 +113,67 @@ fn collect_score_window(
             items.push((member.to_vec(), score));
             true
         },
-    );
-    items
+    )?;
+    Ok(items)
 }
 
-/// Shared BYSCORE core: collect the window, reverse when `rev`, emit.
+/// Shared BYSCORE core: collect the window, reverse when `rev` (the
+/// inherent direction of the ZREV twins, or ZRANGE's REV switch), emit.
+/// A failed scan replies `-ERR` instead of a partial array.
 fn score_window_reply(
     ctx: &mut Ctx<'_>,
     key: &[u8],
     min: (f64, bool),
     max: (f64, bool),
+    opts: &RangeOpts,
     rev: bool,
-    withscores: bool,
-    limit: Option<(i64, i64)>,
+    cmd: &str,
 ) {
     match zset_state(&ctx.shared.store, &ctx.prefix_key, key, expire::now_ms()) {
         ZSetState::WrongType => append_error(ctx.out, WRONGTYPE),
         ZSetState::Missing => append_array(ctx.out, 0),
         ZSetState::ZSet { .. } => {
-            let mut items = collect_score_window(ctx, key, min, max);
+            let Ok(mut items) = collect_score_window(ctx, key, min, max) else {
+                append_error(ctx.out, &format!("ERR: {cmd} failed"));
+                return;
+            };
             if rev {
                 items.reverse();
             }
-            emit(ctx.out, &items, withscores, limit);
+            emit(ctx.out, &items, opts.withscores, opts.limit);
         }
     }
 }
 
 /// Shared BYLEX core: filter the whole index by member bytes, reverse
-/// when `rev`, emit (WITHSCORES never legal here, callers enforce).
+/// when `rev` (inherent to the ZREV twins or ZRANGE's REV switch),
+/// emit (WITHSCORES never legal here, callers enforce). A failed scan
+/// replies `-ERR` instead of a partial array.
 fn lex_window_reply(
     ctx: &mut Ctx<'_>,
     key: &[u8],
     min: &LexBound,
     max: &LexBound,
+    opts: &RangeOpts,
     rev: bool,
-    limit: Option<(i64, i64)>,
+    cmd: &str,
 ) {
     match zset_state(&ctx.shared.store, &ctx.prefix_key, key, expire::now_ms()) {
         ZSetState::WrongType => append_error(ctx.out, WRONGTYPE),
         ZSetState::Missing => append_array(ctx.out, 0),
         ZSetState::ZSet { .. } => {
-            let mut items: Vec<(Vec<u8>, f64)> =
-                collect_scored(&ctx.shared.store, &ctx.prefix_key, key)
-                    .into_iter()
-                    .filter(|(member, _)| lex_within(member, min, max))
-                    .collect();
+            let Ok(items) = collect_scored(&ctx.shared.store, &ctx.prefix_key, key) else {
+                append_error(ctx.out, &format!("ERR: {cmd} failed"));
+                return;
+            };
+            let mut items: Vec<(Vec<u8>, f64)> = items
+                .into_iter()
+                .filter(|(member, _)| lex_within(member, min, max))
+                .collect();
             if rev {
                 items.reverse();
             }
-            emit(ctx.out, &items, false, limit);
+            emit(ctx.out, &items, false, opts.limit);
         }
     }
 }
@@ -204,7 +215,7 @@ pub async fn zrange(ctx: &mut Ctx<'_>) {
             append_error(ctx.out, "ERR min or max not valid string range item");
             return;
         };
-        lex_window_reply(ctx, &key, &min, &max, opts.rev, opts.limit);
+        lex_window_reply(ctx, &key, &min, &max, &opts, opts.rev, "zrange");
         return;
     }
     if opts.by_score {
@@ -219,26 +230,26 @@ pub async fn zrange(ctx: &mut Ctx<'_>) {
             append_error(ctx.out, "ERR min or max not valid float");
             return;
         };
-        score_window_reply(ctx, &key, min, max, opts.rev, opts.withscores, opts.limit);
+        score_window_reply(ctx, &key, min, max, &opts, opts.rev, "zrange");
         return;
     }
     let (Some(start), Some(stop)) = (parse_i64(&ctx.args[1]), parse_i64(&ctx.args[2])) else {
         append_error(ctx.out, "ERR value is not an integer or out of range");
         return;
     };
-    rank_window_reply(ctx, &key, start, stop, opts.rev, opts.withscores);
+    rank_window_reply(ctx, &key, start, stop, &opts, "zrange");
 }
 
 /// Rank mode: `[start..=stop]` with Redis clamping (negatives from the
 /// back, empty selection -> `*0`); REV walks the same window but emits
-/// descending.
+/// descending. A failed scan replies `-ERR` instead of a partial array.
 fn rank_window_reply(
     ctx: &mut Ctx<'_>,
     key: &[u8],
     start: i64,
     stop: i64,
-    rev: bool,
-    withscores: bool,
+    opts: &RangeOpts,
+    cmd: &str,
 ) {
     match zset_state(&ctx.shared.store, &ctx.prefix_key, key, expire::now_ms()) {
         ZSetState::WrongType => append_error(ctx.out, WRONGTYPE),
@@ -248,12 +259,15 @@ fn rank_window_reply(
                 append_array(ctx.out, 0);
                 return;
             };
-            let mut items = collect_scored(&ctx.shared.store, &ctx.prefix_key, key);
-            if rev {
+            let Ok(mut items) = collect_scored(&ctx.shared.store, &ctx.prefix_key, key) else {
+                append_error(ctx.out, &format!("ERR: {cmd} failed"));
+                return;
+            };
+            if opts.rev {
                 items.reverse();
             }
             match items.get(from as usize..=to as usize) {
-                Some(slice) => emit(ctx.out, slice, withscores, None),
+                Some(slice) => emit(ctx.out, slice, opts.withscores, None),
                 None => append_array(ctx.out, 0),
             }
         }
@@ -278,7 +292,7 @@ pub async fn zrangebyscore(ctx: &mut Ctx<'_>) {
         return;
     };
     let key = ctx.args[0].clone();
-    score_window_reply(ctx, &key, min, max, false, opts.withscores, opts.limit);
+    score_window_reply(ctx, &key, min, max, &opts, false, "zrangebyscore");
 }
 
 /// ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT o c] -> descending;
@@ -300,7 +314,7 @@ pub async fn zrevrangebyscore(ctx: &mut Ctx<'_>) {
         return;
     };
     let key = ctx.args[0].clone();
-    score_window_reply(ctx, &key, min, max, true, opts.withscores, opts.limit);
+    score_window_reply(ctx, &key, min, max, &opts, true, "zrevrangebyscore");
 }
 
 /// ZRANGEBYLEX key min max [LIMIT o c] -> members in byte order
@@ -325,7 +339,7 @@ pub async fn zrangebylex(ctx: &mut Ctx<'_>) {
         return;
     };
     let key = ctx.args[0].clone();
-    lex_window_reply(ctx, &key, &min, &max, false, opts.limit);
+    lex_window_reply(ctx, &key, &min, &max, &opts, false, "zrangebylex");
 }
 
 /// ZREVRANGEBYLEX key max min [LIMIT o c] -> members in reverse byte
@@ -350,7 +364,7 @@ pub async fn zrevrangebylex(ctx: &mut Ctx<'_>) {
         return;
     };
     let key = ctx.args[0].clone();
-    lex_window_reply(ctx, &key, &min, &max, true, opts.limit);
+    lex_window_reply(ctx, &key, &min, &max, &opts, true, "zrevrangebylex");
 }
 
 /// ZLEXCOUNT key min max -> members within the lex bounds.
@@ -371,11 +385,18 @@ pub async fn zlexcount(ctx: &mut Ctx<'_>) {
         expire::now_ms(),
     ) {
         ZSetState::WrongType => append_error(ctx.out, WRONGTYPE),
-        _ => {
-            let n = collect_scored(&ctx.shared.store, &ctx.prefix_key, &ctx.args[0])
-                .iter()
-                .filter(|(member, _)| lex_within(member, &min, &max))
-                .count();
+        ZSetState::Missing => append_int(ctx.out, 0),
+        ZSetState::ZSet { .. } => {
+            let n = match collect_scored(&ctx.shared.store, &ctx.prefix_key, &ctx.args[0]) {
+                Ok(items) => items
+                    .iter()
+                    .filter(|(member, _)| lex_within(member, &min, &max))
+                    .count(),
+                Err(_) => {
+                    append_error(ctx.out, "ERR: zlexcount failed");
+                    return;
+                }
+            };
             append_int(ctx.out, n as i64);
         }
     }

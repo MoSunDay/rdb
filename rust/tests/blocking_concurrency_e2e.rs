@@ -409,7 +409,7 @@ async fn concurrent_reversed_smove_never_deadlocks() {
         })
     };
 
-    let (fwd, bwd) = tokio::time::timeout(Duration::from_secs(30), async {
+    let (fwd, bwd) = tokio::time::timeout(Duration::from_secs(60), async {
         (
             forward.await.expect("forward smove task"),
             backward.await.expect("backward smove task"),

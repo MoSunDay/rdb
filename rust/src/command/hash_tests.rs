@@ -344,3 +344,34 @@ fn hash_commands_reject_string_key() {
     assert_eq!(call(&s, "hincrby", &[b"str", b"f", b"1"]), wrong);
     assert_eq!(call(&s, "hscan", &[b"str", b"0"]), wrong);
 }
+
+/// Cardinality lock: every field_exists consumer (HSET dedup, HSETNX,
+/// HINCRBY/HINCRBYFLOAT creation flag, HDEL) must keep HLEN exact. A
+/// storage error misread as "field absent" would double-create the field
+/// and drift the meta count permanently (read errors are not forceable
+/// in-process; this pins the success-path arithmetic).
+#[test]
+fn hash_cardinality_stays_exact_across_writes() {
+    let (_g, s) = shared_for("127.0.0.1:40322");
+    call(&s, "hset", &[b"k", b"a", b"1", b"b", b"2"]);
+    // HSETNX over an existing field is a no-op: the count must not grow.
+    assert_eq!(int_of(&call(&s, "hsetnx", &[b"k", b"a", b"x"])), 0);
+    assert_eq!(int_of(&call(&s, "hlen", &[b"k"])), 2);
+    assert_eq!(bulk_of(&call(&s, "hget", &[b"k", b"a"])), b"1".to_vec());
+    // Overwrites are never counted as new fields.
+    assert_eq!(
+        int_of(&call(&s, "hset", &[b"k", b"a", b"9", b"c", b"3"])),
+        1
+    );
+    assert_eq!(int_of(&call(&s, "hlen", &[b"k"])), 3);
+    // Repeated increments on existing fields keep the count constant.
+    for _ in 0..5 {
+        call(&s, "hincrby", &[b"k", b"a", b"1"]);
+    }
+    call(&s, "hincrbyfloat", &[b"k", b"b", b"0.5"]);
+    assert_eq!(int_of(&call(&s, "hlen", &[b"k"])), 3);
+    // HDEL over a mix of present and absent fields is exact.
+    assert_eq!(int_of(&call(&s, "hdel", &[b"k", b"zz", b"a", b"b"])), 2);
+    assert_eq!(int_of(&call(&s, "hlen", &[b"k"])), 1);
+    assert_eq!(bulk_of(&call(&s, "hget", &[b"k", b"c"])), b"3".to_vec());
+}
