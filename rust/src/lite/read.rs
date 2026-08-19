@@ -250,9 +250,6 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
             "ERR The $ ID is meaningless in the context of this command",
         );
     }
-    let group_str = String::from_utf8_lossy(&group).to_string();
-    let stream_str = String::from_utf8_lossy(&stream).to_string();
-
     // Explicit id: catch-up view over the log; watermark untouched.
     if id_arg != b">" {
         let Some(explicit) = model::parse_id(&id_arg) else {
@@ -261,16 +258,10 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
                 "ERR Invalid stream ID specified as stream command argument",
             );
         };
-        if offset::load(
-            &ctx.shared.lite.offsets,
-            &ctx.shared.store,
-            &prefix,
-            &stream_str,
-            &group_str,
-        )
-        .ok()
-        .flatten()
-        .is_none()
+        if offset::load(&ctx.shared.lite.offsets, &ctx.shared.store, &prefix, &stream, &group)
+            .ok()
+            .flatten()
+            .is_none()
         {
             return nogroup(ctx.out, &stream, &group);
         }
@@ -303,15 +294,10 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
     loop {
         {
             let _guard = crate::ds::latch::lock(&ctx.shared.latch, &wake).await;
-            let Some(st) = offset::load(
-                &ctx.shared.lite.offsets,
-                &ctx.shared.store,
-                &prefix,
-                &stream_str,
-                &group_str,
-            )
-            .ok()
-            .flatten() else {
+            let Some(st) =
+                offset::load(&ctx.shared.lite.offsets, &ctx.shared.store, &prefix, &stream, &group)
+                    .ok()
+                    .flatten() else {
                 return nogroup(ctx.out, &stream, &group);
             };
             after_snapshot = st.delivered;
@@ -327,12 +313,7 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
                 }
                 Ok(v) if !v.is_empty() => {
                     if let Some(last) = v.last().map(|e| e.id) {
-                        offset::advance_delivered(
-                            &ctx.shared.lite.offsets,
-                            &stream_str,
-                            &group_str,
-                            last,
-                        );
+                        offset::advance_delivered(&ctx.shared.lite.offsets, &stream, &group, last);
                     }
                     monitor::observe_lite_message(&ctx.shared.monitor, "read", v.len() as u64);
                     return append_read_reply(ctx.out, &stream, &v);
