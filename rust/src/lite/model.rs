@@ -228,6 +228,12 @@ pub fn decode_entry(raw: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         Some(out)
     };
     let n = u32::from_be_bytes(take(4, &mut i)?.try_into().ok()?) as usize;
+    // A count over the pairs the body can hold (8-byte header
+    // each) is corrupt: reject instead of trusting it for
+    // with_capacity (a forged u32::MAX would OOM).
+    if n > body.len() / 8 {
+        return None;
+    }
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let flen = u32::from_be_bytes(take(4, &mut i)?.try_into().ok()?) as usize;
@@ -321,5 +327,37 @@ mod tests {
         );
         // Fresh stream (no last id): the clock position, seq 0.
         assert_eq!(auto_id(None, 42), Some(EntryId { ms: 42, seq: 0 }));
+    }
+
+    #[test]
+    fn decode_entry_rejects_corrupt_huge_count() {
+        // Only the count, zero pairs: a forged u32::MAX must be refused
+        // before it reaches with_capacity.
+        let raw = codec::encode_envelope(0, &u32::MAX.to_be_bytes());
+        assert_eq!(decode_entry(&raw), None);
+    }
+
+    #[test]
+    fn decode_entry_roundtrip_and_truncated() {
+        let pairs = [
+            (b"f1".as_slice(), b"v1".as_slice()),
+            (b"f2".as_slice(), b"".as_slice()),
+        ];
+        assert_eq!(
+            decode_entry(&encode_entry(&pairs)),
+            Some(vec![
+                (b"f1".to_vec(), b"v1".to_vec()),
+                (b"f2".to_vec(), Vec::new()),
+            ])
+        );
+
+        // Claims n=2 but carries only one complete pair: the guard lets
+        // the honest count through and the take loop hits the wall.
+        let one = encode_entry(&[(b"f1", b"v1")]);
+        let (_, one_pair) = codec::decode_envelope(&one);
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&one_pair[4..]);
+        assert_eq!(decode_entry(&codec::encode_envelope(0, &body)), None);
     }
 }

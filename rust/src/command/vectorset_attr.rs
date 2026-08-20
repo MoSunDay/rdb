@@ -47,14 +47,20 @@ pub async fn vsetattr(ctx: &mut Ctx<'_>) {
         VectorSetState::VectorSet { dim, .. } => dim,
     };
     // Only a live element can carry an attribute; its vector is decoded
-    // and re-encoded unchanged (attr_len 0 for the empty string).
-    let Some((vector, _)) =
-        vectorset_ds::read_elem(&ctx.shared.store, &ctx.prefix_key, &key, &element, dim)
-            .unwrap_or(None)
-    else {
-        append_int(ctx.out, 0);
-        return;
-    };
+    // and re-encoded unchanged (attr_len 0 for the empty string). A read
+    // error must not masquerade as "element missing" (vgetattr errs too).
+    let vector =
+        match vectorset_ds::read_elem(&ctx.shared.store, &ctx.prefix_key, &key, &element, dim) {
+            Ok(Some((vector, _))) => vector,
+            Ok(None) => {
+                append_int(ctx.out, 0);
+                return;
+            }
+            Err(_) => {
+                append_error(ctx.out, "ERR: vsetattr failed");
+                return;
+            }
+        };
     let mut batch = WriteBatch::default();
     vectorset_ds::put_elem(
         &mut batch,
