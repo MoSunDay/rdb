@@ -1,0 +1,54 @@
+# Quality gate for the Rust implementation (the only maintained one):
+# fmt -> clippy (-D warnings) -> full test suite -> release build.
+# rust/.cargo/config.toml (committed) sets --cfg tokio_unstable for every
+# cargo invocation, so the LIFO-slot workaround applies in CI as locally.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      # librocksdb-sys compiles bundled C/C++ sources (rocksdb + lz4/
+      # snappy/zstd/zlib/bzip2); clang covers the C toolchain and any
+      # bindgen-style probing without depending on the runner image.
+      - name: Install rocksdb build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: release build
+        run: cargo build --release --workspace
