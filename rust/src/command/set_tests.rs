@@ -426,3 +426,20 @@ fn set_cardinality_stays_exact_across_writes() {
     assert_eq!(int_of(&call(&s, "exists", &[b"{g}dst"])), 0);
     assert_eq!(members(&s, key), vec![b"b".to_vec(), b"c".to_vec()]);
 }
+
+/// Corrupted state: meta count > 0 but the member record is physically
+/// gone. SPOP must fail explicitly (`-ERR: spop failed`) instead of
+/// panicking on `% 0` / `picked[0]` or fabricating a null reply while
+/// the meta count still claims one member.
+#[test]
+fn spop_corrupt_empty_members_fails() {
+    let (_g, s) = shared_for("127.0.0.1:40323");
+    assert_eq!(int_of(&call(&s, "sadd", &[b"k", b"a"])), 1);
+    // Drop the physical member record only; meta keeps count=1.
+    let mut batch = rocksdb::WriteBatch::default();
+    batch.delete(crate::ds::set_ds::member_key(PREFIX, b"k", b"a"));
+    crate::store::ops::batch_write(&s.store, batch).expect("raw delete");
+    assert_eq!(int_of(&call(&s, "scard", &[b"k"])), 1);
+    assert!(call(&s, "spop", &[b"k"]).starts_with(b"-ERR: spop failed"));
+    assert!(call(&s, "spop", &[b"k", b"1"]).starts_with(b"-ERR: spop failed"));
+}

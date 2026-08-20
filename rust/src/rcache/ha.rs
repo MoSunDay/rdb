@@ -410,8 +410,9 @@ pub fn spawn_backup_map_init(raft: Arc<RdbRaft>, kv: KvMap, conf: &conf::Config)
     let self_addr = conf.raft_tcp_address.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(INIT_INTERVAL);
+        ticker.tick().await; // Go sleeps 1s before the first iteration
         loop {
-            ticker.tick().await; // Go order: sleep 1s, read sentinel up front,
+            ticker.tick().await; // Go order: read sentinel up front,
                                  // exit on the NEXT tick after applying.
             let init = kv_get(&kv, BACKUP_INIT_KEY);
             if !init.is_empty() {

@@ -309,10 +309,20 @@ pub async fn spop(ctx: &mut Ctx<'_>) {
                 return;
             }
         };
+    // meta count > 0 with zero member records is a corrupted state:
+    // random picking needs at least one member, so fail explicitly
+    // instead of panicking on `% 0` / `picked[0]`.
+    if page.members.is_empty() {
+        append_error(ctx.out, "ERR: spop failed");
+        return;
+    }
+    // clamp to the physical member count (not just the meta count):
+    // the None path also clamps so `% (idx.len() - i)` never sees 0.
     let want = match count {
         None => 1,
-        Some(n) => (n as u64).min(page.members.len() as u64),
-    };
+        Some(n) => n as u64,
+    }
+    .min(page.members.len() as u64);
     // Random distinct picks by shuffling indices (Fisher-Yates over a
     // prefix of length `want`): the first `want` slots end up random.
     let mut idx: Vec<usize> = (0..page.members.len()).collect();
