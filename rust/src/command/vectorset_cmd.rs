@@ -223,10 +223,21 @@ pub async fn vrem(ctx: &mut Ctx<'_>) {
             dim,
             count,
         } => {
-            let exists =
-                vectorset_ds::read_elem(&ctx.shared.store, &ctx.prefix_key, &key, &element, dim)
-                    .map(|e| e.is_some())
-                    .unwrap_or(false);
+            // A read error must not masquerade as "element missing"
+            // (the meta count would still hold the element).
+            let exists = match vectorset_ds::read_elem(
+                &ctx.shared.store,
+                &ctx.prefix_key,
+                &key,
+                &element,
+                dim,
+            ) {
+                Ok(e) => e.is_some(),
+                Err(_) => {
+                    append_error(ctx.out, "ERR: vrem failed");
+                    return;
+                }
+            };
             if !exists {
                 append_int(ctx.out, 0);
                 return;

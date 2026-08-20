@@ -29,7 +29,7 @@ use openraft::RPCTypes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout_at, Instant};
 
 use crate::rcache::{typ, Node, NodeId, TypeConfig};
 use crate::utils::md5_with40;
@@ -171,16 +171,17 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Send one request frame and await the response frame, bounded by
-    /// [`RPC_TIMEOUT`] (Go: 10s stream deadline per RPC). The dial is
-    /// part of the budget: a blackholed peer fails fast as
-    /// `Unreachable` instead of hanging past the deadline semantics.
+    /// Send one request frame and await the response frame under a single
+    /// [`RPC_TIMEOUT`] deadline shared by the dial and the roundtrip (Go:
+    /// one 10s stream deadline per RPC covering dial+write+read). A step
+    /// that exhausts the budget makes the following ones fail instantly.
     async fn call<E: std::error::Error>(
         &mut self,
         msg: &InMsg,
         action: RPCTypes,
     ) -> Result<OutMsg, typ::RPCError<E>> {
-        match timeout(RPC_TIMEOUT, self.ensure_connected()).await {
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        match timeout_at(deadline, self.ensure_connected()).await {
             Err(_elapsed) => {
                 // Cancelling the connect future dropped the half-open
                 // socket; surface as Unreachable so openraft backs off.
@@ -206,7 +207,7 @@ impl Connection {
             Err(e) => return Err(network_err(&e)),
         };
 
-        let res = timeout(RPC_TIMEOUT, roundtrip(stream, &payload)).await;
+        let res = timeout_at(deadline, roundtrip(stream, &payload)).await;
         let frame = match res {
             Err(_elapsed) => {
                 self.drop_stream();
