@@ -431,6 +431,52 @@ mod tests {
         assert_eq!(data_path("/tmp/a", ".."), PathBuf::from("/tmp"));
     }
 
+    /// Engine-evaluation record (documentation-by-test; see COMPAT.md
+    /// "Transactions"): rust-rocksdb 0.24's OptimisticTransactionDB was
+    /// evaluated for EXEC and rejected on three measured grounds:
+    ///
+    /// 1. A base (non-tx) write racing an open OCC transaction makes the
+    ///    transaction's commit fail with "Resource busy" -- regardless of
+    ///    `enable_pipelined_write`. Since non-transactional writes are the
+    ///    hot path here (transactions are opt-in per request), every
+    ///    concurrent plain write would abort in-flight transactions.
+    /// 2. The transactional WriteBatch variant (`<true>`) lacks
+    ///    `delete_range`, which the ds-layer family deletes depend on.
+    /// 3. Staging writes inside a transaction hides them from the command
+    ///    read path (no read-your-writes), breaking RMW chains like
+    ///    MULTI; INCR; INCR; EXEC.
+    ///
+    /// EXEC isolation is therefore enforced at the application level with
+    /// byte-sorted key latches (`tx::exec`). If this test ever fails,
+    /// upstream changed premise (1) -- re-evaluate the engine then.
+    #[test]
+    fn occ_engine_evaluation_record() {
+        use rocksdb::OptimisticTransactionDB;
+
+        let race = |pipelined: bool| -> String {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.set_enable_pipelined_write(pipelined);
+            let db: OptimisticTransactionDB =
+                OptimisticTransactionDB::open(&opts, dir.path().to_str().unwrap()).unwrap();
+            // an isolated transaction opens and commits fine
+            let solo = db.transaction();
+            solo.put(b"solo", b"1").unwrap();
+            solo.commit().expect("isolated commit works");
+            // ...but a racing base write breaks the commit path
+            let txn = db.transaction();
+            txn.put(b"k", b"txn").unwrap();
+            db.put_opt(b"k", b"raced", &sync_write_opts()).unwrap();
+            match txn.commit() {
+                Ok(()) => "committed".to_string(),
+                Err(e) => e.to_string(),
+            }
+        };
+        assert_eq!(race(true), "Resource busy: ");
+        assert_eq!(race(false), "Resource busy: ");
+    }
+
     #[test]
     fn close_drops_store() {
         let (dir, store) = open_tmp();
