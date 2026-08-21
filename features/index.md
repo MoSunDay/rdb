@@ -7,6 +7,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 - [Raft 控制面与高可用](./raft-ha/index.md)
 - [数据迁移](./migrate/index.md)
 - [Lite MQ（MQ 路线决策 + Streams 动词面规范）](./mq-lite.md)
+- [SQL 数据面（MySQL 协议 + 分布式事务）](./sql-dataplane.md)
 
 ## Changelog
 - [changelog](./changelog/)
