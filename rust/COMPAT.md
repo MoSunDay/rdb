@@ -318,6 +318,49 @@ docs, postings, term stats, centroids and ANN partitions together).
   there is no distributed query planner. `FT.SEARCH` replies are node-local:
   `:N` then per hit docid [, score] [, original JSON].
 
+## SQL data plane (MySQL wire, Rust-only)
+
+The Rust tree adds a SQL data plane the Go implementation never had. Summary of the
+contract; module map lives in `agents/rust/sql.md`.
+
+- **Access**: `mysql_bind` listener (opensrv-mysql; native-password only, `mysql_user`/
+  `mysql_password` from config; any other account is rejected at handshake). USE/SET are
+  tolerated no-ops; `SELECT @@var` is intercepted server-side.
+- **MVCC rows**: physical key `<slot>/ 0x20 table_id(BE u32) pk_key ts(BE !ts)` — newest
+  version first per pk; value = header (0x01 live, 0x00 tombstone, 0x02 2PC-prepared) +
+  null bitmap + typed payloads. Slot = `crc16(table_id BE ++ pk_key) % 16384` (same 16384
+  slot space as RESP; SQL is not subject to RESP MOVED — routing is node-internal).
+- **Timestamps**: node-local atomic oracle when the cluster is not ready; once
+  `CLUSTER INIT` lands, block allocation through the raft leader (`sql_ts_cursor`,
+  HTTP `/sql/ts?n=` on the leader, 4096-ts blocks, cursor persisted via raft BEFORE a
+  block is served). Unreachable leader degrades to locally-bumped ranges above the last
+  known global watermark (monotonicity over availability of strict ordering).
+- **Transactions**: `BEGIN`/`COMMIT`/`ROLLBACK` snapshot isolation — reads pinned at the
+  txn read_ts (registered with the oracle), writes staged in a per-session write set,
+  first-committer-wins write-write validation (MySQL error 1213). DDL inside a txn is
+  rejected. Disconnect rolls back. Autocommit statements skip staging (single batch).
+- **Secondary indexes**: `0x21` secondary (`slot/ 0x21 table_id col_pos key(val) pk`), `0x22`
+  unique (`slot/ 0x22 table_id col_pos key(val)` -> pk). Index slot = `crc16(table_id ++
+  col_pos)` so one index is contiguous in one slot band. NULLs unindexed. Unique is
+  enforced at write/commit (1062); `CREATE UNIQUE INDEX` pre-checks existing rows (a race
+  window vs concurrent writers is accepted and documented in-code). Single-column only.
+- **Planner**: sargable `=`/`IN`/`BETWEEN` on an indexed column -> pk lookup (>1000 pks or
+  no index -> SeqScan). In cluster mode the index path is disabled (v1) and EXPLAIN shows
+  `Gather(bands=N)` over `SeqScan`.
+- **2PC writes**: any node accepts DML; the coordinator groups the pre-encoded batch by
+  slot-band owner, PREPAREs (0x02 headers + unique entries + durable participant marker,
+  one atomic RocksDB batch per participant), durably records the decision, then DECIDEs
+  (commit flips 0x02->0x01 + applies secondary index entries; abort deletes). In-doubt
+  markers resolve via `/sql2pc/status?id=` on the coordinator, presumed-abort after a
+  60s lease. Readers never see 0x02 rows.
+- **Scatter-gather reads**: single-table scans fan out per slot band over the internal
+  `sql_rpc_bind` TCP protocol (length-prefixed JSON), merged at the coordinator and then
+  filtered/ordered/aggregated there. A dead band owner fails the query loudly (no partial
+  results). JOINs and index paths stay local-only (v1).
+- **GC**: a 30s sweep deletes versions at or below the oracle watermark except each pk's
+  newest (live) anchor; tombstone anchors take their whole prefix with them. Prepared
+  (0x02) versions are never swept.
+
 ## Runtime verification (this tree)
 
 - Full RESP drill (gate text, cluster init/nodes, MOVED format+routing, hash-tag co-location,

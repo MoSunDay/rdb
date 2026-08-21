@@ -9,8 +9,10 @@
 use std::collections::BTreeMap;
 
 use crate::sql::exec::expr::{eval, truthy, ColumnScope};
+use crate::sql::index;
 use crate::sql::parse::ast::{Expr, TableRef};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
+use crate::sql::plan;
 use crate::sql::storage::catalog;
 use crate::sql::storage::row::{self, HEADER_LIVE};
 use crate::sql::storage::schema::{SqlType, TableSchema, Value};
@@ -160,22 +162,25 @@ pub fn visible_rows(
     schema: &TableSchema,
     read_ts: u64,
 ) -> SqlResult<Vec<Vec<Value>>> {
-    // pk -> visible (ts, raw version). Versions of one pk arrive
-    // newest-first (inverted ts suffix in the key), so the FIRST entry
-    // with ts <= read_ts is the visible version (`or_insert` keeps it).
-    let mut newest: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
-    ops::for_each_from(store, b"0/", false, &mut |key, val| {
-        if let Some((_slot, table_id, pk, ts)) = row::parse_version_key(key) {
-            if table_id == schema.id && ts <= read_ts {
-                newest.entry(pk).or_insert_with(|| (ts, val.to_vec()));
-            }
-        }
-        true
-    })
-    .map_err(SqlError::from)?;
-    let mut rows = Vec::with_capacity(newest.len());
-    for (_pk, (_ts, raw)) in newest {
+    visible_rows_between(store, schema, read_ts, 0, u16::MAX)
+}
+
+/// Live rows whose slot lies in `[lo, hi]` (inclusive), visible at
+/// `read_ts` and ordered by pk -- `visible_rows` restricted to one
+/// slot band (the M3 scatter-gather unit: a node owns exactly its
+/// band, so band scans are disjoint by construction).
+pub fn visible_rows_between(
+    store: &Store,
+    schema: &TableSchema,
+    read_ts: u64,
+    lo: u16,
+    hi: u16,
+) -> SqlResult<Vec<Vec<Value>>> {
+    let mut rows = Vec::new();
+    for (_pk, raw) in visible_versions_between(store, schema, read_ts, lo, hi)? {
         let (header, values) = row::decode_version(schema, &raw).map_err(SqlError::from)?;
+        // Only live versions are collected below; re-checking keeps a
+        // corrupt entry from resurrecting as a row.
         if header == HEADER_LIVE {
             rows.push(values);
         }
@@ -183,22 +188,127 @@ pub fn visible_rows(
     Ok(rows)
 }
 
+/// `(pk_key, raw LIVE version bytes)` of every row of `schema` in slot
+/// band `[lo, hi]` visible at `read_ts`, ordered by pk bytes. This is
+/// the shared core of the local scan and the dist `ScanBand` reply:
+/// the raw bytes are exactly what `decode_version` consumes locally,
+/// so a gathered row decodes identically to a locally scanned one.
+pub fn visible_versions_between(
+    store: &Store,
+    schema: &TableSchema,
+    read_ts: u64,
+    lo: u16,
+    hi: u16,
+) -> SqlResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    // pk -> visible (ts, raw version). Versions of one pk arrive
+    // newest-first (inverted ts suffix in the key), so the FIRST entry
+    // with ts <= read_ts that is NOT a prepared (0x02) version is the
+    // visible version (`or_insert` keeps it); prepared versions are
+    // skipped so an in-flight 2PC write cannot shadow older commits.
+    let mut newest: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+    ops::for_each_from(store, b"0/", false, &mut |key, val| {
+        if let Some((slot, table_id, pk, ts)) = row::parse_version_key(key) {
+            // Slot keys are decimal strings, so byte order is NOT slot
+            // order ("1000/" < "999/"): no prefix seek is possible, the
+            // band is a numeric filter over the ordered walk.
+            if lo <= slot
+                && slot <= hi
+                && table_id == schema.id
+                && ts <= read_ts
+                && !row::is_prepared(val)
+            {
+                newest.entry(pk).or_insert_with(|| (ts, val.to_vec()));
+            }
+        }
+        true
+    })
+    .map_err(SqlError::from)?;
+    let mut out = Vec::with_capacity(newest.len());
+    for (pk, (_ts, raw)) in newest {
+        // Tombstones stay invisible: the pk exists but has no live row.
+        if raw.first() == Some(&HEADER_LIVE) {
+            out.push((pk, raw));
+        }
+    }
+    Ok(out)
+}
+
+/// Participant side of a remote `ScanBand`: resolve `table_id` in the
+/// local (raft-replicated) catalog and hand back the raw visible
+/// versions of that table's band. The catalog converges with the log,
+/// so a table the coordinator can name is nameable here; an unknown id
+/// (or any scan error) is deterministic and fails the caller's query.
+pub fn band_rows(
+    shared: &Shared,
+    table_id: u32,
+    read_ts: u64,
+    lo: u16,
+    hi: u16,
+) -> SqlResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    let schema = catalog::list_tables(shared)
+        .into_iter()
+        .find(|s| s.id == table_id)
+        .ok_or_else(|| SqlError::new(ErrorCode::Unknown, format!("table id {table_id} unknown")))?;
+    visible_versions_between(&shared.store, &schema, read_ts, lo, hi)
+}
+
+/// Live rows of exactly these pks (sorted, deduped) visible at
+/// `read_ts` -- the IndexLookup row fetch. Stale index entries and
+/// tombstoned/absent pks simply yield no row.
+fn rows_by_pks(
+    store: &Store,
+    schema: &TableSchema,
+    pks: &[Vec<u8>],
+    read_ts: u64,
+) -> SqlResult<Vec<Vec<Value>>> {
+    let mut rows = Vec::with_capacity(pks.len());
+    for pk in pks {
+        if let Some(values) =
+            index::visible_row_at_pk(store, schema, pk, read_ts).map_err(SqlError::from)?
+        {
+            rows.push(values);
+        }
+    }
+    Ok(rows)
+}
+
 /// Materialize a whole FROM clause at `read_ts`: single-table scan or
-/// nested-loop join (cross join when ON is absent).
-pub fn materialize(shared: &Shared, tref: &TableRef, read_ts: u64) -> SqlResult<Source> {
+/// nested-loop join (cross join when ON is absent). An open txn's
+/// staged writes are merged into every table side (own-write visibility).
+///
+/// A single-table FROM with a sargable WHERE conjunct on an indexed
+/// column is read through the index instead (pks from the planner, one
+/// seek per pk); the residual WHERE still applies afterwards, and the
+/// txn overlay unions in staged rows the index cannot see.
+pub fn materialize(
+    shared: &Shared,
+    tref: &TableRef,
+    read_ts: u64,
+    txn: Option<&crate::sql::tx::Txn>,
+    filter: Option<&Expr>,
+) -> SqlResult<Source> {
     match tref {
         TableRef::Table { name, alias } => {
             let schema = catalog::lookup(shared, name)
                 .map_err(SqlError::from)?
                 .ok_or_else(|| SqlError::no_such_table(name))?;
-            let rows = visible_rows(&shared.store, &schema, read_ts)?;
+            let rows = match plan::plan(&shared.store, &schema, alias.as_deref(), filter) {
+                plan::Path::IndexLookup { pks, .. } => {
+                    rows_by_pks(&shared.store, &schema, &pks, read_ts)?
+                }
+                plan::Path::SeqScan => visible_rows(&shared.store, &schema, read_ts)?,
+            };
+            let rows = match txn {
+                Some(t) => crate::sql::tx::merge_rows(&schema, rows, t)?,
+                None => rows,
+            };
             let mut scope = FromScope::default();
             scope.sides.push(table_side(&schema, alias));
             Ok(Source { scope, rows })
         }
         TableRef::Join { left, right, on } => {
-            let l = materialize(shared, left, read_ts)?;
-            let r = materialize(shared, right, read_ts)?;
+            let l = materialize(shared, left, read_ts, txn, None)?;
+            let r = materialize(shared, right, read_ts, txn, None)?;
             let left_width = l.scope.row_width();
             let mut scope = l.scope;
             for mut side in r.scope.sides {

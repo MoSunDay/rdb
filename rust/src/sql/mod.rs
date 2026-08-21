@@ -5,8 +5,11 @@
 //! planner (`plan`), secondary indexes (`index`), transactions (`tx`) and
 //! the node-to-node scatter-gather/2PC layer (`dist`).
 
+pub mod dist;
 pub mod exec;
 pub mod front;
+pub mod index;
 pub mod parse;
+pub mod plan;
 pub mod storage;
 pub mod tx;

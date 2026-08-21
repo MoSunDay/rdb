@@ -329,23 +329,6 @@ async fn do_main() {
         }
     });
 
-    // HTTP control API (Go http.Serve(l, httpServer.Mux)).
-    let http_listener = match tokio::net::TcpListener::bind(&conf.http_address).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("listen {} failed: {}", conf.http_address, e);
-            std::process::exit(1);
-        }
-    };
-    let http_raft = raft.clone();
-    let http_kv = node.kv.clone();
-    let http_token = conf.raft_token.clone();
-    let http_mux = rcache::http::membership_mux();
-    tokio::spawn(async move {
-        let _ =
-            rcache::http::serve_on(http_listener, http_raft, http_kv, http_token, http_mux).await;
-    });
-
     // Cluster join (Go JoinRaftCluster; any non-"ok" reply is fatal).
     if !join_addr.is_empty() {
         let joined =
@@ -383,6 +366,59 @@ async fn do_main() {
         let val = state::raft_get(&raft_state.read().unwrap(), TOPOLOGY_KEY);
         *topo.write().unwrap() = topology::refresh(&val);
     }
+
+    // M3: cluster-global SQL timestamp core (narrow deps, no Shared
+    // cycle): refiller leases raft-authorized blocks, registration
+    // publishes this node's binds for leader discovery, and the HTTP
+    // control API below serves `/sql/ts` from the same core.
+    let cluster_ts = Arc::new(sql::tx::global::ClusterTs::new(
+        sql::tx::global::ClusterTsDeps {
+            raft: raft_state.clone(),
+            topo: topo.clone(),
+            binds: sql::tx::nodes::NodeBinds {
+                resp: conf.bind.clone(),
+                raft: conf.raft_tcp_address.clone(),
+                http: conf.http_address.clone(),
+                mysql: conf.mysql_bind.clone(),
+                sql_rpc: conf.sql_rpc_bind.clone(),
+            },
+            token: conf.raft_token.clone(),
+        },
+    ));
+    sql::tx::global::spawn_refill(cluster_ts.clone());
+    sql::tx::nodes::spawn_register(cluster_ts.deps().clone());
+
+    // HTTP control API (Go http.Serve(l, httpServer.Mux)).
+    let http_listener = match tokio::net::TcpListener::bind(&conf.http_address).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("listen {} failed: {}", conf.http_address, e);
+            std::process::exit(1);
+        }
+    };
+    let http_raft = raft.clone();
+    let http_kv = node.kv.clone();
+    let http_token = conf.raft_token.clone();
+    let http_mux = rcache::http::membership_mux();
+    let http_ts = cluster_ts.clone();
+    // M3: `/sql2pc/status` reads the normal listener's store, which
+    // opens below -- hand the server a late-bound slot and fill it once
+    // the store is up (an empty slot keeps the route at the plain 404).
+    let http_store = rcache::http::store_slot();
+    let http_store_slot = Arc::clone(&http_store);
+    tokio::spawn(async move {
+        let _ = rcache::http::serve_on(
+            http_listener,
+            http_raft,
+            http_kv,
+            http_token,
+            http_mux,
+            Some(http_ts),
+            http_store,
+        )
+        .await;
+    });
+
     spawn_topology_sync(raft_state.clone(), topo.clone(), node.kv.clone());
     spawn_metrics_sync(
         raft_state.clone(),
@@ -426,6 +462,9 @@ async fn do_main() {
             lite: std::sync::Arc::new(rdb::lite::new_runtime()),
             sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
         });
+        // M3: the read-only backup listener shares the cluster core so
+        // its `now()` snapshot reads track the global sequence too.
+        shared.sql_ts.enable_cluster(cluster_ts.clone());
         let listener = match resp::bind(&backup_conf.bind) {
             Ok(l) => l,
             Err(e) => {
@@ -447,7 +486,7 @@ async fn do_main() {
     let shared = Arc::new(state::Shared {
         conf: conf.clone(),
         mode: state::Mode::Normal,
-        store,
+        store: store.clone(),
         topology: topo,
         raft: raft_state,
         monitor: collector,
@@ -456,11 +495,18 @@ async fn do_main() {
         lite: std::sync::Arc::new(rdb::lite::new_runtime()),
         sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
     });
+    // M3: publish the store to the control API's `/sql2pc/status` slot.
+    *http_store_slot.write().unwrap() = Some(Arc::clone(&store));
+    // M3: swap the normal listener's oracle onto the cluster-global
+    // allocator (no-op until `cluster init` flips cluster_ready).
+    shared.sql_ts.enable_cluster(cluster_ts.clone());
     // Active expiration loop (data-plane background task; sees the normal
     // listener's store -- the backup listener is read-only by design).
     ds::expire::spawn_active_expire(Arc::clone(&shared));
     // Lite Mode: periodic group-offset flush + stream gauges.
     rdb::lite::spawn_background(Arc::clone(&shared));
+    // M2: periodic MVCC version GC below the snapshot watermark.
+    sql::storage::gc::spawn_gc(Arc::clone(&shared));
     let listener = match resp::bind(&conf.bind) {
         Ok(l) => l,
         Err(e) => {
@@ -481,6 +527,19 @@ async fn do_main() {
         };
         tokio::spawn(sql::front::serve(listener, Arc::clone(&shared)));
     }
+    // M3: node-to-node 2PC transport (empty sql_rpc_bind = disabled)
+    // and the in-doubt marker recovery sweep.
+    if !conf.sql_rpc_bind.is_empty() {
+        let listener = match sql::dist::server::bind(&conf.sql_rpc_bind) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::spawn(sql::dist::server::serve_on(listener, Arc::clone(&shared)));
+    }
+    sql::dist::recover::spawn_recover(Arc::clone(&shared));
     // E1: install signal handling AFTER every listener/task is up; the
     // watcher flushes the Lite offsets and exits 0 (see spawn_signal_shutdown).
     spawn_signal_shutdown(Arc::clone(&shared));
