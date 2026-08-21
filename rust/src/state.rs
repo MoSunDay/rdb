@@ -328,6 +328,8 @@ pub struct Shared {
     pub wait_hub: ds::wait::WaitHub,
     /// Lite Mode runtime: offset cache, pick counters, stats.
     pub lite: std::sync::Arc<crate::lite::Runtime>,
+    /// SQL plane: MVCC timestamp oracle + live-snapshot registry.
+    pub sql_ts: std::sync::Arc<crate::sql::tx::Oracle>,
 }
 
 #[cfg(test)]
@@ -336,7 +338,9 @@ pub mod testutil {
 
     /// Shared state with a tempdir-backed store and the P1 raft stub.
     pub fn shared_with(conf: conf::Config) -> Shared {
-        let dir = std::env::temp_dir().join(format!("rdb-test-{}", std::process::id()));
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rdb-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = store::data_path(dir.to_str().unwrap(), &conf.bind);
@@ -350,6 +354,7 @@ pub mod testutil {
             latch: ds::latch::Latch::new(),
             wait_hub: ds::wait::WaitHub::new(),
             lite: std::sync::Arc::new(crate::lite::new_runtime()),
+            sql_ts: std::sync::Arc::new(crate::sql::tx::Oracle::new()),
             conf,
         }
     }

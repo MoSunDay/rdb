@@ -11,7 +11,6 @@
 //! any destination TTL).
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use rocksdb::WriteBatch;
 
@@ -20,7 +19,6 @@ use crate::command::set_cmd::set_state;
 use crate::command::{keys_core, Ctx};
 use crate::ds::{expire, latch, setops};
 use crate::resp::codec::{append_array, append_bulk, append_error, append_int};
-use crate::store::ops;
 
 /// Which algebra the shared bodies compute.
 #[derive(Clone, Copy, PartialEq)]
@@ -140,10 +138,7 @@ async fn store_variant(ctx: &mut Ctx<'_>, cmd: &str, op: Op) {
             now,
         )
     };
-    if ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
-        .await
-        .is_ok()
-    {
+    if ctx.commit(batch).await.is_ok() {
         append_int(ctx.out, card as i64);
     } else {
         append_error(ctx.out, &format!("ERR: {cmd} failed"));

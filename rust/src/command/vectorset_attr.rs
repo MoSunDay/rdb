@@ -6,8 +6,6 @@
 //! of the family: keys resolve via `keys_core::resolve`, writes land in
 //! ONE batched fsync under the per-key latch.
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 
 use crate::command::hash_cmd::{arity, WRONGTYPE};
@@ -15,7 +13,6 @@ use crate::command::vectorset_cmd::{vectorset_state, VectorSetState};
 use crate::command::{keys_core, Ctx};
 use crate::ds::{expire, latch, vectorset_ds};
 use crate::resp::codec::{append_bulk, append_error, append_int, append_null};
-use crate::store::ops;
 
 /// VSETATTR key element attr -> :1 when the element existed (attr
 /// rewritten, vector untouched), :0 otherwise. An empty attr clears the
@@ -71,7 +68,7 @@ pub async fn vsetattr(ctx: &mut Ctx<'_>) {
         &vector,
         Some(&attr),
     );
-    match ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    match ctx.commit(batch).await {
         Ok(()) => append_int(ctx.out, 1),
         Err(_) => append_error(ctx.out, "ERR: vsetattr failed"),
     }

@@ -6,8 +6,6 @@
 //! latch. Pops, LREM/LTRIM live in `list_ops`; LINSERT/LPOS/LMOVE in
 //! `list_move`; the blocking variants in `list_block`.
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 
 use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
@@ -17,7 +15,7 @@ use crate::ds::{expire, latch, list_ds, wait};
 use crate::resp::codec::{
     append_array, append_bulk, append_error, append_int, append_null, append_string,
 };
-use crate::store::{ops, Store};
+use crate::store::Store;
 
 /// Blank meta of a list that does not exist yet (no TTL, no entries).
 pub(crate) fn blank_meta() -> list_ds::ListMeta {
@@ -83,13 +81,10 @@ pub(crate) async fn commit_list(
             list_ds::write_meta(&mut batch, &ctx.prefix_key, key, m);
         }
     }
-    ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
-        .await
-        .map(|_| true)
-        .unwrap_or_else(|_| {
-            append_error(ctx.out, &format!("ERR: {cmd} failed"));
-            false
-        })
+    ctx.commit(batch).await.map(|_| true).unwrap_or_else(|_| {
+        append_error(ctx.out, &format!("ERR: {cmd} failed"));
+        false
+    })
 }
 
 /// Lock every DISTINCT latch key of `keys` in byte order (the multi-key

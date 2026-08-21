@@ -5,15 +5,12 @@
 //! per-key latch. Whole-hash reads (HGETALL/HKEYS/HVALS), HSCAN and
 //! HRANDFIELD live in `hash_scan`.
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 
 use crate::command::{keys_core, Ctx};
 use crate::ds::codec::{self, KIND_HASH_META};
 use crate::ds::{expire, hash_ds, latch};
 use crate::resp::codec::{append_array, append_bulk, append_error, append_int, append_null};
-use crate::store::ops;
 
 pub(crate) const WRONGTYPE: &str =
     "WRONGTYPE Operation against a key holding the wrong kind of value";
@@ -103,7 +100,7 @@ pub(crate) async fn commit(
     } else {
         hash_ds::write_meta(&mut batch, &ctx.prefix_key, key, expire_ms, count);
     }
-    ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
+    ctx.commit(batch)
         .await
         .map_err(|_| append_error(ctx.out, &format!("ERR: {cmd} failed")))
 }

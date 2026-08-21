@@ -1,12 +1,17 @@
 //! Command-line parsing (manual, no third-party argument parser).
 
-/// Workload selector; `mixed` alternates set/get by op index parity.
+/// Workload selector; `mixed` alternates set/get by op index parity, the
+/// `x*` trio drives Lite streams (`xadd` produces entries, `xreadgroup`
+/// delivers them, `xack` delivers + acks each one).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Workload {
     Ping,
     Set,
     Get,
     Mixed,
+    Xadd,
+    XReadGroup,
+    Xack,
 }
 
 impl Workload {
@@ -17,6 +22,9 @@ impl Workload {
             "set" => Some(Workload::Set),
             "get" => Some(Workload::Get),
             "mixed" => Some(Workload::Mixed),
+            "xadd" => Some(Workload::Xadd),
+            "xreadgroup" => Some(Workload::XReadGroup),
+            "xack" => Some(Workload::Xack),
             _ => None,
         }
     }
@@ -27,6 +35,9 @@ impl Workload {
             Workload::Set => "set",
             Workload::Get => "get",
             Workload::Mixed => "mixed",
+            Workload::Xadd => "xadd",
+            Workload::XReadGroup => "xreadgroup",
+            Workload::Xack => "xack",
         }
     }
 }
@@ -55,8 +66,12 @@ pub fn usage() -> String {
         "  --pipeline <n>       commands per round trip (default 1); latency is",
         "                      sampled once per batch RTT, so with pipeline > 1",
         "                      rtt_ms stats are per batch, not per command",
-        "  --workload <w>       ping | set | get | mixed (default mixed); mixed",
-        "                      alternates set/get by op index parity",
+        "  --workload <w>       ping | set | get | mixed | xadd | xreadgroup |",
+        "                      xack (default mixed); mixed alternates set/get",
+        "                      by op index parity; the x* workloads drive Lite",
+        "                      streams bench_<client>/c as producer (xadd) and",
+        "                      consumers (xreadgroup deliver-only, xack pairs a",
+        "                      deliver with an ack, counting 2 ops per pair)",
         "",
         "exit codes: 0 = ok, 1 = server error replies (e.g. -MOVED), 2 = bad usage",
     ]
@@ -139,10 +154,9 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
             }
             "--workload" => {
                 let raw = flag_value(args, &mut i, name, inline)?;
-                workload = Some(
-                    Workload::parse(&raw)
-                        .ok_or_else(|| format!("unknown workload '{raw}' (ping|set|get|mixed)"))?,
-                );
+                workload = Some(Workload::parse(&raw).ok_or_else(|| {
+                    format!("unknown workload '{raw}' (ping|set|get|mixed|xadd|xreadgroup|xack)")
+                })?);
             }
             other => return Err(format!("unknown argument '{other}'")),
         }
@@ -187,6 +201,28 @@ mod tests {
         assert_eq!(cfg.token, "sekret");
         assert_eq!(cfg.workload, Workload::Ping);
         assert_eq!((cfg.clients, cfg.duration, cfg.pipeline), (16, 10, 1));
+    }
+
+    #[test]
+    fn parses_lite_stream_workloads() {
+        for raw in ["xadd", "xreadgroup", "xack"] {
+            let cfg = parse_args(&argv(&["--addr", "h:1", "--token", "t", "--workload", raw]))
+                .expect("parse");
+            assert_eq!(cfg.workload.as_str(), raw);
+        }
+        // `expect_err` is not an option: Config is not Debug.
+        let err = match parse_args(&argv(&[
+            "--addr",
+            "h:1",
+            "--token",
+            "t",
+            "--workload",
+            "xgroup",
+        ])) {
+            Err(err) => err,
+            Ok(_) => panic!("expected unknown-workload error"),
+        };
+        assert!(err.contains("xadd|xreadgroup|xack"), "{err}");
     }
 
     #[test]

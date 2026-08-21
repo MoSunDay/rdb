@@ -4,8 +4,6 @@
 //! their STORE twins) lives in `setops_cmd`; SMOVE stays here because it
 //! is a member move, not set algebra.
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 
 use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
@@ -13,7 +11,6 @@ use crate::command::{keys_core, Ctx};
 use crate::ds::codec::{self, KIND_SET_META};
 use crate::ds::{expire, latch, set_ds};
 use crate::resp::codec::{append_array, append_bulk, append_error, append_int, append_null};
-use crate::store::ops;
 use crate::utils::rand_u64;
 
 /// What one key is from the set commands' point of view.
@@ -83,7 +80,7 @@ async fn commit(
     } else {
         set_ds::write_meta(&mut batch, &ctx.prefix_key, key, expire_ms, count);
     }
-    ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
+    ctx.commit(batch)
         .await
         .map_err(|_| append_error(ctx.out, &format!("ERR: {cmd} failed")))
 }
@@ -434,10 +431,7 @@ pub async fn smove(ctx: &mut Ctx<'_>) {
         batch.delete(set_ds::member_key(&ctx.prefix_key, &src, &member));
         set_ds::write_meta(&mut batch, &ctx.prefix_key, &src, src_expire, src_base - 1);
     }
-    if ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
-        .await
-        .is_ok()
-    {
+    if ctx.commit(batch).await.is_ok() {
         append_int(ctx.out, 1);
     } else {
         append_error(ctx.out, "ERR: smove failed");

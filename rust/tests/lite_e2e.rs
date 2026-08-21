@@ -119,13 +119,24 @@ fn group_lifecycle_and_catchup() {
         &[b"group", b"g", b"c1", b"streams", b"orders/q0", b">"],
     ));
     assert!(r.contains("1-3") && !r.contains("1-1"), "{r}");
-    // Explicit id: full catch-up replay without moving watermarks.
+    // Explicit id (Redis semantics): this consumer's PEL history -- only
+    // the still-pending 1-3 (1-1/1-2 were acked out of the PEL); a
+    // different consumer's history is empty.
     let replay = text(&call(
         &shared,
         "xreadgroup",
         &[b"group", b"g", b"c1", b"streams", b"orders/q0", b"0-0"],
     ));
-    assert!(replay.contains("1-1") && replay.contains("1-3"), "{replay}");
+    assert!(
+        replay.contains("1-3") && !replay.contains("1-1"),
+        "{replay}"
+    );
+    let others = text(&call(
+        &shared,
+        "xreadgroup",
+        &[b"group", b"g", b"c9", b"streams", b"orders/q0", b"0-0"],
+    ));
+    assert!(others.contains("*-1") || !others.contains("1-"), "{others}");
     // GROUPS introspection shows committed >= delivered.
     let gi = text(&call(&shared, "xinfo", &[b"groups", b"orders/q0"]));
     assert!(
@@ -261,7 +272,11 @@ fn frame(args: &[&[u8]]) -> Vec<u8> {
 async fn block_wakes_on_xadd_over_wire() {
     let dir = std::env::temp_dir().join(format!("rdb-lite-block-{}", std::process::id()));
     let mut node = spawn_node(&dir, 0, true, None);
-    wait_resp_ready(&mut node, 10).await;
+    // 30s spawn window (not 10s): on a saturated machine -- e.g. a
+    // concurrent cargo build/link pinning every core -- the debug
+    // binary can take >10s to bind RESP; the cluster helper uses
+    // the same 30s (see common::spawn_cluster).
+    wait_resp_ready(&mut node, 30).await;
     let t = common::TOKEN;
     assert!(text(
         &cmd_one_shot(
@@ -419,11 +434,17 @@ async fn block_zero_and_oversized_block_wait_for_xadd() {
     // slice cap must keep waiting too. Each parked reader sits on its own
     // queue, so one XADD per queue wakes exactly one waiter. The whole
     // dance is bounded by an outer timeout: a regression fails fast
-    // instead of hanging the suite.
-    tokio::time::timeout(Duration::from_secs(10), async {
+    // instead of hanging the suite. 30s, not 10s: on a saturated
+    // machine the spawn alone can eat a 10s budget (see the readiness
+    // note below).
+    tokio::time::timeout(Duration::from_secs(30), async {
         let dir = std::env::temp_dir().join(format!("rdb-lite-block0-{}", std::process::id()));
         let mut node = spawn_node(&dir, 0, true, None);
-        wait_resp_ready(&mut node, 10).await;
+        // 30s spawn window (not 10s): on a saturated machine -- e.g. a
+        // concurrent cargo build/link pinning every core -- the debug
+        // binary can take >10s to bind RESP; the cluster helper uses
+        // the same 30s (see common::spawn_cluster).
+        wait_resp_ready(&mut node, 30).await;
         let t = common::TOKEN;
         // Empty queue + group for the XREADGROUP reader.
         assert!(

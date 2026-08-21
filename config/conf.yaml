@@ -20,3 +20,6 @@ backup_target_map:
   127.0.0.1:22685:
     src: 127.0.0.1:32685
     target: 127.0.0.1:32682
+# Redis MULTI/EXEC transactions (set enabled: false to reject MULTI)
+tx:
+  enabled: true

@@ -2,7 +2,7 @@
 //! parks on the shared WaitHub via the dedicated park pool (a sync
 //! Condvar, run off tokio's shared blocking threads);
 //! push-style list commands notify a list's meta root after committing.
-//! The loop mirrors `lite::read::wait_entries`: register FIRST, then one
+//! The loop mirrors `lite::park_wait::wait_targets`: register FIRST, then one
 //! latched quick-path pass over the keys in order, then park -- so a
 //! notify that lands between the read and the park is never lost.
 //!

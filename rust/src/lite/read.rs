@@ -1,24 +1,24 @@
-//! Consuming side: XREAD / XREADGROUP (+ XLEN). Blocking reads park on
-//! the shared WaitHub via the dedicated park pool (the hub is a sync
-//! Condvar, run off tokio's shared blocking threads);
-//! XADD notifies both the stream's and its parent topic's meta keys
-//! after its batch commits. XACK lives in [`ack`].
+//! Consuming side: XREAD / XREADGROUP (+ XLEN). Both read commands take
+//! a multi-stream STREAMS list (first half stream names, second half
+//! ids); blocking reads park ONE waiter registered under every distinct
+//! stream meta key via the dedicated park pool (see [`park_wait`]); XADD notifies both the
+//! stream's and its parent topic's meta keys after its batch commits.
+//! XREADGROUP `>` delivery hands entries to the NAMED consumer and
+//! registers their PEL rows (see [`pel`]); explicit ids serve that
+//! consumer's PEL history. XACK lives in [`ack`].
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::command::Ctx;
-use crate::ds::wait::{self, WaitOutcome};
-use crate::park;
 use crate::resp::codec as resp;
+use crate::store::ops;
 
 use super::entries::{self, Entry};
 use super::model::{self, EntryId, MetaRead};
 use super::offset;
+use super::park_wait::{park_target, remaining_ms, wait_targets, ParkTarget};
+use super::pel;
 use crate::monitor;
-
-/// BLOCK 0 means "forever": park in 24h slices so Condvar math stays sane.
-const MAX_SLICE_MS: u64 = 86_400_000;
 
 struct ReadOpts {
     count: usize,
@@ -61,108 +61,103 @@ fn nil_array(out: &mut Vec<u8>) {
     resp::append_raw(out, b"*-1\r\n");
 }
 
-/// Park until entries with id > `after` exist or `block_ms` elapses;
-/// `block_ms == 0` means forever (Redis BLOCK 0 semantics). Waiting is
-/// chunked: every park is at most MAX_SLICE_MS long and the remaining
-/// budget is recomputed on each wake, so "forever" loops in renewable
-/// slices and oversized BLOCK values are never clamped to one capped
-/// deadline. Registering the waiter BEFORE the final read closes the
-/// lost-notify window against XADD.
-///
-/// A SIGNALLED park that still finds no entries returns
-/// `Some(Ok(vec![]))` -- "woke, nothing new" -- instead of re-parking:
-/// the signal may come from a group op (XGROUP DESTROY / SETID also
-/// notify the stream's meta key), and the XREADGROUP caller must
-/// re-validate the group (NOGROUP, rewound watermarks) rather than sleep
-/// out its BLOCK. Plain XREAD treats the empty wake as a re-park.
-async fn wait_entries(
-    ctx: &mut Ctx<'_>,
-    prefix: &[u8],
-    stream: &[u8],
-    after: EntryId,
-    count: usize,
-    block_ms: u64,
-) -> Option<Result<Vec<Entry>, String>> {
-    let wake = model::meta_key(prefix, stream);
-    // None = no time limit (BLOCK 0, or a value too large for Instant);
-    // Some(t) = absolute expiry.
-    let end = if block_ms == 0 {
-        None
-    } else {
-        Instant::now().checked_add(Duration::from_millis(block_ms))
-    };
-    loop {
-        let waiter = wait::register(&ctx.shared.wait_hub, &wake);
-        match entries::scan_entries(&ctx.shared.store, prefix, stream, after, count) {
-            Err(e) => {
-                wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
-                return Some(Err(e));
-            }
-            Ok(v) if !v.is_empty() => {
-                wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
-                return Some(Ok(v));
-            }
-            Ok(_) => {}
-        }
-        // Renewable slice: whatever remains of the budget, capped at
-        // MAX_SLICE_MS; an unbounded wait parks full slices forever.
-        let now = Instant::now();
-        let slice = match end {
-            None => Duration::from_millis(MAX_SLICE_MS),
-            Some(t) if now >= t => {
-                wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
-                return None;
-            }
-            Some(t) => (t - now).min(Duration::from_millis(MAX_SLICE_MS)),
-        };
-        let w = Arc::clone(&waiter);
-        let woke = park::park(move || wait::wait(&w, slice)).await;
-        wait::unregister(&ctx.shared.wait_hub, &wake, &waiter);
-        match woke.unwrap_or(WaitOutcome::Timeout) {
-            // Budget spent: nil (the caller maps None to the nil reply).
-            WaitOutcome::Timeout if end.is_some_and(|t| Instant::now() >= t) => return None,
-            // Signalled with budget left but no entries landed: hand the
-            // wake back for caller-side re-validation (see above).
-            WaitOutcome::Signaled => return Some(Ok(Vec::new())),
-            // Spurious wake or a slice edge with budget left: re-read.
-            WaitOutcome::Timeout => {}
-        }
+/// One stream's contribution to a read reply: name plus entries
+/// (always >= 1 -- streams with nothing are left out, and no stream
+/// producing anything at all collapses to a nil array).
+pub(crate) type StreamEntries = (Vec<u8>, Vec<Entry>);
+
+// ---- STREAMS list ------------------------------------------------------
+
+/// Per-stream read point of one STREAMS-list element.
+#[derive(Clone, Copy, PartialEq)]
+enum ReadId {
+    /// `>`: deliver entries past the group's delivered watermark.
+    New,
+    /// A fixed exclusive start: XREAD's read position (a resolved `$`
+    /// too) or XREADGROUP's PEL-history start.
+    After(EntryId),
+}
+
+/// One parsed STREAMS-list element.
+#[derive(Clone)]
+pub(crate) struct StreamSpec {
+    pub(crate) stream: Vec<u8>,
+    pub(crate) prefix: Vec<u8>,
+    id: ReadId,
+}
+
+/// The fixed read position of a spec (XREAD specs and history specs are
+/// always `After`; a stray `New` reads from the beginning).
+fn spec_after(s: &StreamSpec) -> EntryId {
+    match s.id {
+        ReadId::After(a) => a,
+        ReadId::New => model::MIN_ID,
     }
 }
 
-fn append_read_reply(out: &mut Vec<u8>, stream: &[u8], entries: &[Entry]) {
-    resp::append_array(out, 1);
-    resp::append_array(out, 2);
-    resp::append_bulk(out, stream);
-    resp::append_array(out, entries.len());
-    for e in entries {
-        entries::append_entry_frame(out, e);
-    }
-}
-
-/// Remaining BLOCK budget handed to one `wait_entries` round in
-/// XREADGROUP's loop. `None` means the deadline already passed — the
-/// caller replies nil now instead of parking. `Some(ms)` is clamped to
-/// at least 1: a sub-millisecond remainder truncated to 0 would be read
-/// by `wait_entries` as BLOCK 0 ("wait forever"), hanging a bounded
-/// read past its deadline. (`None` as `end` is the forever sentinel and
-/// passes the raw `block_ms` through.)
-fn remaining_ms(end: Option<Instant>, block_ms: u64) -> Option<u64> {
-    let t = match end {
-        // No deadline (BLOCK 0 / oversized): the caller's forever
-        // sentinel passes through untouched.
-        None => return Some(block_ms),
-        Some(t) => t,
-    };
-    let now = Instant::now();
-    if now >= t {
+/// Split the tail after STREAMS into `(first-id index, stream count)`:
+/// the first half of the remaining args names streams, the second half
+/// holds one id per stream; an odd or empty tail is "Unbalanced" (the
+/// parser cannot tell which stream lost its id).
+fn split_streams_tail(args: &[Vec<u8>], i: usize) -> Option<(usize, usize)> {
+    let n = args.len().checked_sub(i)?;
+    if n == 0 || n % 2 != 0 {
         return None;
     }
-    Some(((t - now).as_millis() as u64).max(1))
+    Some((i + n / 2, n / 2))
 }
 
-/// `XREAD [COUNT n] [BLOCK ms] STREAMS <stream> <id|$>` -- v1 single stream
-/// (Lite sessions consume one queue; multi-stream is future work).
+/// Scan every spec once, COUNT per stream; streams that produced
+/// nothing are left out of the result (an across-the-board miss is the
+/// caller's nil array). The first store error aborts the command.
+fn scan_specs(
+    store: &crate::store::Store,
+    specs: &[StreamSpec],
+    count: usize,
+) -> Result<Vec<StreamEntries>, String> {
+    let mut out = Vec::new();
+    for s in specs {
+        let v = entries::scan_entries(store, &s.prefix, &s.stream, spec_after(s), count)?;
+        if !v.is_empty() {
+            out.push((s.stream.clone(), v));
+        }
+    }
+    Ok(out)
+}
+
+fn append_streams_reply(out: &mut Vec<u8>, results: &[StreamEntries]) {
+    resp::append_array(out, results.len());
+    for (name, entries) in results {
+        resp::append_array(out, 2);
+        resp::append_bulk(out, name);
+        resp::append_array(out, entries.len());
+        for e in entries {
+            entries::append_entry_frame(out, e);
+        }
+    }
+}
+
+// ---- XREAD -------------------------------------------------------------
+
+/// Per-stream id of an XREAD STREAMS list: `$` resolves to the named
+/// stream's last_id snapshotted NOW (a later BLOCK waits only for
+/// entries added after the command started); anything else must parse.
+/// `None` = malformed id argument.
+fn parse_read_id(ctx: &Ctx<'_>, id_arg: &[u8], prefix: &[u8], stream: &[u8]) -> Option<EntryId> {
+    if id_arg == b"$" {
+        match model::read_meta(&ctx.shared.store, prefix, stream) {
+            Ok(MetaRead::Live(m)) => Some(m.last_id()),
+            _ => Some(model::MIN_ID),
+        }
+    } else {
+        model::parse_id(id_arg)
+    }
+}
+
+/// `XREAD [COUNT n] [BLOCK ms] STREAMS s1 s2... id1 id2...` -- read up
+/// to COUNT entries per stream strictly past each stream's position
+/// (`$` = that stream's last_id). Blocking parks one waiter under every
+/// stream's meta key: the first XADD on any of them wins.
 pub async fn xread(ctx: &mut Ctx<'_>) {
     let Some((opts, mut i)) = parse_opts(&ctx.args, 0) else {
         return resp::append_error(ctx.out, "ERR syntax error");
@@ -171,43 +166,36 @@ pub async fn xread(ctx: &mut Ctx<'_>) {
         return resp::append_error(ctx.out, "ERR syntax error");
     }
     i += 1;
-    if ctx.args.len() != i + 2 {
+    let Some((id_start, n)) = split_streams_tail(&ctx.args, i) else {
         return resp::append_error(
             ctx.out,
-            "ERR XREAD supports exactly one stream in Lite mode",
+            "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.",
         );
+    };
+    // Resolve names first (a bad name replies its own error); then ids.
+    let mut specs = Vec::with_capacity(n);
+    for j in 0..n {
+        let Some((stream, prefix)) = entries::stream_of(ctx, i + j) else {
+            return;
+        };
+        let id_arg = ctx.args[id_start + j].clone();
+        let Some(after) = parse_read_id(ctx, &id_arg, &prefix, &stream) else {
+            return resp::append_error(
+                ctx.out,
+                "ERR Invalid stream ID specified as stream command argument",
+            );
+        };
+        specs.push(StreamSpec {
+            stream,
+            prefix,
+            id: ReadId::After(after),
+        });
     }
-    let Some((stream, prefix)) = entries::stream_of(ctx, i) else {
-        return;
-    };
-    let id_arg = &ctx.args[i + 1];
-    let after = if id_arg == b"$" {
-        match model::read_meta(&ctx.shared.store, &prefix, &stream) {
-            Ok(MetaRead::Live(m)) => m.last_id(),
-            _ => model::MIN_ID,
-        }
-    } else {
-        match model::parse_id(id_arg) {
-            Some(id) => id,
-            None => {
-                return resp::append_error(
-                    ctx.out,
-                    "ERR Invalid stream ID specified as stream command argument",
-                )
-            }
-        }
-    };
     match opts.block_ms {
-        None => {
-            match entries::scan_entries(&ctx.shared.store, &prefix, &stream, after, opts.count) {
-                Err(e) => resp::append_error(ctx.out, &format!("ERR: xread failed: {e}")),
-                Ok(v) if v.is_empty() => nil_array(ctx.out),
-                Ok(v) => {
-                    monitor::observe_lite_message(&ctx.shared.monitor, "read", v.len() as u64);
-                    append_read_reply(ctx.out, &stream, &v)
-                }
-            }
-        }
+        None => match scan_specs(&ctx.shared.store, &specs, opts.count) {
+            Err(e) => resp::append_error(ctx.out, &format!("ERR: xread failed: {e}")),
+            Ok(results) => finish_xread(ctx, results),
+        },
         Some(ms) => {
             // Absolute deadline computed once so a signaled re-park
             // cannot reset the caller's BLOCK budget.
@@ -216,12 +204,16 @@ pub async fn xread(ctx: &mut Ctx<'_>) {
             } else {
                 Instant::now().checked_add(Duration::from_millis(ms))
             };
+            let targets: Vec<ParkTarget> = specs
+                .iter()
+                .map(|s| park_target(s, spec_after(s), opts.count))
+                .collect();
             loop {
                 let Some(budget) = remaining_ms(end, ms) else {
                     nil_array(ctx.out);
                     break;
                 };
-                match wait_entries(ctx, &prefix, &stream, after, opts.count, budget).await {
+                match wait_targets(ctx, &targets, budget).await {
                     None => {
                         nil_array(ctx.out);
                         break;
@@ -230,19 +222,29 @@ pub async fn xread(ctx: &mut Ctx<'_>) {
                         resp::append_error(ctx.out, &format!("ERR: xread failed: {e}"));
                         break;
                     }
-                    // An empty signaled wake (e.g. a group op notified the
-                    // stream's meta key): nothing new for a plain XREAD,
-                    // keep waiting for the remaining budget.
+                    // An empty signaled wake (e.g. a group op notified
+                    // a stream's meta key): nothing new for a plain
+                    // XREAD, keep waiting for the remaining budget.
                     Some(Ok(v)) if v.is_empty() => continue,
                     Some(Ok(v)) => {
-                        monitor::observe_lite_message(&ctx.shared.monitor, "read", v.len() as u64);
-                        append_read_reply(ctx.out, &stream, &v);
+                        finish_xread(ctx, v);
                         break;
                     }
                 }
             }
         }
     }
+}
+
+/// XREAD reply tail: nothing found on any stream -> nil array;
+/// otherwise one observation for the total served + the nested pairs.
+fn finish_xread(ctx: &mut Ctx<'_>, results: Vec<StreamEntries>) {
+    if results.is_empty() {
+        return nil_array(ctx.out);
+    }
+    let total: u64 = results.iter().map(|(_, v)| v.len() as u64).sum();
+    monitor::observe_lite_message(&ctx.shared.monitor, "read", total);
+    append_streams_reply(ctx.out, &results);
 }
 
 /// `XLEN <stream>`: retained entry count (0 for unknown streams).
@@ -264,6 +266,8 @@ pub async fn xlen(ctx: &mut Ctx<'_>) {
     resp::append_int(ctx.out, len as i64);
 }
 
+// ---- XREADGROUP --------------------------------------------------------
+
 const NOGROUP_PREFIX: &str = "NOGROUP No such key";
 
 fn nogroup(out: &mut Vec<u8>, stream: &[u8], group: &[u8]) {
@@ -278,9 +282,230 @@ fn nogroup(out: &mut Vec<u8>, stream: &[u8], group: &[u8]) {
     );
 }
 
-/// `XREADGROUP GROUP <g> <consumer> [COUNT n] [BLOCK ms] STREAMS <stream> >|<id>`
-/// (`>` = new messages; an explicit id is a catch-up view that does not
-/// move the delivery watermark).
+/// Cached group state of one (stream, group); `None` when the group
+/// does not exist (a store error degrades to a miss -- NOGROUP is the
+/// safest visible outcome, same as the pre-split code).
+fn group_state(ctx: &Ctx<'_>, s: &StreamSpec, group: &[u8]) -> Option<offset::GroupState> {
+    let cache = &ctx.shared.lite.offsets;
+    offset::load(cache, &ctx.shared.store, &s.prefix, &s.stream, group)
+        .ok()
+        .flatten()
+}
+
+/// Per-stream id of an XREADGROUP STREAMS list: `>` (new deliveries)
+/// or an explicit id (PEL history start). `$` is meaningless here and
+/// bad ids get Redis's wording.
+fn parse_group_id(id_arg: &[u8]) -> Result<ReadId, &'static str> {
+    if id_arg == b">" {
+        Ok(ReadId::New)
+    } else if id_arg == b"$" {
+        Err("ERR The $ ID is meaningless in the context of this command")
+    } else {
+        model::parse_id(id_arg)
+            .map(ReadId::After)
+            .ok_or("ERR Invalid stream ID specified as stream command argument")
+    }
+}
+
+/// Why a delivery attempt bailed: a store/commit error (generic ERR
+/// reply) or a group that vanished while parked (NOGROUP, per stream).
+enum DeliverErr {
+    Store(String),
+    NoGroup(Vec<u8>),
+}
+
+/// Smallest id strictly greater than `id`; `None` at the id ceiling
+/// (`<u64::MAX, u64::MAX>` -- nothing can ever follow it).
+fn succ_id(id: EntryId) -> Option<EntryId> {
+    match (id.seq < u64::MAX, id.ms < u64::MAX) {
+        // Intra-millisecond: seq bumps; an exhausted seq rolls the ms.
+        (true, _) => Some(EntryId {
+            seq: id.seq + 1,
+            ..id
+        }),
+        (false, true) => Some(EntryId {
+            ms: id.ms + 1,
+            seq: 0,
+        }),
+        // The id ceiling: nothing can ever follow.
+        (false, false) => None,
+    }
+}
+
+/// This consumer's PEL history past `after`: rows owned by THIS
+/// consumer only (XCLAIM is the transfer path), joined back to their
+/// log entries (dangling rows skipped). Never blocks, never mutates.
+fn read_history(
+    ctx: &Ctx<'_>,
+    s: &StreamSpec,
+    group: &[u8],
+    consumer: &[u8],
+    after: EntryId,
+    count: usize,
+) -> Result<Vec<Entry>, String> {
+    // scan_pend's `from` is INCLUSIVE (XPENDING range semantics) while
+    // the explicit id is an EXCLUSIVE start -- probe from its successor
+    // or the entry the caller last processed would come straight back.
+    // (The limit is a row cap applied before the consumer filter, like
+    // every bounded PEL walk.)
+    let Some(from) = succ_id(after) else {
+        return Ok(Vec::new());
+    };
+    let rows = pel::scan_pend(
+        &ctx.shared.store,
+        &s.prefix,
+        &s.stream,
+        group,
+        from,
+        Some(count),
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        if row.state.consumer != consumer {
+            continue;
+        }
+        // Dangling receipt (log entry trimmed / stream deleted): the
+        // PEL/entry reconciliation drops the row; nothing to serve.
+        let Some(raw) = ops::get_physical(
+            &ctx.shared.store,
+            &model::entry_key(&s.prefix, &s.stream, row.id),
+        )?
+        else {
+            continue;
+        };
+        if let Some(fields) = model::decode_entry(&raw) {
+            out.push(Entry { id: row.id, fields });
+        }
+    }
+    Ok(out)
+}
+
+/// Deliver new entries of every `>` stream to `consumer`. All their
+/// meta latches are taken AT ONCE in byte-sorted key order (the shared
+/// deadlock convention, see `flush_offsets_once`) and held across the
+/// awaited commit: under the guards each stream re-loads its watermark
+/// (NOGROUP re-check -- XGROUP DESTROY may have committed while we were
+/// parked), scans past it, advances the watermark, bumps the pending
+/// backlog, and adds its PEL rows plus -- first sight of the consumer
+/// only -- the registry row to ONE batch committed once: a crash either
+/// records a delivery whole or not at all, and watermark + PEL rows can
+/// never disagree on disk.
+async fn deliver_new(
+    ctx: &mut Ctx<'_>,
+    fresh: &[StreamSpec],
+    group: &[u8],
+    consumer: &[u8],
+    count: usize,
+) -> Result<Vec<StreamEntries>, DeliverErr> {
+    let mut keys: Vec<Vec<u8>> = fresh
+        .iter()
+        .map(|s| model::meta_key(&s.prefix, &s.stream))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let mut guards = Vec::with_capacity(keys.len());
+    for k in &keys {
+        guards.push(crate::ds::latch::lock(&ctx.shared.latch, k).await);
+    }
+    let mut batch = rocksdb::WriteBatch::default();
+    let mut results = Vec::new();
+    let mut total: u64 = 0;
+    let now_ms = crate::ds::expire::now_ms();
+    for s in fresh {
+        let Some(st) = group_state(ctx, s, group) else {
+            return Err(DeliverErr::NoGroup(s.stream.clone()));
+        };
+        let v = entries::scan_entries(&ctx.shared.store, &s.prefix, &s.stream, st.delivered, count)
+            .map_err(DeliverErr::Store)?;
+        if v.is_empty() {
+            continue;
+        }
+        // Watermark forward + backlog +n in memory: the 200ms flusher
+        // persists the watermark; the PEL rows are durable right here.
+        if let Some(last) = v.last().map(|e| e.id) {
+            offset::advance_delivered(&ctx.shared.lite.offsets, &s.stream, group, last);
+        }
+        // Rows already pending (a rewind re-delivery: restart to the
+        // committed watermark, XGROUP SETID back) are re-OWNED by this
+        // reader with their delivery count carried over and bumped --
+        // XCLAIM-accumulated history survives a crash redelivery -- but
+        // only brand-new ids grow the backlog counter.
+        let already_pending: std::collections::HashMap<EntryId, u64> = pel::scan_pend(
+            &ctx.shared.store,
+            &s.prefix,
+            &s.stream,
+            group,
+            st.delivered,
+            Some(v.len()),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| (row.id, row.state.times_delivered))
+        .collect();
+        let fresh_rows = v
+            .iter()
+            .filter(|e| !already_pending.contains_key(&e.id))
+            .count() as u64;
+        offset::bump_pending(
+            &ctx.shared.lite.offsets,
+            &s.stream,
+            group,
+            fresh_rows as i64,
+        );
+        for e in &v {
+            let times = already_pending
+                .get(&e.id)
+                .map_or(1, |old| old.saturating_add(1));
+            batch.put(
+                pel::pend_key(&s.prefix, &s.stream, group, e.id),
+                pel::encode_pend(&pel::PendState {
+                    consumer: consumer.to_vec(),
+                    delivered_ms: now_ms,
+                    times_delivered: times,
+                }),
+            );
+        }
+        // First sight of this consumer: registry row rides the batch.
+        if !ctx.shared.lite.ensure_consumer(&s.stream, group, consumer) {
+            batch.put(
+                pel::consumer_key(&s.prefix, &s.stream, group, consumer),
+                pel::encode_consumer(&pel::ConsumerState { created_ms: now_ms }),
+            );
+        }
+        total += v.len() as u64;
+        results.push((s.stream.clone(), v));
+    }
+    if !results.is_empty() {
+        ctx.commit(batch).await.map_err(DeliverErr::Store)?;
+        // One observation per command: delivered entries only (history
+        // reads are local views, not deliveries).
+        monitor::observe_lite_message(&ctx.shared.monitor, "read", total);
+    }
+    Ok(results)
+}
+
+/// Weave per-stream results back into the caller's STREAMS-list order
+/// (`>` deliveries and history are collected apart).
+fn merge_results(
+    specs: &[StreamSpec],
+    mut fresh: Vec<StreamEntries>,
+    mut history: Vec<StreamEntries>,
+) -> Vec<StreamEntries> {
+    let mut merged = Vec::new();
+    for s in specs {
+        if let Some(pos) = fresh.iter().position(|(n, _)| n == &s.stream) {
+            merged.push(fresh.remove(pos));
+        } else if let Some(pos) = history.iter().position(|(n, _)| n == &s.stream) {
+            merged.push(history.remove(pos));
+        }
+    }
+    merged
+}
+
+/// `XREADGROUP GROUP <g> <consumer> [COUNT n] [BLOCK ms] STREAMS
+/// s1 s2... id1 id2...` -- each id is `>` (deliver new entries to
+/// `<consumer>` + register their PEL rows) or explicit (serve this
+/// consumer's PEL history; `$` is meaningless here and rejected).
 pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
     if ctx.args.len() < 6 || !ctx.args[0].eq_ignore_ascii_case(b"GROUP") {
         return resp::append_error(ctx.out, "ERR syntax error");
@@ -293,121 +518,117 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
         return resp::append_error(ctx.out, "ERR syntax error");
     }
     i += 1;
-    if ctx.args.len() != i + 2 {
+    let Some((id_start, n)) = split_streams_tail(&ctx.args, i) else {
         return resp::append_error(
             ctx.out,
-            "ERR XREADGROUP supports exactly one stream in Lite mode",
+            "ERR Unbalanced XREADGROUP list of streams: for each stream key an ID or '$' must be specified.",
         );
-    }
-    let Some((stream, prefix)) = entries::stream_of(ctx, i) else {
-        return;
     };
-    let id_arg = ctx.args[i + 1].clone();
-    if id_arg == b"$" {
-        return resp::append_error(
-            ctx.out,
-            "ERR The $ ID is meaningless in the context of this command",
-        );
-    }
-    // Explicit id: catch-up view over the log; watermark untouched.
-    if id_arg != b">" {
-        let Some(explicit) = model::parse_id(&id_arg) else {
-            return resp::append_error(
-                ctx.out,
-                "ERR Invalid stream ID specified as stream command argument",
-            );
+    let mut specs = Vec::with_capacity(n);
+    for j in 0..n {
+        let Some((stream, prefix)) = entries::stream_of(ctx, i + j) else {
+            return;
         };
-        if offset::load(
-            &ctx.shared.lite.offsets,
-            &ctx.shared.store,
-            &prefix,
-            &stream,
-            &group,
-        )
-        .ok()
-        .flatten()
-        .is_none()
-        {
-            return nogroup(ctx.out, &stream, &group);
+        let id_arg = &ctx.args[id_start + j];
+        let id = match parse_group_id(id_arg) {
+            Ok(id) => id,
+            Err(msg) => return resp::append_error(ctx.out, msg),
+        };
+        specs.push(StreamSpec { stream, prefix, id });
+    }
+    // Up-front validation BEFORE any latch or scan: every named group
+    // must exist (first miss wins), so a typo'd stream fails fast
+    // instead of half-delivering the others first.
+    for s in &specs {
+        if group_state(ctx, s, &group).is_none() {
+            return nogroup(ctx.out, &s.stream, &group);
         }
-        return match entries::scan_entries(
-            &ctx.shared.store,
-            &prefix,
-            &stream,
-            explicit,
-            opts.count,
-        ) {
-            Err(e) => resp::append_error(ctx.out, &format!("ERR: xreadgroup failed: {e}")),
-            Ok(v) if v.is_empty() => nil_array(ctx.out),
-            Ok(v) => append_read_reply(ctx.out, &stream, &v),
-        };
     }
-
-    // `>` mode: serialized read-advance under the stream latch; BLOCK parks
-    // between attempts (never while holding the latch).
-    let _ = consumer;
-    let wake = model::meta_key(&prefix, &stream);
+    // `>` streams deliver under their latches; explicit ids read this
+    // consumer's history. Blocking parks only on the `>` streams --
+    // history is fully served by the loop head.
+    let fresh: Vec<StreamSpec> = specs
+        .iter()
+        .filter(|s| s.id == ReadId::New)
+        .cloned()
+        .collect();
     // Absolute expiry for a bounded BLOCK; None when no bound is
     // computable -- no BLOCK at all, BLOCK 0 (forever), or a value too
-    // large for Instant. wait_entries re-parks in slices itself, so no
-    // clamped deadline is built here.
+    // large for Instant (wait_targets re-parks in slices itself).
     let end = opts
         .block_ms
         .filter(|ms| *ms > 0)
         .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)));
-    let mut after_snapshot;
+    // Wake probes track each `>` stream's last-seen watermark so the
+    // pre-park data check can tell a real append from a spurious or
+    // group-op signal (refreshed after each delivery round).
+    let mut snapshots: Vec<EntryId> = fresh
+        .iter()
+        .map(|s| group_state(ctx, s, &group).map_or(model::MIN_ID, |st| st.delivered))
+        .collect();
     loop {
-        {
-            let _guard = crate::ds::latch::lock(&ctx.shared.latch, &wake).await;
-            let Some(st) = offset::load(
-                &ctx.shared.lite.offsets,
-                &ctx.shared.store,
-                &prefix,
-                &stream,
-                &group,
-            )
-            .ok()
-            .flatten() else {
-                return nogroup(ctx.out, &stream, &group);
-            };
-            after_snapshot = st.delivered;
-            match entries::scan_entries(
-                &ctx.shared.store,
-                &prefix,
-                &stream,
-                st.delivered,
-                opts.count,
-            ) {
+        // History first: never blocks, never mutates, and any hit
+        // alone already completes the reply.
+        let mut history = Vec::new();
+        for s in specs.iter().filter(|s| s.id != ReadId::New) {
+            match read_history(ctx, s, &group, &consumer, spec_after(s), opts.count) {
                 Err(e) => {
                     return resp::append_error(ctx.out, &format!("ERR: xreadgroup failed: {e}"))
                 }
-                Ok(v) if !v.is_empty() => {
-                    if let Some(last) = v.last().map(|e| e.id) {
-                        offset::advance_delivered(&ctx.shared.lite.offsets, &stream, &group, last);
-                    }
-                    monitor::observe_lite_message(&ctx.shared.monitor, "read", v.len() as u64);
-                    return append_read_reply(ctx.out, &stream, &v);
-                }
+                Ok(v) if !v.is_empty() => history.push((s.stream.clone(), v)),
                 Ok(_) => {}
+            }
+        }
+        match deliver_new(ctx, &fresh, &group, &consumer, opts.count).await {
+            Err(DeliverErr::NoGroup(stream)) => return nogroup(ctx.out, &stream, &group),
+            Err(DeliverErr::Store(e)) => {
+                return resp::append_error(ctx.out, &format!("ERR: xreadgroup failed: {e}"))
+            }
+            Ok(delivered) => {
+                // Refresh each delivered stream's wake probe: the last
+                // delivered id IS the advanced watermark.
+                for (idx, s) in fresh.iter().enumerate() {
+                    if let Some(last) = delivered
+                        .iter()
+                        .find(|(n, _)| n == &s.stream)
+                        .and_then(|(_, v)| v.last())
+                    {
+                        snapshots[idx] = last.id;
+                    }
+                }
+                let results = merge_results(&specs, delivered, history);
+                if !results.is_empty() {
+                    return append_streams_reply(ctx.out, &results);
+                }
             }
         }
         let Some(block_ms) = opts.block_ms else {
             return nil_array(ctx.out);
         };
-        // Budget still left to hand to wait_entries; 0 reaches it only
-        // for BLOCK 0 (forever): a bounded wait whose expiry has passed
-        // returns nil here, and a sub-millisecond remainder is clamped
-        // to 1ms inside remaining_ms so it can never become "forever".
+        // Budget still left to hand to wait_targets; 0 reaches it only
+        // for BLOCK 0 (forever) -- a bounded wait whose expiry passed
+        // returns nil here, and remaining_ms clamps a sub-millisecond
+        // remainder up to 1ms so it can never become "forever".
         let Some(left) = remaining_ms(end, block_ms) else {
             return nil_array(ctx.out);
         };
-        match wait_entries(ctx, &prefix, &stream, after_snapshot, opts.count, left).await {
+        // Explicit-id-only reads never park: history was just served
+        // (empty) and waiting on `>` streams cannot grow it.
+        let targets: Vec<ParkTarget> = fresh
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| park_target(s, snapshots[idx], opts.count))
+            .collect();
+        if targets.is_empty() {
+            return nil_array(ctx.out);
+        }
+        match wait_targets(ctx, &targets, left).await {
             None => return nil_array(ctx.out),
             Some(Err(e)) => {
                 return resp::append_error(ctx.out, &format!("ERR: xreadgroup failed: {e}"))
             }
             // Data landed (latched quick path picks it up) OR a group op
-            // signalled the meta key (DESTROY -> NOGROUP re-check, SETID
+            // signalled a meta key (DESTROY -> NOGROUP re-check, SETID
             // rewind -> replay): the loop head re-validates both.
             Some(Ok(_)) => continue,
         }
@@ -419,33 +640,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remaining_ms_passes_forever_sentinel_and_rejects_expired() {
-        // No deadline (BLOCK 0 / oversized): the raw block_ms sentinel
-        // goes through untouched.
-        assert_eq!(remaining_ms(None, 7000), Some(7000));
-        // An already-passed deadline: park nothing, reply nil now.
-        assert_eq!(
-            remaining_ms(Some(Instant::now() - Duration::from_millis(1)), 5),
-            None
-        );
-        // A live deadline: (nearly) all of the remaining milliseconds
-        // (a tick may elapse between building the deadline and the
-        // measurement, so assert a small window, not exact equality).
-        let got = remaining_ms(Some(Instant::now() + Duration::from_millis(10)), 5);
-        assert!(
-            matches!(got, Some(ms) if (8..=10).contains(&ms)),
-            "expected ~10ms, got {got:?}"
-        );
+    fn split_streams_tail_pairs_each_name_with_one_id() {
+        let arg = |s: &str| s.as_bytes().to_vec();
+        // Two streams, two ids: the id half starts after the name half.
+        let args = vec![arg("orders/q0"), arg("orders/q1"), arg("$"), arg("5-0")];
+        assert_eq!(split_streams_tail(&args, 0), Some((2, 2)));
+        let with_opts = vec![arg("COUNT"), arg("10"), arg("a/b"), arg("0-0")];
+        assert_eq!(split_streams_tail(&with_opts, 2), Some((3, 1)));
+        // Odd tail (a stream lost its id) and an empty tail are both
+        // "Unbalanced": the caller cannot pair names to ids.
+        assert_eq!(split_streams_tail(&args[..3], 0), None);
+        assert_eq!(split_streams_tail(&args[..0], 0), None);
     }
 
     #[test]
-    fn remaining_ms_clamps_sub_millisecond_remainder_to_one() {
-        // Regression: 0 < remaining < 1ms truncated to 0, which
-        // wait_entries reads as BLOCK 0 = wait FOREVER; a bounded
-        // XREADGROUP could hang past its deadline until an append woke
-        // it. The remainder must clamp up to 1ms so the timeout fires.
-        let sub = Instant::now() + Duration::from_micros(400);
-        let got = remaining_ms(Some(sub), 5);
-        assert_eq!(got, Some(1), "sub-millisecond budget must be 1ms, not 0");
+    fn succ_id_steps_seq_then_ms() {
+        let id = |ms: u64, seq: u64| model::EntryId { ms, seq };
+        // Intra-millisecond: seq bumps; seq exhausted rolls into the
+        // next millisecond; the id ceiling has no successor.
+        assert_eq!(succ_id(id(5, 1)), Some(id(5, 2)));
+        assert_eq!(succ_id(id(5, u64::MAX)), Some(id(6, 0)));
+        assert_eq!(succ_id(id(u64::MAX, u64::MAX)), None);
     }
 }

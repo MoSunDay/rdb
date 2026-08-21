@@ -35,6 +35,7 @@ fn shared_for(tag: &str) -> state::Shared {
         latch: rdb::ds::latch::Latch::new(),
         wait_hub: rdb::ds::wait::WaitHub::new(),
         lite: std::sync::Arc::new(rdb::lite::new_runtime()),
+        sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
         conf,
     }
 }

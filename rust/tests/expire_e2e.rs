@@ -31,6 +31,7 @@ fn shared_for(tag: &str) -> state::Shared {
         latch: rdb::ds::latch::Latch::new(),
         wait_hub: rdb::ds::wait::WaitHub::new(),
         lite: std::sync::Arc::new(rdb::lite::new_runtime()),
+        sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
         conf,
     }
 }
@@ -49,12 +50,15 @@ fn call(shared: &state::Shared, name: &str, args: &[&[u8]]) -> Vec<u8> {
     };
     let argv: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
     let mut out = Vec::new();
+    let mut conn_state = rdb::tx::session::ConnState::default();
     let mut ctx = command::Ctx {
         shared,
         prefix_key,
         args: argv,
         out: &mut out,
         close_conn: false,
+        conn: &mut conn_state,
+        wrote: false,
     };
     tokio::runtime::Builder::new_current_thread()
         .build()
