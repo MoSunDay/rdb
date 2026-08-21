@@ -46,7 +46,8 @@ pub async fn join_cluster(join_addr: &str, raft_tcp_addr: &str, token: &str) -> 
 /// unreserved set (ALPHA / DIGIT / `-._~`) becomes `%XX`, so reserved
 /// characters (`&`, `+`, `%`, ...) cannot split or mutate the query.
 /// Local pure function: no encoding dependency exists in the workspace.
-fn percent_encode(s: &str) -> String {
+/// `pub(crate)`: the M3 timestamp client builds the same query shape.
+pub(crate) fn percent_encode(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {

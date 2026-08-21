@@ -7,32 +7,80 @@
 //! storage. Aggregate evaluation lives in `agg.rs`, EXPLAIN rendering
 //! in `render.rs`.
 
+use crate::sql::dist::gather;
 use crate::sql::exec::agg::{eval_in_group, has_agg, Unit};
 use crate::sql::exec::expr::{cmp_values, eval, truthy};
 use crate::sql::exec::render;
 use crate::sql::exec::scan::{self, FromScope, Source};
 use crate::sql::exec::{ColMeta, ExecOutcome, SqlSession};
-use crate::sql::parse::ast::{AggFunc, BinOp, Expr, OrderKey, Query, SelectItem, Statement};
+use crate::sql::parse::ast::{
+    AggFunc, BinOp, Expr, OrderKey, Query, SelectItem, Statement, TableRef,
+};
 use crate::sql::parse::error::SqlResult;
+use crate::sql::plan;
 use crate::sql::storage::schema::{SqlType, Value};
 use crate::state::Shared;
 
-/// Execute a SELECT as an autocommitted snapshot read.
+/// Execute a SELECT as a snapshot read. Autocommit reads run at the
+/// oracle's `now()`; inside a transaction the read is pinned to the
+/// txn's `read_ts` and merged with its staged writes.
 pub async fn run(
     shared: &Shared,
-    _sess: &SqlSession,
+    sess: &SqlSession,
     q: Query,
 ) -> SqlResult<(Vec<ColMeta>, Vec<Vec<Value>>)> {
-    // FOR UPDATE degrades to a plain snapshot read in M1; M2 adds
-    // write-intent latching on the matched rows.
-    let read_ts = shared.sql_ts.now();
-    let src = scan::materialize(shared, &q.from, read_ts)?;
+    // FOR UPDATE degrades to a plain snapshot read in M1; the explicit
+    // txn's write-write validation at COMMIT supplies the serialization.
+    let (read_ts, txn) = match sess.txn.as_ref() {
+        Some(t) => (t.read_ts, Some(t)),
+        None => (shared.sql_ts.now(), None),
+    };
+    // Multi-node clusters read scatter-gather (falls back to the local
+    // scan path for joins / single-node topologies).
+    let src = gather::materialize(shared, &q.from, read_ts, txn, q.filter.as_ref()).await?;
     execute_query(&q, &src)
 }
 
-/// EXPLAIN: render a plan rowset (see `render.rs`).
-pub fn explain(stmt: &Statement) -> SqlResult<ExecOutcome> {
-    render::explain(stmt)
+/// EXPLAIN: render a plan rowset (see `render.rs`). The headline
+/// carries the scatter-gather banner plus a SeqScan line in cluster
+/// mode (indexes only cover the owning band, so the planner is not
+/// consulted), else the planner's IndexScan verdict; everything below
+/// the headline is pure IR.
+pub fn explain(shared: &Shared, stmt: &Statement) -> SqlResult<ExecOutcome> {
+    let headline = match stmt {
+        Statement::Select(q) => headline_lines(shared, q),
+        _ => Vec::new(),
+    };
+    render::explain(stmt, headline)
+}
+
+/// EXPLAIN headline lines for a SELECT. Gatherable FROMs read
+/// scatter-gather: the banner rides ABOVE the plain SeqScan line
+/// (bands are scanned, per node, exactly as a local SeqScan would).
+fn headline_lines(shared: &Shared, q: &Query) -> Vec<String> {
+    if let Some(banner) = gather::headline(shared, &q.from) {
+        return vec![banner, format!("SeqScan {}", render::from_display(&q.from))];
+    }
+    access_line(shared, q).into_iter().collect()
+}
+
+/// Planner verdict for the EXPLAIN headline: `IndexScan <idx> -> N pks`
+/// when the query would read through an index, else the plain SeqScan
+/// line. Planning here is exactly what `scan::materialize` will do, so
+/// the explained plan and the executed plan cannot drift.
+fn access_line(shared: &Shared, q: &Query) -> Option<String> {
+    let TableRef::Table { name, alias } = &q.from else {
+        return None; // joins always plan as SeqScan
+    };
+    let schema = crate::sql::storage::catalog::lookup(shared, name)
+        .ok()
+        .flatten()?;
+    match plan::plan(&shared.store, &schema, alias.as_deref(), q.filter.as_ref()) {
+        plan::Path::IndexLookup { index, pks, .. } => {
+            Some(format!("IndexScan {} -> {} pks", index.name, pks.len()))
+        }
+        plan::Path::SeqScan => None,
+    }
 }
 
 /// The whole query over a materialized source. Pure.

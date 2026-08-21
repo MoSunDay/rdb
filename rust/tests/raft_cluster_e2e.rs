@@ -73,6 +73,8 @@ async fn start_node(bootstrap: bool) -> TestNode {
             kv_http,
             TOKEN.into(),
             http::membership_mux(),
+            None,
+            http::store_slot(),
         )
         .await
         {

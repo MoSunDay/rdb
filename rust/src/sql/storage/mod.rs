@@ -3,5 +3,6 @@
 
 pub mod catalog;
 pub mod codec;
+pub mod gc;
 pub mod row;
 pub mod schema;

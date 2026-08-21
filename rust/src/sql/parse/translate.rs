@@ -263,6 +263,17 @@ fn translate(stmt: SqlStatement) -> SqlResult<Statement> {
                 .ok_or_else(|| SqlError::parse("SHOW COLUMNS FROM <table> required"))?;
             Ok(Statement::ShowColumns(object_name(&name)?))
         }
+        // sqlparser has no dedicated SHOW INDEX parse: it surfaces as a
+        // ShowVariable whose identifiers are [index, from, <table>].
+        SqlStatement::ShowVariable { variable } if variable.len() == 3 => {
+            let is_show_index = variable[0].value.eq_ignore_ascii_case("index")
+                && variable[1].value.eq_ignore_ascii_case("from");
+            if is_show_index {
+                Ok(Statement::ShowIndexes(variable[2].value.clone()))
+            } else {
+                Err(SqlError::unsupported("SHOW variables"))
+            }
+        }
         SqlStatement::Set(_) => Ok(Statement::SetIgnored),
         other => Err(SqlError::unsupported(format!("{other}"))),
     }

@@ -22,10 +22,19 @@ async fn exec(shared: &crate::state::Shared, sql: &str) -> ExecOutcome {
 }
 
 async fn write(shared: &crate::state::Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
+    let mut sess = SqlSession::default();
+    write_in(shared, &mut sess, stmt).await
+}
+
+async fn write_in(
+    shared: &crate::state::Shared,
+    sess: &mut SqlSession,
+    stmt: Statement,
+) -> SqlResult<ExecOutcome> {
     match stmt {
-        Statement::Insert { .. } => insert(shared, stmt).await,
-        Statement::Update { .. } => update(shared, stmt).await,
-        Statement::Delete { .. } => delete(shared, stmt).await,
+        Statement::Insert { .. } => insert(shared, sess, stmt).await,
+        Statement::Update { .. } => update(shared, sess, stmt).await,
+        Statement::Delete { .. } => delete(shared, sess, stmt).await,
         other => panic!("not a write: {other:?}"),
     }
 }
@@ -37,7 +46,7 @@ async fn rows(
     let Statement::Select(q) = parse_statement(sql).unwrap() else {
         panic!("select");
     };
-    select::run(shared, &SqlSession { db: String::new() }, q)
+    select::run(shared, &SqlSession::default(), q)
         .await
         .unwrap()
 }
@@ -243,4 +252,84 @@ async fn delete_honors_filter_and_limit() {
         exec(&shared, "DELETE FROM t").await,
         ExecOutcome::Affected(0)
     ));
+}
+
+#[tokio::test]
+async fn txn_staging_merges_own_writes_and_reads_at_read_ts() {
+    let shared = setup().await;
+    exec(&shared, "INSERT INTO t (id, v) VALUES (1, 'one')").await;
+
+    let mut sess = SqlSession {
+        txn: Some(crate::sql::tx::begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    let stmt = |sql: &str| parse_statement(sql).unwrap();
+    write_in(
+        &shared,
+        &mut sess,
+        stmt("INSERT INTO t (id, v) VALUES (2, 'two')"),
+    )
+    .await
+    .unwrap();
+    write_in(
+        &shared,
+        &mut sess,
+        stmt("UPDATE t SET v = 'ONE' WHERE id = 1"),
+    )
+    .await
+    .unwrap();
+    write_in(&shared, &mut sess, stmt("DELETE FROM t WHERE id = 2"))
+        .await
+        .unwrap();
+
+    // nothing reached the store yet: another session sees the seed only
+    let (_, other) = rows(&shared, "SELECT id, v FROM t ORDER BY id").await;
+    assert_eq!(other, vec![vec![Value::Int(1), Value::Str("one".into())]]);
+
+    // the staging session sees own writes merged over the snapshot
+    let Statement::Select(q) = stmt("SELECT id, v FROM t ORDER BY id") else {
+        panic!("select");
+    };
+    let (_, mine) = select::run(&shared, &sess, q).await.unwrap();
+    assert_eq!(mine, vec![vec![Value::Int(1), Value::Str("ONE".into())]]);
+}
+
+#[tokio::test]
+async fn txn_commit_flushes_and_rollback_discards() {
+    let shared = setup().await;
+    exec(&shared, "INSERT INTO t (id, v) VALUES (1, 'one')").await;
+
+    // commit path: staged writes become one committed batch
+    let mut sess = SqlSession {
+        txn: Some(crate::sql::tx::begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    write_in(
+        &shared,
+        &mut sess,
+        parse_statement("INSERT INTO t (id, v) VALUES (2, 'two')").unwrap(),
+    )
+    .await
+    .unwrap();
+    crate::sql::tx::commit(&shared, sess.txn.take().unwrap())
+        .await
+        .unwrap();
+    let (_, got) = rows(&shared, "SELECT id FROM t ORDER BY id").await;
+    assert_eq!(got, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+    // rollback path: staged writes vanish
+    let mut sess = SqlSession {
+        txn: Some(crate::sql::tx::begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    write_in(
+        &shared,
+        &mut sess,
+        parse_statement("DELETE FROM t").unwrap(),
+    )
+    .await
+    .unwrap();
+    crate::sql::tx::rollback(&shared.sql_ts, sess.txn.take().unwrap());
+    let (_, after) = rows(&shared, "SELECT id FROM t ORDER BY id").await;
+    assert_eq!(after.len(), 2, "rollback discarded the staged delete");
 }
