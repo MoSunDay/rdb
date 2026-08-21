@@ -5,8 +5,6 @@
 //! (`$` = only new messages). The group record (kind 0x0E) carries the
 //! committed watermark that survives crashes.
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 
 use crate::command::Ctx;
@@ -46,7 +44,9 @@ fn group_start(stream_last: Option<EntryId>, arg: &[u8]) -> Result<EntryId, ()> 
     }
 }
 
-/// `XGROUP <CREATE|DESTROY|SETID> <stream> <group> [<id|$> [MKSTREAM]]`.
+/// `XGROUP <CREATE|DESTROY|SETID> <stream> <group> [<id|$> [MKSTREAM]]`
+/// plus `<CREATECONSUMER|DELCONSUMER> <stream> <group> <consumer>`
+/// (consumer-registry rows in the kind-0x0F window, see `pel.rs`).
 pub async fn xgroup(ctx: &mut Ctx<'_>) {
     if ctx.args.is_empty() {
         return resp::append_error(
@@ -59,6 +59,8 @@ pub async fn xgroup(ctx: &mut Ctx<'_>) {
         b"create" => create(ctx).await,
         b"destroy" => destroy(ctx).await,
         b"setid" => setid(ctx).await,
+        b"createconsumer" => createconsumer(ctx).await,
+        b"delconsumer" => delconsumer(ctx).await,
         _ => resp::append_error(
             ctx.out,
             &format!(
@@ -132,7 +134,7 @@ async fn create(ctx: &mut Ctx<'_>) {
             committed_seq: start.seq,
         }),
     );
-    if let Err(e) = ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    if let Err(e) = ctx.commit(batch).await {
         return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
     }
     if fresh_meta {
@@ -153,6 +155,7 @@ async fn create(ctx: &mut Ctx<'_>) {
             created_ms: now,
             delivered: start,
             committed: start,
+            pending: 0,
         },
     );
     wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
@@ -179,7 +182,10 @@ async fn destroy(ctx: &mut Ctx<'_>) {
     if existed {
         let mut batch = WriteBatch::default();
         batch.delete(&gkey);
-        if let Err(e) = ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+        // The group's whole pending window (PEL rows + consumer
+        // registry) goes with it: one range delete, no enumeration.
+        super::pel::delete_group_pend(&mut batch, &prefix, &stream, &group);
+        if let Err(e) = ctx.commit(batch).await {
             return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
         }
         // A consumer blocked in XREADGROUP on this stream must not park
@@ -188,7 +194,91 @@ async fn destroy(ctx: &mut Ctx<'_>) {
         wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
     }
     offset::remove_group(&ctx.shared.lite.offsets, &stream, &group);
+    ctx.shared.lite.forget_group(&stream, &group);
     resp::append_int(ctx.out, i64::from(existed));
+}
+
+/// `XGROUP CREATECONSUMER <stream> <group> <consumer>`: register the
+/// consumer name (idempotent from the delivery path too); replies 1 when
+/// newly created, 0 when it already existed.
+async fn createconsumer(ctx: &mut Ctx<'_>) {
+    if ctx.args.len() != 4 {
+        return resp::append_error(
+            ctx.out,
+            "ERR wrong number of arguments for 'xgroup createconsumer' command",
+        );
+    }
+    let Some((stream, prefix)) = super::entries::stream_of(ctx, 1) else {
+        return;
+    };
+    let (group, consumer) = (ctx.args[2].clone(), ctx.args[3].clone());
+    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
+    let ckey = super::pel::consumer_key(&prefix, &stream, &group, &consumer);
+    let existed = ops::get_physical(&ctx.shared.store, &ckey)
+        .ok()
+        .flatten()
+        .is_some();
+    if !existed {
+        let mut batch = WriteBatch::default();
+        batch.put(
+            &ckey,
+            super::pel::encode_consumer(&super::pel::ConsumerState {
+                created_ms: crate::ds::expire::now_ms(),
+            }),
+        );
+        if let Err(e) = ctx.commit(batch).await {
+            return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
+        }
+    }
+    ctx.shared.lite.ensure_consumer(&stream, &group, &consumer);
+    resp::append_int(ctx.out, i64::from(!existed));
+}
+
+/// `XGROUP DELCONSUMER <stream> <group> <consumer>`: drop the registry
+/// row and purge the consumer's pending entries; replies the number of
+/// purged pending messages (Redis semantics).
+async fn delconsumer(ctx: &mut Ctx<'_>) {
+    if ctx.args.len() != 4 {
+        return resp::append_error(
+            ctx.out,
+            "ERR wrong number of arguments for 'xgroup delconsumer' command",
+        );
+    }
+    let Some((stream, prefix)) = super::entries::stream_of(ctx, 1) else {
+        return;
+    };
+    let (group, consumer) = (ctx.args[2].clone(), ctx.args[3].clone());
+    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
+    // Purge every PEL row owned by this consumer (ownership lives in the
+    // row value, so it is a filtered scan, not a range delete).
+    let rows = super::pel::scan_pend(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        &group,
+        model::MIN_ID,
+        None,
+    );
+    let Ok(rows) = rows else {
+        return resp::append_error(ctx.out, "ERR: xgroup failed: pel scan");
+    };
+    let mut purged = 0usize;
+    let mut batch = WriteBatch::default();
+    for row in &rows {
+        if row.state.consumer == consumer {
+            batch.delete(super::pel::pend_key(&prefix, &stream, &group, row.id));
+            purged += 1;
+        }
+    }
+    batch.delete(super::pel::consumer_key(
+        &prefix, &stream, &group, &consumer,
+    ));
+    if let Err(e) = ctx.commit(batch).await {
+        return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
+    }
+    offset::bump_pending(&ctx.shared.lite.offsets, &stream, &group, -(purged as i64));
+    ctx.shared.lite.forget_consumer(&stream, &group, &consumer);
+    resp::append_int(ctx.out, purged as i64);
 }
 
 async fn setid(ctx: &mut Ctx<'_>) {
@@ -233,7 +323,7 @@ async fn setid(ctx: &mut Ctx<'_>) {
     payload.committed_seq = id.seq;
     let mut batch = WriteBatch::default();
     batch.put(&gkey, model::encode_group(&payload));
-    if let Err(e) = ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    if let Err(e) = ctx.commit(batch).await {
         return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
     }
     // The delivery watermark may have moved (a rewind makes previously

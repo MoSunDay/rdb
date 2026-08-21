@@ -76,6 +76,7 @@ mod tests {
             latch: crate::ds::latch::Latch::new(),
             wait_hub: crate::ds::wait::WaitHub::new(),
             lite: std::sync::Arc::new(crate::lite::new_runtime()),
+            sql_ts: std::sync::Arc::new(crate::sql::tx::Oracle::new()),
             conf: c,
         })
     }

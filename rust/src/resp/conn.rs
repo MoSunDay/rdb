@@ -19,20 +19,21 @@
 //! elapsed milliseconds. Histogram buckets are unchanged. Like Go, no
 //! latency sample is recorded on the arity-error or panic paths.
 
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::command;
+use crate::ds::latch;
 use crate::hash;
 use crate::monitor;
 use crate::resp::codec;
 use crate::router;
 use crate::state;
+use crate::tx::keyspec;
+use crate::tx::session::{ConnState, QueueResult};
 
 /// Cumulative per-connection read-buffer cap: a client that streams
 /// incomplete-but-valid data forever would grow `buf` without bound.
@@ -92,11 +93,23 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// One connection: parse-loop with pipelining, write-after-drain.
 pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
+    // The connection's whole lifetime runs inside a task-local latch
+    // scope: during EXEC replays the latch layer recognizes keys the
+    // transaction already holds and makes handler acquisitions
+    // reentrant. Outside transactions the scope is inert.
+    latch::with_conn_scope(handle_conn_inner(sock, shared)).await
+}
+
+async fn handle_conn_inner(sock: TcpStream, shared: Arc<state::Shared>) {
     let (mut rd, mut wr) = sock.into_split();
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut out: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     let mut authed = false;
+    // Per-connection transaction state (MULTI queue + WATCHes); dropped
+    // with the connection, so a vanished client takes its transaction
+    // with it.
+    let mut conn_state = ConnState::default();
     // ONE cumulative pre-auth clock, started at connect: every
     // unauthenticated read below shares it, so slow-dribble clients
     // cannot reset the deadline per read. Meaningless once authed.
@@ -174,7 +187,15 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
                         }
                         out.clear();
                     }
-                    process_command(&shared, args, &mut authed, &mut out, &mut close).await;
+                    process_command(
+                        &shared,
+                        args,
+                        &mut authed,
+                        &mut conn_state,
+                        &mut out,
+                        &mut close,
+                    )
+                    .await;
                     if close {
                         break;
                     }
@@ -210,24 +231,15 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<state::Shared>) {
 /// commands must be flushed to the socket BEFORE dispatch, mirroring
 /// Redis's behavior of answering everything ahead of a blocking call.
 fn may_block(first: &str) -> bool {
-    matches!(
-        first,
-        "blpop"
-            | "brpop"
-            | "blmove"
-            | "brpoplpush"
-            | "bzpopmin"
-            | "bzpopmax"
-            | "xread"
-            | "xreadgroup"
-    )
+    keyspec::may_block(first)
 }
 
 /// Dispatch one parsed command (Go `server.go` handler closure).
 async fn process_command(
     shared: &state::Shared,
-    mut argv: Vec<Vec<u8>>,
+    argv: Vec<Vec<u8>>,
     authed: &mut bool,
+    conn: &mut ConnState,
     out: &mut Vec<u8>,
     close: &mut bool,
 ) {
@@ -255,82 +267,94 @@ async fn process_command(
         return;
     }
 
-    let raw0 = String::from_utf8_lossy(&argv[0]);
+    let raw0 = String::from_utf8_lossy(&argv[0]).into_owned();
     let first = raw0.to_lowercase();
-    let start = std::time::Instant::now();
 
-    let handler = match command::lookup(&first) {
-        Some(h) => h,
-        // Go: `ERR unknown command '<original case>'`; no latency observed.
-        None => {
-            codec::append_error(out, &format!("ERR unknown command '{raw0}'"));
-            return;
-        }
-    };
+    // MULTI queueing: inside an open transaction every command except the
+    // transaction controls is validated and QUEUED, never executed here
+    // (see queue_command for the queue-time rejection rules).
+    if conn.in_multi() && !is_tx_control(&first) {
+        queue_command(shared, argv, &first, &raw0, conn, out);
+        return;
+    }
 
-    // Slot routing for non-whitelisted commands.
-    let mut prefix_key: Vec<u8> = Vec::new();
-    if !router::is_whitelisted(&first) {
-        // BREAKING (approved): Go indexed cmd.Args[1] unconditionally, so a
-        // lone command name surfaced as a fabricated runtime-panic reply;
-        // use the Redis-standard arity error instead. No latency sample on
-        // this error path (Go observes only after the handler returns).
+    let wrote = command::dispatch(shared, argv, conn, out, close).await;
+    // Redis: a write executed on the connection OUTSIDE MULTI implicitly
+    // discards its WATCHes. (Writes inside MULTI are only ever the EXEC
+    // replay itself, which manages watches explicitly.)
+    if wrote && !conn.in_multi() {
+        conn.clear_watches();
+    }
+}
+
+/// Transaction-control commands keep DISPATCHING inside MULTI (never
+/// queue): EXEC/DISCARD finish the transaction, nested MULTI and
+/// WATCH-inside-MULTI are rejected by their own handlers (marking the
+/// transaction dirty, matching Redis).
+fn is_tx_control(first: &str) -> bool {
+    matches!(first, "multi" | "exec" | "discard" | "watch" | "unwatch")
+}
+
+/// Queue one command into the open MULTI (queue-time validation).
+///
+/// Rejections reply the error immediately AND mark the transaction dirty:
+/// later commands still queue, EXEC fails wholesale with EXECABORT
+/// (Redis `queueDialogCommand` behavior). Rules:
+/// * unknown command                       -> dirty
+/// * blocking command (`keyspec::may_block`) -> dirty
+/// * MIGRATE / RAFT (cluster admin)        -> dirty
+/// * arity / MOVED (same checks as dispatch) -> dirty
+/// * keys hashing to another slot          -> dirty (CROSSSLOT)
+fn queue_command(
+    shared: &state::Shared,
+    argv: Vec<Vec<u8>>,
+    first: &str,
+    raw0: &str,
+    conn: &mut ConnState,
+    out: &mut Vec<u8>,
+) {
+    if command::lookup(first).is_none() {
+        codec::append_error(out, &format!("ERR unknown command '{raw0}'"));
+        conn.mark_dirty();
+        return;
+    }
+    if keyspec::may_block(first) || first == "migrate" || first == "raft" {
+        codec::append_error(
+            out,
+            &format!("ERR command '{first}' is not allowed in transactions"),
+        );
+        conn.mark_dirty();
+        return;
+    }
+    // Arity + slot routing, mirroring dispatch: a queue-time MOVED also
+    // aborts the transaction (the keys live on another node).
+    if !router::is_whitelisted(first) {
         if argv.len() < 2 {
-            arity_error(out, &first);
+            arity_error(out, first);
+            conn.mark_dirty();
             return;
         }
         let tag = hash::hash_tag(&argv[1]);
-        let (slot, prefix) = hash::slot_with_prefix(tag);
-        prefix_key = prefix;
-
-        let decision = {
-            let topo = shared.topology.read().unwrap();
-            router::route(
-                slot,
-                &topo.stable_addrs,
-                topo.per_node_slots,
-                &shared.conf.bind,
-            )
-        };
-        if let router::RouteDecision::Moved { slot, addr } = decision {
-            codec::append_error(out, &router::moved_error_line(slot, &addr));
-            observe(shared, &first, true, start);
+        let (slot, _) = hash::slot_with_prefix(tag);
+        if let Some(line) = command::moved_line(shared, slot) {
+            codec::append_error(out, &line);
+            conn.mark_dirty();
             return;
         }
     }
-
-    // Run the handler behind Go's `defer recover()` safety net.
-    let mut ctx = command::Ctx {
-        shared,
-        prefix_key,
-        args: argv.split_off(1),
-        out,
-        close_conn: false,
-    };
-    let panicked = {
-        AssertUnwindSafe(handler(&mut ctx))
-            .catch_unwind()
-            .await
-            .err()
-    };
-    match panicked {
-        Some(payload) => {
-            codec::append_error(ctx.out, &format!("fatal error: {}", payload_str(&payload)));
-            // Reply text is unchanged, but the connection now closes after
-            // the flush: a panicked handler may have desynced the framing,
-            // so keep talking on it is unsafe.
-            *close = true;
+    let args: Vec<Vec<u8>> = argv.iter().skip(1).cloned().collect();
+    let keys = keyspec::keys_of(first, &args);
+    let slot_of = |key: &[u8]| hash::slot_with_prefix(hash::hash_tag(key)).0;
+    match conn.queue(argv, &keys, &slot_of) {
+        QueueResult::Queued => {
+            monitor::tx_event(&shared.monitor, "queued");
+            codec::append_string(out, "QUEUED");
         }
-        // Label order mirrors Go: (mode, lowercase command, was-MOVED). Go
-        // observes after `fn(...)` returns; a panicking handler unwinds past
-        // it, so no late sample is recorded on this error path.
-        None => observe(shared, &first, false, start),
-    }
-
-    if ctx.close_conn {
-        // Go `quit` writes its replies then closes the connection; the flush
-        // happens in the caller before we return.
-        *close = true;
+        // Session::queue already marked the transaction dirty; only the
+        // cluster CROSSSLOT text remains.
+        QueueResult::Rejected => {
+            codec::append_error(out, crate::ds::setops::CROSSSLOT_ERROR);
+        }
     }
 }
 
@@ -343,28 +367,7 @@ fn arity_error(out: &mut Vec<u8>, cmd: &str) {
     );
 }
 
-/// Latency helper keeping the Go label order via monitor::observe_latency.
-fn observe(shared: &state::Shared, cmd: &str, is_moved: bool, start: std::time::Instant) {
-    monitor::observe_latency(
-        &shared.monitor,
-        state::mode_label(shared.mode),
-        cmd,
-        is_moved,
-        start.elapsed().as_millis() as f64,
-    );
-}
-
-/// Panic payload -> message text (Go `err.(error).Error()`).
-fn payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        return s;
-    }
-    if let Some(s) = payload.downcast_ref::<String>() {
-        return s.as_str();
-    }
-    "unknown panic payload"
-}
-
+// Panic payload -> message text (Go `err.(error).Error()`).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,16 +410,6 @@ mod tests {
         assert!(!ct_eq(b"to", b"tok"));
         assert!(!ct_eq(b"", b"t"));
         assert!(!ct_eq(b"t", b""));
-    }
-
-    #[test]
-    fn payload_str_handles_common_types() {
-        let s: String = "boom".to_string();
-        assert_eq!(payload_str(&s), "boom");
-        let lit: &'static str = "bang";
-        assert_eq!(payload_str(&lit), "bang");
-        let n: i32 = 7;
-        assert_eq!(payload_str(&n), "unknown panic payload");
     }
 
     #[test]

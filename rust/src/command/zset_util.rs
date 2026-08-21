@@ -3,8 +3,6 @@
 //! through. Kept apart from the command handlers so the read/pop/range
 //! modules import one focused module instead of reaching into ZADD's.
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 
 use crate::command::hash_cmd::WRONGTYPE;
@@ -12,7 +10,7 @@ use crate::command::{keys_core, Ctx};
 use crate::ds::codec::{self, KIND_ZSET_META};
 use crate::ds::{expire, zset_ds};
 use crate::resp::codec::{append_bulk, append_error};
-use crate::store::{ops, Store};
+use crate::store::Store;
 
 /// What one key is from the sorted-set commands' point of view.
 #[derive(Debug, PartialEq)]
@@ -159,13 +157,10 @@ pub(crate) async fn commit_zset(
             &zset_ds::ZSetMeta { expire_ms, count },
         );
     }
-    ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
-        .await
-        .map(|_| true)
-        .unwrap_or_else(|_| {
-            append_error(ctx.out, &format!("ERR: {cmd} failed"));
-            false
-        })
+    ctx.commit(batch).await.map(|_| true).unwrap_or_else(|_| {
+        append_error(ctx.out, &format!("ERR: {cmd} failed"));
+        false
+    })
 }
 
 /// Collect every member with its score in ascending order (the whole

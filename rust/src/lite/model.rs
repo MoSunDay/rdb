@@ -9,6 +9,7 @@
 //! meta   = data_key(prefix, 0x0C, stream)          value = envelope ++ json
 //! entry  = data_key(prefix, 0x0D, stream) ++ <ms u64BE><seq u64BE>
 //! group  = data_key(prefix, 0x0E, stream) ++ <group name>
+//! pend   = data_key(prefix, 0x0F, stream) ++ <group> <tag> ...  (see pel.rs)
 //! ```
 //!
 //! Entry suffixes are fixed-width big-endian, so the natural key order IS
@@ -25,7 +26,7 @@ use crate::hash;
 use crate::store::Store;
 
 /// `<ms>-<seq>` stream entry id; ordering is (ms, seq) lexicographic.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct EntryId {
     pub ms: u64,
     pub seq: u64,

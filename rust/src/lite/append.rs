@@ -3,7 +3,6 @@
 //! lands in ONE batched fsync (meta + entry + TTL index together).
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use rocksdb::WriteBatch;
 
@@ -142,7 +141,7 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     );
     expire::set_ttl_entries(&mut batch, &prefix, mkey.clone(), old_expire, new_expire);
 
-    if let Err(e) = ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    if let Err(e) = ctx.commit(batch).await {
         return resp::append_error(ctx.out, &format!("ERR: xadd failed: {e}"));
     }
     if fresh {
@@ -158,7 +157,7 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     // Wake EVERY hub key a blocked reader could be parked on for this
     // append (both use the parent-derived slot prefix, so they agree):
     // the appended child stream's meta key (where XREAD/XREADGROUP on
-    // `parent/child` park, via read::wait_entries) AND the bare parent
+    // `parent/child` park, via park_wait::wait_targets) AND the bare parent
     // topic's key. Notifying only the child key left anything parked at
     // the parent level asleep until its BLOCK timeout even though data
     // had landed. notify on a key with no waiter is a no-op.
@@ -295,7 +294,7 @@ pub async fn xtrim(ctx: &mut Ctx<'_>) {
         model::meta_key(&prefix, &stream),
         model::encode_meta_at(&next, kept_expire),
     );
-    match ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    match ctx.commit(batch).await {
         Err(e) => resp::append_error(ctx.out, &format!("ERR: xtrim failed: {e}")),
         Ok(()) => resp::append_int(ctx.out, victims.len() as i64),
     }
@@ -354,7 +353,7 @@ pub async fn xdel(ctx: &mut Ctx<'_>) {
             model::encode_meta_at(&next, kept_expire),
         );
     }
-    match ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    match ctx.commit(batch).await {
         Err(e) => resp::append_error(ctx.out, &format!("ERR: xdel failed: {e}")),
         Ok(()) => resp::append_int(ctx.out, found as i64),
     }
@@ -415,7 +414,7 @@ pub async fn xidle(ctx: &mut Ctx<'_>) {
     let mut batch = WriteBatch::default();
     batch.put(&mkey, model::encode_meta_at(&next, new_expire));
     expire::set_ttl_entries(&mut batch, &prefix, mkey.clone(), old_expire, new_expire);
-    match ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    match ctx.commit(batch).await {
         Err(e) => resp::append_error(ctx.out, &format!("ERR: xidle failed: {e}")),
         Ok(()) => resp::append_string(ctx.out, "OK"),
     }

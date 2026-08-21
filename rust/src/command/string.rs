@@ -16,7 +16,7 @@ use crate::resp::codec::{
     append_array, append_bulk, append_bulk_string, append_error, append_int, append_null,
     append_string,
 };
-use crate::store::{self, ops};
+use crate::store::{self};
 
 fn arity(out: &mut Vec<u8>, cmd: &str) {
     append_error(
@@ -185,7 +185,7 @@ pub async fn set(ctx: &mut Ctx<'_>) {
     let mut batch = WriteBatch::default();
     clear_key_family(&mut batch, &ctx.prefix_key, &key, &state);
     write_string_record(&mut batch, &ctx.prefix_key, &key, &val, deadline);
-    match ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    match ctx.commit(batch).await {
         Ok(()) => {
             if opts.get {
                 reply_old_or_null(ctx.out, old);
@@ -208,6 +208,7 @@ pub async fn del(ctx: &mut Ctx<'_>) {
         return;
     }
     let key = std::mem::take(&mut ctx.args[0]);
+    ctx.wrote = true; // write command: implicit UNWATCH outside MULTI
     let res = store::del_async(Arc::clone(&ctx.shared.store), ctx.prefix_key.clone(), key).await;
     append_int(ctx.out, i64::from(matches!(res, Ok(true))));
 }
@@ -288,7 +289,7 @@ pub async fn mset(ctx: &mut Ctx<'_>) {
         clear_key_family(&mut batch, &ctx.prefix_key, &pair[0], &state);
         write_string_record(&mut batch, &ctx.prefix_key, &pair[0], &pair[1], 0);
     }
-    match ops::batch_write_async(Arc::clone(&ctx.shared.store), batch).await {
+    match ctx.commit(batch).await {
         Ok(()) => append_string(ctx.out, "OK"),
         Err(_) => append_error(ctx.out, "ERR: set key failed"),
     }

@@ -6,8 +6,6 @@
 //! batched fsync under the per-key latch. Attributes (VSETATTR/VGETATTR)
 //! live in `vectorset_attr`, similarity search (VSIM) in `vectorset_sim`.
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 
 use crate::command::hash_cmd::{arity, parse_f64, WRONGTYPE};
@@ -16,7 +14,7 @@ use crate::command::{keys_core, Ctx};
 use crate::ds::codec::KIND_VECTORSET_META;
 use crate::ds::{expire, latch, vectorset_ds};
 use crate::resp::codec::{append_error, append_int};
-use crate::store::{ops, Store};
+use crate::store::Store;
 
 /// Missing key on the commands that require one (VDIM/VSIM).
 pub(crate) const ERR_NO_KEY: &str = "ERR vector set does not exist";
@@ -108,13 +106,10 @@ pub(crate) fn parse_vector(
 
 /// Land one batched fsync; on failure the error reply is written here.
 async fn commit(ctx: &mut Ctx<'_>, batch: WriteBatch, cmd: &str) -> bool {
-    ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
-        .await
-        .map(|_| true)
-        .unwrap_or_else(|_| {
-            append_error(ctx.out, &format!("ERR: {cmd} failed"));
-            false
-        })
+    ctx.commit(batch).await.map(|_| true).unwrap_or_else(|_| {
+        append_error(ctx.out, &format!("ERR: {cmd} failed"));
+        false
+    })
 }
 
 /// VADD key (FP16|VALUES) dim element <vector...> -> :1 when the

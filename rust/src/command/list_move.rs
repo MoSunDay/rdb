@@ -2,8 +2,6 @@
 //! LPOS (match scan with RANK/COUNT/MAXLEN) and LMOVE/RPOPLPUSH (pop
 //! off one key, push onto another, ONE fsync for both; same-slot only).
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 
 use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
@@ -13,7 +11,6 @@ use crate::command::list_cmd::{
 use crate::command::{keys_core, Ctx};
 use crate::ds::{expire, latch, list_ds, setops, wait};
 use crate::resp::codec::{append_bulk, append_error, append_int, append_null};
-use crate::store::ops;
 
 /// LEFT/RIGHT tokens (case-insensitive) -> `(pop_left, push_left)`.
 pub(crate) fn parse_dirs(pop: &[u8], push: &[u8]) -> Option<(bool, bool)> {
@@ -354,10 +351,7 @@ async fn move_elem(
         dst_expire,
     );
     list_ds::write_meta(&mut batch, &ctx.prefix_key, &dst, &dst_after);
-    if ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
-        .await
-        .is_ok()
-    {
+    if ctx.commit(batch).await.is_ok() {
         wait::notify(
             &ctx.shared.wait_hub,
             &list_ds::meta_key(&ctx.prefix_key, &dst),

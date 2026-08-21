@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use prometheus::{
-    CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
+    CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
+    TextEncoder,
 };
 
 pub const STATES: [&str; 5] = ["Shutdown", "Follower", "Leader", "Candidate", "Unknown"];
@@ -24,6 +25,18 @@ pub struct Collector {
     pub lite_streams: GaugeVec,
     /// Lite Mode: group offsets awaiting the 200ms flush.
     pub lite_offset_dirty: Gauge,
+    pub lite_backlog: Gauge,
+    /// SQL data plane: statement latency (labels: kind = ddl|select|insert|
+    /// update|delete|explain|other).
+    pub sql_query_latency: HistogramVec,
+    /// SQL transactions currently in-flight (explicit or 2PC).
+    pub sql_tx_active: Gauge,
+    /// SQL transactions committed / aborted, by outcome (commit|abort).
+    pub sql_tx_total: CounterVec,
+    /// Redis MULTI/EXEC transactions: queued commands, outcomes.
+    pub tx_events: CounterVec,
+    /// Redis MULTI/EXEC: wall-clock commit (replay) latency, ms.
+    pub tx_commit_latency: Histogram,
     registry: Registry,
 }
 
@@ -50,6 +63,43 @@ pub fn new_collector() -> Collector {
     .expect("gauge");
     let lite_offset_dirty =
         Gauge::new("rdb_lite_offset_dirty", "lite group offsets pending flush").expect("gauge");
+    let lite_backlog = Gauge::new(
+        "rdb_lite_backlog",
+        "lite unacked pending stream entries (PEL) across consumer groups",
+    )
+    .expect("gauge");
+    let tx_events = CounterVec::new(
+        Opts::new("rdb_tx_events", "redis multi/exec transaction events"),
+        &["event"],
+    )
+    .expect("counter");
+    // ms-scale buckets: replays include at least one fsync commit.
+    let tx_commit_latency = Histogram::with_opts(
+        HistogramOpts::new(
+            "rdb_tx_commit_latency",
+            "multi/exec replay latency (millisecond)",
+        )
+        .buckets(vec![1.0, 5.0, 25.0, 100.0, 500.0, 2000.0]),
+    )
+    .expect("histogram");
+    // SQL: same bucket shape as the RESP histogram keeps dashboards uniform.
+    let sql_buckets: Vec<f64> = (0..8).map(|i| 5.0 + 25.0 * i as f64).collect();
+    let sql_query_latency = HistogramVec::new(
+        HistogramOpts::new(
+            "rdb_sql_query_latency",
+            "sql statement latency(millisecond)",
+        )
+        .buckets(sql_buckets),
+        &["kind"],
+    )
+    .expect("sql histogram");
+    let sql_tx_active =
+        Gauge::new("rdb_sql_tx_active", "sql transactions in flight").expect("gauge");
+    let sql_tx_total = CounterVec::new(
+        Opts::new("rdb_sql_tx_total", "sql transaction outcomes"),
+        &["outcome"],
+    )
+    .expect("counter");
     let registry = Registry::new();
     registry
         .register(Box::new(latency.clone()))
@@ -66,6 +116,29 @@ pub fn new_collector() -> Collector {
     registry
         .register(Box::new(lite_offset_dirty.clone()))
         .expect("reg lite_offset_dirty");
+    registry
+        .register(Box::new(lite_backlog.clone()))
+        .expect("reg lite_backlog");
+    registry
+        .register(Box::new(tx_events.clone()))
+        .expect("reg tx_events");
+    registry
+        .register(Box::new(tx_commit_latency.clone()))
+        .expect("reg tx_commit_latency");
+    for event in ["queued", "commits", "aborts", "conflicts"] {
+        tx_events.with_label_values(&[event]).inc_by(0.0);
+    }
+    registry
+        .register(Box::new(sql_query_latency.clone()))
+        .expect("reg sql_query_latency");
+    registry
+        .register(Box::new(sql_tx_active.clone()))
+        .expect("reg sql_tx_active");
+    registry
+        .register(Box::new(sql_tx_total.clone()))
+        .expect("reg sql_tx_total");
+    sql_tx_total.with_label_values(&["commit"]).inc_by(0.0);
+    sql_tx_total.with_label_values(&["abort"]).inc_by(0.0);
     // Zero-initialize the labeled lite gauges so every series is present in
     // /metrics output before the background loop first refreshes them.
     lite_streams.with_label_values(&["live"]).set(0.0);
@@ -76,8 +149,41 @@ pub fn new_collector() -> Collector {
         lite_messages,
         lite_streams,
         lite_offset_dirty,
+        lite_backlog,
+        tx_events,
+        tx_commit_latency,
+        sql_query_latency,
+        sql_tx_active,
+        sql_tx_total,
         registry,
     }
+}
+
+/// SQL data plane: observe one statement's latency by IR kind label.
+pub fn observe_sql_latency(c: &Collector, kind: &str, ms: f64) {
+    c.sql_query_latency.with_label_values(&[kind]).observe(ms);
+}
+
+/// Redis MULTI/EXEC: bump one event counter (queued/commits/aborts/conflicts).
+pub fn tx_event(c: &Collector, event: &str) {
+    c.tx_events.with_label_values(&[event]).inc();
+}
+
+/// Redis MULTI/EXEC: observe one commit's replay latency.
+pub fn tx_commit_latency(c: &Collector, ms: f64) {
+    c.tx_commit_latency.observe(ms);
+}
+
+/// SQL data plane: +1 / -1 in-flight transaction.
+pub fn sql_tx_enter(c: &Collector) {
+    c.sql_tx_active.inc();
+}
+
+pub fn sql_tx_exit(c: &Collector, committed: bool) {
+    c.sql_tx_active.dec();
+    c.sql_tx_total
+        .with_label_values(&[if committed { "commit" } else { "abort" }])
+        .inc();
 }
 
 /// Lite Mode: count message-level operations (op = add|read|ack).
@@ -94,6 +200,11 @@ pub fn set_lite_streams(c: &Collector, live: f64, reaped: f64) {
 /// Lite Mode: gauge of group offsets awaiting the periodic flush.
 pub fn set_lite_offset_dirty(c: &Collector, n: f64) {
     c.lite_offset_dirty.set(n);
+}
+
+/// Unacked-pending (PEL) backlog, refreshed by the lite background loop.
+pub fn set_lite_backlog(c: &Collector, n: f64) {
+    c.lite_backlog.set(n);
 }
 
 /// Go label order is (mode, firstCmd, isMoved) mapping onto (type, mode, ack):

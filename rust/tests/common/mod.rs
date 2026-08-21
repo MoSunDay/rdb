@@ -51,6 +51,8 @@ pub struct ProcNode {
     pub raft: String,
     pub http: String,
     pub monitor: String,
+    /// MySQL-protocol bind address ("" when the SQL plane is disabled).
+    pub mysql: String,
 }
 
 impl ProcNode {
@@ -111,10 +113,23 @@ pub fn all_ctx(nodes: &[ProcNode]) -> String {
 }
 
 /// Write the node's conf.yaml (only the keys the binary needs).
-fn write_config(path: &Path, node_dir: &Path, resp: &str, raft: &str, http: &str, monitor: &str) {
+fn write_config(
+    path: &Path,
+    node_dir: &Path,
+    resp: &str,
+    raft: &str,
+    http: &str,
+    monitor: &str,
+    mysql: &str,
+) {
+    let sql_keys = if mysql.is_empty() {
+        String::new()
+    } else {
+        format!("mysql_bind: \"{mysql}\"\nmysql_user: \"root\"\nmysql_password: \"e2e-sql-pass\"\n")
+    };
     let yaml = format!(
         "bind: \"{resp}\"\nstore_path: \"{}\"\nraft_bind_address: \"{raft}\"\n\
-         raft_http_bind_address: \"{http}\"\nmonitor_addr: \"{monitor}\"\nraft_token: \"{TOKEN}\"\n",
+         raft_http_bind_address: \"{http}\"\nmonitor_addr: \"{monitor}\"\nraft_token: \"{TOKEN}\"\n{sql_keys}",
         node_dir.display()
     );
     std::fs::write(path, yaml).expect("write conf.yaml");
@@ -163,7 +178,7 @@ pub fn spawn_node(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str
     std::fs::create_dir_all(&node_dir).expect("create node dir");
     let (resp, raft, http, monitor) = (free_addr(), free_addr(), free_addr(), free_addr());
     let config_path = node_dir.join("conf.yaml");
-    write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor);
+    write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor, "");
     let stderr_path = node_dir.join("stderr.log");
     let child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
     ProcNode {
@@ -175,6 +190,65 @@ pub fn spawn_node(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str
         raft,
         http,
         monitor,
+        mysql: String::new(),
+    }
+}
+
+/// Spawn a node with the SQL (MySQL-protocol) plane enabled on a fresh
+/// port; native-password login is root/e2e-sql-pass.
+pub fn spawn_node_mysql(
+    dir: &Path,
+    id: usize,
+    bootstrap: bool,
+    join_http: Option<&str>,
+) -> ProcNode {
+    let node_dir = dir.join(format!("node{id}"));
+    std::fs::create_dir_all(&node_dir).expect("create node dir");
+    let (resp, raft, http, monitor, mysql) = (
+        free_addr(),
+        free_addr(),
+        free_addr(),
+        free_addr(),
+        free_addr(),
+    );
+    let config_path = node_dir.join("conf.yaml");
+    write_config(
+        &config_path,
+        &node_dir,
+        &resp,
+        &raft,
+        &http,
+        &monitor,
+        &mysql,
+    );
+    let stderr_path = node_dir.join("stderr.log");
+    let child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
+    ProcNode {
+        dir: node_dir,
+        config_path,
+        stderr_path,
+        child,
+        resp,
+        raft,
+        http,
+        monitor,
+        mysql,
+    }
+}
+
+/// Poll the node's MySQL port until it accepts connections.
+pub async fn wait_mysql_ready(node: &ProcNode, secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if TcpStream::connect(&node.mysql).await.is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mysql port never came up; {}",
+            node.ctx()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

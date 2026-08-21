@@ -39,6 +39,41 @@ pub struct Config {
     pub backup_target_map: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default, rename = "allow_ip_list")]
     pub ip_list: Vec<String>,
+    /// SQL data plane: MySQL-protocol listener (empty = disabled).
+    #[serde(default, rename = "mysql_bind")]
+    pub mysql_bind: String,
+    /// SQL login user (empty = "root"); password may be empty.
+    #[serde(default, rename = "mysql_user")]
+    pub mysql_user: String,
+    #[serde(default, rename = "mysql_password")]
+    pub mysql_password: String,
+    /// Node-to-node SQL RPC (sub-plans, 2PC); empty = disabled.
+    #[serde(default, rename = "sql_rpc_bind")]
+    pub sql_rpc_bind: String,
+    /// Redis MULTI/EXEC transactions; disabled -> MULTI errors.
+    #[serde(default, rename = "tx")]
+    pub tx: TxConfig,
+}
+
+/// `[tx]` section. Serde's `default` calls [`Default::default`] (NOT the
+/// derive): the manual impl keeps `enabled = true` when the section is
+/// absent, matching `Config::default()` used by tests and Lite Mode.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct TxConfig {
+    #[serde(default = "tx_enabled_default")]
+    pub enabled: bool,
+}
+
+fn tx_enabled_default() -> bool {
+    true
+}
+
+impl Default for TxConfig {
+    fn default() -> Self {
+        TxConfig {
+            enabled: tx_enabled_default(),
+        }
+    }
 }
 
 /// Read and parse the YAML config file at `path`.
@@ -92,6 +127,20 @@ backup_target_map:
     src: 127.0.0.1:32683
     target: 127.0.0.1:32686
 "#;
+
+    #[test]
+    fn tx_section_defaults_and_overrides() {
+        // absent section -> enabled (manual Default, not the derive's false)
+        let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1").unwrap();
+        assert!(cfg.tx.enabled);
+        assert!(Config::default().tx.enabled);
+        // explicit disable
+        let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1\ntx:\n  enabled: false\n").unwrap();
+        assert!(!cfg.tx.enabled);
+        // section present, flag omitted -> still enabled
+        let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1\ntx: {}\n").unwrap();
+        assert!(cfg.tx.enabled);
+    }
 
     #[test]
     fn parse_full_yaml() {

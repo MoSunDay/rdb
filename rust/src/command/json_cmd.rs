@@ -7,8 +7,6 @@
 //! and number edits live in `json_str`, array edits in `json_arr`,
 //! object reads in `json_obj`.
 
-use std::sync::Arc;
-
 use rocksdb::WriteBatch;
 use serde_json::Value;
 
@@ -21,7 +19,6 @@ use crate::ds::{expire, json_ds, latch, setops};
 use crate::resp::codec::{
     append_array, append_bulk, append_error, append_int, append_null, append_string,
 };
-use crate::store::ops;
 
 /// A path argument that is not legacy deterministic syntax.
 pub(crate) const ERR_PATH_SYNTAX: &str = "ERR wrong static path";
@@ -90,13 +87,10 @@ pub(crate) async fn save_doc(
         expire_ms,
         &doc_bytes(doc),
     );
-    ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
-        .await
-        .map(|_| true)
-        .unwrap_or_else(|_| {
-            append_error(ctx.out, &format!("ERR: {cmd} failed"));
-            false
-        })
+    ctx.commit(batch).await.map(|_| true).unwrap_or_else(|_| {
+        append_error(ctx.out, &format!("ERR: {cmd} failed"));
+        false
+    })
 }
 
 /// JSON.SET key path value [NX|XX] -> +OK, nil bulk when the condition
@@ -259,10 +253,7 @@ pub async fn json_del(ctx: &mut Ctx<'_>) {
             if segs.is_empty() {
                 let mut batch = WriteBatch::default();
                 json_ds::delete_family(&mut batch, &ctx.prefix_key, &key, expire_ms);
-                if ops::batch_write_async(Arc::clone(&ctx.shared.store), batch)
-                    .await
-                    .is_ok()
-                {
+                if ctx.commit(batch).await.is_ok() {
                     append_int(ctx.out, 1);
                 } else {
                     append_error(ctx.out, "ERR: json.del failed");

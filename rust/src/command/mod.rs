@@ -28,6 +28,7 @@ pub mod set_scan;
 pub mod setops_cmd;
 pub mod string;
 pub mod string_opts;
+pub mod tx_cmd;
 pub mod vectorset_attr;
 pub mod vectorset_cmd;
 pub mod vectorset_sim;
@@ -41,7 +42,15 @@ pub mod zset_scan;
 pub mod zset_util;
 pub mod zsetops_cmd;
 
+use std::panic::AssertUnwindSafe;
+
+use futures::FutureExt;
+
+use crate::hash;
+use crate::resp::codec;
+use crate::router;
 use crate::state;
+use crate::tx::session::ConnState;
 
 /// Per-command execution context (Go rtypes.CommandContext).
 pub struct Ctx<'a> {
@@ -55,6 +64,24 @@ pub struct Ctx<'a> {
     pub out: &'a mut Vec<u8>,
     /// Set by `quit`; the connection layer closes after flushing.
     pub close_conn: bool,
+    /// Connection transaction state (MULTI queue / WATCHes); handlers of
+    /// the transaction control commands mutate it, everything else only
+    /// reads it.
+    pub conn: &'a mut ConnState,
+    /// Whether the command performed a write; the connection layer uses
+    /// this to implicitly UNWATCH after writes outside MULTI.
+    pub wrote: bool,
+}
+
+impl<'a> Ctx<'a> {
+    /// Commit a write batch through the async fsync path. All command
+    /// handlers write through this method (never `ops::batch_write_async`
+    /// directly) so the write is visible to the implicit-UNWATCH rule and,
+    /// during EXEC replays, is covered by the transaction's latches.
+    pub async fn commit(&mut self, batch: rocksdb::WriteBatch) -> Result<(), String> {
+        self.wrote = true;
+        crate::store::ops::batch_write_async(std::sync::Arc::clone(&self.shared.store), batch).await
+    }
 }
 
 /// Boxed handler future: handlers are async because write commands await
@@ -136,6 +163,9 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "xack" => Some(|ctx| Box::pin(crate::lite::ack::xack(ctx))),
         "xgroup" => Some(|ctx| Box::pin(crate::lite::group::xgroup(ctx))),
         "xinfo" => Some(|ctx| Box::pin(crate::lite::info::xinfo(ctx))),
+        "xpending" => Some(|ctx| Box::pin(crate::lite::pending::xpending(ctx))),
+        "xclaim" => Some(|ctx| Box::pin(crate::lite::claim::xclaim(ctx))),
+        "xautoclaim" => Some(|ctx| Box::pin(crate::lite::autoclaim::xautoclaim(ctx))),
         "xpick" => Some(|ctx| Box::pin(crate::lite::info::xpick(ctx))),
         // List family: blocking pops (list_block), moves + LINSERT/LPOS
         // (list_move), reads/writes (list_cmd), pops (list_ops) and
@@ -218,7 +248,147 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "vsetattr" => Some(|ctx| Box::pin(vectorset_attr::vsetattr(ctx))),
         "vgetattr" => Some(|ctx| Box::pin(vectorset_attr::vgetattr(ctx))),
         "vsim" => Some(|ctx| Box::pin(vectorset_sim::vsim(ctx))),
+        "multi" => Some(|ctx| Box::pin(tx_cmd::multi(ctx))),
+        "exec" => Some(|ctx| Box::pin(tx_cmd::exec(ctx))),
+        "discard" => Some(|ctx| Box::pin(tx_cmd::discard(ctx))),
+        "watch" => Some(|ctx| Box::pin(tx_cmd::watch(ctx))),
+        "unwatch" => Some(|ctx| Box::pin(tx_cmd::unwatch(ctx))),
         _ => None,
+    }
+}
+
+/// MOVED reply line for a foreign slot, or `None` when the slot is local.
+pub(crate) fn moved_line(shared: &state::Shared, slot: u16) -> Option<String> {
+    let decision = {
+        let topo = shared.topology.read().unwrap();
+        router::route(
+            slot,
+            &topo.stable_addrs,
+            topo.per_node_slots,
+            &shared.conf.bind,
+        )
+    };
+    match decision {
+        router::RouteDecision::Moved { slot, addr } => Some(router::moved_error_line(slot, &addr)),
+        _ => None,
+    }
+}
+
+fn arity_error(out: &mut Vec<u8>, cmd: &str) {
+    codec::append_error(
+        out,
+        &format!("ERR wrong number of arguments for '{cmd}' command"),
+    );
+}
+
+fn observe(shared: &state::Shared, cmd: &str, is_moved: bool, start: std::time::Instant) {
+    crate::monitor::observe_latency(
+        &shared.monitor,
+        state::mode_label(shared.mode),
+        cmd,
+        is_moved,
+        start.elapsed().as_millis() as f64,
+    );
+}
+
+/// Execute one parsed command post-auth: lookup, slot routing, handler
+/// under the panic net, latency metrics (Go `server.go` dispatch pipeline;
+/// hoisted here so EXEC replays run the exact same path).
+///
+/// Returns whether the command performed a write (`Ctx::wrote`) -- the
+/// connection layer unwatches on writes outside MULTI.
+pub(crate) async fn dispatch(
+    shared: &state::Shared,
+    mut argv: Vec<Vec<u8>>,
+    conn: &mut ConnState,
+    out: &mut Vec<u8>,
+    close: &mut bool,
+) -> bool {
+    let raw0 = String::from_utf8_lossy(&argv[0]);
+    let first = raw0.to_lowercase();
+    let start = std::time::Instant::now();
+
+    let handler = match lookup(&first) {
+        Some(h) => h,
+        // Go: `ERR unknown command '<original case>'`; no latency observed.
+        None => {
+            codec::append_error(out, &format!("ERR unknown command '{raw0}'"));
+            return false;
+        }
+    };
+
+    // Slot routing for non-whitelisted commands.
+    let mut prefix_key: Vec<u8> = Vec::new();
+    if !router::is_whitelisted(&first) {
+        // BREAKING (approved): Go indexed cmd.Args[1] unconditionally, so a
+        // lone command name surfaced as a fabricated runtime-panic reply;
+        // use the Redis-standard arity error instead. No latency sample on
+        // this error path (Go observes only after the handler returns).
+        if argv.len() < 2 {
+            arity_error(out, &first);
+            return false;
+        }
+        let tag = hash::hash_tag(&argv[1]);
+        let (slot, prefix) = hash::slot_with_prefix(tag);
+        prefix_key = prefix;
+        if let Some(line) = moved_line(shared, slot) {
+            codec::append_error(out, &line);
+            observe(shared, &first, true, start);
+            return false;
+        }
+    }
+
+    // Run the handler behind Go's `defer recover()` safety net.
+    let mut ctx = Ctx {
+        shared,
+        prefix_key,
+        args: argv.split_off(1),
+        out,
+        close_conn: false,
+        conn,
+        wrote: false,
+    };
+    let panicked = {
+        AssertUnwindSafe(handler(&mut ctx))
+            .catch_unwind()
+            .await
+            .err()
+    };
+    match panicked {
+        Some(payload) => {
+            codec::append_error(
+                ctx.out,
+                &format!("fatal error: {}", panic_payload(&payload)),
+            );
+            // Reply text is unchanged, but the connection now closes after
+            // the flush: a panicked handler may have desynced the framing,
+            // so keep talking on it is unsafe.
+            *close = true;
+        }
+        // Label order mirrors Go: (mode, lowercase command, was-MOVED). Go
+        // observes after `fn(...)` returns; a panicking handler unwinds past
+        // it, so no late sample is recorded on this error path.
+        None => observe(shared, &first, false, start),
+    }
+
+    if ctx.close_conn {
+        // Go `quit` writes its replies then closes the connection; the flush
+        // happens in the caller before we return.
+        *close = true;
+    }
+    ctx.wrote
+}
+
+/// Panic payload -> human text (Go prints `%v` of the recovered value).
+fn panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(n) = payload.downcast_ref::<i32>() {
+        n.to_string()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -229,12 +399,30 @@ pub(crate) fn test_ctx<'a>(
     args: Vec<Vec<u8>>,
     out: &'a mut Vec<u8>,
 ) -> Ctx<'a> {
+    // Tests never drive MULTI state; a leaked default is fine (one
+    // small struct per call, test-only).
+    let leaked: &'a mut ConnState = Box::leak(Box::new(ConnState::default()));
+    test_ctx_with_conn(shared, prefix_key, args, out, leaked)
+}
+
+/// [`test_ctx`] with explicit per-connection transaction state (the
+/// transaction-command tests drive a real session through it).
+#[cfg(test)]
+pub(crate) fn test_ctx_with_conn<'a>(
+    shared: &'a state::Shared,
+    prefix_key: Vec<u8>,
+    args: Vec<Vec<u8>>,
+    out: &'a mut Vec<u8>,
+    conn: &'a mut ConnState,
+) -> Ctx<'a> {
     Ctx {
         shared,
         prefix_key,
         args,
         out,
         close_conn: false,
+        conn,
+        wrote: false,
     }
 }
 
@@ -256,3 +444,19 @@ mod json_tests;
 #[cfg(test)]
 #[path = "vectorset_tests.rs"]
 mod vectorset_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_payload_strings_and_ints() {
+        fn as_any(b: impl 'static + Send) -> Box<dyn std::any::Any + Send> {
+            Box::new(b)
+        }
+        assert_eq!(panic_payload(&as_any("boom".to_string())), "boom");
+        assert_eq!(panic_payload(&as_any("bang")), "bang");
+        assert_eq!(panic_payload(&as_any(7_i32)), "7");
+        assert_eq!(panic_payload(&as_any(true)), "unknown panic payload");
+    }
+}
