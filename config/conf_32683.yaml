@@ -6,3 +6,6 @@ raft_http_bind_address: 127.0.0.1:12683
 raft_token: "6Mwqjg7TF9jcnF8PRxrq7jK3pG3DZ28fy5guk3Hm264smyftmuhUGtz5mssHfG7Ztg23j4FMb5qmpxdhBusfpevkveyR93eNfx6uv5YEZYyczfdYn4rpKxcRxiXhirik"
 raft_bind_address: 127.0.0.1:22683
 monitor_addr: 127.0.0.1:42683
+# Redis MULTI/EXEC transactions (set enabled: false to reject MULTI)
+tx:
+  enabled: true

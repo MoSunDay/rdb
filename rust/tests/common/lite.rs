@@ -33,6 +33,7 @@ pub fn open_shared(c: &conf::Config, path: &std::path::Path) -> state::Shared {
         latch: rdb::ds::latch::Latch::new(),
         wait_hub: rdb::ds::wait::WaitHub::new(),
         lite: Arc::new(rdb::lite::new_runtime()),
+        sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
         conf: c.clone(),
     }
 }
@@ -53,6 +54,9 @@ pub fn call(shared: &state::Shared, name: &str, args: &[&[u8]]) -> Vec<u8> {
         args: argv,
         out: &mut out,
         close_conn: false,
+        // Tests never drive MULTI state; a leaked default is fine (test-only).
+        conn: Box::leak(Box::new(rdb::tx::session::ConnState::default())),
+        wrote: false,
     };
     tokio::runtime::Builder::new_current_thread()
         .build()
@@ -63,6 +67,18 @@ pub fn call(shared: &state::Shared, name: &str, args: &[&[u8]]) -> Vec<u8> {
 
 pub fn text(reply: &[u8]) -> String {
     String::from_utf8_lossy(reply).into_owned()
+}
+
+/// `[id, consumer, idle, deliveries]` rows of an XPENDING range reply,
+/// tokenized by `\r\n`: row[1]=id, row[3]=consumer, row[4]=":<idle-ms>",
+/// row[5]=":<times-delivered>" (the idle value is wall-clock dependent,
+/// so callers assert it loosely or skip it).
+pub fn pel_rows(reply: &[u8]) -> Vec<Vec<String>> {
+    text(reply)
+        .split("*4\r\n")
+        .skip(1)
+        .map(|row| row.split("\r\n").map(str::to_string).collect())
+        .collect()
 }
 
 /// One RESP array frame.

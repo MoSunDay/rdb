@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use rdb::rcache::fsm::KvMap;
 use rdb::rcache::RdbRaft;
-use rdb::{conf, ds, monitor, rcache, resp, state, store, topology};
+use rdb::{conf, ds, monitor, rcache, resp, sql, state, store, topology};
 
 const TOPOLOGY_KEY: &str = "cluster_slots_stable_instances";
 
@@ -424,6 +424,7 @@ async fn do_main() {
             latch: rdb::ds::latch::Latch::new(),
             wait_hub: rdb::ds::wait::WaitHub::new(),
             lite: std::sync::Arc::new(rdb::lite::new_runtime()),
+            sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
         });
         let listener = match resp::bind(&backup_conf.bind) {
             Ok(l) => l,
@@ -453,6 +454,7 @@ async fn do_main() {
         latch: ds::latch::Latch::new(),
         wait_hub: ds::wait::WaitHub::new(),
         lite: std::sync::Arc::new(rdb::lite::new_runtime()),
+        sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
     });
     // Active expiration loop (data-plane background task; sees the normal
     // listener's store -- the backup listener is read-only by design).
@@ -466,6 +468,19 @@ async fn do_main() {
             std::process::exit(1);
         }
     };
+    // M1: MySQL-protocol SQL frontend on the normal listener's engine
+    // state (empty mysql_bind = disabled; user/password from the same
+    // config, empty user means "root").
+    if !conf.mysql_bind.is_empty() {
+        let listener = match sql::front::bind(&conf.mysql_bind) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::spawn(sql::front::serve(listener, Arc::clone(&shared)));
+    }
     // E1: install signal handling AFTER every listener/task is up; the
     // watcher flushes the Lite offsets and exits 0 (see spawn_signal_shutdown).
     spawn_signal_shutdown(Arc::clone(&shared));

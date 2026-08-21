@@ -24,6 +24,11 @@ pub struct GroupState {
     pub created_ms: u64,
     pub delivered: EntryId,
     pub committed: EntryId,
+    /// Cache-only unacked-pending (PEL) count; NOT part of the persisted
+    /// GroupPayload. Reloaded exactly from the kind-0x0F window on the
+    /// first load after a restart, then maintained by delivery (+n),
+    /// XACK (-n) and XGROUP DELCONSUMER (-k) deltas.
+    pub pending: u64,
 }
 
 /// Cache keys are RAW BYTES `(stream, group)`, never lossy-decoded
@@ -74,6 +79,9 @@ pub fn load(
         return Ok(Some(*st));
     }
     let Some(p) = loaded else { return Ok(None) };
+    // Exact pending backlog after a restart: one PEL scan per group per
+    // process (loads are cached), then deltas keep it exact.
+    let pending = super::pel::count_pend(store, prefix, stream, group).unwrap_or(0);
     let st = GroupState {
         created_ms: p.created_ms,
         delivered: EntryId {
@@ -84,6 +92,7 @@ pub fn load(
             ms: p.committed_ms,
             seq: p.committed_seq,
         },
+        pending,
     };
     write.map.insert(key, st);
     Ok(Some(st))
@@ -133,6 +142,33 @@ pub fn ack(cache: &OffsetCache, stream: &[u8], group: &[u8], ids: &[EntryId]) ->
         write.dirty.insert(key);
     }
     Some(count)
+}
+
+/// Adjust the cached pending backlog of one group (delivery +n, ack
+/// / DELCONSUMER purges -n). Signed so one call site covers both; the
+/// value is a counter, never a watermark -- it must NOT clamp delivery.
+pub fn bump_pending(cache: &OffsetCache, stream: &[u8], group: &[u8], delta: i64) {
+    let mut write = cache.inner.write().unwrap();
+    let key = (stream.to_vec(), group.to_vec());
+    if let Some(st) = write.map.get_mut(&key) {
+        st.pending = if delta >= 0 {
+            st.pending.saturating_add(delta as u64)
+        } else {
+            st.pending.saturating_sub(delta.unsigned_abs())
+        };
+    }
+}
+
+/// Total unacked-pending across every cached group (rdb_lite_backlog).
+pub fn total_pending(cache: &OffsetCache) -> u64 {
+    cache
+        .inner
+        .read()
+        .unwrap()
+        .map
+        .values()
+        .map(|st| st.pending)
+        .sum()
 }
 
 /// XGROUP SETID: reset the whole resume position (operator action),
@@ -241,6 +277,7 @@ mod tests {
                 created_ms: 1,
                 delivered: EntryId { ms: 10, seq: 0 },
                 committed: EntryId { ms: 10, seq: 0 },
+                pending: 0,
             },
         );
         // in-order acks: 2 of 3 beyond the watermark
@@ -285,6 +322,7 @@ mod tests {
                 created_ms: 1,
                 delivered: EntryId { ms: 50, seq: 0 },
                 committed: EntryId { ms: 40, seq: 0 },
+                pending: 0,
             },
         );
         set_position(&c, b"t/q0", b"g", EntryId { ms: 5, seq: 5 });
@@ -307,6 +345,7 @@ mod tests {
                 created_ms: 1,
                 delivered: EntryId { ms: 10, seq: 0 },
                 committed: EntryId { ms: 10, seq: 0 },
+                pending: 0,
             },
         );
         // Flush round A snapshots committed=20; a newer ack (committed=30)
@@ -340,6 +379,7 @@ mod tests {
                 created_ms: 1,
                 delivered: EntryId { ms: 10, seq: 0 },
                 committed: EntryId { ms: 10, seq: 0 },
+                pending: 0,
             },
         );
         // Nothing dirty yet: the peek is empty.

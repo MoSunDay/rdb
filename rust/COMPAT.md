@@ -130,17 +130,43 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
 - **Monitor**: Prometheus text format and metric/label names match Go's collector.
 - **Lite Mode (RocketMQ-style, rdb extension)**: parent topics with dynamic per-group queues
   exposed through Streams-verb commands (XADD/XLEN/XRANGE/XTRIM/XDEL/XIDLE/XREAD/XREADGROUP/
-  XACK/XGROUP/XINFO/XPICK). This is not a Redis Streams emulator:
-  - XREAD/XREADGROUP accept exactly ONE stream (multi-stream syntax is an error).
-  - No PEL: XACK persists the group's committed watermark synchronously (kind-0x0E record,
-    delivered := committed), so a kill -9 restart resumes from the watermark and redelivers
-    only post-watermark entries — at-least-once semantics, not exactly-once.
+  XACK/XGROUP [CREATE|DESTROY|CREATECONSUMER|DELCONSUMER]/XPENDING/XCLAIM/XAUTOCLAIM/
+  XINFO [STREAM|GROUPS|CONSUMERS|TOPICS|LITE]/XPICK). This is not a Redis Streams emulator:
+  - PEL is persisted on the reserved KIND_STREAM_PEND (0x0F) window: pend rows
+    (`group ++ 0x00 ++ id16BE`, id-ordered) plus a consumer registry
+    (`group ++ 0x01 ++ name`); values = expire envelope + JSON
+    `{consumer, delivered_ms, times_delivered}`. Delivery (`XREADGROUP ... >`) writes PEL
+    rows synchronously in one latched WAL batch (same durability as entries) and
+    auto-registers the consumer on first delivery; XACK deletes PEL rows atomically with
+    the watermark persist. A kill -9 restart rewinds delivered to the committed watermark
+    (kind-0x0E record) and redelivers everything still pending — at-least-once semantics;
+    client idempotency is the contract, and the 200ms offset flusher window can only cause
+    redelivery, never loss.
+  - XREAD/XREADGROUP accept balanced multi-stream STREAMS lists (COUNT is a per-stream
+    quota); a blocking all-`>` XREADGROUP parks ONE waiter registered under every
+    `>`-stream meta key (any stream waking it serves the read).
+  - XACK's reply counts WATERMARK advancement, not pending rows removed (an older-than-
+    watermark id still acks `:0` while its PEL row is deleted).
+  - XCLAIM supports only the FORCE / JUSTID options (IDLE/TIME/RETRYCOUNT/LASTID are
+    syntax errors); XAUTOCLAIM returns the Redis>=7 3-element reply (with deleted-ids),
+    COUNT defaults to 100 with a 10x scan cap.
+  - Explicit-id XREADGROUP (any id other than `>`) reads only that consumer's own PEL
+    history from disk; consumer idle times derive from the PEL's delivered_ms (no
+    per-activity tracking).
   - XIDLE sets a per-stream idle TTL reusing the uniform expire envelope; expiry reaps the
     whole stream (entries + group state).
   - XPICK and XINFO TOPICS / XINFO LITE are rdb extensions; a bare parent name in XADD
     auto-picks a queue.
   - Physical slot prefix is derived from the PARENT topic name (CRC16), so all queues of a
     topic family co-locate and any node serves the family (all Lite verbs route-local).
+  - Kafka wire-protocol compatibility was evaluated and explicitly rejected for now: every
+    current MQ gap is engine-level (a protocol swap solves none), a full compat surface is
+    11 wire APIs + an embedded group coordinator + RecordBatch v2 + 4 codecs (months of
+    work), and half-compat would be a trust trap — Kafka clients expect acks=all/ISR/
+    idempotence/transactions over a data plane that is node-local and non-replicated
+    (plain KV included). Engine first; a future optional `kafka front` adapter could map
+    parent/child to topic/partition the way a sql/front would for MySQL. Decision record
+    and living Lite-MQ spec: [features/mq-lite.md](../features/mq-lite.md).
 - **JSON (P3, json.* verbs)**: single-record storage — one kind-0x10 record per key holds the
   whole document (LEB128 expire envelope + compact serde_json body, `preserve_order` keeps
   object key insertion order like Redis). Every mutation deserializes, mutates and re-serializes
@@ -214,6 +240,54 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     (`src/park.rs`), isolated from tokio's shared blocking pool where RocksDB fsyncs run —
     internal change, listed because 512+ concurrent blocking waits no longer stall writes
     (client-visible only as better tail latency).
+
+
+### Transactions: MULTI/EXEC/DISCARD/WATCH/UNWATCH (per-request, optional)
+
+Implemented at the application layer — NOT via RocksDB's
+`OptimisticTransactionDB` (evaluated and rejected: base-store writes
+conflict with open OCC transactions as engine-level `Resource busy`
+failures on the hot path, transactional batches lack `delete_range` for
+family deletes, and staged writes are invisible to command read paths —
+no read-your-writes; see `src/store/rocksdb.rs::occ_engine_evaluation_record`).
+
+Semantics:
+- `MULTI` opens a queue on the connection; commands are validated at
+  QUEUE time and replied `+QUEUED`. Queue-time rejections reply the
+  error immediately AND mark the transaction dirty: unknown command,
+  blocking commands (`BLPOP`/`BZPOPMIN`/`XREAD BLOCK`/...), `MIGRATE`
+  and `RAFT` (cluster admin), arity/MOVED, nested `MULTI`, and
+  `WATCH` inside `MULTI`.
+- Single-slot rule: every key of every queued command must hash to the
+  same slot (first keyed command binds it); violations reply
+  `ERR CROSSSLOT Keys in request don't hash to the same slot` and mark
+  the transaction dirty. Hash tags (`{u}a`, `{u}b`) co-locate as usual.
+- `EXEC`: dirty transactions fail wholesale with
+  `-EXECABORT Transaction discarded because of previous errors.`;
+  otherwise the replies of all queued commands are returned as one
+  array (`*N`), with per-command errors embedded in it (replay
+  continues past single-command errors, Redis-style).
+- Isolation: EXEC acquires the per-key latches of every queued key
+  (byte-sorted, held across the whole replay) — handlers' own latch
+  acquisitions are reentrant no-ops during replay, and all writes land
+  while the latches are held. Watched keys are re-hashed under the
+  latches; any change (including lazy expires performed by other
+  connections' reads) aborts with a null array `*-1`.
+- `WATCH` hashes the key's FULL physical family (raw string + every
+  typed-kind range), so any layout change is detected. Any write
+  executed on the connection outside MULTI implicitly UNWATCHes
+  (including DEL of a missing key; a no-op cannot change any hash).
+- `DISCARD` drops the queue and unwatches; `EXEC` always unwatches.
+- Connection loss drops the transaction with it (state is per-connection).
+- Config: `[tx] enabled` (default `true`); `false` makes `MULTI` reply
+  `ERR transactions are disabled`.
+- Metrics: `rdb_tx_events{event=queued|commits|aborts|conflicts}` and
+  `rdb_tx_commit_latency` histogram.
+
+Deviations vs Redis: commands unknown to this server are rejected at
+queue time (Redis also does); `AUTH` is not queueable (this fork's AUTH
+is a pre-dispatch connection gate); arity is not checked for some
+commands until replay.
 
 ## Runtime verification (this tree)
 

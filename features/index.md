@@ -6,6 +6,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 - [Redis Cluster 协议兼容](./cluster-protocol/index.md)
 - [Raft 控制面与高可用](./raft-ha/index.md)
 - [数据迁移](./migrate/index.md)
+- [Lite MQ（MQ 路线决策 + Streams 动词面规范）](./mq-lite.md)
 
 ## Changelog
 - [changelog](./changelog/)

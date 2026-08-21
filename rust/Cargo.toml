@@ -22,9 +22,17 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # Only used for TCP keepalive on raft sockets; already in the tree via tokio.
 # The "all" feature unlocks `TcpKeepalive::with_retries` (TCP_KEEPCNT).
 socket2 = { version = "0.6", features = ["all"] }
+# MySQL-protocol frontend (M1): shim + SQL parsing + native-password auth.
+opensrv-mysql = { version = "=0.7.0", default-features = false }
+sqlparser = "=0.62.0"
+sha1 = "0.10"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# tests/sql_e2e.rs hand-rolls the mysql_native_password scramble.
+sha1 = "0.10"
+mysql_async = "0.37.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

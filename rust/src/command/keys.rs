@@ -76,6 +76,9 @@ pub async fn del(ctx: &mut Ctx<'_>) {
     }
     let now = ds::expire::now_ms();
     let mut n = 0i64;
+    // DEL is a write command: implicitly UNWATCHes outside MULTI even when
+    // it removes nothing (a no-op cannot change any watched key's hash).
+    ctx.wrote = true;
     for key in &ctx.args {
         match keys_core::delete_records(ctx.shared, &ctx.prefix_key, key, now).await {
             Ok(true) => n += 1,
@@ -124,6 +127,7 @@ async fn expire_common(ctx: &mut Ctx<'_>, cmd: &str, unit_ms: i64, absolute: boo
         (now as i64).saturating_add(n.saturating_mul(unit_ms))
     }
     .max(0) as u64;
+    ctx.wrote = true; // TTL change is a key modification (implicit UNWATCH)
     match keys_core::apply_ttl(ctx.shared, &ctx.prefix_key, &ctx.args[0], new_ms, flag, now).await {
         Ok(changed) => append_int(ctx.out, i64::from(changed)),
         Err(_) => append_error(ctx.out, "ERR: expire failed"),
@@ -184,6 +188,7 @@ pub async fn persist(ctx: &mut Ctx<'_>) {
         return;
     }
     let now = ds::expire::now_ms();
+    ctx.wrote = true; // PERSIST removes a TTL: same modification semantics
     match keys_core::persist_key(ctx.shared, &ctx.prefix_key, &ctx.args[0], now).await {
         Ok(cleared) => append_int(ctx.out, i64::from(cleared)),
         Err(_) => append_error(ctx.out, "ERR: persist failed"),

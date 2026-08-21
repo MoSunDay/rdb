@@ -1,4 +1,5 @@
-//! Introspection: `XINFO` (STREAM / GROUPS / TOPICS / LITE / HELP) and the
+//! Introspection: `XINFO` (STREAM / GROUPS / CONSUMERS / TOPICS / LITE /
+//! HELP) and the
 //! Rust-only `XPICK` queue-selection command.
 //!
 //! Replies are flat arrays of `field, value` pairs (the RESP codec has no
@@ -96,6 +97,80 @@ fn topics_info(ctx: &mut Ctx<'_>, parent: &[u8]) {
     }
 }
 
+/// `XINFO CONSUMERS <stream> <group>`: one flat array per registered
+/// consumer -- name, pending-row count and idle derived from the newest
+/// PEL delivery (Lite has no per-activity tracking: idle counts from the
+/// last delivery/claim, not the last read).
+fn consumers_info(ctx: &mut Ctx<'_>) {
+    let Some((stream, prefix)) = stream_and_prefix(ctx, 1) else {
+        return;
+    };
+    let group = ctx.args[2].clone();
+    if offset::load(
+        &ctx.shared.lite.offsets,
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        &group,
+    )
+    .ok()
+    .flatten()
+    .is_none()
+    {
+        return resp::append_error(
+            ctx.out,
+            &format!(
+                "NOGROUP No such key '{}' or consumer group '{}'",
+                String::from_utf8_lossy(&stream),
+                String::from_utf8_lossy(&group)
+            ),
+        );
+    }
+    let rows = match super::pel::scan_pend(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        &group,
+        model::MIN_ID,
+        None,
+    ) {
+        Ok(rows) => rows,
+        Err(e) => return resp::append_error(ctx.out, &format!("ERR: xinfo failed: {e}")),
+    };
+    // Registry rows keep empty-history consumers visible; PEL rows
+    // provide live pending counts and the freshest delivery time.
+    let mut names: Vec<Vec<u8>> =
+        match super::pel::scan_consumers(&ctx.shared.store, &prefix, &stream, &group) {
+            Ok(consumers) => consumers.into_iter().map(|c| c.name).collect(),
+            Err(e) => return resp::append_error(ctx.out, &format!("ERR: xinfo failed: {e}")),
+        };
+    names.sort();
+    names.dedup();
+    let now = crate::ds::expire::now_ms();
+    resp::append_array(ctx.out, names.len());
+    for name in &names {
+        // Redis reports idle since the LAST interaction; with no
+        // per-activity tracking the freshest PEL delivery is the best
+        // proxy (0 when the consumer has no pending history at all).
+        let (mut pending, mut last_ms, mut seen) = (0u64, 0u64, false);
+        for row in &rows {
+            if &row.state.consumer == name {
+                pending += 1;
+                seen = true;
+                last_ms = last_ms.max(row.state.delivered_ms);
+            }
+        }
+        let idle = if seen { now.saturating_sub(last_ms) } else { 0 };
+        resp::append_array(ctx.out, 6);
+        resp::append_bulk_string(ctx.out, "name");
+        resp::append_bulk(ctx.out, name);
+        resp::append_bulk_string(ctx.out, "pending");
+        resp::append_int(ctx.out, pending as i64);
+        resp::append_bulk_string(ctx.out, "idle");
+        resp::append_int(ctx.out, idle as i64);
+    }
+}
+
 /// `XINFO LITE`: runtime counters (Lite extension).
 fn lite_info(ctx: &mut Ctx<'_>) {
     let s = &ctx.shared.lite.stats;
@@ -127,6 +202,7 @@ fn lite_info(ctx: &mut Ctx<'_>) {
 const HELP: &[&str] = &[
     "XINFO STREAM <stream> -- summary of one stream",
     "XINFO GROUPS <stream> -- consumer groups of one stream",
+    "XINFO CONSUMERS <stream> <group> -- consumers of one group",
     "XINFO TOPICS <parent> -- queues of a Lite parent topic",
     "XINFO LITE -- Lite runtime counters",
     "No help available for subcommand",
@@ -146,6 +222,7 @@ pub async fn xinfo(ctx: &mut Ctx<'_>) {
             }
         }
         b"lite" if ctx.args.len() == 1 => lite_info(ctx),
+        b"consumers" if ctx.args.len() == 3 => consumers_info(ctx),
         b"stream" | b"groups" | b"topics" if ctx.args.len() == 2 => {
             let arg = ctx.args[1].clone();
             match sub.as_slice() {

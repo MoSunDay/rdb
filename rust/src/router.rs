@@ -78,6 +78,16 @@ pub fn is_whitelisted(cmd_lowercase: &str) -> bool {
             | "xgroup"
             | "xinfo"
             | "xpick"
+            | "xpending"
+            | "xclaim"
+            | "xautoclaim"
+            // transaction controls: no keys to route (WATCH is NOT here --
+            // it routes like any keyed command so it can record the key's
+            // slot prefix and honor MOVED)
+            | "multi"
+            | "exec"
+            | "discard"
+            | "unwatch"
     )
 }
 
@@ -303,6 +313,9 @@ mod tests {
             "xgroup",
             "xinfo",
             "xpick",
+            "xpending",
+            "xclaim",
+            "xautoclaim",
         ] {
             assert!(is_whitelisted(c), "{} should be whitelisted", c);
         }

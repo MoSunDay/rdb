@@ -14,15 +14,20 @@
 
 pub mod ack;
 pub mod append;
+pub mod autoclaim;
+pub mod claim;
 pub mod entries;
 pub mod group;
 pub mod info;
 pub mod model;
 pub mod offset;
+pub mod park_wait;
+pub mod pel;
+pub mod pending;
 pub mod read;
 pub mod select;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -90,13 +95,49 @@ pub struct Runtime {
     pub offsets: offset::OffsetCache,
     /// Per-parent round-robin cursors.
     pub picks: Mutex<HashMap<Vec<u8>, u64>>,
+    /// Consumers already registered this process, (stream, group,
+    /// consumer) raw bytes: delivery skips the registry-key rewrite once
+    /// the name is known (the key survives on disk).
+    pub consumers: Mutex<HashSet<pel::ConsumerId>>,
     pub stats: Stats,
+}
+
+impl Runtime {
+    /// First-sight check for the consumer registry: `false` = not yet
+    /// known this process (the caller writes the registry key once),
+    /// `true` = already registered -- and remembered either way.
+    pub fn ensure_consumer(&self, stream: &[u8], group: &[u8], consumer: &[u8]) -> bool {
+        let mut set = self
+            .consumers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.insert((stream.to_vec(), group.to_vec(), consumer.to_vec()))
+    }
+
+    /// Forget one consumer (XGROUP DELCONSUMER).
+    pub fn forget_consumer(&self, stream: &[u8], group: &[u8], consumer: &[u8]) {
+        let mut set = self
+            .consumers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.remove(&(stream.to_vec(), group.to_vec(), consumer.to_vec()));
+    }
+
+    /// Forget every consumer of a group (XGROUP DESTROY wiped its window).
+    pub fn forget_group(&self, stream: &[u8], group: &[u8]) {
+        let mut set = self
+            .consumers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.retain(|(s, g, _)| !(s == stream && g == group));
+    }
 }
 
 pub fn new_runtime() -> Runtime {
     Runtime {
         offsets: offset::new_cache(),
         picks: Mutex::new(HashMap::new()),
+        consumers: Mutex::new(HashSet::new()),
         stats: Stats::default(),
     }
 }
@@ -162,6 +203,12 @@ pub fn spawn_background(shared: Arc<state::Shared>) {
                 &shared.monitor,
                 shared.lite.stats.streams_live.load(Ordering::Relaxed) as f64,
                 shared.lite.stats.streams_reaped.load(Ordering::Relaxed) as f64,
+            );
+            // Unacked-pending backlog across every cached group (exact:
+            // reloaded from the PEL window at first load, then delta-kept).
+            monitor::set_lite_backlog(
+                &shared.monitor,
+                offset::total_pending(&shared.lite.offsets) as f64,
             );
         }
     });
