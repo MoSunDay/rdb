@@ -27,6 +27,8 @@ opensrv-mysql = { version = "=0.7.0", default-features = false }
 sqlparser = "=0.62.0"
 sha1 = "0.10"
 async-trait = "0.1"
+# Chinese word segmentation for the FT.* search tokenizer (embedded dict).
+jieba-rs = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
