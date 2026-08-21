@@ -126,7 +126,7 @@ fn family_delete_ranges_upper_is_never_empty_for_typed_roots() {
 fn classify_raw_vs_typed() {
     assert_eq!(classify(b"abc"), Classification::Raw);
     assert_eq!(classify(b""), Classification::Raw);
-    assert_eq!(classify(&[0x13]), Classification::Raw); // unassigned, >= 0x13
+    assert_eq!(classify(&[0x19]), Classification::Raw); // unassigned, > KIND_ANN_POSTING
     assert_eq!(classify(&[0x20]), Classification::Raw);
     assert_eq!(
         classify(&[KIND_HASH_META, 0, 0, 0, 1]),

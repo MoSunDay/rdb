@@ -43,6 +43,16 @@ pub const KIND_STREAM_PEND: u8 = 0x0F;
 pub const KIND_JSON: u8 = 0x10;
 pub const KIND_VECTORSET_META: u8 = 0x11;
 pub const KIND_VECTORSET_ELEM: u8 = 0x12;
+/// FT.* full-text/search-engine family (`crate::search`): index meta
+/// (schema + corpus stats), per-doc records, inverted postings, term
+/// statistics, ANN centroid table and ANN partition postings. One
+/// family so a single lazy-purge/TTL wipe covers text + vector parts.
+pub const KIND_SEARCH_META: u8 = 0x13;
+pub const KIND_SEARCH_DOC: u8 = 0x14;
+pub const KIND_SEARCH_POSTING: u8 = 0x15;
+pub const KIND_SEARCH_TERMSTAT: u8 = 0x16;
+pub const KIND_ANN_CENTROID: u8 = 0x17;
+pub const KIND_ANN_POSTING: u8 = 0x18;
 /// Never a user-visible type: the active-expiration index record.
 pub const KIND_EXPIRE_INDEX: u8 = 0xFD;
 
@@ -57,9 +67,10 @@ pub const ZSET_FAMILY: CodecFamily = (KIND_ZSET_META, KIND_ZSET_SCORE);
 pub const STREAM_FAMILY: CodecFamily = (KIND_STREAM_META, KIND_STREAM_PEND);
 pub const JSON_FAMILY: CodecFamily = (KIND_JSON, KIND_JSON);
 pub const VECTORSET_FAMILY: CodecFamily = (KIND_VECTORSET_META, KIND_VECTORSET_ELEM);
+pub const SEARCH_FAMILY: CodecFamily = (KIND_SEARCH_META, KIND_ANN_POSTING);
 
 /// Meta/root kinds a user key can exist under (one record = key "exists").
-pub const META_KINDS: [u8; 8] = [
+pub const META_KINDS: [u8; 9] = [
     KIND_STRING_TTL,
     KIND_HASH_META,
     KIND_LIST_META,
@@ -68,6 +79,7 @@ pub const META_KINDS: [u8; 8] = [
     KIND_STREAM_META,
     KIND_JSON,
     KIND_VECTORSET_META,
+    KIND_SEARCH_META,
 ];
 
 /// `true` for kinds that represent a whole user key (raw strings are the
@@ -93,6 +105,8 @@ pub fn family_of(kind: u8) -> Option<CodecFamily> {
         }
         KIND_JSON => JSON_FAMILY,
         KIND_VECTORSET_META | KIND_VECTORSET_ELEM => VECTORSET_FAMILY,
+        KIND_SEARCH_META | KIND_SEARCH_DOC | KIND_SEARCH_POSTING | KIND_SEARCH_TERMSTAT
+        | KIND_ANN_CENTROID | KIND_ANN_POSTING => SEARCH_FAMILY,
         _ => return None,
     };
     Some(family)
@@ -244,7 +258,7 @@ pub fn decode_count(payload: &[u8]) -> u64 {
 
 /// How a physical key (after the slot prefix) reads during iteration.
 ///
-/// Rule: bytes `<= 0x12` or `== 0xFD` are typed records (kind header);
+/// Rule: bytes `<= 0x18` or `== 0xFD` are typed records (kind header);
 /// anything else is a raw string whose user key is the whole remainder.
 ///
 /// COLLISION CAVEAT (accepted breaking change, documented for COMPAT.md):
@@ -260,7 +274,7 @@ pub enum Classification {
 
 pub fn classify(after_prefix: &[u8]) -> Classification {
     match after_prefix.first() {
-        Some(&b) if b <= KIND_VECTORSET_ELEM || b == KIND_EXPIRE_INDEX => Classification::Typed(b),
+        Some(&b) if b <= KIND_ANN_POSTING || b == KIND_EXPIRE_INDEX => Classification::Typed(b),
         _ => Classification::Raw,
     }
 }

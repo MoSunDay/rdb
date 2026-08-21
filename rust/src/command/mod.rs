@@ -248,6 +248,16 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "vsetattr" => Some(|ctx| Box::pin(vectorset_attr::vsetattr(ctx))),
         "vgetattr" => Some(|ctx| Box::pin(vectorset_attr::vgetattr(ctx))),
         "vsim" => Some(|ctx| Box::pin(vectorset_sim::vsim(ctx))),
+        // Search engine (search::ft_cmd / search::ft_search): the index
+        // key is argv[1], so cluster routing/keyspec defaults apply.
+        "ft.create" => Some(|ctx| Box::pin(crate::search::ft_cmd::ft_create(ctx))),
+        "ft.add" => Some(|ctx| Box::pin(crate::search::ft_cmd::ft_add(ctx))),
+        "ft.del" => Some(|ctx| Box::pin(crate::search::ft_cmd::ft_del(ctx))),
+        "ft.drop" => Some(|ctx| Box::pin(crate::search::ft_cmd::ft_drop(ctx))),
+        "ft.dropindex" => Some(|ctx| Box::pin(crate::search::ft_cmd::ft_drop(ctx))),
+        "ft.build" => Some(|ctx| Box::pin(crate::search::ft_cmd::ft_build(ctx))),
+        "ft.info" => Some(|ctx| Box::pin(crate::search::ft_cmd::ft_info(ctx))),
+        "ft.search" => Some(|ctx| Box::pin(crate::search::ft_search::ft_search(ctx))),
         "multi" => Some(|ctx| Box::pin(tx_cmd::multi(ctx))),
         "exec" => Some(|ctx| Box::pin(tx_cmd::exec(ctx))),
         "discard" => Some(|ctx| Box::pin(tx_cmd::discard(ctx))),

@@ -15,6 +15,7 @@ pub mod rcache;
 pub mod resp;
 pub mod router;
 pub mod rtypes;
+pub mod search;
 pub mod sql;
 pub mod state;
 pub mod store;
