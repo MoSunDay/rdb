@@ -13,7 +13,8 @@
 9. - [x] 支持简单的数据迁移
 10. - [x] 支持 `Raft` 与 `Redis Client` 的身份验证
 11. - [] 支持无损数据迁移
-12. - [] 进一步的性能优化
+12. - [x] MySQL 协议接入的分布式 SQL 数据面（MVCC 快照隔离事务、二级/唯一索引、raft 全局时间戳、跨节点 2PC 与 scatter-gather，见 `rust/`）
+13. - [] 进一步的性能优化
 
 #### Benchmark
 `3` 个 `rdb` 实例组成的集群以及压力发生器「redis-benchmark」在同一台服务器上运行，机器为 `DELL XPS`
