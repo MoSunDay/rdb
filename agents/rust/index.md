@@ -35,6 +35,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `keys*.rs`：TYPE/EXISTS/DEL/UNLINK/EXPIRE 族（NX/XX/GT/LT）/TTL/PTTL/PERSIST/SCAN/KEYS/RANDOMKEY/RENAME(NX)（核心状态 `keys_core.rs`，游标类 `keys_scan.rs`）；
   - `json_*.rs`：JSON 全命令（RedisJSON v1 legacy 路径：`$`/`.f`/`['f']`/`[i]`，无通配符）——`json_path.rs` 路径解析与 Value 导航（get/set/remove，字段自动建、数组 len 处追加）、`json_cmd.rs` SET(NX/XX)/GET/DEL/FORGET/TYPE/MGET、`json_str.rs` STRAPPEND/STRLEN/NUMINCRBY、`json_arr.rs` ARRAPPEND/ARRPOP/ARRINDEX/ARRINSERT/ARRLEN/ARRTRIM、`json_obj.rs` OBJKEYS/OBJLEN；多路径 GET 返回扁平数组（偏差见 COMPAT.md）。
   - `vectorset_*.rs`：VectorSet 全命令——`vectorset_cmd.rs` VADD（FP16 blob/VALUES 文本，重加保属性回 0）/VREM/VCARD/VDIM、`vectorset_attr.rs` VSETATTR/VGETATTR、`vectorset_sim.rs` VSIM（暴力 cosine，score=(cos+1)/2，COUNT/WITHSCORES/WITHATTRIBS）；偏差见 COMPAT.md（无 HNSW/EF/FILTER）。
+  - `search/`（`src/search/`，Rust 独有）：FT.* 搜索引擎——`ft_cmd.rs` CREATE/ADD/DEL/DROP/INFO/BUILD、`ft_search.rs` 查询执行（BM25 文本 + KNN 探测重排）；`tokenize.rs` jieba+bigram 混合分词（索引/查询同源）、`bm25.rs` 打分与 TopK、`index_codec.rs` 记录编解码、`ft_index.rs` 增删批构建、`ann.rs` k-means/分区/KNN、`vecmath.rs`/`quant.rs` SQ8 标定与向量数学（VSIM 复用）；偏差与命令面见 COMPAT.md「Full-text + vector search」。
   - `hash_*.rs`：Hash 全命令——`hash_cmd.rs` 写/读、`hash_scan.rs` HGETALL/HKEYS/HVALS/HSCAN/HRANDFIELD、`hash_incr.rs` HINCRBY/HINCRBYFLOAT；
   - `set_*.rs`：Set 全命令——`set_cmd.rs`、`set_scan.rs` SSCAN/SRANDMEMBER、`setops_cmd.rs` SDIFF/SINTER/SUNION（±STORE）；
   - `mod.rs` 注册表为 async（`Handler -> HandlerFuture`，140 个命令），多 key 命令做 CROSSSLOT 校验。
@@ -54,7 +55,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `codec.rs`：typed 物理编码——`<slot>/<kind:u8><u32 BE key_len><key><suffix>`；kind 0x00 为 raw string（无信封，零开销）；其余 value = LEB128 `expire_ms` 信封 + payload；`0xFD` 过期索引键；`family_delete_ranges` 整键族删除（测试外置 `codec_tests.rs`）；
   - `expire.rs`：全类型统一 TTL——读路径惰性判定 + `spawn_active_expire` 后台采样清理（`main.rs` 装配）；
   - `latch.rs`：用户键分片读写锁（读改写串行化）；`wait.rs`：阻塞命令 WaitHub（BLPOP 族备用）；
-  - `hash_ds.rs`/`set_ds.rs`/`setops.rs`：Hash/Set 的派生键读写与集合代数；`json_ds.rs`：JSON 单记录存取（kind 0x10，整文档 envelope+compact body，preserve_order 保序）。`vectorset_ds.rs`：向量集双记录存取（meta=kind 0x11 存 LEB128 dim/count，elem=kind 0x12 存 dim×f64 LE 向量+LEB128 长度前缀属性）与手写 FP16→f64 解码。
+  - `hash_ds.rs`/`set_ds.rs`/`setops.rs`：Hash/Set 的派生键读写与集合代数；`json_ds.rs`：JSON 单记录存取（kind 0x10，整文档 envelope+compact body，preserve_order 保序）。`vectorset_ds.rs`：向量集双记录存取（meta=kind 0x11 存 LEB128 dim/count，elem=kind 0x12 存 dim×f64 LE 向量+LEB128 长度前缀属性）与手写 FP16→f64 解码。`search` 家族 kind 0x13–0x18（meta/doc/posting/termstat/ann_centroid/ann_posting，单键族整删）。
 - `router.rs`：MOVED 路由纯函数（`slot <= (index+1)*per_node_slots`，保留 Go 越界本地兜底）、白名单判断。
 - `hash.rs`：CRC-16/XMODEM（与 Go `crc16tab` 同表）与 hash tag 解析。
 - `state.rs`：`Shared`/`RaftState` 共享状态、apply loop（`spawn_apply_loop`，5s apply 超时对齐 Go）、openraft metrics → leader 状态同步。
@@ -82,7 +83,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `raft_cluster_e2e.rs`：bootstrap + HTTP join/depart 的两节点集群；
   - `raft_transport.rs`：双节点复制，覆盖 install-snapshot 路径；
   - `ha_failover.rs`：`backup_target_map` 故障切换与恢复；
-  - `ds_e2e.rs` / `expire_e2e.rs` / `hash_set_e2e.rs`：数据结构 e2e——信封 roundtrip、主动过期采样、EXPIRE 族/TTL 持久化、Hash/Set 全命令生命周期与 CROSSSLOT；`list_e2e.rs` / `zset_e2e.rs`：List/ZSet 全命令生命周期、LREM compaction、TTL 惰性清理、ZSCAN 游标、BLPOP/BZPOPMIN 跨连接唤醒与超时（含丢失唤醒回归用例）；`json_e2e.rs`：JSON 全命令生命周期（SET/GET 字节稳定、嵌套导航、ARR/OBJ 族、TTL 保持与惰性清理、MGET+CROSSSLOT）；`vectorset_e2e.rs`：VectorSet 全命令生命周期（VADD 两种向量形态、VSIM 召回排序与 score 格式、属性增改查、VREM 清空、TTL 交互）；
+  - `ds_e2e.rs` / `expire_e2e.rs` / `hash_set_e2e.rs`：数据结构 e2e——信封 roundtrip、主动过期采样、EXPIRE 族/TTL 持久化、Hash/Set 全命令生命周期与 CROSSSLOT；`list_e2e.rs` / `zset_e2e.rs`：List/ZSet 全命令生命周期、LREM compaction、TTL 惰性清理、ZSCAN 游标、BLPOP/BZPOPMIN 跨连接唤醒与超时（含丢失唤醒回归用例）；`json_e2e.rs`：JSON 全命令生命周期（SET/GET 字节稳定、嵌套导航、ARR/OBJ 族、TTL 保持与惰性清理、MGET+CROSSSLOT）；`vectorset_e2e.rs`：VectorSet 全命令生命周期（VADD 两种向量形态、VSIM 召回排序与 score 格式、属性增改查、VREM 清空、TTL 交互）；`search_e2e.rs`：FT.* 全链路——文本 BM25 排序/中文命中/替换/删除/DROP、KNN 暴力→SPANN 构建→预过滤、索引键 TTL 整族清理；
   - `process_cluster_e2e.rs` / `process_failover_e2e.rs` / `process_metrics_e2e.rs` / `process_sigterm_e2e.rs`：进程级 e2e——`CARGO_BIN_EXE_rdb` 拉起真实二进制 + 临时 yaml 组 3 节点集群，断言协议应答原文（`-ERR: NOAUTH`、`-MOVED <slot> <addr>`、kill -9 后新 leader 选主、RocksDB 重启回读）、HTTP /depart 活节点 + 重 join 与 MIGRATE task/list 正/错路径、七数据家族 kill -9 存活、真实进程 scrape `/metrics`（`rdb_command_latency`/`raft_stats`）、SIGTERM/SIGINT 优雅停机（退出码 0 + Lite offset 水位已刷）；公共工具在 `tests/common/mod.rs`；
   - `string_e2e.rs`：SET 全选项矩阵（NX/XX/EX/PX/EXAT/PXAT/KEEPTTL/GET 与语法错）+ MSET/MGET + CROSSSLOT。
 - 集成测试统一用 `tempfile` 临时目录与临时端口（端口 0），无固定端口依赖。

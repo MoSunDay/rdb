@@ -289,6 +289,35 @@ queue time (Redis also does); `AUTH` is not queueable (this fork's AUTH
 is a pre-dispatch connection gate); arity is not checked for some
 commands until replay.
 
+
+## Full-text + vector search (FT.*, Rust-only)
+
+The Go archive has no search engine; the Rust tree ships one on the typed-record
+data plane (kinds `0x13`-`0x18`, one physical family, so index-key TTL purges
+docs, postings, term stats, centroids and ANN partitions together).
+
+- Commands: `FT.CREATE <idx> SCHEMA <f> TEXT | <f> VECTOR DIM <n>` (at most one
+  VECTOR field), `FT.ADD <idx> <docid> <json>` (add/replace, one fsync),
+  `FT.DEL <idx> <docid>`, `FT.DROP`/`FT.dropindex`, `FT.INFO`, `FT.BUILD [K n]
+  [ITERS n] [SEED n]`, `FT.SEARCH <idx> <query> [LIMIT o c] [WITHSCORES]
+  [NOCONTENT] [NPROBE n] [KNN k <field> FP16 <blob>|VALUES v...]`.
+- Tokenizer (index and query sides are identical by construction): Latin
+  alphanumeric runs lowercased; Han runs cut by jieba (embedded dict + HMM),
+  dictionary misses fall back to overlapping bigrams (the CJKAnalyzer trick);
+  an isolated single character emits itself.
+- Text ranking: BM25 (Lucene idf `ln(1+(n-df+0.5)/(df+0.5))`, K1=1.2, B=0.75),
+  terms AND-ed within a query, ties broken by docid ascending.
+- Vectors: SQ8 quantization (per-dimension min/scale, field-global calibration)
+  plus k-means centroids in a SPANN-style partition layout. `FT.BUILD` retrains
+  and repartitions; KNN probes `nprobe` nearest partitions and reranks on
+  dequantized vectors, score = `1/(1+L2)`. Without a trained table KNN
+  degrades to exact brute force. A `@field:term` query before `KNN`
+  prefilters candidates by text match (exact vectors, no SQ8 error).
+- Cross-node: an index lives on the slot of its key; non-local requests get
+  `MOVED` like any other command. Cross-index queries are client fan-out —
+  there is no distributed query planner. `FT.SEARCH` replies are node-local:
+  `:N` then per hit docid [, score] [, original JSON].
+
 ## Runtime verification (this tree)
 
 - Full RESP drill (gate text, cluster init/nodes, MOVED format+routing, hash-tag co-location,

@@ -12,20 +12,12 @@ use crate::command::zset_util::eq_ignore_case;
 use crate::command::Ctx;
 use crate::ds::{expire, vectorset_ds};
 use crate::resp::codec::{append_array, append_bulk, append_error, append_null};
+use crate::search::vecmath;
 
-/// Cosine similarity of two equal-length vectors; a zero vector has no
-/// direction, so any pair touching one scores 0 (-> VSIM score 0.5).
+/// Cosine similarity lives in `search::vecmath` (shared with the FT.* KNN
+/// path): zero vector -> 0 (-> VSIM score 0.5), result clamped to [-1, 1].
 fn cosine(a: &[f64], b: &[f64]) -> f64 {
-    let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
+    vecmath::cosine(a, b)
 }
 
 /// VSIM key [COUNT n] [WITHSCORES] [WITHATTRIBS] (FP16 <blob> |
