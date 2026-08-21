@@ -21,6 +21,15 @@ pub enum ErrorCode {
     WrongValueCount,
     NotSupported,
     AccessDenied,
+    /// Another transaction committed a newer version of a key this
+    /// transaction also wrote (first committer wins).
+    WriteConflict,
+    /// DDL attempted while an explicit transaction is open.
+    TxnDdl,
+    /// A scatter-gather read could not reach a cluster node. Fails the
+    /// whole query (v1 never serves partial results); HA failover of
+    /// SQL reads is future work.
+    NodeUnreachable,
     Unknown,
 }
 
@@ -61,6 +70,12 @@ impl SqlError {
             ErrorCode::WrongValueCount => ErrorKind::ER_WRONG_VALUE_COUNT_ON_ROW,
             ErrorCode::NotSupported => ErrorKind::ER_NOT_SUPPORTED_YET,
             ErrorCode::AccessDenied => ErrorKind::ER_ACCESS_DENIED_ERROR,
+            // 1027 (ER_FILE_USED): reads must not silently degrade to
+            // partial results when a band owner cannot be reached.
+            ErrorCode::NodeUnreachable => ErrorKind::ER_FILE_USED,
+            // 1213: the MySQL serialization-failure error clients retry on.
+            ErrorCode::WriteConflict => ErrorKind::ER_LOCK_DEADLOCK,
+            ErrorCode::TxnDdl => ErrorKind::ER_NOT_SUPPORTED_YET,
             ErrorCode::Unknown => ErrorKind::ER_UNKNOWN_ERROR,
         }
     }

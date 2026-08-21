@@ -115,6 +115,8 @@ fn materialize_single_table_reads_catalog() {
             alias: Some("x".into()),
         },
         5,
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(src.rows, vec![row_of(1, "a"), row_of(2, "b")]);
@@ -130,6 +132,8 @@ fn materialize_single_table_reads_catalog() {
             alias: None,
         },
         5,
+        None,
+        None,
     );
     assert!(missing.is_err());
 }
@@ -162,7 +166,7 @@ fn materialize_nested_loop_join_with_on() {
     let crate::sql::parse::ast::Statement::Select(q) = parsed else {
         panic!("shape")
     };
-    let src = materialize(&shared, &q.from, 10).unwrap();
+    let src = materialize(&shared, &q.from, 10, None, None).unwrap();
     assert_eq!(src.rows.len(), 2); // both o-rows match u.id=1
     assert_eq!(src.scope.row_width(), 3);
     assert_eq!(src.scope.resolve(Some("u"), "id"), Some(0));
@@ -180,7 +184,7 @@ fn materialize_nested_loop_join_with_on() {
         }),
         on: None,
     };
-    let src = materialize(&shared, &cross, 10).unwrap();
+    let src = materialize(&shared, &cross, 10, None, None).unwrap();
     assert_eq!(src.rows.len(), 4);
 }
 

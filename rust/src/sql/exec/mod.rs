@@ -17,6 +17,7 @@ pub mod write;
 use crate::sql::parse::ast::Statement;
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::schema::SqlType;
+use crate::sql::tx;
 use crate::state::Shared;
 
 /// Result column metadata (name + wire type) for row-producing statements.
@@ -40,11 +41,14 @@ pub enum ExecOutcome {
     Ok,
 }
 
-/// Per-connection SQL session state (USE target; M2 adds the open
-/// snapshot). One instance lives in the frontend shim per connection.
+/// Per-connection SQL session state (USE target + the open explicit
+/// transaction). One instance lives in the frontend shim per connection.
 #[derive(Debug, Default, Clone)]
 pub struct SqlSession {
     pub db: String,
+    /// Open BEGIN..COMMIT/ROLLBACK transaction, if any: a pinned
+    /// snapshot plus the staged write set (see [`crate::sql::tx`]).
+    pub txn: Option<crate::sql::tx::Txn>,
 }
 
 /// Execute one statement against the shared engine state.
@@ -69,26 +73,62 @@ async fn dispatch(
     sess: &mut SqlSession,
     stmt: Statement,
 ) -> SqlResult<ExecOutcome> {
+    // DDL mutates the raft-replicated catalog; refusing it inside an
+    // open transaction keeps snapshot reads consistent with the schema
+    // they were planned against.
+    if sess.txn.is_some()
+        && matches!(
+            stmt,
+            Statement::CreateTable { .. }
+                | Statement::DropTable { .. }
+                | Statement::CreateIndex { .. }
+                | Statement::DropIndex { .. }
+        )
+    {
+        return Err(SqlError::new(
+            ErrorCode::TxnDdl,
+            "DDL not allowed inside a transaction".to_string(),
+        ));
+    }
     match stmt {
+        Statement::Begin => {
+            // MySQL semantics: BEGIN implicitly commits any open txn.
+            if let Some(txn) = sess.txn.take() {
+                tx::commit(shared, txn).await?;
+            }
+            sess.txn = Some(tx::begin(&shared.sql_ts));
+            Ok(ExecOutcome::Ok)
+        }
+        Statement::Commit => match sess.txn.take() {
+            Some(txn) => {
+                tx::commit(shared, txn).await?;
+                Ok(ExecOutcome::Ok)
+            }
+            None => Ok(ExecOutcome::Ok),
+        },
+        Statement::Rollback => {
+            if let Some(txn) = sess.txn.take() {
+                tx::rollback(&shared.sql_ts, txn);
+            }
+            Ok(ExecOutcome::Ok)
+        }
         Statement::CreateTable { .. } | Statement::DropTable { .. } => ddl::run(shared, stmt).await,
         Statement::CreateIndex { .. } | Statement::DropIndex { .. } => ddl::run(shared, stmt).await,
-        Statement::Insert { .. } => write::insert(shared, stmt).await,
-        Statement::Update { .. } => write::update(shared, stmt).await,
-        Statement::Delete { .. } => write::delete(shared, stmt).await,
+        Statement::Insert { .. } => write::insert(shared, sess, stmt).await,
+        Statement::Update { .. } => write::update(shared, sess, stmt).await,
+        Statement::Delete { .. } => write::delete(shared, sess, stmt).await,
         Statement::Select(q) => {
             let (columns, rows) = select::run(shared, sess, q).await?;
             Ok(ExecOutcome::Rows { columns, rows })
         }
-        Statement::Explain(inner) => select::explain(&inner),
-        Statement::ShowTables | Statement::ShowColumns(_) => show::run(shared, sess, &stmt),
+        Statement::Explain(inner) => select::explain(shared, &inner),
+        Statement::ShowTables | Statement::ShowColumns(_) | Statement::ShowIndexes(_) => {
+            show::run(shared, sess, &stmt)
+        }
         Statement::Use(db) => {
             sess.db = db;
             Ok(ExecOutcome::Ok)
         }
         Statement::SetIgnored => Ok(ExecOutcome::Ok),
-        Statement::Begin | Statement::Commit | Statement::Rollback => Err(SqlError::new(
-            ErrorCode::NotSupported,
-            "explicit transactions are not supported yet (autocommit only)".to_string(),
-        )),
     }
 }

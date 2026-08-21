@@ -42,6 +42,18 @@ pub fn membership_mux() -> MembershipMux {
 
 /// Go `http.DefaultMaxHeaderBytes`.
 const MAX_HEAD_BYTES: usize = 1 << 20;
+
+/// M3: late-bound handle to the data store behind `/sql2pc/status`.
+/// The control API binds (and starts answering) before the normal
+/// listener's store opens, so the slot starts empty and main fills it
+/// once the store is up; an empty slot keeps the pre-M3 route set (the
+/// route answers the plain 404).
+pub type StoreSlot = Arc<std::sync::RwLock<Option<Arc<crate::store::Store>>>>;
+
+/// A fresh empty store slot.
+pub fn store_slot() -> StoreSlot {
+    Arc::new(std::sync::RwLock::new(None))
+}
 /// Read deadline for one request head; the Go server has none, but a
 /// stalled client must not pin a task forever.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -59,25 +71,40 @@ pub async fn serve(
     kv: KvMap,
     token: String,
     mux: MembershipMux,
+    ts: Option<Arc<crate::sql::tx::ClusterTs>>,
+    store: StoreSlot,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    serve_on(listener, raft, kv, token, mux).await
+    serve_on(listener, raft, kv, token, mux, ts, store).await
 }
 
 /// Serve on an already bound listener (tests use ephemeral ports).
+/// `ts` is the M3 cluster timestamp core serving `/sql/ts` (None keeps
+/// the pre-M3 route set: the route answers the plain 404); `store` is
+/// the M3 slot backing `/sql2pc/status` (same None semantics).
 pub async fn serve_on(
     listener: TcpListener,
     raft: Arc<RdbRaft>,
     kv: KvMap,
     token: String,
     mux: MembershipMux,
+    ts: Option<Arc<crate::sql::tx::ClusterTs>>,
+    store: StoreSlot,
 ) -> io::Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let (raft, kv, token, mux) = (raft.clone(), kv.clone(), token.clone(), mux.clone());
+                let (raft, kv, token, mux, ts, store) = (
+                    raft.clone(),
+                    kv.clone(),
+                    token.clone(),
+                    mux.clone(),
+                    ts.clone(),
+                    store.clone(),
+                );
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, &raft, &kv, &token, &mux).await {
+                    if let Err(e) = handle_conn(stream, &raft, &kv, &token, &mux, &ts, &store).await
+                    {
                         if e.kind() != io::ErrorKind::UnexpectedEof {
                             eprintln!("rcache http: connection failed: {e}");
                         }
@@ -96,6 +123,8 @@ async fn handle_conn(
     kv: &KvMap,
     token: &str,
     mux: &MembershipMux,
+    ts: &Option<Arc<crate::sql::tx::ClusterTs>>,
+    store: &StoreSlot,
 ) -> io::Result<()> {
     let (head, _rest) = read_head(&mut stream).await?;
     let Some(target) = request_target(&head) else {
@@ -110,6 +139,14 @@ async fn handle_conn(
         "/get" => ("200 OK", do_get(kv, token, &params)),
         "/join" => do_join(raft, mux, token, &params).await,
         "/depart" => do_depart(raft, mux, token, &params).await,
+        // M3: timestamp block leases (leader-only inside the handler).
+        "/sql/ts" => crate::sql::tx::global::route_sql_ts(ts.as_ref(), token, &params).await,
+        // M3: follower bind registration forwarded to the leader.
+        "/sql/nodes" => crate::sql::tx::nodes::route_register(ts.as_ref(), token, &params).await,
+        // M3: 2PC outcome inquiry (recovery + coordinator retry).
+        "/sql2pc/status" => {
+            crate::sql::dist::recover::route_status(store.read().unwrap().as_ref(), token, &params)
+        }
         // Go http.ServeMux plain 404.
         _ => ("404 Not Found", "404 page not found\n".to_string()),
     };
@@ -222,7 +259,7 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 /// Go `url.Values.Get`: first value of the key, "" when absent.
-fn first_param<'a>(params: &'a [(String, String)], key: &str) -> &'a str {
+pub(crate) fn first_param<'a>(params: &'a [(String, String)], key: &str) -> &'a str {
     params
         .iter()
         .find(|(k, _)| k == key)

@@ -127,6 +127,8 @@ mod tests {
             Statement::DropIndex { .. }
         ));
         assert!(matches!(stmt("BEGIN"), Statement::Begin));
+        assert!(matches!(stmt("BEGIN WORK"), Statement::Begin));
+        assert!(matches!(stmt("START TRANSACTION"), Statement::Begin));
         assert!(matches!(stmt("COMMIT"), Statement::Commit));
         assert!(matches!(stmt("ROLLBACK"), Statement::Rollback));
         assert!(matches!(stmt("USE mydb"), Statement::Use(_)));

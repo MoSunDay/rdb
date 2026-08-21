@@ -17,6 +17,7 @@ use opensrv_mysql::{
     QueryResultWriter, StatementMetaWriter,
 };
 use tokio::io::AsyncWrite;
+use tokio::sync::Mutex;
 
 use crate::sql::exec::{self, ExecOutcome, SqlSession};
 use crate::sql::front::{auth, conv, vars};
@@ -38,8 +39,10 @@ pub struct SqlShim<W> {
     shared: Arc<Shared>,
     user: String,
     password: String,
-    /// USE target and (M2) the open snapshot.
-    sess: SqlSession,
+    /// USE target and the open explicit transaction. Behind an Arc so
+    /// the connection runner can still release the txn snapshot after
+    /// the packet loop ends (the intermediary consumes the shim).
+    sess: Arc<Mutex<SqlSession>>,
     /// Client-assigned id -> parsed-but-unbound statement.
     prepared: HashMap<u32, Statement>,
     next_id: u32,
@@ -57,12 +60,20 @@ pub fn new_shim<W>(shared: Arc<Shared>, user: String, password: String, seed: u6
         shared,
         user,
         password,
-        sess: SqlSession::default(),
+        sess: Arc::new(Mutex::new(SqlSession::default())),
         prepared: HashMap::new(),
         next_id: 1,
         salt: auth::salt_from_seed(seed),
         id: (seed as u32) | 1,
         _ph: PhantomData,
+    }
+}
+
+impl<W> SqlShim<W> {
+    /// Handle to the session outliving the packet loop (the connection
+    /// runner uses it for disconnect cleanup).
+    pub fn session_handle(&self) -> Arc<Mutex<SqlSession>> {
+        Arc::clone(&self.sess)
     }
 }
 
@@ -112,7 +123,10 @@ where
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        let out = run_statement(&self.shared, &mut self.sess, query).await;
+        let out = {
+            let mut sess = self.sess.lock().await;
+            run_statement(&self.shared, &mut sess, query).await
+        };
         write_outcome(results, out).await
     }
 
@@ -175,7 +189,10 @@ where
             results.error(e.kind(), e.msg.as_bytes()).await?;
             return Ok(());
         }
-        let out = exec::execute(&self.shared, &mut self.sess, stmt).await;
+        let out = {
+            let mut sess = self.sess.lock().await;
+            exec::execute(&self.shared, &mut sess, stmt).await
+        };
         write_outcome(results, out).await
     }
 
@@ -188,7 +205,7 @@ where
         db: &'a str,
         w: InitWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        self.sess.db = db.to_string();
+        self.sess.lock().await.db = db.to_string();
         w.ok().await
     }
 }

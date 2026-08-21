@@ -55,6 +55,8 @@ pub enum Statement {
     Use(String),
     ShowTables,
     ShowColumns(String),
+    /// SHOW INDEX FROM <table> (sqlparser parses it as ShowVariable).
+    ShowIndexes(String),
     /// SET ...: accepted and ignored (no session variables in v1).
     SetIgnored,
 }

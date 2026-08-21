@@ -130,10 +130,13 @@ fn agg_name(f: &crate::sql::parse::ast::AggFunc) -> &'static str {
     }
 }
 
-/// One row per plan line: the whole EXPLAIN resultset.
-pub fn explain(stmt: &Statement) -> SqlResult<ExecOutcome> {
+/// One row per plan line: the whole EXPLAIN resultset. `headline` is
+/// the storage-aware access verdict computed by the caller (planner
+/// index choice, scatter-gather banner); empty means "no verdict" and
+/// renders as the default SeqScan line.
+pub fn explain(stmt: &Statement, headline: Vec<String>) -> SqlResult<ExecOutcome> {
     let lines = match stmt {
-        Statement::Select(q) => explain_select(q),
+        Statement::Select(q) => explain_select(q, headline),
         other => vec![format!("Direct execution ({})", other.metric_kind())],
     };
     Ok(ExecOutcome::Rows {
@@ -146,8 +149,12 @@ pub fn explain(stmt: &Statement) -> SqlResult<ExecOutcome> {
     })
 }
 
-fn explain_select(q: &Query) -> Vec<String> {
-    let mut lines = vec![format!("SeqScan {}", from_display(&q.from))];
+fn explain_select(q: &Query, headline: Vec<String>) -> Vec<String> {
+    let mut lines = if headline.is_empty() {
+        vec![format!("SeqScan {}", from_display(&q.from))]
+    } else {
+        headline
+    };
     let mut ons = Vec::new();
     collect_join_ons(&q.from, &mut ons);
     for on in ons {
@@ -213,7 +220,8 @@ fn explain_select(q: &Query) -> Vec<String> {
     lines
 }
 
-fn from_display(t: &TableRef) -> String {
+/// FROM rendering shared with the EXPLAIN headline builders.
+pub(crate) fn from_display(t: &TableRef) -> String {
     match t {
         TableRef::Table { name, alias } => match alias {
             Some(a) => format!("{name} AS {a}"),
@@ -294,7 +302,7 @@ mod tests {
             Statement::Explain(inner) => *inner,
             other => other,
         };
-        let ExecOutcome::Rows { rows, .. } = explain(&inner).expect("explain") else {
+        let ExecOutcome::Rows { rows, .. } = explain(&inner, Vec::new()).expect("explain") else {
             panic!("rows");
         };
         rows.into_iter()
@@ -329,13 +337,52 @@ mod tests {
 
         // Non-SELECT statements plan as one direct-execution row.
         let stmt = parse_statement("INSERT INTO t (a) VALUES (1)").unwrap();
-        let ExecOutcome::Rows { rows, .. } = explain(&stmt).expect("explain") else {
+        let ExecOutcome::Rows { rows, .. } = explain(&stmt, Vec::new()).expect("explain") else {
             panic!("rows");
         };
         assert_eq!(
             rows[0][0],
             Value::Str("Direct execution (insert)".to_string())
         );
+    }
+
+    #[test]
+    fn explain_renders_multi_line_headline_in_order() {
+        // Scatter-gather plans: the Gather banner rides ABOVE the
+        // per-band SeqScan line, exactly as the caller ordered them.
+        let inner = match parse_statement("SELECT id FROM t").unwrap() {
+            Statement::Explain(i) => *i,
+            other => other,
+        };
+        let ExecOutcome::Rows { rows, .. } = explain(
+            &inner,
+            vec!["Gather(bands=3)".to_string(), "SeqScan t".to_string()],
+        )
+        .unwrap() else {
+            panic!("rows");
+        };
+        assert_eq!(rows[0][0], Value::Str("Gather(bands=3)".to_string()));
+        assert_eq!(rows[1][0], Value::Str("SeqScan t".to_string()));
+    }
+
+    #[test]
+    fn explain_replaces_headline_with_the_access_line() {
+        // The planner verdict (computed by the caller, storage-aware)
+        // overrides the default SeqScan headline; the rest is unchanged.
+        let inner = match parse_statement("SELECT id FROM t WHERE v = 'red'").unwrap() {
+            Statement::Explain(i) => *i,
+            other => other,
+        };
+        let ExecOutcome::Rows { rows, .. } =
+            explain(&inner, vec!["IndexScan idx_v -> 2 pks".to_string()]).unwrap()
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            rows[0][0],
+            Value::Str("IndexScan idx_v -> 2 pks".to_string())
+        );
+        assert_eq!(rows[1][0], Value::Str("Filter: v = 'red'".to_string()));
     }
 
     #[test]

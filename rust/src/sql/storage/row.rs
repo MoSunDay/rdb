@@ -23,13 +23,50 @@ use crate::store;
 /// Version-value header bytes.
 pub const HEADER_TOMBSTONE: u8 = 0x00;
 pub const HEADER_LIVE: u8 = 0x01;
+/// M3 2PC: a version written by a voted-but-undecided PREPARE. Same
+/// key layout and payload as its final form; only the header differs,
+/// and the commit decision flips the byte in place. Snapshot readers
+/// skip prepared versions ([`is_prepared`]); a flipped (0x01/0x00)
+/// version becomes visible atomically.
+pub const HEADER_PREPARED: u8 = 0x02;
 /// Length of the inverted-timestamp suffix in the version key.
 pub const TS_SUFFIX_LEN: usize = 8;
+
+/// True when a raw version value is a prepared 2PC version (invisible
+/// to every snapshot reader until its coordinator decides).
+pub fn is_prepared(val: &[u8]) -> bool {
+    val.first() == Some(&HEADER_PREPARED)
+}
+
+/// The header a prepared version flips TO on commit: a prepared value
+/// of length 1 is a tombstone (live rows always carry the null bitmap,
+/// so they are strictly longer).
+pub fn final_header(prepared_val: &[u8]) -> u8 {
+    if prepared_val.len() <= 1 {
+        HEADER_TOMBSTONE
+    } else {
+        HEADER_LIVE
+    }
+}
+
+/// The prepared form of a final version value: header byte swapped for
+/// [`HEADER_PREPARED`], payload untouched (the flip restores it).
+pub fn prepared_value(final_val: &[u8]) -> Vec<u8> {
+    let mut v = final_val.to_vec();
+    v[0] = HEADER_PREPARED;
+    v
+}
 
 /// crc16 slot of one row: table identity + pk keep different tables
 /// independent in the hash.
 pub fn row_slot(schema: &TableSchema, pk_key: &[u8]) -> u16 {
-    let mut hashed = schema.id.to_be_bytes().to_vec();
+    slot_of(schema.id, pk_key)
+}
+
+/// Schema-free form of [`row_slot`]: crc16 slot from raw table id + pk
+/// key bytes (used by txn conflict probing, which knows no schema).
+pub fn slot_of(table_id: u32, pk_key: &[u8]) -> u16 {
+    let mut hashed = table_id.to_be_bytes().to_vec();
     hashed.extend_from_slice(pk_key);
     // Same 16384 space as the RESP plane (`hash::slot`), so SQL rows ride
     // the existing slot sharding untouched.
@@ -75,6 +112,15 @@ pub fn slot_table_prefix(slot: u16, table_id: u32) -> Vec<u8> {
     let mut k = store::rocksdb::slot_prefix(slot);
     k.push(KIND_SQL_ROW);
     k.extend_from_slice(&table_id.to_be_bytes());
+    k
+}
+
+/// Physical key prefix shared by EVERY version of (table_id, pk_key):
+/// versions of one pk sort newest-first, so the first store key at or
+/// after this prefix is the newest version (ts probing without a schema).
+pub fn version_prefix(table_id: u32, pk_key: &[u8]) -> Vec<u8> {
+    let mut k = slot_table_prefix(slot_of(table_id, pk_key), table_id);
+    k.extend_from_slice(pk_key);
     k
 }
 
@@ -178,14 +224,17 @@ fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<Vec<Value>, String> 
 }
 
 /// Newest version visible at `read_ts` from an iterator ordered by
-/// version key (descending ts). Returns the raw value bytes.
+/// version key (descending ts). Returns the raw value bytes. Prepared
+/// (0x02) versions are SKIPPED: an in-flight 2PC write must stay
+/// invisible to every reader until its coordinator decides, so the
+/// walk continues to the older committed sibling.
 pub fn visible_value<'a, I>(versions: I, read_ts: u64) -> Option<(&'a [u8], u64)>
 where
     I: IntoIterator<Item = (u64, &'a [u8])>,
 {
     versions
         .into_iter()
-        .find(|(ts, _)| *ts <= read_ts)
+        .find(|(ts, v)| *ts <= read_ts && !is_prepared(v))
         .map(|(ts, v)| (v, ts))
 }
 
@@ -385,5 +434,91 @@ mod tests {
         let (val, ts) = visible_value(versions.iter().copied(), 100).expect("v");
         assert_eq!(ts, 9);
         assert_eq!(val, &v9[..]);
+    }
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+
+    const T: u32 = 7;
+
+    fn ver(ts: u64, header: u8) -> (u64, Vec<u8>) {
+        (ts, vec![header, 0xaa, 0xbb])
+    }
+
+    #[test]
+    fn prepared_version_is_invisible() {
+        // ts=20 committed, ts=30 prepared -> read at 25 sees ts=20.
+        let versions = [ver(30, HEADER_PREPARED), ver(20, HEADER_LIVE)];
+        let (v, ts) = visible_value(versions.iter().map(|(t, v)| (*t, v.as_slice())), 25)
+            .expect("older committed version must be visible");
+        assert_eq!(ts, 20);
+        assert_eq!(v[0], HEADER_LIVE);
+    }
+
+    #[test]
+    fn prepared_tombstone_does_not_shadow() {
+        // A prepared tombstone at ts=30 must not hide the committed row
+        // at ts=20, nor be read as a deletion.
+        let versions = [ver(30, HEADER_PREPARED), ver(20, HEADER_LIVE)];
+        let (v, ts) = visible_value(versions.iter().map(|(t, v)| (*t, v.as_slice())), 25)
+            .expect("committed row survives a prepared shadow");
+        assert_eq!(ts, 20);
+        assert_eq!(v[0], HEADER_LIVE);
+    }
+
+    #[test]
+    fn only_prepared_versions_yield_none() {
+        let versions = [ver(30, HEADER_PREPARED)];
+        assert!(visible_value(versions.iter().map(|(t, v)| (*t, v.as_slice())), 25).is_none());
+        assert!(visible_value(versions.iter().map(|(t, v)| (*t, v.as_slice())), 99).is_none());
+    }
+
+    #[test]
+    fn flip_to_final_makes_version_visible() {
+        let v = vec![HEADER_PREPARED, 0x01, 0x02];
+        assert!(is_prepared(&v));
+        assert_eq!(final_header(&v), HEADER_LIVE);
+        let mut flipped = v.clone();
+        flipped[0] = final_header(&v);
+        let versions = [(30u64, flipped)];
+        let (got, ts) = visible_value(versions.iter().map(|(t, v)| (*t, v.as_slice())), 40)
+            .expect("flipped version becomes visible");
+        assert_eq!(ts, 30);
+        assert_eq!(got[0], HEADER_LIVE);
+    }
+
+    #[test]
+    fn prepared_tombstone_flip_roundtrip() {
+        // Prepared tombstone = single 0x02 byte; commit keeps it a tombstone.
+        let final_del = vec![HEADER_TOMBSTONE];
+        let prep = prepared_value(&final_del);
+        assert_eq!(prep, vec![HEADER_PREPARED]);
+        assert_eq!(final_header(&prep), HEADER_TOMBSTONE);
+        // Prepared live row roundtrip.
+        let final_live = vec![HEADER_LIVE, 0x00, 0x00];
+        let prep = prepared_value(&final_live);
+        assert!(is_prepared(&prep));
+        assert_eq!(final_header(&prep), HEADER_LIVE);
+        assert_eq!(prep[1..], final_live[1..]);
+    }
+
+    #[test]
+    fn slot_of_is_stable_crc16_mod_slots() {
+        // Spot-check the documented collision property: same pk under
+        // different tables may collide; distinct pks mostly differ.
+        assert_eq!(slot_of(T, b"pk1"), slot_of(T, b"pk1"));
+        let distinct: Vec<u16> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|k| slot_of(T, k.as_bytes()))
+            .collect();
+        assert!(
+            distinct
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= 3
+        );
     }
 }

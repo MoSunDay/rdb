@@ -16,6 +16,7 @@ async fn setup() -> crate::state::Shared {
     .unwrap();
     write::insert(
         &shared,
+        &mut SqlSession::default(),
         parse_statement("INSERT INTO t (id, v) VALUES (1, 'b'), (2, NULL), (3, 'a'), (4, NULL)")
             .unwrap(),
     )
@@ -28,9 +29,7 @@ async fn select_all(shared: &crate::state::Shared, sql: &str) -> (Vec<ColMeta>, 
     let Statement::Select(q) = parse_statement(sql).unwrap() else {
         panic!("select");
     };
-    run(shared, &SqlSession { db: String::new() }, q)
-        .await
-        .unwrap()
+    run(shared, &SqlSession::default(), q).await.unwrap()
 }
 
 async fn col(shared: &crate::state::Shared, sql: &str) -> Vec<Value> {
@@ -134,6 +133,7 @@ async fn join_qualified_columns_and_ambiguity() {
     .unwrap();
     write::insert(
         &shared,
+        &mut SqlSession::default(),
         parse_statement("INSERT INTO u (id, tag) VALUES (1, 'x'), (3, 'y')").unwrap(),
     )
     .await
@@ -156,16 +156,14 @@ async fn join_qualified_columns_and_ambiguity() {
         panic!("select");
     };
     let read_ts = shared.sql_ts.now();
-    let _ = scan::materialize(&shared, &q.from, read_ts).unwrap();
-    let err = run(&shared, &SqlSession { db: String::new() }, q)
-        .await
-        .unwrap_err();
+    let _ = scan::materialize(&shared, &q.from, read_ts, None, None).unwrap();
+    let err = run(&shared, &SqlSession::default(), q).await.unwrap_err();
     assert!(err.msg.contains("ambiguous column 'id'"), "{}", err.msg);
     // unknown column
     let Statement::Select(q) = parse_statement("SELECT nope FROM t").unwrap() else {
         panic!("select");
     };
-    let err = run(&shared, &SqlSession { db: String::new() }, q)
+    let err = run(&shared, &SqlSession::default(), q)
         .await
         .expect_err("unknown column must error");
     assert!(err.msg.contains("unknown column"), "{}", err.msg);
@@ -181,4 +179,22 @@ async fn explain_and_alias_metadata() {
     let (meta, rows) = select_all(&shared, "SELECT * FROM t WHERE id = 1").await;
     assert_eq!(meta.len(), 2);
     assert_eq!(rows, vec![vec![Value::Int(1), Value::Str("b".into())]]);
+}
+
+/// EXPLAIN headline: single-node topologies keep the plain SeqScan
+/// (or planner index) verdict; a ready multi-node cluster plans the
+/// same single-table read as scatter-gather, banner on top.
+#[test]
+fn explain_headline_prefers_gather_in_cluster_mode() {
+    let shared = testutil::shared_with(testutil::test_config());
+    let Statement::Select(q) = parse_statement("SELECT id FROM t").unwrap() else {
+        panic!("select");
+    };
+    // No cluster: no storage-aware verdict (no catalog entry either).
+    assert!(headline_lines(&shared, &q).is_empty());
+    *shared.topology.write().unwrap() = crate::topology::refresh("a, b, c");
+    assert_eq!(
+        headline_lines(&shared, &q),
+        vec!["Gather(bands=3)".to_string(), "SeqScan t".to_string()]
+    );
 }

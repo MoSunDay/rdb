@@ -65,12 +65,26 @@ pub async fn serve(listener: TcpListener, shared: Arc<Shared>) -> ! {
 /// are logged and dropped: the listener outlives every connection.
 async fn handle_conn(sock: TcpStream, shared: Arc<Shared>, user: String, password: String) {
     let (read_half, write_half) = sock.into_split();
-    let shim = new_shim::<tokio::net::tcp::OwnedWriteHalf>(shared, user, password, conn_seed());
+    let shim = new_shim::<tokio::net::tcp::OwnedWriteHalf>(
+        Arc::clone(&shared),
+        user,
+        password,
+        conn_seed(),
+    );
+    let sess = shim.session_handle();
     let opts = intermediary_options();
     if let Err(e) =
         AsyncMysqlIntermediary::run_with_options(shim, read_half, write_half, &opts).await
     {
         eprintln!("[mysql] connection ended with error: {e}");
+    }
+    // Connection end: a client that just drops the socket may leave a
+    // BEGIN's snapshot registered; release it so the GC watermark never
+    // pins on a dead session (staged writes die with it -- nothing was
+    // written to the store).
+    let mut sess = sess.lock().await;
+    if let Some(txn) = sess.txn.take() {
+        crate::sql::tx::rollback(&shared.sql_ts, txn);
     }
 }
 

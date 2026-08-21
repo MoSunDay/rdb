@@ -53,6 +53,8 @@ pub struct ProcNode {
     pub monitor: String,
     /// MySQL-protocol bind address ("" when the SQL plane is disabled).
     pub mysql: String,
+    /// M3 2PC node-to-node bind address ("" when disabled).
+    pub sql_rpc: String,
 }
 
 impl ProcNode {
@@ -171,27 +173,50 @@ fn spawn_child(
     cmd.spawn().expect("spawn rdb binary")
 }
 
+/// Launch attempts per node: free-:0 port probes race with sibling tests
+/// binding them first (the child needs ~0.5s to reach its binds), so a
+/// node that dies instantly on EADDRINUSE is respawned on fresh ports.
+const SPAWN_ATTEMPTS: usize = 4;
+
+/// None while the child is alive and startup proceeds; Some(true) when it
+/// died of a port collision (respawn on fresh ports); Some(false) for any
+/// other early exit (intentional in some failover tests -- surface it).
+fn early_exit_kind(child: &mut std::process::Child, stderr_path: &std::path::Path) -> Option<bool> {
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if matches!(child.try_wait(), Ok(None)) {
+        return None;
+    }
+    let tail = std::fs::read_to_string(stderr_path).unwrap_or_default();
+    Some(tail.contains("Address already in use"))
+}
+
 /// Spawn node `id` below the per-test `dir`: node dir + conf.yaml + 4 fresh
 /// ports, child launched per `bootstrap`/`join_http`.
 pub fn spawn_node(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str>) -> ProcNode {
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
-    let (resp, raft, http, monitor) = (free_addr(), free_addr(), free_addr(), free_addr());
-    let config_path = node_dir.join("conf.yaml");
-    write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor, "");
-    let stderr_path = node_dir.join("stderr.log");
-    let child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
-    ProcNode {
-        dir: node_dir,
-        config_path,
-        stderr_path,
-        child,
-        resp,
-        raft,
-        http,
-        monitor,
-        mysql: String::new(),
+    for _ in 0..SPAWN_ATTEMPTS {
+        let (resp, raft, http, monitor) = (free_addr(), free_addr(), free_addr(), free_addr());
+        let config_path = node_dir.join("conf.yaml");
+        write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor, "");
+        let stderr_path = node_dir.join("stderr.log");
+        let mut child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
+        if !matches!(early_exit_kind(&mut child, &stderr_path), Some(true)) {
+            return ProcNode {
+                dir: node_dir,
+                config_path,
+                stderr_path,
+                child,
+                resp,
+                raft,
+                http,
+                monitor,
+                mysql: String::new(),
+                sql_rpc: String::new(),
+            };
+        }
     }
+    panic!("rdb kept dying at startup; see stderr.log in {node_dir:?}");
 }
 
 /// Spawn a node with the SQL (MySQL-protocol) plane enabled on a fresh
@@ -204,36 +229,97 @@ pub fn spawn_node_mysql(
 ) -> ProcNode {
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
-    let (resp, raft, http, monitor, mysql) = (
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-    );
-    let config_path = node_dir.join("conf.yaml");
-    write_config(
-        &config_path,
-        &node_dir,
-        &resp,
-        &raft,
-        &http,
-        &monitor,
-        &mysql,
-    );
-    let stderr_path = node_dir.join("stderr.log");
-    let child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
-    ProcNode {
-        dir: node_dir,
-        config_path,
-        stderr_path,
-        child,
-        resp,
-        raft,
-        http,
-        monitor,
-        mysql,
+    for _ in 0..SPAWN_ATTEMPTS {
+        let (resp, raft, http, monitor, mysql) = (
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+        );
+        let config_path = node_dir.join("conf.yaml");
+        write_config(
+            &config_path,
+            &node_dir,
+            &resp,
+            &raft,
+            &http,
+            &monitor,
+            &mysql,
+        );
+        let stderr_path = node_dir.join("stderr.log");
+        let mut child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
+        if !matches!(early_exit_kind(&mut child, &stderr_path), Some(true)) {
+            return ProcNode {
+                dir: node_dir,
+                config_path,
+                stderr_path,
+                child,
+                resp,
+                raft,
+                http,
+                monitor,
+                mysql,
+                sql_rpc: String::new(),
+            };
+        }
     }
+    panic!("rdb kept dying at startup; see stderr.log in {node_dir:?}");
+}
+
+/// Spawn a node with BOTH SQL planes enabled on fresh ports: the MySQL
+/// frontend (login root/e2e-sql-pass, same as `spawn_node_mysql`) and
+/// the M3 2PC node-to-node transport (`sql_rpc_bind`). The base yaml
+/// comes from `write_config` (unchanged signature); the 2PC bind is
+/// appended as one extra top-level key.
+pub fn spawn_node_sql(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str>) -> ProcNode {
+    let node_dir = dir.join(format!("node{id}"));
+    std::fs::create_dir_all(&node_dir).expect("create node dir");
+    for _ in 0..SPAWN_ATTEMPTS {
+        let (resp, raft, http, monitor, mysql, sql_rpc) = (
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+        );
+        let config_path = node_dir.join("conf.yaml");
+        write_config(
+            &config_path,
+            &node_dir,
+            &resp,
+            &raft,
+            &http,
+            &monitor,
+            &mysql,
+        );
+        std::fs::write(
+            &config_path,
+            format!(
+                "{}sql_rpc_bind: \"{sql_rpc}\"\n",
+                std::fs::read_to_string(&config_path).expect("read back conf.yaml")
+            ),
+        )
+        .expect("append sql_rpc_bind");
+        let stderr_path = node_dir.join("stderr.log");
+        let mut child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
+        if !matches!(early_exit_kind(&mut child, &stderr_path), Some(true)) {
+            return ProcNode {
+                dir: node_dir,
+                config_path,
+                stderr_path,
+                child,
+                resp,
+                raft,
+                http,
+                monitor,
+                mysql,
+                sql_rpc,
+            };
+        }
+    }
+    panic!("rdb kept dying at startup; see stderr.log in {node_dir:?}");
 }
 
 /// Poll the node's MySQL port until it accepts connections.

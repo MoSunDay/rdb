@@ -211,7 +211,7 @@ mod tests {
             Value::Bool(true),
             Value::Int(-5),
             Value::Double(1.5),
-            Value::Str("héllo".into()),
+            Value::Str("h\u{e9}llo".into()),
             Value::Bytes(vec![0, 1, 255]),
         ];
         for v in vals {

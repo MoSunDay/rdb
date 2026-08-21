@@ -15,12 +15,18 @@
 
 use std::sync::Arc;
 
+use rocksdb::WriteBatch;
+
+use crate::sql::exec::scan;
 use crate::sql::exec::ExecOutcome;
+use crate::sql::index::{self, IndexOps, IndexRef};
 use crate::sql::parse::ast::{ColumnSpec, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog::{self, CatalogTxn};
+use crate::sql::storage::row;
 use crate::sql::storage::schema::{ColumnDef, IndexDef, TableSchema};
 use crate::state::Shared;
+use crate::store::ops;
 
 pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
     match stmt {
@@ -137,10 +143,20 @@ async fn create_index(
             format!("unknown column '{column}' in '{table}'"),
         ));
     }
-    // M1 does NOT backfill existing rows into a new index (reads keep
-    // using the pk scan until M2 adds backfill); the definition itself
-    // is durable so M2's backfiller can find it. A second index on an
-    // already-indexed column is allowed (no uniqueness of columns).
+    // Multi-column indexes never reach here (translate rejects them),
+    // but keep the guard local: M2 indexes exactly one column.
+    // UNIQUE pre-check runs BEFORE the catalog entry exists, so a clean
+    // rejection leaves nothing behind. Rows are read at the CURRENT
+    // committed snapshot.
+    let index = IndexRef {
+        name: name.to_string(),
+        column: column.to_string(),
+        unique,
+    };
+    if unique {
+        let rows = scan::visible_rows(&shared.store, &schema, shared.sql_ts.now())?;
+        index::maintain::assert_no_duplicates(&schema, &index, &rows)?;
+    }
     let id = catalog::next_index_id(&schema);
     schema.indexes.push(IndexDef {
         id,
@@ -149,7 +165,35 @@ async fn create_index(
         unique,
     });
     catalog_apply(shared, CatalogMutation::Put(schema)).await?;
+    // Backfill: rescan AFTER the catalog entry is committed, so every
+    // row visible at this point is covered (any writer that started
+    // earlier and lands later may miss its entry -- the accepted M2
+    // race window; the residual WHERE filter hides stale entries, and
+    // missing entries only cost the planner an index that finds fewer
+    // pks than exist, which the fallback heuristic bounds).
+    let schema = lookup_table(shared, table)?;
+    backfill_index(shared, &schema, &index).await?;
     Ok(ExecOutcome::Ok)
+}
+
+/// Write index entries for every live row (leader-side, after the
+/// catalog entry committed). One synced batch per whole backfill.
+async fn backfill_index(shared: &Shared, schema: &TableSchema, index: &IndexRef) -> SqlResult<()> {
+    let read_ts = shared.sql_ts.now();
+    let rows = scan::visible_rows(&shared.store, schema, read_ts)?;
+    let mut ops: IndexOps = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let pk_key = row::pk_encode(&r[schema.pk_index()]).map_err(SqlError::from)?;
+        ops.extend(index::entries_for_live_row(schema, index, &pk_key, r).map_err(SqlError::from)?);
+    }
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let mut batch = WriteBatch::default();
+    index::maintain::apply_ops(&mut batch, ops);
+    ops::batch_write_async(Arc::clone(&shared.store), batch)
+        .await
+        .map_err(SqlError::from)
 }
 
 async fn drop_index(
@@ -172,9 +216,26 @@ async fn drop_index(
             format!("index '{name}' doesn't exist"),
         ));
     };
-    // Removal by position keeps the remaining index ids stable.
+    // Capture the column before the definition leaves the schema: the
+    // on-disk keys are identified by (table_id, col_pos) alone.
+    let col_pos = schema
+        .column_index(&schema.indexes[pos].column)
+        .ok_or_else(|| {
+            SqlError::new(
+                ErrorCode::BadField,
+                format!("unknown column '{}'", schema.indexes[pos].column),
+            )
+        })?;
+    // Removal by position keeps the remaining index ids stable. The
+    // catalog entry goes first: if the entry sweep then fails, the
+    // orphaned keys are unreachable (no index def) and harmless, while
+    // the reverse order could leave a DECLARED index with no entries.
+    let table_id = schema.id;
     schema.indexes.remove(pos);
     catalog_apply(shared, CatalogMutation::Put(schema)).await?;
+    index::drop_entries(Arc::clone(&shared.store), table_id, col_pos as u32)
+        .await
+        .map_err(SqlError::from)?;
     Ok(ExecOutcome::Ok)
 }
 
