@@ -2,25 +2,25 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 # rust（Rust 重写实现）
 
 ## 职责
-- Rust 版 rdb 的完整实现，位于 `rust/`：独立 cargo workspace（`rust/Cargo.toml`，根包 `rdb`（`rust/src`、`rust/tests`）与 `rust/bench`），服务二进制与库同名 `rdb`，压测工具 `rdb-bench`。
+- Rust 版 rdb 的完整实现，位于仓库根目录：cargo workspace（`Cargo.toml`，根包 `rdb`（`src`、`tests`）与 `bench`），服务二进制与库同名 `rdb`，压测工具 `rdb-bench`。
 - 数据面：tokio TCP + RESP2 编解码（与 Go 的 redcon fork 字节对齐），命令分发、slot 路由与 `MOVED` 重定向；已支持 string/keys 族/Hash/Set/List/ZSet/JSON/VectorSet 七类命令（含 BLPOP/BZPOPMIN 等阻塞命令族，经 `ds/wait.rs` WaitHub 唤醒、由专用有界 park 池 `park.rs` 承载（与 RocksDB fsync 池隔离）；JSON 为 RedisJSON v1 legacy 确定路径子集，VectorSet 为暴力 cosine 相似度子集）与全类型统一 TTL（`ds/` 基座，七类结构 7/7 齐备）。
 - 控制面：openraft 0.9.25 复制集群元数据（实例列表、备份映射、迁移任务），对外提供 HTTP join/depart/get。
 - 存储：RocksDB 持久化，物理 key 带 `<slot>/` 十进制前缀（如 `5465/`，见 `store::slot_prefix`）。
-- 与 Go 实现功能对齐：RESP 数据面与 Raft HTTP API 字节兼容；Raft TCP 线协议不同（openraft JSON 帧 vs hashicorp msgpack），兼容性细节与偏差清单见 `rust/COMPAT.md`。
+- 与 Go 实现功能对齐：RESP 数据面与 Raft HTTP API 字节兼容；Raft TCP 线协议不同（openraft JSON 帧 vs hashicorp msgpack），兼容性细节与偏差清单见 `COMPAT.md`。
 
 ## 边界
-- 负责：整个 Rust 进程（入口 `rust/src/main.rs`）——RESP 接入、命令处理器、openraft 节点装配、HTTP 控制 API、HA 心跳观察、备份实例监听、SIGTERM/SIGINT 优雅停机（限时刷 Lite offset 水位后 exit 0）。
+- 负责：整个 Rust 进程（入口 `src/main.rs`）——RESP 接入、命令处理器、openraft 节点装配、HTTP 控制 API、HA 心跳观察、备份实例监听、SIGTERM/SIGINT 优雅停机（限时刷 Lite offset 水位后 exit 0）。
 - 与 Go 代码（已归档至 `archive/go/`）无编译期依赖、无共享代码，仅行为对齐：共用 yaml 配置格式（`config/` 下文件可直接复用）、RESP 应答文本与 HTTP 路由。
 - Go 与 Rust 节点不能混组同一 raft 集群（线协议不兼容），部署须全 Go 或全 Rust。
 
 ## 构建要求（关键）
-- `rust/.cargo/config.toml` 设置 `rustflags = ["--cfg", "tokio_unstable"]`，使 `main.rs` 中 `Builder::disable_lifo_slot()` 编译生效：tokio multi_thread 默认 LIFO slot 在本负载下丢唤醒，导致整个 runtime 冻结（6s+ 停顿）。
-- 在 `rust/` 目录外构建需显式 `RUSTFLAGS='--cfg tokio_unstable'`；缺该 cfg 时回退为带 LIFO slot 的 multi_thread runtime（冻结复现）。
+- `.cargo/config.toml` 设置 `rustflags = ["--cfg", "tokio_unstable"]`，使 `main.rs` 中 `Builder::disable_lifo_slot()` 编译生效：tokio multi_thread 默认 LIFO slot 在本负载下丢唤醒，导致整个 runtime 冻结（6s+ 停顿）。
+- 在仓库根目录外构建需显式 `RUSTFLAGS='--cfg tokio_unstable'`；缺该 cfg 时回退为带 LIFO slot 的 multi_thread runtime（冻结复现）。
 - 环境变量：`RDB_CURRENT_THREAD=1` 改用 current_thread runtime（应急逃生，单线程）；`RDB_WORKER_THREADS=N` 设置 worker 数（默认对齐 Go NumCPU）；`RDB_BEACON=1` 开启诊断心跳（默认关闭）。
-- 详见 `rust/COMPAT.md`。
+- 详见 `COMPAT.md`。
 
 ## 模块结构
-源码位于 `rust/src/`，布局对照归档 Go `archive/go/internal/`：
+源码位于 `src/`，布局对照归档 Go `archive/go/internal/`：
 - `main.rs`：进程入口——runtime 构建（含 `disable_lifo_slot`）、`-config` 参数解析、进程装配；私有 `mod beacon`。
 - `conf.rs`：yaml 配置 `Config`（字段键名与 Go 一致）+ env 读取（`RAFT_BOOTSTRAP` 严格等于 `true` 才生效、`RAFT_JOIN_ADDR`），默认配置路径 `config/config.yml`。
 - `resp/`：RESP 层。
@@ -78,7 +78,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 8. 可选备份监听（`backup_bind` 非空，mode=backup，独立 store 路径）→ 正常监听：`store::open` + `resp::serve`（不返回）。
 
 ## 测试
-- 单元测试内联于各模块 `#[cfg(test)]`；集成测试位于 `rust/tests/`：
+- 单元测试内联于各模块 `#[cfg(test)]`；集成测试位于 `tests/`：
   - `resp_e2e.rs`：RESP 层 e2e（AUTH 门、字符串命令、MOVED、协议错误）；
   - `lite_e2e.rs` / `lite_streams_e2e.rs` / `lite_group_e2e.rs` / `lite_proc_e2e.rs`：Lite Mode e2e（含非 UTF8 组名隔离、XDEL 重复 ID/XTRIM 越界回归）——父主题自动选队列、XPICK、XINFO、组生命周期与补读、重启自已提交水位恢复、空闲 TTL 整流回收、BLOCK 跨连接唤醒、指标暴露；XRANGE 边界/COUNT、XTRIM MAXLEN 裁剪、XDEL 命中与 missing；进程级 kill -9 重启恢复；公共工具 `tests/common/lite.rs`；
   - `raft_cluster_e2e.rs`：bootstrap + HTTP join/depart 的两节点集群；
@@ -88,9 +88,9 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `process_cluster_e2e.rs` / `process_failover_e2e.rs` / `process_metrics_e2e.rs` / `process_sigterm_e2e.rs`：进程级 e2e——`CARGO_BIN_EXE_rdb` 拉起真实二进制 + 临时 yaml 组 3 节点集群，断言协议应答原文（`-ERR: NOAUTH`、`-MOVED <slot> <addr>`、kill -9 后新 leader 选主、RocksDB 重启回读）、HTTP /depart 活节点 + 重 join 与 MIGRATE task/list 正/错路径、七数据家族 kill -9 存活、真实进程 scrape `/metrics`（`rdb_command_latency`/`raft_stats`）、SIGTERM/SIGINT 优雅停机（退出码 0 + Lite offset 水位已刷）；公共工具在 `tests/common/mod.rs`；
   - `string_e2e.rs`：SET 全选项矩阵（NX/XX/EX/PX/EXAT/PXAT/KEEPTTL/GET 与语法错）+ MSET/MGET + CROSSSLOT。
 - 集成测试统一用 `tempfile` 临时目录与临时端口（端口 0），无固定端口依赖。
-- 压测工具 `rust/bench`（bin `rdb-bench`，见 `rust/bench/src/`）：RESP 负载发生器，`--workload ping|set|get|mixed` × `--clients` × `--pipeline`，延迟按每批 RTT 采样（pipeline>1 时为批 RTT 非单命令 RTT）；自带单元测试。示例：`rdb-bench --addr 127.0.0.1:6379 --token <t> --workload mixed --clients 16 --pipeline 16`。
+- 压测工具 `bench`（bin `rdb-bench`，见 `bench/src/`）：RESP 负载发生器，`--workload ping|set|get|mixed` × `--clients` × `--pipeline`，延迟按每批 RTT 采样（pipeline>1 时为批 RTT 非单命令 RTT）；自带单元测试。示例：`rdb-bench --addr 127.0.0.1:6379 --token <t> --workload mixed --clients 16 --pipeline 16`。
 
 ## 相关文档
 - Go 对应模块：[server](../server/index.md)、[rcache](../rcache/index.md)、[command](../command/index.md)、[store](../store/index.md)
 - 特性文档：[raft-ha](../../features/raft-ha/index.md)
-- 兼容性说明：[rust/COMPAT.md](../../rust/COMPAT.md)
+- 兼容性说明：[COMPAT.md](../../COMPAT.md)

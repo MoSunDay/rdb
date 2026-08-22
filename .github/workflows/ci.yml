@@ -1,6 +1,6 @@
 # Quality gate for the Rust implementation (the only maintained one):
 # fmt -> clippy (-D warnings) -> full test suite -> release build.
-# rust/.cargo/config.toml (committed) sets --cfg tokio_unstable for every
+# .cargo/config.toml (committed) sets --cfg tokio_unstable for every
 # cargo invocation, so the LIFO-slot workaround applies in CI as locally.
 name: ci
 
@@ -19,9 +19,6 @@ env:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: rust
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +36,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: .
 
       - name: fmt
         run: cargo fmt --check
