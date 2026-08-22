@@ -17,7 +17,7 @@
   HTTP `join` / `depart` / `get` 控制 API（与 Go 实现字节兼容）。
 - **高可用**：Raft 心跳观察 + `backup_target_map` 实现故障节点与备份实例的槽位切换；
   另起只读备份实例（`backup_bind`）。
-- **数据迁移**：跨节点迁移任务经 Raft 复制分发。
+- **数据迁移**：`migrate task/list/help` 迁移任务登记（经 Raft 复制分发）；实际数据搬迁未实现。
 - **Lite MQ**：Streams 流命令族（RocketMQ 语义主题/队列、消费组、PEL 窗口）。
 - **SQL 数据面**：MySQL 协议接入（opensrv-mysql）、MVCC 快照隔离事务、二级/唯一索引、
   raft 全局时间戳、跨节点 2PC 写与 scatter-gather 读。
@@ -95,7 +95,7 @@ SET **53,087** requests/s（p50 5.975ms）、GET **54,145** requests/s（p50 3.2
 
 ## Roadmap
 
-- [ ] 无损数据迁移
+- [ ] 无损数据迁移（当前仅 `migrate task/list/help` 任务登记，无实际数据搬迁）
 - [ ] 进一步的性能优化
 
 ## 参考
