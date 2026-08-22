@@ -57,8 +57,8 @@
 
 ## Lite MQ 面规范（本批落地）
 
-以下为规范（spec），由 `rust/src/lite/`（`pel.rs` / `pending.rs` / `claim.rs` / `autoclaim.rs` / `read.rs` /
-`park_wait.rs` / `group.rs` / `ack.rs`）实现；对 Redis 的偏差总表见 [rust/COMPAT.md](../rust/COMPAT.md)
+以下为规范（spec），由 `src/lite/`（`pel.rs` / `pending.rs` / `claim.rs` / `autoclaim.rs` / `read.rs` /
+`park_wait.rs` / `group.rs` / `ack.rs`）实现；对 Redis 的偏差总表见 [COMPAT.md](../COMPAT.md)
 Lite Mode 条目。
 
 ### PEL 物理布局（kind 0x0F 窗口）
@@ -107,6 +107,6 @@ Lite Mode 条目。
 
 ## 关联
 - 实现：[agents/rust](../agents/rust/index.md)（`lite/` 模块族）
-- 偏差总表：[rust/COMPAT.md](../rust/COMPAT.md)
+- 偏差总表：[COMPAT.md](../COMPAT.md)
 - 首次落地：[changelog 2026-08-17 lite-mode](./changelog/2026-08-17/lite-mode.md)
 - 本批落地：[changelog 2026-08-21](./changelog/2026-08-21/mq-lite-engine-and-kafka-decision.md)
