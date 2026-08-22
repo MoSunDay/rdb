@@ -35,4 +35,4 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
 
 ## 相关
 - 实现模块：[agents/rust/sql.md](../agents/rust/sql.md)；契约与偏差：
-  `rust/COMPAT.md` "SQL data plane" 节。
+  `COMPAT.md` "SQL data plane" 节。

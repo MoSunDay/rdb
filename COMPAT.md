@@ -6,7 +6,7 @@ JSON framing vs hashicorp msgpack), so Go and Rust nodes cannot join the same ra
 
 ## Critical build requirement (tokio LIFO-slot freeze)
 
-`rust/.cargo/config.toml` sets `rustflags = ["--cfg", "tokio_unstable"]` so that
+`.cargo/config.toml` sets `rustflags = ["--cfg", "tokio_unstable"]` so that
 `tokio::runtime::Builder::disable_lifo_slot()` in `src/main.rs` compiles and takes effect.
 
 Why this exists: with the tokio multi_thread runtime's default LIFO slot, this workload suffers
@@ -19,8 +19,8 @@ scheduling, not to write load. Evidence:
 - HA drill: kill -9 leader → follower elected in ~6s, writes OK, restarted node rejoins and
   catches up.
 
-If you build the binary without `rust/.cargo/config.toml` in scope (e.g. building from outside
-the `rust/` directory), set `RUSTFLAGS='--cfg tokio_unstable'`. At startup the binary now
+If you build the binary without `.cargo/config.toml` in scope (e.g. building from outside the
+repository root), set `RUSTFLAGS='--cfg tokio_unstable'`. At startup the binary now
 logs one line stating whether the cfg took effect (`tokio LIFO slot: disabled ...`) or not
 (`tokio LIFO slot: ENABLED (DANGER: ...)`) — check it after any build-pipeline change that
 overrides RUSTFLAGS. Without the cfg, the code falls

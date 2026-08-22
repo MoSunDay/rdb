@@ -21,7 +21,7 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 ## 关键状态与异常
 - 状态：数据面无独立状态；路由状态（ClusterReady/StableAddrs）来自控制面。
 - 异常：处理器 panic 由 server `recover` 兜底（`fatal error: ...`）。
-- 限制：Go 实现无 TTL/过期与复合类型；Rust 实现七类结构已全部落地——stream 定形为 Lite Mode 流命令族（RocketMQ 语义主题/队列，`KIND_STREAM_PEND 0x0F` 仅作将来完整 PEL 预留），json/vector-set 为语义子集（legacy 确定路径 / 暴力 cosine，偏差见 `rust/COMPAT.md`）。
+- 限制：Go 实现无 TTL/过期与复合类型；Rust 实现七类结构已全部落地——stream 定形为 Lite Mode 流命令族（RocketMQ 语义主题/队列，`KIND_STREAM_PEND 0x0F` 仅作将来完整 PEL 预留），json/vector-set 为语义子集（legacy 确定路径 / 暴力 cosine，偏差见 `COMPAT.md`）。
 
 ## 关联逻辑模块
 - [store](../../agents/store/index.md)

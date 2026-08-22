@@ -13,7 +13,7 @@
 9. - [x] 支持简单的数据迁移
 10. - [x] 支持 `Raft` 与 `Redis Client` 的身份验证
 11. - [] 支持无损数据迁移
-12. - [x] MySQL 协议接入的分布式 SQL 数据面（MVCC 快照隔离事务、二级/唯一索引、raft 全局时间戳、跨节点 2PC 与 scatter-gather，见 `rust/`）
+12. - [x] MySQL 协议接入的分布式 SQL 数据面（MVCC 快照隔离事务、二级/唯一索引、raft 全局时间戳、跨节点 2PC 与 scatter-gather，见 `agents/rust/`）
 13. - [] 进一步的性能优化
 
 #### Benchmark

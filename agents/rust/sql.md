@@ -1,12 +1,12 @@
 Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
-# rust/sql（SQL 数据面：MySQL 接入 + MVCC 事务 + 分布式执行）
+# rdb/sql（SQL 数据面：MySQL 接入 + MVCC 事务 + 分布式执行）
 
 ## 职责
 - 经 MySQL 线协议（opensrv-mysql，native-password）提供 SQL 数据面：DDL/DML/SELECT/
   SHOW/EXPLAIN/预编译语句；目录（catalog）经 raft 复制（leader-only 写）。
 - 行存为 MVCC 多版本链，读写共用 16384 slot 物理空间（`<slot>/` 前缀），但 SQL 路径
   不走 RESP 的 MOVED——跨节点分布由本模块族内部完成（scatter-gather 读 + 2PC 写）。
-- 与 Go 归档实现无对应关系（Rust 独有）；行为契约与偏差清单见 `rust/COMPAT.md` 的
+- 与 Go 归档实现无对应关系（Rust 独有）；行为契约与偏差清单见 `COMPAT.md` 的
   "SQL data plane" 节。
 
 ## 模块地图
@@ -45,7 +45,7 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
 
 ## 测试地图
 - 单元：各模块旁 `*_tests.rs`（tx/global、index、plan、exec/*、storage/gc）。
-- 进程级 e2e（`rust/tests/`）：`sql_e2e.rs`（握手/DDL/DML/SELECT 全链）、
+- 进程级 e2e（`tests/`）：`sql_e2e.rs`（握手/DDL/DML/SELECT 全链）、
   `sql_txn_e2e.rs`（快照隔离/冲突）、`sql_index_e2e.rs`（索引/唯一/计划）、
   `sql_oracle_cluster_e2e.rs`（进程内 3 节点全局 ts）、`sql_2pc_e2e.rs` 与
   `sql_dist_read_e2e.rs`（3 进程 2PC 写与 scatter-gather 读）。

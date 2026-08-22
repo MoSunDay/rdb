@@ -6,4 +6,4 @@ test.go
 rdb_debug
 scrtips/auto_config/output
 scrtips/auto_install.sh
-rust/target/
+/target/
