@@ -12,6 +12,9 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   自写可见、断连自动回滚；两个并发事务改同一主键，后提交者得到 1213 冲突错误。
 - 索引：单列二级索引与唯一索引（唯一冲突报 1062）；带索引的等值/IN/BETWEEN 查询
   走索引点查（EXPLAIN 可见 IndexScan）。
+- 列存表：`CREATE TABLE ... ENGINE=columnar`——追加式（仅 INSERT，UPDATE/DELETE/
+  索引不支持），每次提交每表生成一个不可变列式段文件；读为全段扫描
+  （WHERE/聚合/JOIN 照常生效）。详见 `COMPAT.md` "Columnar table engine" 节。
 
 ## 集群行为（3 节点及以上）
 - 时间戳全局化：`CLUSTER INIT` 后所有事务时间戳由 raft leader 块授权
@@ -27,6 +30,8 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
 ## 配置
 - `mysql_bind` / `mysql_user` / `mysql_password`：MySQL 接入。
 - `sql_rpc_bind`：节点间 SQL RPC（scatter-gather/2PC），空=关闭（单机语义）。
+- `columnar_flush_rows` / `columnar_flush_bytes`：列存单语句/事务-表追加限额
+  （默认 65536 行 / 64 MiB，0=用内置默认）。
 
 ## 用户可见规则
 - 错误语义对齐 MySQL 常用号段：1062 唯一冲突、1213 写写冲突（可重试）、

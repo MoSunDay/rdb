@@ -32,6 +32,10 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   `participant.rs` 参与者（PREPARE/DECIDE 各为单原子批 + 参与者标记）、`plan.rs`
   （写计划按 slot 归属分组）、`gather.rs`（按 band scatter-gather 读）、`recover.rs`
   （在疑标记经 `/sql2pc/status` 决议，60s 租期 presumed-abort）。
+- `columnar/`：列存引擎——段文件（`format.rs` 信封/自写 CRC-32、`encode.rs`
+  PLAIN+DICT 页、`decode.rs`）、元数据 kind `0x23`（`meta.rs`，无 slot 前缀）、
+  段注册表（`mod.rs`，按 `(store_path, bind)` 缓存）、冲刷/放置（`writer.rs`、
+  `commit.rs`）、读（`reader.rs`）、DROP 清理与孤儿清扫（`commit.rs`、`gc.rs`）。
 
 ## 关键不变量
 - 版本键 ts 后缀取反（`!ts`）：同 pk 新版本在前；`visible_value` 取 `ts ≤ read_ts`
@@ -42,10 +46,13 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   COMMIT 翻转 0x02→0x01 并补 0x21 项；读路径永不显露 0x02。
 - 集群模式（>1 稳定实例）下：读走 Gather（band 并发拉取，任一 owner 不可达即整查
   报错）；索引路径与 JOIN 物化保持本地（v1 限制）。
+- 列存：段只落提交节点，读向所有节点扇出（`ScanColumnar`）；可见性=段级
+  `commit_ts ≤ read_ts`，prepared 段不入注册表即不可见；段元数据与行写同批原子发布。
 
 ## 测试地图
 - 单元：各模块旁 `*_tests.rs`（tx/global、index、plan、exec/*、storage/gc）。
 - 进程级 e2e（`tests/`）：`sql_e2e.rs`（握手/DDL/DML/SELECT 全链）、
   `sql_txn_e2e.rs`（快照隔离/冲突）、`sql_index_e2e.rs`（索引/唯一/计划）、
   `sql_oracle_cluster_e2e.rs`（进程内 3 节点全局 ts）、`sql_2pc_e2e.rs` 与
-  `sql_dist_read_e2e.rs`（3 进程 2PC 写与 scatter-gather 读）。
+  `sql_dist_read_e2e.rs`（3 进程 2PC 写与 scatter-gather 读）、
+  `columnar_e2e.rs`（列存单机 + 3 节点集群扇出读）。
