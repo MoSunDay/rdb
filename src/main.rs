@@ -520,6 +520,8 @@ async fn do_main() {
     rdb::lite::spawn_background(Arc::clone(&shared));
     // M2: periodic MVCC version GC below the snapshot watermark.
     sql::storage::gc::spawn_gc(Arc::clone(&shared));
+    // M5: periodic columnar segment orphan/garbage sweep.
+    sql::columnar::gc::spawn_columnar_gc(Arc::clone(&shared));
     let listener = match resp::bind(&conf.bind) {
         Ok(l) => l,
         Err(e) => {
