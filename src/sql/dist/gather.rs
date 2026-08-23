@@ -27,6 +27,11 @@
 //!   (a node's secondary indexes only cover its band, so an
 //!   IndexLookup could silently miss remote rows -- the planner is
 //!   bypassed entirely on the gather path).
+//! - Columnar tables fan out to EVERY member instead of slot bands:
+//!   segments commit where the txn closed, so any node may hold some
+//!   of the table's segments. Each node answers one `ScanColumnar`
+//!   with its locally visible rows and the coordinator concatenates
+//!   (no dedup: a segment lives on exactly one node).
 //!
 //! ## Failures
 //! A node that cannot be reached (or errors mid-scan) fails the WHOLE
@@ -45,7 +50,7 @@ use futures::future::join_all;
 use super::client;
 use super::proto::{Req, Resp};
 use super::server::sql_rpc_of;
-use super::{bands, routing, Band};
+use super::{bands, routing, Band, Routing};
 use crate::sql::exec::scan::{self, table_side, FromScope, Source};
 use crate::sql::parse::ast::{Expr, TableRef};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
@@ -66,8 +71,19 @@ pub fn gatherable(shared: &Shared, tref: &TableRef) -> Option<Vec<Band>> {
     (r.addrs.len() > 1).then(|| bands(&r))
 }
 
-/// EXPLAIN headline of the distributed plan ("Gather(bands=N)").
+/// EXPLAIN headline of the distributed plan ("Gather(bands=N)", or
+/// "Gather(columnar, nodes=N)" when the FROM is a plain columnar
+/// table, which fans out to every member instead of slot bands).
 pub fn headline(shared: &Shared, tref: &TableRef) -> Option<String> {
+    if let TableRef::Table { name, .. } = tref {
+        if let Ok(Some(schema)) = catalog::lookup(shared, name) {
+            if schema.engine.is_columnar() {
+                let r = routing(shared)?;
+                return (r.addrs.len() > 1)
+                    .then(|| format!("Gather(columnar, nodes={})", r.addrs.len()));
+            }
+        }
+    }
     gatherable(shared, tref).map(|bs| format!("Gather(bands={})", bs.len()))
 }
 
@@ -83,6 +99,31 @@ pub async fn materialize(
     txn: Option<&Txn>,
     filter: Option<&Expr>,
 ) -> SqlResult<Source> {
+    // Columnar tables: segments commit where the txn closed, so a
+    // ready multi-node cluster fans out to EVERY member (no slot
+    // bands); single-node reads stay on the local segment scan. The
+    // residual filter applies downstream, exactly like band gathers.
+    if let TableRef::Table { name, alias } = tref {
+        let schema = catalog::lookup(shared, name)
+            .map_err(SqlError::from)?
+            .ok_or_else(|| SqlError::no_such_table(name))?;
+        if schema.engine.is_columnar() {
+            let mut rows = match routing(shared) {
+                Some(r) if r.addrs.len() > 1 => {
+                    gather_columnar(shared, &r, &schema, read_ts).await?
+                }
+                _ => crate::sql::columnar::reader::scan_local(shared, &schema, read_ts, None)?,
+            };
+            if let Some(t) = txn {
+                if let Some(ov) = t.appends.get(&schema.name) {
+                    rows.extend(ov.iter().cloned());
+                }
+            }
+            let mut scope = FromScope::default();
+            scope.sides.push(scan::table_side(&schema, alias));
+            return Ok(Source { scope, rows });
+        }
+    }
     let TableRef::Table { name, alias } = tref else {
         return scan::materialize(shared, tref, read_ts, txn, filter);
     };
@@ -142,6 +183,41 @@ async fn gather_rows(
     Ok(merged.into_values().collect())
 }
 
+/// Union of every node's locally visible columnar rows at `read_ts`.
+/// Self scans its store; every other member answers one `ScanColumnar`.
+/// Concatenation (no dedup: segments live on exactly one node). First
+/// failure aborts the whole read, same contract as `gather_rows`.
+async fn gather_columnar(
+    shared: &Shared,
+    r: &Routing,
+    schema: &TableSchema,
+    read_ts: u64,
+) -> SqlResult<Vec<Vec<Value>>> {
+    let mut rows = Vec::new();
+    let mut remote = Vec::new();
+    for addr in &r.addrs {
+        if *addr == shared.conf.bind {
+            rows.extend(crate::sql::columnar::reader::scan_local(
+                shared, schema, read_ts, None,
+            )?);
+        } else {
+            remote.push(scan_columnar_remote(shared, schema, addr.clone(), read_ts));
+        }
+    }
+    for (owner, part) in join_all(remote).await {
+        match part {
+            Ok(part_rows) => rows.extend(part_rows),
+            Err(why) => {
+                return Err(SqlError::new(
+                    ErrorCode::NodeUnreachable,
+                    format!("cluster node {owner} unreachable: {why}"),
+                ))
+            }
+        }
+    }
+    Ok(rows)
+}
+
 /// One remote owner's band scan: resolve its sql_rpc port through the
 /// raft-replicated `sql_nodes` registry, exchange one request. The
 /// Err side carries the REASON; the caller renders the node error.
@@ -176,6 +252,43 @@ async fn request_band(sql_rpc: &str, req: &Req) -> Result<Vec<(Vec<u8>, Vec<u8>)
         Err(e) => match client::request(sql_rpc, req).await {
             Ok(Resp::BandRows { rows, error }) if error.is_empty() => Ok(rows),
             Ok(Resp::BandRows { error, .. }) => Err(format!("{e}; retry scan failed: {error}")),
+            second => Err(format!("{e}; retry {second:?}")),
+        },
+    }
+}
+
+/// One remote member's columnar scan: resolve its sql_rpc port through
+/// the raft-replicated `sql_nodes` registry, exchange one
+/// `ScanColumnar`. The Err side carries the REASON; the caller renders
+/// the node error.
+async fn scan_columnar_remote(
+    shared: &Shared,
+    schema: &TableSchema,
+    owner: String,
+    read_ts: u64,
+) -> (String, Result<Vec<Vec<Value>>, String>) {
+    let req = Req::ScanColumnar {
+        table_id: schema.id,
+        read_ts,
+    };
+    let res = match sql_rpc_of(shared, &owner) {
+        None => Err("no sql_rpc registration".to_string()),
+        Some(addr) => request_columnar(&addr, &req).await,
+    };
+    (owner, res)
+}
+
+/// One ScanColumnar exchange with a single immediate retry on transport
+/// errors (connection blips); participant-side scan failures are
+/// deterministic and never retried.
+async fn request_columnar(sql_rpc: &str, req: &Req) -> Result<Vec<Vec<Value>>, String> {
+    match client::request(sql_rpc, req).await {
+        Ok(Resp::ColumnarRows { rows, error }) if error.is_empty() => Ok(rows),
+        Ok(Resp::ColumnarRows { error, .. }) => Err(format!("scan failed: {error}")),
+        Ok(other) => Err(format!("unexpected reply {other:?}")),
+        Err(e) => match client::request(sql_rpc, req).await {
+            Ok(Resp::ColumnarRows { rows, error }) if error.is_empty() => Ok(rows),
+            Ok(Resp::ColumnarRows { error, .. }) => Err(format!("{e}; retry scan failed: {error}")),
             second => Err(format!("{e}; retry {second:?}")),
         },
     }
