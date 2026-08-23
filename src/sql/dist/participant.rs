@@ -335,6 +335,19 @@ pub fn markers(store: &Store) -> Vec<(String, Marker)> {
         .collect()
 }
 
+/// Every key referenced by any in-doubt marker (columnar GC sweep
+/// input): these belong to a 2PC txn that has not decided yet and
+/// must never be swept. Undecodable markers contribute nothing.
+pub fn in_doubt_keys(store: &Store) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = markers(store)
+        .into_iter()
+        .flat_map(|(_, marker)| marker.keys)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 /// Every outcome record on this store (GC sweep input).
 pub fn outcomes(store: &Store) -> Vec<(String, OutcomeRecord)> {
     ops::prefix_iter_collect(store, OUTCOME_PREFIX.as_bytes(), 100_000)

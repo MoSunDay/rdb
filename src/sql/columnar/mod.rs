@@ -22,11 +22,19 @@
 //! executes the DDL (clusters keep the catalog's leader-only model):
 //! segments parked on other members become unreachable orphans behind
 //! the tombstone, exactly like orphaned row bytes, and wait for the
-//! M5 GC sweep.
+//! GC sweep.
+//! M5 scope: the background sweep -- every 30s `gc::sweep` walks all
+//! 0x23 metas (the store is the source of truth, not the registry),
+//! deletes undecodable metas, metas of tables gone from the catalog
+//! and stale `Prepared` metas referenced by no in-doubt 2PC marker
+//! (one batch), resyncs the [`Registry`], and unlinks unreferenced
+//! segment files older than one hour. Prepared metas of undecided
+//! 2PC txns are never touched.
 pub mod commit;
 pub mod decode;
 pub mod encode;
 pub mod format;
+pub mod gc;
 pub mod meta;
 pub mod reader;
 pub mod writer;
@@ -161,3 +169,7 @@ mod tests_2pc;
 #[cfg(test)]
 #[path = "tests_scan.rs"]
 mod tests_scan;
+
+#[cfg(test)]
+#[path = "tests_gc.rs"]
+mod tests_gc;
