@@ -350,13 +350,20 @@ pub mod testutil {
     use super::*;
 
     /// Shared state with a tempdir-backed store and the P1 raft stub.
+    /// `conf.store_path` is rewritten to the instance's temp dir so
+    /// path-keyed process globals (e.g. the columnar registry cache)
+    /// never collide across test instances.
     pub fn shared_with(conf: conf::Config) -> Shared {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("rdb-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = store::data_path(dir.to_str().unwrap(), &conf.bind);
+        let conf = conf::Config {
+            store_path: dir.to_str().unwrap().to_string(),
+            ..conf
+        };
+        let path = store::data_path(&conf.store_path, &conf.bind);
         let st = store::open(path.to_str().unwrap()).unwrap();
         Shared {
             mode: Mode::Normal,

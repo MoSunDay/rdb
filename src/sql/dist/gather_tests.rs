@@ -200,6 +200,7 @@ async fn gather_merges_bands_disjointly() {
     let mut txn = Txn {
         read_ts: 10,
         writes: BTreeMap::new(),
+        ..Default::default()
     };
     tx::stage_upsert(&mut txn, &s, row_of(99, "staged")).unwrap();
     tx::stage_delete(&mut txn, &s, row::pk_encode(&Value::Int(1)).unwrap());

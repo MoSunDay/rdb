@@ -8,7 +8,7 @@ pub mod ts;
 
 pub use global::ClusterTs;
 pub use session::{
-    begin, commit, conflict_check, merge_rows, rollback, stage_delete, stage_upsert, Txn, TxnKey,
-    TxnWrite,
+    begin, commit, conflict_check, merge_rows, rollback, stage_append, stage_delete, stage_upsert,
+    Txn, TxnKey, TxnWrite,
 };
 pub use ts::Oracle;

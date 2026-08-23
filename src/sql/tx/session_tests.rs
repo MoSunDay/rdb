@@ -114,6 +114,7 @@ fn merge_rows_substitutes_deletes_and_injects() {
     let mut txn = Txn {
         read_ts: 1,
         writes: BTreeMap::new(),
+        ..Default::default()
     };
     stage_upsert(&mut txn, &s, row_of(2, "TWO")).unwrap();
     stage_delete(&mut txn, &s, pk_key(3));
@@ -137,6 +138,7 @@ fn merge_rows_reinserts_tombstoned_store_key() {
     let mut txn = Txn {
         read_ts: 5,
         writes: BTreeMap::new(),
+        ..Default::default()
     };
     stage_upsert(&mut txn, &s, row_of(7, "new")).unwrap();
     assert_eq!(
@@ -152,6 +154,7 @@ fn merge_rows_ignores_other_tables() {
     let mut txn = Txn {
         read_ts: 0,
         writes: BTreeMap::new(),
+        ..Default::default()
     };
     stage_upsert(&mut txn, &b, row_of(9, "x")).unwrap();
     assert_eq!(
@@ -169,6 +172,7 @@ fn conflict_check_first_committer_wins() {
     let mut stale = Txn {
         read_ts: 1,
         writes: BTreeMap::new(),
+        ..Default::default()
     };
     stage_upsert(&mut stale, &s, row_of(1, "stale")).unwrap();
     conflict_check(&shared.store, &stale).expect("no newer version yet");
@@ -182,6 +186,7 @@ fn conflict_check_first_committer_wins() {
     let mut fresh = Txn {
         read_ts: 2,
         writes: BTreeMap::new(),
+        ..Default::default()
     };
     stage_upsert(&mut fresh, &s, row_of(1, "next")).unwrap();
     conflict_check(&shared.store, &fresh).expect("read_ts covers the winner");
@@ -194,6 +199,7 @@ fn conflict_check_missing_pk_is_clean() {
     let mut txn = Txn {
         read_ts: 0,
         writes: BTreeMap::new(),
+        ..Default::default()
     };
     stage_upsert(&mut txn, &s, row_of(42, "fresh insert")).unwrap();
     conflict_check(&shared.store, &txn).expect("no prior version exists");
@@ -295,4 +301,218 @@ async fn conflicting_commit_releases_snapshot_and_writes_nothing() {
     );
     let visible = crate::sql::exec::scan::visible_rows(&shared.store, &s, oracle.now()).unwrap();
     assert_eq!(visible, vec![row_of(1, "winner")], "loser wrote nothing");
+}
+
+// ---------- M2: columnar append write path ----------
+
+fn columnar_schema(id: u32, name: &str) -> TableSchema {
+    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
+    TableSchema {
+        id,
+        name: name.to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                sql_type: SqlType::Int,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "v".into(),
+                sql_type: SqlType::VarChar,
+                nullable: true,
+            },
+        ],
+        pk: "id".into(),
+        engine: Engine::Columnar,
+        indexes: vec![],
+    }
+}
+
+async fn sql_insert(
+    shared: &Shared,
+    sess: &mut crate::sql::exec::SqlSession,
+    sql: &str,
+) -> crate::sql::parse::error::SqlResult<crate::sql::exec::ExecOutcome> {
+    let stmt = crate::sql::parse::parse_statement(sql).unwrap();
+    crate::sql::exec::write::insert(shared, sess, stmt).await
+}
+
+fn segment_path(
+    shared: &Shared,
+    meta: &crate::sql::columnar::meta::SegmentMeta,
+) -> std::path::PathBuf {
+    crate::sql::columnar::writer::columnar_dir(&shared.conf).join(&meta.file)
+}
+
+#[tokio::test]
+async fn autocommit_columnar_insert_publishes_live_segment() {
+    let shared = shared();
+    let s = columnar_schema(11, "ct");
+    seed_catalog(&shared, &s);
+    let mut sess = crate::sql::exec::SqlSession::default();
+    let out = sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ct (id, v) VALUES (1, 'a'), (2, NULL)",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(out, crate::sql::exec::ExecOutcome::Affected(2)));
+    let segs = crate::sql::columnar::registry_of(&shared).segments(s.id);
+    assert_eq!(segs.len(), 1);
+    assert_eq!(
+        segs[0].state,
+        crate::sql::columnar::meta::SegmentState::Live
+    );
+    assert_eq!(segs[0].num_rows, 2);
+    assert!(segment_path(&shared, &segs[0]).exists());
+}
+
+#[tokio::test]
+async fn explicit_txn_flushes_all_appends_as_one_segment() {
+    let shared = shared();
+    let s = columnar_schema(12, "ct2");
+    seed_catalog(&shared, &s);
+    let mut sess = crate::sql::exec::SqlSession {
+        txn: Some(begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ct2 (id, v) VALUES (1, 'a')",
+    )
+    .await
+    .unwrap();
+    sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ct2 (id, v) VALUES (2, 'b'), (3, 'c')",
+    )
+    .await
+    .unwrap();
+    let reg = crate::sql::columnar::registry_of(&shared);
+    assert!(
+        reg.segments(s.id).is_empty(),
+        "nothing flushed before COMMIT"
+    );
+    commit(&shared, sess.txn.take().unwrap()).await.unwrap();
+    let segs = reg.segments(s.id);
+    assert_eq!(segs.len(), 1, "one segment for the whole txn per table");
+    assert_eq!(segs[0].num_rows, 3);
+    assert_eq!(
+        segs[0].state,
+        crate::sql::columnar::meta::SegmentState::Live
+    );
+    assert!(segment_path(&shared, &segs[0]).exists());
+}
+
+#[tokio::test]
+async fn mixed_txn_commits_row_versions_and_segment_meta_together() {
+    let shared = shared();
+    let row_t = schema(13, "rt");
+    let col_t = columnar_schema(14, "ctm");
+    seed_catalog(&shared, &row_t);
+    seed_catalog(&shared, &col_t);
+    let mut sess = crate::sql::exec::SqlSession {
+        txn: Some(begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    sql_insert(&shared, &mut sess, "INSERT INTO rt (id, v) VALUES (1, 'r')")
+        .await
+        .unwrap();
+    sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ctm (id, v) VALUES (5, 'c')",
+    )
+    .await
+    .unwrap();
+    commit(&shared, sess.txn.take().unwrap()).await.unwrap();
+    // row side: a live MVCC version visible at the post-commit ts
+    let visible =
+        crate::sql::exec::scan::visible_rows(&shared.store, &row_t, shared.sql_ts.now()).unwrap();
+    assert_eq!(visible, vec![row_of(1, "r")]);
+    // columnar side: one Live meta in BOTH the store and the registry
+    let segs = crate::sql::columnar::registry_of(&shared).segments(col_t.id);
+    assert_eq!(segs.len(), 1);
+    let raw = crate::store::ops::get_physical(
+        &shared.store,
+        &crate::sql::columnar::meta::meta_key(col_t.id, segs[0].segment_id),
+    )
+    .unwrap()
+    .expect("meta persisted");
+    let meta = crate::sql::columnar::meta::decode_meta(&raw).unwrap();
+    assert_eq!(meta.state, crate::sql::columnar::meta::SegmentState::Live);
+    assert_eq!(meta.commit_ts, segs[0].commit_ts);
+}
+
+#[tokio::test]
+async fn columnar_insert_exceeding_flush_rows_is_rejected() {
+    let conf = crate::conf::Config {
+        columnar_flush_rows: 1,
+        ..testutil::test_config()
+    };
+    let shared = testutil::shared_with(conf);
+    let s = columnar_schema(15, "ctl");
+    seed_catalog(&shared, &s);
+    let mut sess = crate::sql::exec::SqlSession::default();
+    let err = sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ctl (id, v) VALUES (1, 'a'), (2, 'b')",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotSupported);
+    assert!(crate::sql::columnar::registry_of(&shared).all().is_empty());
+    // cumulative staged limit inside an explicit txn
+    let mut sess = crate::sql::exec::SqlSession {
+        txn: Some(begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ctl (id, v) VALUES (1, 'a')",
+    )
+    .await
+    .unwrap();
+    let err = sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ctl (id, v) VALUES (2, 'b')",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotSupported);
+    rollback(&shared.sql_ts, sess.txn.take().unwrap());
+    assert!(crate::sql::columnar::registry_of(&shared).all().is_empty());
+}
+
+#[tokio::test]
+async fn rollback_discards_staged_columnar_appends() {
+    let shared = shared();
+    let s = columnar_schema(16, "ctr");
+    seed_catalog(&shared, &s);
+    let mut sess = crate::sql::exec::SqlSession {
+        txn: Some(begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ctr (id, v) VALUES (1, 'x'), (2, 'y')",
+    )
+    .await
+    .unwrap();
+    let txn = sess.txn.take().unwrap();
+    assert_eq!(txn.appends.get("ctr").map(|v| v.len()), Some(2));
+    rollback(&shared.sql_ts, txn);
+    assert!(crate::sql::columnar::registry_of(&shared).all().is_empty());
+    let dir = crate::sql::columnar::writer::columnar_dir(&shared.conf);
+    assert!(
+        !dir.exists() || std::fs::read_dir(&dir).unwrap().count() == 0,
+        "rollback must not leave segment files"
+    );
 }
