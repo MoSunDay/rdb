@@ -372,6 +372,41 @@ contract; module map lives in `agents/rust/sql.md`.
   newest (live) anchor; tombstone anchors take their whole prefix with them. Prepared
   (0x02) versions are never swept.
 
+## Columnar table engine (Rust-only)
+
+A second storage engine behind the same SQL front end: `CREATE TABLE ... ENGINE=columnar`
+(the default stays the MVCC row store). Append-only and scan-oriented; segments are
+immutable once published.
+
+- **DDL**: `ENGINE=columnar` table option (case-insensitive). Column types are the row
+  store's (`BIGINT`, `VARCHAR(n)`, `DOUBLE`, `BOOLEAN`/`BOOL`, `BLOB`); CREATE/DROP run
+  through the same raft-linearized catalog as row tables.
+- **Physical layout**: segment files live under `<store_path>/<bind>/columnar/`
+  (magic | per-column pages | JSON footer | footer_len | crc32; PLAIN and string DICT
+  encodings with per-page zonemaps) — never inside RocksDB, whose LSM compaction would
+  rewrite them. RocksDB stores only the small `0x23 | table_id BE | segment_id BE` meta
+  per segment (state, commit_ts, file name, column layout); a per-instance in-memory
+  registry caches the live metas.
+- **Writes**: append-only. Autocommit INSERT flushes one Live segment per statement and
+  commits it locally on a single timestamp (never 2PC); inside an explicit txn rows are
+  staged and COMMIT flushes one segment per table into the txn's atomic batch (in a ready
+  cluster the segment rides the 2PC plan as a pending segment on the coordinator's own
+  slice). UPDATE / DELETE / CREATE INDEX on a columnar table are rejected (MySQL 1235).
+  No pk dedup, no secondary indexes. Per-statement and staged buffers are bounded by
+  `columnar_flush_rows` / `columnar_flush_bytes`.
+- **Reads**: visibility is segment-level (`commit_ts <= read_ts`); scans decode Live
+  segments in `(commit_ts, segment_id)` order plus an open txn's staged appends. In a
+  ready cluster every SELECT fans out to EVERY member (EXPLAIN shows
+  `Gather(columnar, nodes=N)`) and the coordinator merges the union — segments live where
+  the committing INSERT ran. A member's snapshot read point is its own ts knowledge, so
+  right after concurrent INSERTs on different nodes a reader may need its read point
+  advanced (any 2PC row-store commit does that via Decide) before it sees every segment.
+- **DROP TABLE**: after the raft catalog tombstone lands, the DDL-executing node deletes
+  every `0x23` meta of the table in one contiguous scan + one batch, forgets the registry
+  entries and best-effort unlinks the files. Cluster-wide this mirrors the row store: only
+  the executing (leader) node purges, segments on other members become unreachable orphans
+  behind the tombstone, reclaimed by the planned M5 GC sweep.
+
 ## Runtime verification (this tree)
 
 - Full RESP drill (gate text, cluster init/nodes, MOVED format+routing, hash-tag co-location,

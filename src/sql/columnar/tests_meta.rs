@@ -209,3 +209,62 @@ fn rebuild_and_registry_of_recover_metas_from_store() {
     assert_eq!(cached.segments(3).len(), 2);
     assert_eq!(cached.max_table_id(), 3);
 }
+
+#[tokio::test]
+async fn drop_table_segments_purges_metas_registry_and_files() {
+    let shared = testutil::shared_with(testutil::test_config());
+    let schema = two_col_schema(); // table id 21
+    let rows = vec![
+        vec![Value::Int(1), Value::Str("a".into())],
+        vec![Value::Int(2), Value::Null],
+    ];
+    let m1 = writer::commit_segment(&shared, &schema, 11, 10, &rows)
+        .await
+        .unwrap();
+    let m2 = writer::commit_segment(&shared, &schema, 12, 20, &rows)
+        .await
+        .unwrap();
+    // A neighbor table's meta must survive the prefix-bounded walk.
+    let mut other = two_col_schema();
+    other.id = 22;
+    other.name = "neighbor".into();
+    let m3 = writer::commit_segment(&shared, &other, 13, 30, &rows)
+        .await
+        .unwrap();
+    let dir = writer::columnar_dir(&shared.conf);
+    assert!(dir.join(&m1.file).exists() && dir.join(&m2.file).exists());
+
+    super::commit::drop_table_segments(&shared, schema.id)
+        .await
+        .unwrap();
+
+    for m in [&m1, &m2] {
+        assert!(
+            crate::store::ops::get_physical(&shared.store, &meta_key(m.table_id, m.segment_id))
+                .unwrap()
+                .is_none(),
+            "meta of segment {} must be deleted",
+            m.segment_id
+        );
+        assert!(
+            !dir.join(&m.file).exists(),
+            "file {} must be deleted",
+            m.file
+        );
+    }
+    assert!(registry_of(&shared).segments(schema.id).is_empty());
+    // the neighbor table is untouched
+    assert_eq!(registry_of(&shared).segments(other.id), vec![m3.clone()]);
+    assert!(
+        crate::store::ops::get_physical(&shared.store, &meta_key(m3.table_id, m3.segment_id))
+            .unwrap()
+            .is_some()
+    );
+    assert!(dir.join(&m3.file).exists());
+
+    // a second call is a no-op
+    super::commit::drop_table_segments(&shared, schema.id)
+        .await
+        .unwrap();
+    assert!(registry_of(&shared).segments(schema.id).is_empty());
+}
