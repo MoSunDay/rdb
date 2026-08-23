@@ -19,7 +19,7 @@ pub enum SqlType {
 }
 
 /// A runtime value. `Null` is its own variant (SQL three-valued logic).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -61,6 +61,24 @@ pub struct IndexDef {
     pub unique: bool,
 }
 
+/// Table storage engine. Row = the MVCC row-store in RocksDB (the
+/// default); Columnar = append-only versioned segment files + RocksDB
+/// segment meta (kind 0x23). Old catalog JSON without the field
+/// decodes as Row (`#[serde(default)]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    #[default]
+    Row,
+    Columnar,
+}
+
+impl Engine {
+    pub fn is_columnar(self) -> bool {
+        matches!(self, Engine::Columnar)
+    }
+}
+
 /// A table schema, stored as JSON under `sql_catalog/<table>` (see
 /// `catalog.rs`). `id` is stable across renames (there are none in v1) and
 /// namespaces physical row keys, so a dropped+recreated table never reads
@@ -72,6 +90,8 @@ pub struct TableSchema {
     pub columns: Vec<ColumnDef>,
     /// Exactly one primary-key column in v1 (enforced at DDL time).
     pub pk: String,
+    #[serde(default)]
+    pub engine: Engine,
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
 }
@@ -144,6 +164,7 @@ mod tests {
                 },
             ],
             pk: "id".into(),
+            engine: Engine::Row,
             indexes: vec![],
         }
     }

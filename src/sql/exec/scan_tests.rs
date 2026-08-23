@@ -2,7 +2,7 @@
 //! scan.rs stays under the 400-line budget for new files).
 
 use super::*;
-use crate::sql::storage::schema::ColumnDef;
+use crate::sql::storage::schema::{ColumnDef, Engine};
 use crate::state::testutil;
 
 fn schema(id: u32, name: &str) -> TableSchema {
@@ -22,6 +22,7 @@ fn schema(id: u32, name: &str) -> TableSchema {
             },
         ],
         pk: "id".into(),
+        engine: Engine::Row,
         indexes: vec![],
     }
 }
@@ -151,6 +152,7 @@ fn materialize_nested_loop_join_with_on() {
             nullable: false,
         }],
         pk: "uid".into(),
+        engine: Engine::Row,
         indexes: vec![],
     };
     seed_catalog(&shared, &u);
@@ -196,6 +198,7 @@ fn resolve_reports_ambiguity() {
         name: "t2".into(),
         columns: s.columns.clone(),
         pk: "id".into(),
+        engine: Engine::Row,
         indexes: vec![],
     };
     let scope = FromScope {

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::sql::parse::parse_statement;
-use crate::sql::storage::schema::{ColumnDef, IndexDef, SqlType};
+use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, SqlType};
 use crate::state::testutil;
 use crate::state::Shared;
 
@@ -28,6 +28,7 @@ fn schema() -> TableSchema {
             },
         ],
         pk: "id".into(),
+        engine: Engine::Row,
         indexes: vec![IndexDef {
             id: 1,
             name: "idx_v".into(),

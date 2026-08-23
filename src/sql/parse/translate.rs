@@ -5,9 +5,9 @@
 //! executor only ever sees runnable shapes.
 
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, DataType, Expr as SqlExpr, FromTable, ObjectName,
-    ObjectNamePart, SetExpr, Statement as SqlStatement, TableConstraint, TableFactor, TableObject,
-    TableWithJoins,
+    ColumnDef as SqlColumnDef, ColumnOption, CreateTableOptions, DataType, Expr as SqlExpr,
+    FromTable, ObjectName, ObjectNamePart, SetExpr, SqlOption, Statement as SqlStatement,
+    TableConstraint, TableFactor, TableObject, TableWithJoins,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -16,7 +16,7 @@ use crate::sql::parse::ast::*;
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 pub(crate) use crate::sql::parse::expr::translate_expr;
 
-use crate::sql::storage::schema::{SqlType, Value};
+use crate::sql::storage::schema::{Engine, SqlType, Value};
 
 /// Parse one SQL string; exactly one statement expected (clients send one).
 pub fn parse_statement(sql: &str) -> SqlResult<Statement> {
@@ -364,7 +364,34 @@ fn translate_create_table(c: sqlparser::ast::CreateTable) -> SqlResult<Statement
         if_not_exists: c.if_not_exists,
         columns,
         pk,
+        engine: table_engine(&c.table_options),
     })
+}
+
+/// MySQL `ENGINE=...` table option -> storage engine. sqlparser hands
+/// the plain option list over as [`SqlOption::NamedParenthesizedList`]
+/// entries; anything but `ENGINE=columnar` (absent, other keys, other
+/// values) falls back to [`Engine::Row`] -- accepted and ignored,
+/// MySQL-style.
+fn table_engine(opts: &CreateTableOptions) -> Engine {
+    let options = match opts {
+        CreateTableOptions::Plain(o)
+        | CreateTableOptions::With(o)
+        | CreateTableOptions::Options(o) => o,
+        _ => return Engine::Row,
+    };
+    for opt in options {
+        let SqlOption::NamedParenthesizedList(npl) = opt else {
+            continue;
+        };
+        if npl.key.value.eq_ignore_ascii_case("engine") {
+            return match &npl.name {
+                Some(id) if id.value.eq_ignore_ascii_case("columnar") => Engine::Columnar,
+                _ => Engine::Row,
+            };
+        }
+    }
+    Engine::Row
 }
 
 fn translate_column(col: &SqlColumnDef) -> SqlResult<(ColumnSpec, bool)> {
