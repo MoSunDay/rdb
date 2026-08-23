@@ -45,10 +45,72 @@ pub async fn handle(ctx: &mut Ctx<'_>) {
         b"nodes" | b"NODES" => cluster_nodes(ctx),
         b"slots" | b"SLOTS" => cluster_slots(ctx),
         b"test" => cluster_test(ctx),
-        b"keyslot" | b"KEYSLOT" => cluster_slot::cluster_key_slot(ctx),
-        b"getkeysinslot" | b"GETKEYSINSLOT" => cluster_slot::cluster_get_keys_in_slot(ctx),
+        b"keyslot" | b"KEYSLOT" => cluster_key_slot(ctx),
+        b"getkeysinslot" | b"GETKEYSINSLOT" => cluster_get_keys_in_slot(ctx),
         b"setslot" | b"SETSLOT" => cluster_slot::cluster_set_slot(ctx).await,
         _ => cluster_help(ctx),
+    }
+}
+
+/// `ASKING`: single-shot flag allowing access to an importing slot (follows an
+/// `ASK` redirection). Whitelisted: no slot routing of its own.
+pub async fn asking(ctx: &mut Ctx<'_>) {
+    ctx.conn.asking = true;
+    append_string(ctx.out, "OK");
+}
+/// `CLUSTER KEYSLOT key`: the hash-tag slot of `key` (`keyHashSlot`).
+pub fn cluster_key_slot(ctx: &mut Ctx<'_>) {
+    let Some(key) = ctx.args.get(1) else {
+        append_error(
+            ctx.out,
+            "ERR wrong number of arguments for 'cluster|keyslot' command",
+        );
+        return;
+    };
+    let (slot, _) = crate::hash::slot_with_prefix(crate::hash::hash_tag(key));
+    append_int(ctx.out, slot as i64);
+}
+/// `CLUSTER GETKEYSINSLOT slot count`: up to `count` user keys physically
+/// stored in `slot` on this node (the source side of a slot migration).
+/// Mirrors Redis: top-level data keys only (no hash fields / list elems),
+/// raw strings included, expire-index records skipped.
+pub fn cluster_get_keys_in_slot(ctx: &mut Ctx<'_>) {
+    if ctx.args.len() < 3 {
+        append_error(
+            ctx.out,
+            "ERR wrong number of arguments for 'cluster|getkeysinslot' command",
+        );
+        return;
+    }
+    let parse_u16 = |b: &[u8]| {
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+    };
+    let Some(slot) = parse_u16(&ctx.args[1]) else {
+        append_error(ctx.out, "ERR Invalid slot");
+        return;
+    };
+    let count = parse_u16(&ctx.args[2]).map(|c| c as usize).unwrap_or(0);
+    let prefix = crate::store::rocksdb::slot_prefix(slot);
+    let prefix_len = prefix.len();
+    let mut user_keys: Vec<Vec<u8>> = Vec::new();
+    for pk in crate::store::ops::prefix_keys_collect(&ctx.shared.store, &prefix, count) {
+        let after = &pk[prefix_len..];
+        match crate::ds::codec::classify(after) {
+            crate::ds::codec::Classification::Raw => user_keys.push(after.to_vec()),
+            crate::ds::codec::Classification::Typed(_) => {
+                if let Some((_, key, rest)) = crate::ds::codec::decode_data_key(&pk, prefix_len) {
+                    if rest.is_empty() {
+                        user_keys.push(key);
+                    }
+                }
+            }
+        }
+    }
+    append_array(ctx.out, user_keys.len());
+    for k in &user_keys {
+        crate::resp::codec::append_bulk(ctx.out, k);
     }
 }
 

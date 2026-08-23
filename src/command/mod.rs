@@ -98,7 +98,7 @@ pub fn lookup(name: &str) -> Option<Handler> {
     match name {
         "ping" => Some(|ctx| Box::pin(string::ping(ctx))),
         "quit" => Some(|ctx| Box::pin(string::quit(ctx))),
-        "asking" => Some(|ctx| Box::pin(cluster_slot::asking(ctx))),
+        "asking" => Some(|ctx| Box::pin(cluster::asking(ctx))),
         "restore" => Some(|ctx| Box::pin(migrate::restore(ctx))),
         "get" => Some(|ctx| Box::pin(string::get(ctx))),
         "set" => Some(|ctx| Box::pin(string::set(ctx))),
