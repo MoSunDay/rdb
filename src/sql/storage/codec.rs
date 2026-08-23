@@ -19,6 +19,8 @@ use crate::sql::storage::schema::{SqlType, Value};
 pub const KIND_SQL_ROW: u8 = 0x20;
 pub const KIND_SQL_INDEX: u8 = 0x21;
 pub const KIND_SQL_UNIQUE_INDEX: u8 = 0x22;
+/// Columnar segment meta — JSON `SegmentMeta` value.
+pub const KIND_SQL_SEGMENT: u8 = 0x23;
 
 /// Encode a value with its type tag (self-describing; used for index
 /// payloads where the reader may only know the index column type later).

@@ -24,7 +24,7 @@ use crate::sql::parse::ast::{ColumnSpec, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog::{self, CatalogTxn};
 use crate::sql::storage::row;
-use crate::sql::storage::schema::{ColumnDef, IndexDef, TableSchema};
+use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, TableSchema};
 use crate::state::Shared;
 use crate::store::ops;
 
@@ -35,7 +35,8 @@ pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
             if_not_exists,
             columns,
             pk,
-        } => create_table(shared, &name, if_not_exists, &columns, &pk).await,
+            engine,
+        } => create_table(shared, &name, if_not_exists, &columns, &pk, engine).await,
         Statement::DropTable { name, if_exists } => drop_table(shared, &name, if_exists).await,
         Statement::CreateIndex {
             table,
@@ -83,8 +84,9 @@ async fn create_table(
     if_not_exists: bool,
     columns: &[ColumnSpec],
     pk: &str,
+    engine: Engine,
 ) -> SqlResult<ExecOutcome> {
-    let schema = build_schema(0, name, columns, pk)?;
+    let schema = build_schema(0, name, columns, pk, engine)?;
     if catalog::lookup(shared, name)
         .map_err(SqlError::from)?
         .is_some()
@@ -128,6 +130,12 @@ async fn create_index(
     if_not_exists: bool,
 ) -> SqlResult<ExecOutcome> {
     let mut schema = lookup_table(shared, table)?;
+    if schema.engine.is_columnar() {
+        return Err(SqlError::new(
+            ErrorCode::NotSupported,
+            format!("indexes are not supported on columnar table '{table}'"),
+        ));
+    }
     if schema.index(name).is_some() {
         if if_not_exists {
             return Ok(ExecOutcome::Ok);
@@ -263,6 +271,7 @@ pub fn build_schema(
     name: &str,
     columns: &[ColumnSpec],
     pk: &str,
+    engine: Engine,
 ) -> SqlResult<TableSchema> {
     let pk_idx = columns
         .iter()
@@ -297,6 +306,7 @@ pub fn build_schema(
         name: name.to_string(),
         columns: defs,
         pk: columns[pk_idx].name.clone(),
+        engine,
         indexes: Vec::new(),
     })
 }
@@ -330,15 +340,15 @@ mod tests {
             spec("d", SqlType::Double, false),
         ];
         // missing pk column
-        let err = build_schema(0, "t", &cols, "nope").unwrap_err();
+        let err = build_schema(0, "t", &cols, "nope", Engine::Row).unwrap_err();
         assert_eq!(err.code, ErrorCode::Parse);
         assert!(err.msg.contains("primary key column 'nope'"));
         // duplicate column
         let dup = [int_spec("id"), int_spec("ID")];
-        let err = build_schema(0, "t", &dup, "id").unwrap_err();
+        let err = build_schema(0, "t", &dup, "id", Engine::Row).unwrap_err();
         assert!(err.msg.contains("duplicate column"));
         // pk is implicitly NOT NULL even when declared NULL
-        let s = build_schema(7, "t", &cols, "id").unwrap();
+        let s = build_schema(7, "t", &cols, "id", Engine::Row).unwrap();
         assert_eq!(s.id, 7);
         assert_eq!(s.pk, "id");
         assert!(!s.columns[0].nullable, "pk coerced NOT NULL");

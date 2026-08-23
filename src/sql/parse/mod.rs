@@ -17,7 +17,7 @@ pub use translate::{bind_placeholders, parse_statement, placeholder_count};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::storage::schema::{SqlType, Value};
+    use crate::sql::storage::schema::{Engine, SqlType, Value};
 
     fn stmt(sql: &str) -> Statement {
         parse_statement(sql).expect("parse")
@@ -47,6 +47,27 @@ mod tests {
             panic!("shape")
         };
         assert_eq!(pk, "k");
+    }
+
+    #[test]
+    fn create_table_engine_option() {
+        let Statement::CreateTable { engine, .. } =
+            stmt("CREATE TABLE t (id BIGINT PRIMARY KEY) ENGINE=columnar")
+        else {
+            panic!("shape");
+        };
+        assert_eq!(engine, Engine::Columnar);
+        let Statement::CreateTable { engine, .. } =
+            stmt("CREATE TABLE t (id BIGINT PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        else {
+            panic!("shape");
+        };
+        assert_eq!(engine, Engine::Row);
+        let Statement::CreateTable { engine, .. } = stmt("CREATE TABLE t (id BIGINT PRIMARY KEY)")
+        else {
+            panic!("shape");
+        };
+        assert_eq!(engine, Engine::Row);
     }
 
     #[test]
