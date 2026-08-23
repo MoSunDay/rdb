@@ -165,6 +165,21 @@ async fn dispatch(req: &Req, shared: &Shared, mux: &tokio::sync::Mutex<()>) -> R
                 },
             }
         }
+        Req::ScanColumnar { table_id, read_ts } => {
+            // Same read-only rationale as ScanBand: segment files are
+            // immutable once published, so no mutex is needed.
+            let res = crate::sql::columnar::reader::table_rows(shared, *table_id, *read_ts);
+            match res {
+                Ok(rows) => Resp::ColumnarRows {
+                    rows,
+                    error: String::new(),
+                },
+                Err(e) => Resp::ColumnarRows {
+                    rows: Vec::new(),
+                    error: e.to_string(),
+                },
+            }
+        }
     }
 }
 

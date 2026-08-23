@@ -516,3 +516,118 @@ async fn rollback_discards_staged_columnar_appends() {
         "rollback must not leave segment files"
     );
 }
+
+// ---------- M3: columnar read/scan path (SELECT level) ----------
+
+async fn sql_select(
+    shared: &Shared,
+    sess: &crate::sql::exec::SqlSession,
+    sql: &str,
+) -> Vec<Vec<Value>> {
+    let stmt = crate::sql::parse::parse_statement(sql).unwrap();
+    let crate::sql::parse::ast::Statement::Select(q) = stmt else {
+        panic!("not a SELECT: {sql}");
+    };
+    crate::sql::exec::select::run(shared, sess, q)
+        .await
+        .unwrap()
+        .1
+}
+
+#[tokio::test]
+async fn select_where_filters_columnar_rows() {
+    let shared = shared();
+    let s = columnar_schema(30, "cw");
+    seed_catalog(&shared, &s);
+    let mut sess = crate::sql::exec::SqlSession::default();
+    sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO cw (id, v) VALUES (1, 'a'), (2, NULL), (3, 'b'), (4, 'b')",
+    )
+    .await
+    .unwrap();
+    let rows = sql_select(&shared, &sess, "SELECT id FROM cw WHERE v = 'b'").await;
+    assert_eq!(rows, vec![vec![Value::Int(3)], vec![Value::Int(4)]]);
+    let rows = sql_select(&shared, &sess, "SELECT id FROM cw WHERE v IS NULL").await;
+    assert_eq!(rows, vec![vec![Value::Int(2)]]);
+}
+
+#[tokio::test]
+async fn open_txn_sees_staged_appends_other_sessions_do_not() {
+    let shared = shared();
+    let s = columnar_schema(31, "cv");
+    seed_catalog(&shared, &s);
+    let mut owner = crate::sql::exec::SqlSession {
+        txn: Some(begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    sql_insert(
+        &shared,
+        &mut owner,
+        "INSERT INTO cv (id, v) VALUES (7, 'own')",
+    )
+    .await
+    .unwrap();
+    let own = sql_select(&shared, &owner, "SELECT id FROM cv").await;
+    assert_eq!(own, vec![vec![Value::Int(7)]], "own staged appends visible");
+    let stranger = sql_select(
+        &shared,
+        &crate::sql::exec::SqlSession::default(),
+        "SELECT id FROM cv",
+    )
+    .await;
+    assert!(
+        stranger.is_empty(),
+        "uncommitted appends invisible elsewhere"
+    );
+    commit(&shared, owner.txn.take().unwrap()).await.unwrap();
+    let after = sql_select(
+        &shared,
+        &crate::sql::exec::SqlSession::default(),
+        "SELECT id FROM cv",
+    )
+    .await;
+    assert_eq!(
+        after,
+        vec![vec![Value::Int(7)]],
+        "committed segment visible"
+    );
+}
+
+#[tokio::test]
+async fn join_row_and_columnar_tables() {
+    let shared = shared();
+    let rt = schema(32, "rj");
+    let ct = columnar_schema(33, "cj");
+    seed_catalog(&shared, &rt);
+    seed_catalog(&shared, &ct);
+    let mut sess = crate::sql::exec::SqlSession::default();
+    sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO rj (id, v) VALUES (1, 'r1'), (2, 'r2')",
+    )
+    .await
+    .unwrap();
+    sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO cj (id, v) VALUES (1, 'c1'), (2, 'c2')",
+    )
+    .await
+    .unwrap();
+    let rows = sql_select(
+        &shared,
+        &sess,
+        "SELECT rj.v, cj.v FROM rj JOIN cj ON rj.id = cj.id ORDER BY rj.id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Str("r1".into()), Value::Str("c1".into())],
+            vec![Value::Str("r2".into()), Value::Str("c2".into())],
+        ]
+    );
+}
