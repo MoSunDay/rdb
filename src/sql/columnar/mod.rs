@@ -11,11 +11,16 @@
 //! publishing its 0x23 meta in the SAME atomic batch as the txn's row
 //! writes. Visibility stays segment-level (`commit_ts <= read_ts`,
 //! decided at read time, M3); the [`Registry`] caches live metas.
+//! M3 scope: the read/scan path -- `reader` decodes the Live segments
+//! with `commit_ts <= read_ts` (plus an open txn's staged appends) in
+//! `(commit_ts, segment_id)` order, and dist fans columnar reads out
+//! to every cluster member.
 pub mod commit;
 pub mod decode;
 pub mod encode;
 pub mod format;
 pub mod meta;
+pub mod reader;
 pub mod writer;
 
 use std::collections::BTreeMap;
@@ -144,3 +149,7 @@ mod tests_meta;
 #[cfg(test)]
 #[path = "tests_2pc.rs"]
 mod tests_2pc;
+
+#[cfg(test)]
+#[path = "tests_scan.rs"]
+mod tests_scan;

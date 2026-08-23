@@ -252,3 +252,119 @@ async fn unreachable_node_fails_the_whole_read() {
         err.msg
     );
 }
+
+// ---------- M3: columnar fan-out (ScanColumnar) ----------
+
+fn columnar_schema(id: u32, name: &str) -> TableSchema {
+    let mut s = schema(id, name);
+    s.engine = Engine::Columnar;
+    s
+}
+
+/// Columnar reads fan out to EVERY member (segments commit where the
+/// txn closed): the coordinator unions its own segments with each
+/// peer's `ScanColumnar` reply; read_ts applies on both sides and the
+/// txn's staged appends ride last.
+#[tokio::test]
+async fn columnar_fanout_unions_every_node() {
+    let a = shared_at("127.0.0.1:33111");
+    let b = shared_at("127.0.0.1:33112");
+    let s = columnar_schema(9, "cg");
+    seed_catalog(&a, &s);
+    seed_catalog(&b, &s);
+    set_topology(&a, &["127.0.0.1:33111", "127.0.0.1:33112"]);
+    set_topology(&b, &["127.0.0.1:33111", "127.0.0.1:33112"]);
+    // Each node commits its OWN segment (per-node registry caches).
+    crate::sql::columnar::writer::commit_segment(&a, &s, 1, 5, &[row_of(1, "from-a")])
+        .await
+        .unwrap();
+    crate::sql::columnar::writer::commit_segment(&b, &s, 2, 6, &[row_of(2, "from-b")])
+        .await
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sql_rpc = listener.local_addr().unwrap().to_string();
+    tokio::spawn(super::super::server::serve_on(listener, Arc::new(b)));
+    register_node(&a, "127.0.0.1:33112", &sql_rpc);
+
+    let src = materialize(&a, &tref("cg"), 10, None, None).await.unwrap();
+    assert_eq!(src.scope.sides.len(), 1);
+    assert_eq!(src.scope.sides[0].qualifier, "cg");
+    let mut got = src.rows.clone();
+    got.sort_by_key(|r| match r[0] {
+        Value::Int(i) => i,
+        _ => panic!("non-int id"),
+    });
+    assert_eq!(got, vec![row_of(1, "from-a"), row_of(2, "from-b")]);
+
+    // read_ts cutoff applies on the remote side too (ts 6 > 5).
+    let src = materialize(&a, &tref("cg"), 5, None, None).await.unwrap();
+    assert_eq!(src.rows, vec![row_of(1, "from-a")]);
+
+    // The coordinator appends the open txn's staged appends last.
+    let mut txn = Txn {
+        read_ts: 10,
+        writes: BTreeMap::new(),
+        ..Default::default()
+    };
+    txn.appends
+        .insert("cg".to_string(), vec![row_of(3, "staged")]);
+    let src = materialize(&a, &tref("cg"), 10, Some(&txn), None)
+        .await
+        .unwrap();
+    assert_eq!(src.rows.len(), 3);
+    assert_eq!(src.rows.last(), Some(&row_of(3, "staged")));
+}
+
+/// A downed member fails the WHOLE columnar read with the 1027-style
+/// node error, never a partial union (same contract as band gathers).
+#[tokio::test]
+async fn columnar_fanout_fails_whole_read_when_node_unreachable() {
+    let a = shared_at("127.0.0.1:33113");
+    let s = columnar_schema(10, "cd");
+    seed_catalog(&a, &s);
+    crate::sql::columnar::writer::commit_segment(&a, &s, 1, 5, &[row_of(1, "local")])
+        .await
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let flaky = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            drop(sock); // close instantly: connect ok, then EOF
+        }
+    });
+    let peer = "127.0.0.1:33114";
+    set_topology(&a, &["127.0.0.1:33113", peer]);
+    register_node(&a, peer, &flaky);
+
+    let err = materialize(&a, &tref("cd"), 10, None, None)
+        .await
+        .expect_err("remote is down");
+    assert_eq!(err.code, ErrorCode::NodeUnreachable);
+    assert!(
+        err.msg.contains("cluster node") && err.msg.contains("unreachable"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// EXPLAIN headline: a plain columnar table in a ready multi-node
+/// cluster banners the node fan-out, not the slot bands.
+#[test]
+fn headline_banners_columnar_fanout() {
+    let a = shared_at("127.0.0.1:33115");
+    let s = columnar_schema(11, "ch");
+    seed_catalog(&a, &s);
+    // Single node: nothing to gather.
+    assert!(headline(&a, &tref("ch")).is_none());
+    set_topology(&a, &["127.0.0.1:33115", "127.0.0.1:33116", "c"]);
+    assert_eq!(
+        headline(&a, &tref("ch")).unwrap(),
+        "Gather(columnar, nodes=3)"
+    );
+    // Row tables keep the bands banner.
+    let r = schema(12, "rh");
+    seed_catalog(&a, &r);
+    assert_eq!(headline(&a, &tref("rh")).unwrap(), "Gather(bands=3)");
+}

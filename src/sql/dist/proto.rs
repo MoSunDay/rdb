@@ -5,8 +5,8 @@
 //! carries any number of request/response pairs; every reply matches
 //! the request kind it answers (`Prepare` -> `Vote`, `Decide` ->
 //! `Ack`, `TxnStatus` -> `Status`, `Ping` -> `Pong`, `ScanBand` ->
-//! `BandRows`), so a client with one outstanding request per
-//! connection needs no correlation ids.
+//! `BandRows`, `ScanColumnar` -> `ColumnarRows`), so a client with one
+//! outstanding request per connection needs no correlation ids.
 //!
 //! All payloads are JSON (serde): `Vec<u8>` fields encode as number
 //! arrays -- verbose but inspectable, and the messages are small (one
@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::rcache::transport::{read_frame, write_frame};
+use crate::sql::storage::schema::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -109,6 +110,12 @@ pub enum Req {
         slot_hi: u16,
         read_ts: u64,
     },
+    /// Columnar scatter-gather: every row of `table_id` this node can see
+    /// at `read_ts` (its local Live segments; no slot bands involved).
+    ScanColumnar {
+        table_id: u32,
+        read_ts: u64,
+    },
 }
 
 /// Response messages (participant -> client).
@@ -131,6 +138,15 @@ pub enum Resp {
     /// query (partial results are never served).
     BandRows {
         rows: Vec<(Vec<u8>, Vec<u8>)>,
+        #[serde(default)]
+        error: String,
+    },
+    /// Columnar scatter-gather reply: the node's locally visible rows of
+    /// the table, full-width in schema order. `error` is empty on
+    /// success; a non-empty error fails the coordinator's WHOLE query
+    /// (partial results are never served).
+    ColumnarRows {
+        rows: Vec<Vec<Value>>,
         #[serde(default)]
         error: String,
     },
@@ -200,6 +216,16 @@ mod tests {
                 txn_id: "t7".into(),
                 node: "127.0.0.1:1".into(),
             },
+            Req::ScanBand {
+                table_id: 5,
+                slot_lo: 0,
+                slot_hi: 8191,
+                read_ts: 42,
+            },
+            Req::ScanColumnar {
+                table_id: 5,
+                read_ts: 42,
+            },
         ];
         rt().block_on(async {
             let mut buf = Vec::new();
@@ -236,6 +262,14 @@ mod tests {
             Resp::BandRows {
                 rows: Vec::new(),
                 error: "table 9 vanished".into(),
+            },
+            Resp::ColumnarRows {
+                rows: vec![vec![Value::Int(1), Value::Null]],
+                error: String::new(),
+            },
+            Resp::ColumnarRows {
+                rows: Vec::new(),
+                error: "table id 9 unknown".into(),
             },
         ];
         rt().block_on(async {

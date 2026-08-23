@@ -4,7 +4,10 @@
 //! (left side's columns first) plus the [`FromScope`] that resolves
 //! column references into offsets of those rows. Scans are snapshot
 //! reads: per primary key only the newest version with `ts <= read_ts`
-//! is decoded, and tombstoned keys are invisible.
+//! is decoded, and tombstoned keys are invisible. Columnar tables
+//! bypass the row store: their rows come from the table's immutable
+//! segment files (`columnar::reader::scan_local`) plus the txn's
+//! staged appends.
 
 use std::collections::BTreeMap;
 
@@ -292,15 +295,26 @@ pub fn materialize(
             let schema = catalog::lookup(shared, name)
                 .map_err(SqlError::from)?
                 .ok_or_else(|| SqlError::no_such_table(name))?;
-            let rows = match plan::plan(&shared.store, &schema, alias.as_deref(), filter) {
-                plan::Path::IndexLookup { pks, .. } => {
-                    rows_by_pks(&shared.store, &schema, &pks, read_ts)?
+            let rows = if schema.engine.is_columnar() {
+                let overlay = txn
+                    .and_then(|t| t.appends.get(&schema.name))
+                    .map(|v| v.as_slice());
+                crate::sql::columnar::reader::scan_local(shared, &schema, read_ts, overlay)?
+            } else {
+                let rows = match plan::plan(&shared.store, &schema, alias.as_deref(), filter) {
+                    plan::Path::IndexLookup { pks, .. } => {
+                        rows_by_pks(&shared.store, &schema, &pks, read_ts)?
+                    }
+                    plan::Path::SeqScan => visible_rows(&shared.store, &schema, read_ts)?,
+                };
+                // The pk-keyed merge would reorder/collapse append-only
+                // rows, so it stays on the row-engine side; a columnar
+                // txn's overlay already rode in via `scan_local` (its
+                // staged row writes are rejected up front anyway).
+                match txn {
+                    Some(t) => crate::sql::tx::merge_rows(&schema, rows, t)?,
+                    None => rows,
                 }
-                plan::Path::SeqScan => visible_rows(&shared.store, &schema, read_ts)?,
-            };
-            let rows = match txn {
-                Some(t) => crate::sql::tx::merge_rows(&schema, rows, t)?,
-                None => rows,
             };
             let mut scope = FromScope::default();
             scope.sides.push(table_side(&schema, alias));
