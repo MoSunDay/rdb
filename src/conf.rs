@@ -50,6 +50,15 @@ pub struct Config {
     /// Node-to-node SQL RPC (sub-plans, 2PC); empty = disabled.
     #[serde(default, rename = "sql_rpc_bind")]
     pub sql_rpc_bind: String,
+    /// Columnar engine: max rows one transaction/INSERT statement may
+    /// append before the flush refuses it (0 = built-in default 65536).
+    #[serde(default, rename = "columnar_flush_rows")]
+    pub columnar_flush_rows: u64,
+    /// Columnar engine: max buffered row bytes one transaction/INSERT
+    /// statement may append before the flush refuses it (0 = built-in
+    /// default 64 MiB). No spill to disk.
+    #[serde(default, rename = "columnar_flush_bytes")]
+    pub columnar_flush_bytes: u64,
     /// Redis MULTI/EXEC transactions; disabled -> MULTI errors.
     #[serde(default, rename = "tx")]
     pub tx: TxConfig,
