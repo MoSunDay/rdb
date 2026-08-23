@@ -6,6 +6,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::command::cluster_slot;
 use crate::command::Ctx;
 use crate::resp::codec::{
     append_array, append_bulk_string, append_error, append_int, append_string,
@@ -44,12 +45,81 @@ pub async fn handle(ctx: &mut Ctx<'_>) {
         b"nodes" | b"NODES" => cluster_nodes(ctx),
         b"slots" | b"SLOTS" => cluster_slots(ctx),
         b"test" => cluster_test(ctx),
+        b"keyslot" | b"KEYSLOT" => cluster_slot::cluster_key_slot(ctx),
+        b"getkeysinslot" | b"GETKEYSINSLOT" => cluster_slot::cluster_get_keys_in_slot(ctx),
+        b"setslot" | b"SETSLOT" => cluster_slot::cluster_set_slot(ctx).await,
         _ => cluster_help(ctx),
     }
 }
 
 fn cluster_help(ctx: &mut Ctx<'_>) {
-    append_string(ctx.out, "cluster [ help | nodes | slots | test ]");
+    append_string(
+        ctx.out,
+        "cluster [ help | nodes | slots | test | keyslot | getkeysinslot | setslot ]",
+    );
+}
+
+/// `ASKING`: set the connection's single-shot ASK flag, consumed by the
+/// Per-node contiguous slot ranges (inclusive start/end) honoring
+/// `owner_map` overrides; the equal-split band decides unlisted slots.
+/// Order: stable_addrs order; a node may appear with several ranges when
+/// it absorbed migrated slots.
+fn attributed_ranges(topo: &topology::Topology) -> Vec<(String, Vec<(u16, u16)>)> {
+    let n = topo.stable_addrs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let ids: Vec<String> = topo
+        .stable_addrs
+        .iter()
+        .map(|a| utils::md5_with40(a))
+        .collect();
+    let owner_of: Vec<usize> = (0..topology::SLOT_NUMBER)
+        .map(|slot| {
+            if let Some(addr) = topo.owner_map.get(&(slot as u16)) {
+                let id = utils::md5_with40(addr);
+                ids.iter().position(|x| *x == id).unwrap_or(0)
+            } else {
+                band_owner_index(slot, n, topo.per_node_slots)
+            }
+        })
+        .collect();
+    let mut out: Vec<(String, Vec<(u16, u16)>)> = Vec::new();
+    let mut start = 0u16;
+    while start < topology::SLOT_NUMBER as u16 {
+        let owner = owner_of[start as usize];
+        let mut end = start;
+        while end + 1 < topology::SLOT_NUMBER as u16 && owner_of[(end + 1) as usize] == owner {
+            end += 1;
+        }
+        let id = ids[owner].clone();
+        match out.last_mut() {
+            Some((last_id, ranges)) if *last_id == id => ranges.push((start, end)),
+            _ => out.push((id, vec![(start, end)])),
+        }
+        start = end + 1;
+    }
+    out
+}
+
+/// Index of the equal-split owner of `slot` (same loop as `router::route`).
+fn band_owner_index(slot: usize, n: usize, per: usize) -> usize {
+    let last = n - 1;
+    for index in 0..n {
+        if index == last || slot <= (index + 1) * per {
+            return index;
+        }
+    }
+    last
+}
+
+/// Render one range: `1234` for a single slot, else `1234-5678`.
+fn render_range((start, end): (u16, u16)) -> String {
+    if start == end {
+        format!("{start}")
+    } else {
+        format!("{start}-{end}")
+    }
 }
 
 fn cluster_info(ctx: &mut Ctx<'_>) {
@@ -82,8 +152,8 @@ fn cluster_info(ctx: &mut Ctx<'_>) {
 fn cluster_nodes(ctx: &mut Ctx<'_>) {
     let topo = ctx.shared.topology.read().unwrap();
     let addrs = topo.stable_addrs.clone();
+    let ranges = attributed_ranges(&topo);
     drop(topo);
-    let node_slots = topology::parse_node_slots(&addrs);
     let mut response = String::new();
     for addr in &addrs {
         let port = addr.split(':').nth(1).unwrap_or("");
@@ -97,7 +167,16 @@ fn cluster_nodes(ctx: &mut Ctx<'_>) {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let slots = node_slots.get(addr).map(String::as_str).unwrap_or("");
+        let slots = ranges
+            .iter()
+            .find(|(id, _)| *id == uuid)
+            .map(|(_, rs)| {
+                rs.iter()
+                    .map(|r| render_range(*r))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
         response.push_str(&format!(
             "{uuid} {addr}@{port} {flag}master - 0 {timestamp_ms} 1 connected {slots}\r\n"
         ));
@@ -108,28 +187,34 @@ fn cluster_nodes(ctx: &mut Ctx<'_>) {
 fn cluster_slots(ctx: &mut Ctx<'_>) {
     let topo = ctx.shared.topology.read().unwrap();
     let addrs = topo.stable_addrs.clone();
+    let ranges = attributed_ranges(&topo);
     drop(topo);
-    let node_slots = topology::parse_node_slots(&addrs);
-    append_array(ctx.out, addrs.len());
-    for addr in &addrs {
-        append_array(ctx.out, 3);
-        let mut range = node_slots
-            .get(addr)
-            .map(String::as_str)
-            .unwrap_or("")
-            .split('-');
-        let start = parse_or_zero(range.next());
-        let end = parse_or_zero(range.next());
+    let mut entries = 0usize;
+    for (id, rs) in &ranges {
+        let addr = addrs
+            .iter()
+            .find(|a| utils::md5_with40(a) == *id)
+            .cloned()
+            .unwrap_or_default();
         let mut parts = addr.split(':');
         let ip = parts.next().unwrap_or("");
         let port = parse_or_zero(parts.next());
-        append_int(ctx.out, start);
-        append_int(ctx.out, end);
-        append_array(ctx.out, 3);
-        append_bulk_string(ctx.out, ip);
-        append_int(ctx.out, port);
-        append_bulk_string(ctx.out, &utils::md5_with40(addr));
+        for (start, end) in rs {
+            append_array(ctx.out, 3);
+            append_int(ctx.out, *start as i64);
+            append_int(ctx.out, *end as i64);
+            append_array(ctx.out, 3);
+            append_bulk_string(ctx.out, ip);
+            append_int(ctx.out, port);
+            append_bulk_string(ctx.out, id);
+            entries += 1;
+        }
     }
+    // Redis writes the array header before its elements; re-emit by
+    // prepending the header to the already-appended frames.
+    let body = std::mem::take(ctx.out);
+    crate::resp::codec::append_array(ctx.out, entries);
+    ctx.out.extend_from_slice(&body);
 }
 
 /// Go ignores the ParseInt error and uses the zero value on failure.
@@ -229,7 +314,7 @@ mod tests {
         // Empty args bypass the gate and reach help.
         assert_eq!(
             call(&shared, &[]),
-            b"+cluster [ help | nodes | slots | test ]\r\n"
+            b"+cluster [ help | nodes | slots | test | keyslot | getkeysinslot | setslot ]\r\n"
         );
         // Init arity error still passes the gate.
         assert_eq!(call(&shared, &[b"init"]), b"-cluster init [instances]\r\n");
@@ -287,7 +372,7 @@ mod tests {
         assert_eq!(call(&shared, &[b"info"]), expected);
         assert_eq!(
             call(&shared, &[b"bogus"]),
-            b"+cluster [ help | nodes | slots | test ]\r\n"
+            b"+cluster [ help | nodes | slots | test | keyslot | getkeysinslot | setslot ]\r\n"
         );
     }
 

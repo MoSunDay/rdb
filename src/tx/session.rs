@@ -68,6 +68,10 @@ impl MultiState {
 pub struct ConnState {
     pub multi: Option<MultiState>,
     pub watches: Vec<WatchEntry>,
+    /// Single-shot `ASKING` flag (cluster slot migration): consumed by the
+    /// next routed command, which is then served even while this node is
+    /// only an ASK redirection target (IMPORTING slot).
+    pub asking: bool,
 }
 
 /// Result of queuing one command.

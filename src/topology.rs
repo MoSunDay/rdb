@@ -2,6 +2,11 @@
 //! `cluster_slots_stable_instances` (Go syncs it every 3s in
 //! `internal/server/server.go`).
 //!
+//! Slot ownership can be overridden per slot by the raft key
+//! `slot_owner_map` (JSON `{"<slot>":"<resp addr>"}`): after a migration
+//! the new owner's addr is authoritative for that slot and the equal-split
+//! band only applies to unlisted slots (`router::route_with_owners`).
+//!
 //! AGREED BUG FIX for the rewrite: `cluster_ready` simply means "the
 //! instances list is non-empty". The Go second clause
 //! `(len(addrs)%2 != 0 && addrs[0] != "")` is dead because the first
@@ -22,6 +27,9 @@ pub struct Topology {
     pub stable_addrs: Vec<String>,
     /// Slots per node: `SLOT_NUMBER / len(stable_addrs)` (integer division).
     pub per_node_slots: usize,
+    /// Post-migration ownership overrides: slot -> owning RESP addr.
+    /// Authoritative over the equal-split band (unlisted slots only).
+    pub owner_map: HashMap<u16, String>,
 }
 
 /// A topology with no cluster state (not ready, no addrs, zero slots/node).
@@ -30,6 +38,7 @@ pub fn empty() -> Topology {
         cluster_ready: false,
         stable_addrs: Vec::new(),
         per_node_slots: 0,
+        owner_map: HashMap::new(),
     }
 }
 
@@ -48,7 +57,50 @@ pub fn refresh(instances: &str) -> Topology {
         cluster_ready: true,
         stable_addrs: addrs,
         per_node_slots: per,
+        owner_map: HashMap::new(),
     }
+}
+
+/// Serialize the per-slot ownership overrides for the `slot_owner_map`
+/// raft value (JSON `{"<slot>":"<addr>",...}`, sorted by slot for
+/// deterministic diffs).
+pub fn owner_map_json(map: &HashMap<u16, String>) -> String {
+    let mut entries: Vec<(&u16, &String)> = map.iter().collect();
+    entries.sort_by_key(|(slot, _)| **slot);
+    let body: Vec<String> = entries
+        .iter()
+        .map(|(slot, addr)| format!("\"{slot}\":\"{addr}\""))
+        .collect();
+    format!("{{{}}}", body.join(","))
+}
+
+/// Raft key holding the per-slot ownership overrides (JSON map).
+pub const OWNER_MAP_KEY: &str = "slot_owner_map";
+
+/// Parse the `slot_owner_map` raft value (JSON `{"<slot>":"<addr>"}`,
+/// slots as decimal strings). Malformed values yield an empty map: routing
+/// then falls back to the equal-split bands, which is the pre-migration
+/// state (safe -- the same key names the raft value writer uses).
+pub fn parse_owner_map(json: &str) -> HashMap<u16, String> {
+    let Ok(map) = serde_json::from_str::<HashMap<String, String>>(json) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for (slot, addr) in map {
+        if let Ok(s) = slot.parse::<u16>() {
+            if s < SLOT_NUMBER as u16 && !addr.is_empty() {
+                out.insert(s, addr);
+            }
+        }
+    }
+    out
+}
+
+/// [`refresh`] plus the ownership overrides from `slot_owner_map`.
+pub fn refresh_with_owners(instances: &str, owner_map_json: &str) -> Topology {
+    let mut t = refresh(instances);
+    t.owner_map = parse_owner_map(owner_map_json);
+    t
 }
 
 /// Per-node displayed slot ranges used by `cluster nodes` / `cluster slots`.
@@ -165,5 +217,22 @@ mod tests {
         assert_eq!(m.get("c").unwrap(), "6553-9828");
         assert_eq!(m.get("d").unwrap(), "9829-13104");
         assert_eq!(m.get("e").unwrap(), "13105-16383");
+    }
+    #[test]
+    fn parse_owner_map_roundtrip_and_validation() {
+        let m = parse_owner_map(r#"{"100":"b:1","99999":"x:1","":"y:1","12":"c:1"}"#);
+        assert_eq!(m.len(), 2, "out-of-range and empty addr entries dropped");
+        assert_eq!(m.get(&100), Some(&"b:1".to_string()));
+        assert_eq!(m.get(&12), Some(&"c:1".to_string()));
+        assert!(parse_owner_map("not json").is_empty());
+        assert!(parse_owner_map("").is_empty());
+    }
+
+    #[test]
+    fn refresh_with_owners_carries_overrides() {
+        let t = refresh_with_owners("a,b,c", r#"{"5":"b:1"}"#);
+        assert_eq!(t.stable_addrs, strings(&["a", "b", "c"]));
+        assert_eq!(t.owner_map.get(&5), Some(&"b:1".to_string()));
+        assert!(!t.owner_map.contains_key(&6));
     }
 }
