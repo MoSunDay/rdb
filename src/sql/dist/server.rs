@@ -87,11 +87,14 @@ async fn dispatch(req: &Req, shared: &Shared, mux: &tokio::sync::Mutex<()>) -> R
             let _guard = mux.lock().await;
             match participant::vote(
                 &shared.store,
+                &shared.raft,
+                &crate::sql::columnar::writer::columnar_dir(&shared.conf),
                 txn_id,
                 coordinator,
                 *commit_ts,
                 *read_ts,
                 entries,
+                &[], // wire participants never receive segments in M2
             ) {
                 Ok(participant::Vote::Yes) => Resp::Vote {
                     yes: true,
@@ -111,7 +114,14 @@ async fn dispatch(req: &Req, shared: &Shared, mux: &tokio::sync::Mutex<()>) -> R
             index_ops,
         } => {
             let _guard = mux.lock().await;
-            match participant::decide(&shared.store, txn_id, *commit, index_ops) {
+            match participant::decide(
+                &shared.store,
+                &crate::sql::columnar::writer::columnar_dir(&shared.conf),
+                &crate::sql::columnar::registry_of(shared),
+                txn_id,
+                *commit,
+                index_ops,
+            ) {
                 Ok(commit_ts) => {
                     // The flipped rows carry ts values this node never
                     // allocated: raise its read point or local snapshots

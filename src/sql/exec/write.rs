@@ -42,13 +42,6 @@ pub async fn insert(
         unreachable!("dispatch maps only Insert here");
     };
     let schema = lookup(shared, &table)?;
-    if schema.engine.is_columnar() {
-        // M2 replaces this with the columnar flush path.
-        return Err(SqlError::new(
-            ErrorCode::NotSupported,
-            format!("columnar table '{table}': write path not yet enabled"),
-        ));
-    }
     if rows.is_empty() {
         return Ok(ExecOutcome::Affected(0));
     }
@@ -57,6 +50,9 @@ pub async fn insert(
         full_rows.push(build_insert_row(&schema, &columns, exprs)?);
     }
     let n = full_rows.len() as u64;
+    if schema.engine.is_columnar() {
+        return insert_columnar(shared, sess, &schema, full_rows).await;
+    }
     if let Some(txn) = sess.txn.as_mut() {
         for values in full_rows {
             tx::stage_upsert(txn, &schema, values)?;
@@ -106,6 +102,78 @@ pub async fn insert(
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
         .map_err(SqlError::from)?;
+    Ok(ExecOutcome::Affected(n))
+}
+
+/// Columnar INSERT: append-only, no pk dedup, no index maintenance.
+/// Autocommit flushes one LIVE segment per statement; an open txn
+/// stages the rows into its append buffer (flushed once at COMMIT).
+/// Per-statement and cumulative staged sizes are bounded by
+/// `columnar_flush_rows` / `columnar_flush_bytes` (one segment per
+/// flush by design, so an oversized batch cannot be split silently).
+async fn insert_columnar(
+    shared: &Shared,
+    sess: &mut SqlSession,
+    schema: &TableSchema,
+    rows: Vec<Vec<Value>>,
+) -> SqlResult<ExecOutcome> {
+    use crate::sql::columnar::writer as cw;
+    let row_limit = cw::flush_rows_limit(&shared.conf);
+    let byte_limit = cw::flush_bytes_limit(&shared.conf);
+    let stmt_bytes: u64 = rows.iter().map(|r| cw::estimate_row_bytes(r) as u64).sum();
+    if rows.len() as u64 > row_limit {
+        return Err(SqlError::new(
+            ErrorCode::NotSupported,
+            format!(
+                "columnar INSERT of {} rows exceeds columnar_flush_rows ({row_limit}); \
+                 split the statement",
+                rows.len()
+            ),
+        ));
+    }
+    if stmt_bytes > byte_limit {
+        return Err(SqlError::new(
+            ErrorCode::NotSupported,
+            format!(
+                "columnar INSERT of {stmt_bytes} bytes exceeds columnar_flush_bytes \
+                 ({byte_limit}); split the statement"
+            ),
+        ));
+    }
+    let n = rows.len() as u64;
+    if let Some(txn) = sess.txn.as_mut() {
+        // Cumulative per-table limits for the staged buffer: one
+        // segment per table at COMMIT, so the buffer itself must stay
+        // within the flush limits.
+        let (staged_rows, staged_bytes) = txn
+            .appends
+            .get(&schema.name)
+            .map(|v| {
+                (
+                    v.len() as u64,
+                    v.iter().map(|r| cw::estimate_row_bytes(r) as u64).sum(),
+                )
+            })
+            .unwrap_or((0, 0));
+        if staged_rows + rows.len() as u64 > row_limit || staged_bytes + stmt_bytes > byte_limit {
+            return Err(SqlError::new(
+                ErrorCode::NotSupported,
+                format!(
+                    "columnar append buffer for '{}' would exceed columnar_flush_rows/\
+                     columnar_flush_bytes",
+                    schema.name
+                ),
+            ));
+        }
+        for values in rows {
+            tx::stage_append(txn, &schema.name, values);
+        }
+        return Ok(ExecOutcome::Affected(n));
+    }
+    let commit_ts = shared.sql_ts.alloc();
+    let segment_id = cw::local_segment_id(shared, schema.id, commit_ts)
+        .map_err(|e| SqlError::new(ErrorCode::Unknown, e))?;
+    cw::commit_segment(shared, schema, segment_id, commit_ts, &rows).await?;
     Ok(ExecOutcome::Affected(n))
 }
 

@@ -96,14 +96,19 @@ pub enum Vote {
 /// PREPARE: validate every entry, then stage one atomic batch.
 ///
 /// Veto reasons are prefixed strings the coordinator maps to client
-/// errors: `conflict:` -> 1213, `dup:` -> 1062.
+/// errors: `conflict:` -> 1213, `dup:` -> 1062. A columnar segment is
+/// vetoed (`schema mismatch ...`) when the local catalog disagrees.
+#[allow(clippy::too_many_arguments)] // explicit handles beat a param struct here
 pub fn vote(
     store: &Store,
+    raft: &std::sync::RwLock<crate::state::RaftState>,
+    dir: &std::path::Path,
     txn_id: &str,
     coordinator: &str,
     commit_ts: u64,
     read_ts: u64,
     entries: &[Entry],
+    segments: &[crate::sql::columnar::commit::PendingSegment],
 ) -> Result<Vote, String> {
     for e in entries {
         match e.kind {
@@ -136,14 +141,57 @@ pub fn vote(
             EntryKind::UniqueDel => {}
         }
     }
+    // Columnar segments: the local catalog must agree (same table id
+    // and columns, columnar engine) before any file is written.
+    for seg in segments {
+        let local = crate::sql::storage::catalog::lookup_raft(raft, &seg.schema.name)
+            .map_err(|e| format!("error: catalog lookup failed: {e}"))?;
+        let matches = local
+            .map(|s| {
+                s.engine.is_columnar() && s.id == seg.schema.id && s.columns == seg.schema.columns
+            })
+            .unwrap_or(false);
+        if !matches {
+            return Ok(Vote::No(format!(
+                "schema mismatch for columnar table '{}'",
+                seg.schema.name
+            )));
+        }
+    }
     let mut batch = WriteBatch::default();
-    let mut keys = Vec::with_capacity(entries.len());
+    let mut keys = Vec::with_capacity(entries.len() + segments.len());
     for e in entries {
         match e.kind {
             EntryKind::UniqueDel => batch.delete(&e.key),
             _ => batch.put(&e.key, &e.value),
         }
         keys.push(e.key.clone());
+    }
+    // Segment files are created BEFORE the marker write: a crash in
+    // between leaves an orphan file (swept in M5), never a dangling
+    // meta. Metas stage as Prepared; decide(commit) flips them Live.
+    for seg in segments {
+        let (file, columns, num_rows) = crate::sql::columnar::writer::write_segment_file(
+            dir,
+            &seg.schema,
+            seg.segment_id,
+            &seg.rows,
+        )
+        .map_err(|e| format!("error: columnar flush failed: {e}"))?;
+        let meta = crate::sql::columnar::writer::build_meta(
+            &seg.schema,
+            seg.segment_id,
+            seg.commit_ts,
+            crate::sql::columnar::meta::SegmentState::Prepared,
+            file,
+            columns,
+            num_rows,
+        );
+        let key = crate::sql::columnar::meta::meta_key(meta.table_id, meta.segment_id);
+        let encoded = crate::sql::columnar::meta::encode_meta(&meta)
+            .map_err(|e| format!("error: columnar flush failed: {e}"))?;
+        batch.put(&key, encoded);
+        keys.push(key);
     }
     let marker = serde_json::to_vec(&Marker {
         coordinator: coordinator.to_string(),
@@ -158,13 +206,16 @@ pub fn vote(
 }
 
 /// DECIDE (and recovery's replay of one): apply the decision
-/// atomically -- flips, index ops, marker removal and the local
-/// outcome record share one batch. Idempotent. Returns the highest
-/// version ts this decision made visible (0 when this node had no
-/// marker or staged no rows): a participant raises its read point to
-/// it, or snapshots taken below it would never see the flipped rows.
+/// atomically -- flips, segment-meta flips, index ops, marker removal
+/// and the local outcome record share one batch. Idempotent. Returns
+/// the highest version ts this decision made visible (0 when this node
+/// had no marker or staged no rows): a participant raises its read
+/// point to it, or snapshots taken below it would never see the
+/// flipped rows.
 pub fn decide(
     store: &Store,
+    dir: &std::path::Path,
+    registry: &crate::sql::columnar::Registry,
     txn_id: &str,
     commit: bool,
     index_ops: &[WireOp],
@@ -177,6 +228,23 @@ pub fn decide(
     if commit {
         if let Some(m) = &marker {
             for key in &m.keys {
+                if crate::sql::columnar::meta::parse_meta_key(key).is_some() {
+                    // Segment meta: flip Prepared -> Live in the same
+                    // batch; the segment commit_ts already lives in the
+                    // marker's ts range, so `hi` needs no update.
+                    if let Some(v) = ops::get_physical(store, key)? {
+                        if let Ok(mut meta) = crate::sql::columnar::meta::decode_meta(&v) {
+                            if meta.state == crate::sql::columnar::meta::SegmentState::Prepared {
+                                meta.state = crate::sql::columnar::meta::SegmentState::Live;
+                                if let Ok(enc) = crate::sql::columnar::meta::encode_meta(&meta) {
+                                    batch.put(key, enc);
+                                }
+                            }
+                            registry.insert(&meta);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(v) = ops::get_physical(store, key)? {
                     if row::is_prepared(&v) {
                         let mut final_v = v;
@@ -197,6 +265,17 @@ pub fn decide(
         }
     } else if let Some(m) = &marker {
         for key in &m.keys {
+            // Segment metas also vanish from the registry and disk:
+            // best-effort (the batch delete below is the source of
+            // truth; file cleanup only avoids orphans eagerly).
+            if let Some((table_id, segment_id)) = crate::sql::columnar::meta::parse_meta_key(key) {
+                if let Ok(Some(v)) = ops::get_physical(store, key) {
+                    if let Ok(meta) = crate::sql::columnar::meta::decode_meta(&v) {
+                        registry.remove(table_id, &[segment_id]);
+                        let _ = std::fs::remove_file(dir.join(meta.file));
+                    }
+                }
+            }
             batch.delete(key);
         }
     }

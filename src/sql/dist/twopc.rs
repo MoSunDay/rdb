@@ -68,6 +68,8 @@ async fn prepare_one(
 ) -> Result<(), SqlError> {
     if addr == shared.conf.bind {
         let store = Arc::clone(&shared.store);
+        let raft = Arc::clone(&shared.raft);
+        let dir = crate::sql::columnar::writer::columnar_dir(&shared.conf);
         let (txn_id, coord, ts, read_ts) = (
             plan.txn_id.clone(),
             plan.coordinator_http.clone(),
@@ -75,8 +77,11 @@ async fn prepare_one(
             plan.read_ts,
         );
         let entries = pp.entries.clone();
+        let segments = pp.segments.clone();
         let vote = tokio::task::spawn_blocking(move || {
-            participant::vote(&store, &txn_id, &coord, ts, read_ts, &entries)
+            participant::vote(
+                &store, &raft, &dir, &txn_id, &coord, ts, read_ts, &entries, &segments,
+            )
         })
         .await
         .map_err(|e| spill("join", e.to_string()))?
@@ -135,9 +140,11 @@ async fn decide_all(shared: &Shared, plan: &CommitPlan, commit: bool, voted: &[S
             .unwrap_or_default();
         if addr == &shared.conf.bind {
             let store = Arc::clone(&shared.store);
+            let dir = crate::sql::columnar::writer::columnar_dir(&shared.conf);
+            let registry = crate::sql::columnar::registry_of(shared);
             let txn_id = plan.txn_id.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                participant::decide(&store, &txn_id, commit, &ops_for_addr)
+                participant::decide(&store, &dir, &registry, &txn_id, commit, &ops_for_addr)
             })
             .await;
             // Self slice: the coordinator allocated the ts range, so its

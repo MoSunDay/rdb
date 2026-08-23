@@ -67,7 +67,16 @@ pub fn begin(raft: &mut RaftState) -> Result<CatalogTxn<'_>, String> {
 
 /// Read one table's schema from the FSM view (leader and followers alike).
 pub fn lookup(shared: &Shared, table: &str) -> Result<Option<TableSchema>, String> {
-    let raw = state::raft_get(&shared.raft.read().unwrap(), &catalog_key(table));
+    lookup_raft(&shared.raft, table)
+}
+
+/// Same as [`lookup`] but over a bare raft-state handle: the 2PC
+/// participant code runs inside `spawn_blocking` with no `Shared`.
+pub fn lookup_raft(
+    raft: &std::sync::RwLock<RaftState>,
+    table: &str,
+) -> Result<Option<TableSchema>, String> {
+    let raw = state::raft_get(&raft.read().unwrap(), &catalog_key(table));
     if raw.is_empty() {
         return Ok(None);
     }

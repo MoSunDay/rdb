@@ -41,6 +41,10 @@ pub struct ParticipantPlan {
     pub entries: Vec<Entry>,
     /// Secondary-index ops applied only at Decide{commit}.
     pub index_ops: Vec<WireOp>,
+    /// Columnar segments owned by this participant (coordinator's own
+    /// slice only -- segments never travel over the wire in M2). Not
+    /// serialized anywhere.
+    pub segments: Vec<crate::sql::columnar::commit::PendingSegment>,
 }
 
 /// A fully-built 2PC commit: entries + per-participant grouping.
@@ -87,7 +91,15 @@ pub fn try_plan_txn(shared: &Shared, txn: &Txn) -> SqlResult<Option<CommitPlan>>
             },
         ));
     }
-    build(shared, &r, txn.read_ts, &schemas, &writes, &idx)
+    build(
+        shared,
+        &r,
+        txn.read_ts,
+        &schemas,
+        &writes,
+        &idx,
+        &txn.appends,
+    )
 }
 
 /// Plan one autocommit statement's decided writes; `None` keeps the
@@ -107,13 +119,15 @@ pub fn try_plan_simple(
         .iter()
         .map(|(pk, values)| (schema.id, pk.clone(), *values))
         .collect();
-    build(shared, &r, read_ts, &schemas, &full, idx)
+    build(shared, &r, read_ts, &schemas, &full, idx, &BTreeMap::new())
 }
 
 /// Core builder: one version per write (ts assigned in write order),
 /// unique reservations split out of the index ops, everything grouped
-/// by the slot-owner of its key. `None` when no participant is
-/// another node.
+/// by the slot-owner of its key; columnar appends become one pending
+/// segment each, attached to the coordinator's own slice. `None` when
+/// no participant is another node (the caller's single-batch local
+/// path then handles rows + segments atomically).
 fn build(
     shared: &Shared,
     r: &Routing,
@@ -121,8 +135,13 @@ fn build(
     schemas: &BTreeMap<u32, TableSchema>,
     writes: &[PlanWrite],
     idx: &IndexOps,
+    appends: &BTreeMap<String, Vec<Vec<Value>>>,
 ) -> SqlResult<Option<CommitPlan>> {
-    let ts = shared.sql_ts.alloc_n(writes.len() as u64);
+    // Rows take the head of the ts range, one segment commit ts per
+    // appended table takes the tail (BTreeMap order = deterministic).
+    let ts = shared
+        .sql_ts
+        .alloc_n(writes.len() as u64 + appends.len() as u64);
     let mut participants: BTreeMap<String, ParticipantPlan> = BTreeMap::new();
     for (i, (table_id, pk, values)) in writes.iter().enumerate() {
         let schema = schemas.get(table_id).ok_or_else(|| {
@@ -147,6 +166,38 @@ fn build(
                 kind: EntryKind::RowPrepared,
             },
         );
+    }
+    // Columnar appends: one planned segment per table on the
+    // coordinator's own slice (segments never cross the wire in M2).
+    if !appends.is_empty() {
+        let mut segments = Vec::with_capacity(appends.len());
+        for (i, (table, rows)) in appends.iter().enumerate() {
+            let seg_ts = ts.start + writes.len() as u64 + i as u64;
+            let schema = crate::sql::storage::catalog::lookup(shared, table)
+                .map_err(|e| SqlError::new(ErrorCode::Unknown, e))?
+                .ok_or_else(|| {
+                    SqlError::new(
+                        ErrorCode::NoSuchTable,
+                        format!("table '{table}' left the catalog mid-txn"),
+                    )
+                })?;
+            if !schema.engine.is_columnar() {
+                return Err(SqlError::new(
+                    ErrorCode::NotSupported,
+                    format!("table '{table}' is not columnar"),
+                ));
+            }
+            let segment_id =
+                crate::sql::columnar::writer::local_segment_id(shared, schema.id, seg_ts)
+                    .map_err(|e| SqlError::new(ErrorCode::Unknown, e))?;
+            segments.push(crate::sql::columnar::commit::PendingSegment {
+                schema,
+                segment_id,
+                commit_ts: seg_ts,
+                rows: rows.clone(),
+            });
+        }
+        participants.entry(r.host.clone()).or_default().segments = segments;
     }
     let mut secondary: Vec<WireOp> = Vec::new();
     for (key, val) in idx.iter().cloned() {

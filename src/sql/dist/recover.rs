@@ -139,12 +139,15 @@ async fn decide_blocking(
     ops: &[(Vec<u8>, Option<Vec<u8>>)],
 ) -> Result<(), String> {
     let store = Arc::clone(&shared.store);
+    let dir = crate::sql::columnar::writer::columnar_dir(&shared.conf);
+    let registry = crate::sql::columnar::registry_of(shared);
     let txn_id = txn_id.to_string();
     let ops = ops.to_vec();
-    let applied =
-        tokio::task::spawn_blocking(move || participant::decide(&store, &txn_id, commit, &ops))
-            .await
-            .map_err(|e| e.to_string())??;
+    let applied = tokio::task::spawn_blocking(move || {
+        participant::decide(&store, &dir, &registry, &txn_id, commit, &ops)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     if commit {
         // Same reasoning as the Decide dispatch: recovery may apply a
         // commit whose ts this node never granted itself.

@@ -51,6 +51,8 @@ pub struct Txn {
     pub read_ts: u64,
     /// Staged writes; at most one entry per (table, pk).
     pub writes: BTreeMap<TxnKey, TxnWrite>,
+    /// Columnar appends per table name, staged at INSERT, flushed at COMMIT.
+    pub appends: BTreeMap<String, Vec<Vec<Value>>>,
 }
 
 /// BEGIN: pin the latest committed timestamp and register the snapshot
@@ -61,7 +63,17 @@ pub fn begin(oracle: &Oracle) -> Txn {
     Txn {
         read_ts,
         writes: BTreeMap::new(),
+        appends: BTreeMap::new(),
     }
+}
+
+/// Stage one full-width row into the columnar append buffer of its
+/// table (INSERT on a columnar table; append-only, no pk dedup).
+pub fn stage_append(txn: &mut Txn, table_name: &str, values: Vec<Value>) {
+    txn.appends
+        .entry(table_name.to_string())
+        .or_default()
+        .push(values);
 }
 
 /// Stage a full-width row (INSERT, or the new-pk half of a pk-moving
@@ -202,14 +214,15 @@ pub async fn commit(shared: &Shared, txn: Txn) -> SqlResult<()> {
 }
 
 async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
-    if txn.writes.is_empty() {
+    if txn.writes.is_empty() && txn.appends.is_empty() {
         return Ok(()); // read-only txn: nothing to validate or write
     }
     // M3: with a ready cluster and any remote slot-owner, the commit
     // becomes a 2PC (participants validate; the coordinator's own
     // slice runs through the same participant code by direct call).
     // Single-node deployments never enter this branch: the exact M2
-    // batch sequence below stays untouched.
+    // batch sequence below stays untouched. Segments travel inside the
+    // plan attached to the coordinator's own slice.
     if let Some(plan) = crate::sql::dist::plan::try_plan_txn(shared, txn)? {
         return crate::sql::dist::twopc::run(shared, &plan).await;
     }
@@ -220,12 +233,33 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
     // versions its reads would have seen), unique claims are validated
     // against them, and the entry ops ride in the same commit batch.
     let idx = commit_index_ops(shared, txn, &schemas)?;
-    let ts = shared.sql_ts.alloc_n(txn.writes.len() as u64);
-    let mut batch = build_commit_batch(&txn.writes, &schemas, ts)?;
+    // Rows and columnar appends share ONE ts range and publish in one
+    // atomic batch: rows take the head, one ts per columnar table's
+    // segment takes the tail (BTreeMap order = deterministic).
+    let total = txn.writes.len() as u64 + txn.appends.len() as u64;
+    let ts = shared.sql_ts.alloc_n(total);
+    let row_ts = ts.start..ts.start + txn.writes.len() as u64;
+    let mut batch = build_commit_batch(&txn.writes, &schemas, row_ts)?;
     crate::sql::index::maintain::apply_ops(&mut batch, idx);
+    let mut metas = Vec::new();
+    for (i, (table, rows)) in txn.appends.iter().enumerate() {
+        let commit_ts = ts.start + txn.writes.len() as u64 + i as u64;
+        let meta = crate::sql::columnar::commit::flush_appends(shared, table, rows, commit_ts)?;
+        let encoded = crate::sql::columnar::meta::encode_meta(&meta)
+            .map_err(|e| SqlError::new(ErrorCode::Unknown, e))?;
+        batch.put(
+            crate::sql::columnar::meta::meta_key(meta.table_id, meta.segment_id),
+            encoded,
+        );
+        metas.push(meta);
+    }
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
-        .map_err(SqlError::from)
+        .map_err(SqlError::from)?;
+    for m in &metas {
+        crate::sql::columnar::registry_of(shared).insert(m);
+    }
+    Ok(())
 }
 
 /// Index-entry ops of a whole staged write set, per table, with unique
