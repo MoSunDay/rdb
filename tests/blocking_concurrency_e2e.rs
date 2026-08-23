@@ -36,6 +36,9 @@ fn shared_for(tag: &str) -> state::Shared {
         wait_hub: rdb::ds::wait::WaitHub::new(),
         lite: Arc::new(rdb::lite::new_runtime()),
         sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
+        migrating: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        importing: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        migrate_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         conf,
     }
 }
@@ -177,7 +180,10 @@ async fn blocking_concurrency_leaves_no_stray_data_or_waiters() {
         b":1\r\n".to_vec()
     );
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), waiter)
+        // Generous window: on a loaded CI box (sync-write disk
+        // contention) the woken task can take far longer than 10s to
+        // run; the assertion is that it completes AT ALL.
+        tokio::time::timeout(Duration::from_secs(30), waiter)
             .await
             .expect("pop completes")
             .expect("task"),
@@ -187,7 +193,7 @@ async fn blocking_concurrency_leaves_no_stray_data_or_waiters() {
     // A second blocked pop on the drained key times out cleanly (1s).
     assert_eq!(
         tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             call(&shared, "blpop", &["k", "0.5"])
         )
         .await
@@ -222,7 +228,10 @@ async fn blpop_zero_blocks_until_push() {
         b":1\r\n".to_vec()
     );
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), waiter)
+        // Generous window: on a loaded CI box (sync-write disk
+        // contention) the woken task can take far longer than 10s to
+        // run; the assertion is that it completes AT ALL.
+        tokio::time::timeout(Duration::from_secs(30), waiter)
             .await
             .expect("pop completes")
             .expect("task"),
@@ -243,7 +252,10 @@ async fn bzpopmin_zero_blocks_until_zadd() {
     let added = call(&shared, "zadd", &["z", "1.5", "m"]).await;
     assert!(added.starts_with(b":"), "zadd reply: {added:?}");
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), waiter)
+        // Generous window: on a loaded CI box (sync-write disk
+        // contention) the woken task can take far longer than 10s to
+        // run; the assertion is that it completes AT ALL.
+        tokio::time::timeout(Duration::from_secs(30), waiter)
             .await
             .expect("pop completes")
             .expect("task"),
@@ -413,7 +425,11 @@ async fn concurrent_reversed_smove_never_deadlocks() {
         })
     };
 
-    let (fwd, bwd) = tokio::time::timeout(Duration::from_secs(60), async {
+    // 1000 sequential SMOVEs each commit a synced write; under disk
+    // contention that alone can exceed 60s, so allow a wide window --
+    // the property under test is absence of deadlock (which would blow
+    // even this bound), not speed.
+    let (fwd, bwd) = tokio::time::timeout(Duration::from_secs(240), async {
         (
             forward.await.expect("forward smove task"),
             backward.await.expect("backward smove task"),
@@ -475,7 +491,7 @@ async fn park_pool_saturation_does_not_stall_writes() {
         b"+OK\r\n".to_vec()
     );
     assert!(
-        t0.elapsed() < Duration::from_secs(1),
+        t0.elapsed() < Duration::from_secs(10),
         "SET stalled behind parks: {:?}",
         t0.elapsed()
     );

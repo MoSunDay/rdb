@@ -38,6 +38,9 @@ fn test_shared(tag: &str) -> Arc<state::Shared> {
         wait_hub: rdb::ds::wait::WaitHub::new(),
         lite: std::sync::Arc::new(rdb::lite::new_runtime()),
         sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
+        migrating: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        importing: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        migrate_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         conf: c,
     })
 }

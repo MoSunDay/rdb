@@ -94,8 +94,11 @@ fn spawn_topology_sync(
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
             }
-            let val = state::raft_get(&raft.read().unwrap(), TOPOLOGY_KEY);
-            *topo.write().unwrap() = topology::refresh(&val);
+            let raft_guard = raft.read().unwrap();
+            let val = state::raft_get(&raft_guard, TOPOLOGY_KEY);
+            let owners = state::raft_get(&raft_guard, topology::OWNER_MAP_KEY);
+            drop(raft_guard);
+            *topo.write().unwrap() = topology::refresh_with_owners(&val, &owners);
         }
         // Unreachable today (loop never breaks); proves exit if it ever does.
         #[allow(unreachable_code)]
@@ -461,6 +464,13 @@ async fn do_main() {
             wait_hub: rdb::ds::wait::WaitHub::new(),
             lite: std::sync::Arc::new(rdb::lite::new_runtime()),
             sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
+            migrating: std::sync::Arc::new(
+                std::sync::RwLock::new(std::collections::HashMap::new()),
+            ),
+            importing: std::sync::Arc::new(
+                std::sync::RwLock::new(std::collections::HashMap::new()),
+            ),
+            migrate_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         // M3: the read-only backup listener shares the cluster core so
         // its `now()` snapshot reads track the global sequence too.
@@ -494,6 +504,9 @@ async fn do_main() {
         wait_hub: ds::wait::WaitHub::new(),
         lite: std::sync::Arc::new(rdb::lite::new_runtime()),
         sql_ts: std::sync::Arc::new(rdb::sql::tx::Oracle::new()),
+        migrating: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        importing: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        migrate_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     // M3: publish the store to the control API's `/sql2pc/status` slot.
     *http_store_slot.write().unwrap() = Some(Arc::clone(&store));

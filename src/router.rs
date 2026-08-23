@@ -9,6 +9,8 @@
 //! whichever node received them); here the LAST node owns everything
 //! through slot 16383, so every slot has exactly one owner.
 
+use std::collections::HashMap;
+
 /// Outcome of routing one slot against the stable topology.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RouteDecision {
@@ -45,6 +47,30 @@ pub fn route(slot: u16, addrs: &[String], per_node_slots: usize, host: &str) -> 
     RouteDecision::Local
 }
 
+/// Route `slot` with per-slot ownership overrides: an entry in
+/// `owner_map` (post-migration state, replicated via the raft key
+/// `slot_owner_map`) is authoritative; unlisted slots fall back to the
+/// equal-split [`route`] bands.
+pub fn route_with_owners(
+    slot: u16,
+    addrs: &[String],
+    per_node_slots: usize,
+    host: &str,
+    owner_map: &HashMap<u16, String>,
+) -> RouteDecision {
+    if let Some(owner) = owner_map.get(&slot) {
+        return if owner == host {
+            RouteDecision::Local
+        } else {
+            RouteDecision::Moved {
+                slot,
+                addr: owner.clone(),
+            }
+        };
+    }
+    route(slot, addrs, per_node_slots, host)
+}
+
 /// Format the MOVED redirect line: `MOVED <slot> <addr>`.
 pub fn moved_error_line(slot: u16, addr: &str) -> String {
     format!("MOVED {} {}", slot, addr)
@@ -59,6 +85,7 @@ pub fn is_whitelisted(cmd_lowercase: &str) -> bool {
         cmd_lowercase,
         "ping"
             | "quit"
+            | "asking"
             | "config"
             | "cluster"
             | "raft"
@@ -324,5 +351,57 @@ mod tests {
         ] {
             assert!(!is_whitelisted(c), "{} should NOT be whitelisted", c);
         }
+    }
+
+    #[test]
+    fn owner_map_overrides_equal_split() {
+        let a = addrs(3);
+        let mut owners = HashMap::new();
+        owners.insert(0u16, "n2".to_string());
+        owners.insert(5462u16, "n0".to_string());
+        // slot 0 equal-split belongs to n0, but the map says n2.
+        assert_eq!(
+            route_with_owners(0, &a, 5461, "self", &owners),
+            RouteDecision::Moved {
+                slot: 0,
+                addr: "n2".to_string()
+            }
+        );
+        // slot 5462 equal-split belongs to n1, but the map says n0.
+        assert_eq!(
+            route_with_owners(5462, &a, 5461, "self", &owners),
+            RouteDecision::Moved {
+                slot: 5462,
+                addr: "n0".to_string()
+            }
+        );
+        // host matches the mapped owner -> local.
+        assert_eq!(
+            route_with_owners(0, &a, 5461, "n2", &owners),
+            RouteDecision::Local
+        );
+    }
+
+    #[test]
+    fn owner_map_unlisted_slot_falls_back_to_bands() {
+        let a = addrs(3);
+        let mut owners = HashMap::new();
+        owners.insert(16383u16, "n2".to_string());
+        // Unlisted slot 100 follows the equal-split: node0.
+        assert_eq!(
+            route_with_owners(100, &a, 5461, "self", &owners),
+            RouteDecision::Moved {
+                slot: 100,
+                addr: "n0".to_string()
+            }
+        );
+        // Empty map behaves exactly like route().
+        assert_eq!(
+            route_with_owners(5462, &a, 5461, "self", &HashMap::new()),
+            RouteDecision::Moved {
+                slot: 5462,
+                addr: "n1".to_string()
+            }
+        );
     }
 }

@@ -57,8 +57,14 @@ fn reply_old_or_null(out: &mut Vec<u8>, old: OldValue) {
 }
 
 /// Batch entries removing `key`'s current family (any type), so a string
-/// overwrite crosses types exactly like Redis SET/MSET.
-fn clear_key_family(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], state: &KeyState) {
+/// overwrite crosses types exactly like Redis SET/MSET. Also the source
+/// side of MIGRATE's delete.
+pub(crate) fn clear_key_family(
+    batch: &mut WriteBatch,
+    prefix: &[u8],
+    key: &[u8],
+    state: &KeyState,
+) {
     match state {
         KeyState::Missing => {}
         KeyState::RawString { .. } => {
