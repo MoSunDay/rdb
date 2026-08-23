@@ -542,20 +542,24 @@ pub async fn wait_cluster_nodes_list_all(nodes: &[ProcNode], binds: &[String], s
 pub async fn start_cluster(dir: &Path, n: usize) -> (Vec<ProcNode>, usize) {
     let mut nodes = Vec::new();
     let mut first = spawn_node(dir, 0, true, None);
-    wait_resp_ready(&mut first, 30).await;
+    // Generous poll windows: on a loaded CI box the binary's pebble open
+    // (sync writes) and raft bootstrap can take well over 30s; the
+    // child-exit fast-fail inside wait_resp_ready still catches real
+    // startup crashes promptly.
+    wait_resp_ready(&mut first, 90).await;
     nodes.push(first);
-    let l0 = wait_leader(&nodes, 60).await;
+    let l0 = wait_leader(&nodes, 120).await;
     assert_eq!(l0, 0, "node0 must lead before joins\n{}", all_ctx(&nodes));
 
     let join = nodes[0].http.clone();
     for id in 1..n {
         let mut node = spawn_node(dir, id, false, Some(&join));
-        wait_resp_ready(&mut node, 30).await;
+        wait_resp_ready(&mut node, 90).await;
         nodes.push(node);
     }
-    let leader = wait_leader(&nodes, 60).await;
+    let leader = wait_leader(&nodes, 120).await;
     let binds: Vec<String> = nodes.iter().map(|x| x.resp.clone()).collect();
     cluster_init(&nodes[leader], &binds).await;
-    wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
+    wait_cluster_nodes_list_all(&nodes, &binds, 90).await;
     (nodes, leader)
 }

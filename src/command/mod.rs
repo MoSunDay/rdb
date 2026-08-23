@@ -5,6 +5,7 @@
 //! socket directly; `quit` asks for connection close via `close_conn`.
 
 pub mod cluster;
+pub mod cluster_slot;
 pub mod hash_cmd;
 pub mod hash_incr;
 pub mod hash_scan;
@@ -97,6 +98,8 @@ pub fn lookup(name: &str) -> Option<Handler> {
     match name {
         "ping" => Some(|ctx| Box::pin(string::ping(ctx))),
         "quit" => Some(|ctx| Box::pin(string::quit(ctx))),
+        "asking" => Some(|ctx| Box::pin(cluster_slot::asking(ctx))),
+        "restore" => Some(|ctx| Box::pin(migrate::restore(ctx))),
         "get" => Some(|ctx| Box::pin(string::get(ctx))),
         "set" => Some(|ctx| Box::pin(string::set(ctx))),
         "del" => Some(|ctx| Box::pin(keys::del(ctx))),
@@ -267,21 +270,61 @@ pub fn lookup(name: &str) -> Option<Handler> {
     }
 }
 
-/// MOVED reply line for a foreign slot, or `None` when the slot is local.
-pub(crate) fn moved_line(shared: &state::Shared, slot: u16) -> Option<String> {
+/// Redirect line for one routed command, or `None` when this node serves it.
+///
+/// Redis cluster semantics, in order:
+/// 1. Slot in this node's IMPORTING table: only an ASKING connection is
+///    served; anyone else is redirected `MOVED` back to the source node.
+/// 2. Normal ownership routing: the raft `slot_owner_map` first, then the
+///    equal-split band. Foreign slots redirect `MOVED`.
+/// 3. Slot in this node's MIGRATING table and the key absent locally: the
+///    data already moved (or never existed) -> `ASK` to the destination.
+pub(crate) fn redirect_line(
+    shared: &state::Shared,
+    slot: u16,
+    key: &[u8],
+    asking: bool,
+) -> Option<String> {
+    // 1. IMPORTING gate (before ownership routing: the importing node may
+    // not own the slot in any routing table yet).
+    let importing = shared.importing.read().unwrap();
+    if let Some(src) = importing.get(&slot) {
+        if !asking {
+            return Some(router::moved_error_line(slot, src));
+        }
+        return None;
+    }
+    drop(importing);
+    // 2. ownership routing with per-slot overrides.
     let decision = {
         let topo = shared.topology.read().unwrap();
-        router::route(
+        router::route_with_owners(
             slot,
             &topo.stable_addrs,
             topo.per_node_slots,
             &shared.conf.bind,
+            &topo.owner_map,
         )
     };
-    match decision {
-        router::RouteDecision::Moved { slot, addr } => Some(router::moved_error_line(slot, &addr)),
-        _ => None,
+    if let router::RouteDecision::Moved { slot, addr } = decision {
+        return Some(router::moved_error_line(slot, &addr));
     }
+    // 3. MIGRATING source: missing key -> ASK to the destination.
+    let migrating = shared.migrating.read().unwrap();
+    if let Some(dst) = migrating.get(&slot) {
+        if !key_present(shared, slot, key) {
+            return Some(format!("ASK {} {}", slot, dst));
+        }
+    }
+    None
+}
+
+/// Does `key` (of `slot`) exist on this node? Best-effort read through the
+/// standard resolver (lazy-expire purges detached, as on all read paths).
+fn key_present(shared: &state::Shared, slot: u16, key: &[u8]) -> bool {
+    let prefix = crate::store::rocksdb::slot_prefix(slot);
+    crate::command::keys_core::resolve_arc(&shared.store, &prefix, key, crate::ds::expire::now_ms())
+        .is_present()
 }
 
 fn arity_error(out: &mut Vec<u8>, cmd: &str) {
@@ -341,7 +384,9 @@ pub(crate) async fn dispatch(
         let tag = hash::hash_tag(&argv[1]);
         let (slot, prefix) = hash::slot_with_prefix(tag);
         prefix_key = prefix;
-        if let Some(line) = moved_line(shared, slot) {
+        let asking = conn.asking;
+        conn.asking = false; // single-shot: consumed by this routed command
+        if let Some(line) = redirect_line(shared, slot, &argv[1], asking) {
             codec::append_error(out, &line);
             observe(shared, &first, true, start);
             return false;
@@ -455,9 +500,101 @@ mod json_tests;
 #[path = "vectorset_tests.rs"]
 mod vectorset_tests;
 
+/// Seed a string through the real SET handler (argv WITHOUT the command
+/// name, like `test_ctx` callers). Test-only cross-module helper.
+#[cfg(test)]
+pub(crate) fn seed_for(shared: &state::Shared, key: &[u8], val: &[u8]) {
+    let (_, prefix) = crate::hash::slot_with_prefix(crate::hash::hash_tag(key));
+    let mut out = Vec::new();
+    let argv = vec![key.to_vec(), val.to_vec()];
+    let mut ctx = test_ctx(shared, prefix, argv, &mut out);
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime")
+        .block_on(crate::command::string::set(&mut ctx));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::testutil;
+    use crate::state::Shared;
+    use crate::topology;
+
+    const INSTANCES: &str = "127.0.0.1:32681,127.0.0.1:32683,127.0.0.1:32685";
+
+    fn shared_for(bind: &str) -> (std::sync::MutexGuard<'static, ()>, Shared) {
+        let guard = crate::command::string::TEST_STORE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut conf = testutil::test_config();
+        conf.bind = bind.to_string();
+        (guard, testutil::shared_with(conf))
+    }
+
+    /// Seed a string via the real SET handler (correct slot prefix).
+    /// `test_ctx` receives argv WITHOUT the command name.
+    fn seed(shared: &Shared, key: &[u8], val: &[u8]) {
+        seed_for(shared, key, val);
+    }
+
+    #[test]
+    fn redirect_importing_gate_serves_only_asking() {
+        let (_guard, shared) = shared_for("127.0.0.1:32681");
+        *shared.topology.write().unwrap() = topology::refresh(INSTANCES);
+        shared
+            .importing
+            .write()
+            .unwrap()
+            .insert(100, "127.0.0.1:32681".to_string());
+        // Non-ASKING: redirected MOVED back to the source.
+        assert_eq!(
+            redirect_line(&shared, 100, b"k", false),
+            Some("MOVED 100 127.0.0.1:32681".to_string())
+        );
+        // ASKING: served locally even though the band owner is this node
+        // and the importing table names it as source.
+        assert_eq!(redirect_line(&shared, 100, b"k", true), None);
+    }
+
+    #[test]
+    fn redirect_owner_map_override_wins_over_band() {
+        let (_guard, shared) = shared_for("127.0.0.1:32681");
+        *shared.topology.write().unwrap() = topology::refresh(INSTANCES);
+        // Band says slot 100 lives here; the raft owner map overrides.
+        assert_eq!(redirect_line(&shared, 100, b"k", false), None);
+        shared
+            .topology
+            .write()
+            .unwrap()
+            .owner_map
+            .insert(100, "127.0.0.1:32683".to_string());
+        assert_eq!(
+            redirect_line(&shared, 100, b"k", false),
+            Some("MOVED 100 127.0.0.1:32683".to_string())
+        );
+    }
+
+    #[test]
+    fn redirect_migrating_missing_key_asks_to_destination() {
+        let (_guard, shared) = shared_for("127.0.0.1:32681");
+        *shared.topology.write().unwrap() = topology::refresh(INSTANCES);
+        // `{b}` tags to slot 3300, inside this node's (0-5461) band.
+        let (slot, _) = crate::hash::slot_with_prefix(crate::hash::hash_tag(b"{b}here"));
+        shared
+            .migrating
+            .write()
+            .unwrap()
+            .insert(slot, "127.0.0.1:32683".to_string());
+        // Key absent locally -> ASK to the destination.
+        assert_eq!(
+            redirect_line(&shared, slot, b"gone", false),
+            Some(format!("ASK {slot} 127.0.0.1:32683"))
+        );
+        // Key present locally -> served (still the source owner).
+        seed(&shared, b"{b}here", b"1");
+        assert_eq!(redirect_line(&shared, slot, b"{b}here", false), None);
+    }
 
     #[test]
     fn panic_payload_strings_and_ints() {

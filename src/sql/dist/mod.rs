@@ -81,12 +81,15 @@ pub const LEASE_SECS: u64 = 60;
 pub const OUTCOME_GC_SECS: u64 = 300;
 
 /// Cluster routing snapshot for one write: slot bands plus this node's
-/// RESP address (`stable_addrs` entries are RESP addresses).
+/// RESP address (`stable_addrs` entries are RESP addresses), with the
+/// raft-replicated per-slot ownership overrides (post-migration state)
+/// that take precedence over the equal-split bands.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Routing {
     pub addrs: Vec<String>,
     pub per_node_slots: usize,
     pub host: String,
+    pub owner_map: std::collections::HashMap<u16, String>,
 }
 
 /// Routing for `shared` when the cluster is ready, else None (the
@@ -100,12 +103,13 @@ pub fn routing(shared: &Shared) -> Option<Routing> {
         addrs: topo.stable_addrs.clone(),
         per_node_slots: topo.per_node_slots,
         host: shared.conf.bind.clone(),
+        owner_map: topo.owner_map.clone(),
     })
 }
 
 /// Owning node (RESP address) of `slot`; `None` when no routing.
 pub fn owner(r: &Routing, slot: u16) -> String {
-    match router::route(slot, &r.addrs, r.per_node_slots, &r.host) {
+    match router::route_with_owners(slot, &r.addrs, r.per_node_slots, &r.host, &r.owner_map) {
         RouteDecision::Local => r.host.clone(),
         RouteDecision::Moved { addr, .. } => addr,
     }
@@ -123,30 +127,27 @@ pub struct Band {
     pub owner: String,
 }
 
-/// The disjoint per-owner slot bands covering 0..=16383, in
-/// `Routing.addrs` order. `route` binds node i (i < last) to
-/// `(i-1)*per < slot <= i*per` -- i.e. `[i*per + 1, (i+1)*per]`, with
-/// node 0 starting at 0 -- and the last node absorbs the division
-/// remainder through 16383. Every pk maps to exactly one band.
+/// The disjoint per-owner slot bands covering 0..=16383. Without
+/// overrides this is the equal-split cut (`route` binds node i, i <
+/// last, to `[i*per + 1, (i+1)*per]`, node 0 starting at 0, the last
+/// node absorbing the remainder); an `owner_map` entry wins for its
+/// slot. Bands are built by assigning every slot its owner and merging
+/// contiguous same-owner runs, so owner_map overrides never split the
+/// scatter-gather incorrectly. Every pk maps to exactly one band.
 pub fn bands(r: &Routing) -> Vec<Band> {
-    let last = r.addrs.len().saturating_sub(1);
-    r.addrs
-        .iter()
-        .enumerate()
-        .map(|(i, addr)| {
-            let lo = i * r.per_node_slots + usize::from(i > 0);
-            let hi = if i == last {
-                16383
-            } else {
-                (i + 1) * r.per_node_slots
-            };
-            Band {
-                lo: lo.min(u16::MAX as usize) as u16,
-                hi: hi.min(u16::MAX as usize) as u16,
-                owner: addr.clone(),
-            }
-        })
-        .collect()
+    let mut out: Vec<Band> = Vec::new();
+    for slot in 0..=16383u16 {
+        let owner = owner(r, slot);
+        match out.last_mut() {
+            Some(b) if b.owner == owner && b.hi + 1 == slot => b.hi = slot,
+            _ => out.push(Band {
+                lo: slot,
+                hi: slot,
+                owner,
+            }),
+        }
+    }
+    out
 }
 
 /// Owning node of one physical key: the `<slot>/` prefix decides.
@@ -179,6 +180,7 @@ mod tests {
             addrs: ["a:1", "b:2", host].iter().map(|s| s.to_string()).collect(),
             per_node_slots: SLOT_NUMBER / 3,
             host: host.to_string(),
+            owner_map: Default::default(),
         }
     }
 
@@ -212,14 +214,18 @@ mod tests {
 
     #[test]
     fn bands_partition_slots_with_remainder_on_last_owner() {
+        // host "b:2" also appears as addrs[1], so the two b:2 runs merge
+        // into one band (contiguous same-owner runs always collapse).
         let r = routing3("b:2");
         let bs = bands(&r);
-        assert_eq!(bs.len(), 3);
+        assert_eq!(bs.len(), 2);
         assert_eq!(
             bs.iter().map(|b| (b.lo, b.hi)).collect::<Vec<_>>(),
-            vec![(0, 5461), (5462, 10922), (10923, 16383)],
+            vec![(0, 5461), (5462, 16383)],
             "inclusive bounds, remainder rides the last band"
         );
+        assert_eq!(bs[0].owner, "a:1");
+        assert_eq!(bs[1].owner, "b:2");
         // Every band's owner is what router::route says for both ends.
         for b in &bs {
             assert_eq!(owner(&r, b.lo), b.owner);
@@ -236,11 +242,37 @@ mod tests {
     }
 
     #[test]
+    fn owner_map_overrides_win_and_bands_merge() {
+        let mut r = routing3("c:3");
+        // Slot 0 is band-a (a:1) by default; migration moved it to c:3.
+        r.owner_map.insert(0, "c:3".to_string());
+        r.owner_map.insert(16383, "a:1".to_string());
+        assert_eq!(owner(&r, 0), "c:3");
+        assert_eq!(owner(&r, 16383), "a:1");
+        let bs = bands(&r);
+        // Disjoint + complete, and no band mixes owners.
+        let mut all: Vec<u16> = bs.iter().flat_map(|b| b.lo..=b.hi).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n);
+        assert_eq!(all.first(), Some(&0));
+        assert_eq!(all.last(), Some(&16383));
+        assert_eq!(bs.iter().find(|b| b.lo == 0).unwrap().owner, "c:3");
+        assert_eq!(bs.iter().find(|b| b.hi == 16383).unwrap().owner, "a:1");
+        for b in &bs {
+            assert_eq!(owner(&r, b.lo), b.owner);
+            assert_eq!(owner(&r, b.hi), b.owner);
+        }
+    }
+
+    #[test]
     fn bands_single_owner_covers_everything() {
         let r = Routing {
             addrs: vec!["solo:1".to_string()],
             per_node_slots: SLOT_NUMBER,
             host: "solo:1".to_string(),
+            owner_map: Default::default(),
         };
         assert_eq!(
             bands(&r),

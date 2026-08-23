@@ -14,6 +14,8 @@
 //!   [`sync_from_metrics`].
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -330,6 +332,17 @@ pub struct Shared {
     pub lite: std::sync::Arc<crate::lite::Runtime>,
     /// SQL plane: MVCC timestamp oracle + live-snapshot registry.
     pub sql_ts: std::sync::Arc<crate::sql::tx::Oracle>,
+    /// Per-node MIGRATING state (Redis semantics): slot -> destination
+    /// RESP addr. Set by `CLUSTER SETSLOT <slot> MIGRATING <id>` on the
+    /// source; a missing key in such a slot routes as `-ASK <slot> <dst>`.
+    pub migrating: Arc<RwLock<HashMap<u16, String>>>,
+    /// Per-node IMPORTING state: slot -> source RESP addr. Set by
+    /// `CLUSTER SETSLOT <slot> IMPORTING <id>` on the target; without a
+    /// connection-level ASKING flag such slots route `-MOVED <slot> <src>`.
+    pub importing: Arc<RwLock<HashMap<u16, String>>>,
+    /// One in-process migration run at a time (task handler and the
+    /// leader reaper share the slot; the loser skips its round).
+    pub migrate_busy: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -355,6 +368,9 @@ pub mod testutil {
             wait_hub: ds::wait::WaitHub::new(),
             lite: std::sync::Arc::new(crate::lite::new_runtime()),
             sql_ts: std::sync::Arc::new(crate::sql::tx::Oracle::new()),
+            migrating: Arc::new(RwLock::new(HashMap::new())),
+            importing: Arc::new(RwLock::new(HashMap::new())),
+            migrate_busy: Arc::new(AtomicBool::new(false)),
             conf,
         }
     }

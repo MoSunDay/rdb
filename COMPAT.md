@@ -68,12 +68,23 @@ parity).
    control plane), and a departed voter is fully removed (openraft
    `change_membership(.., false)`, no lingering learner).
 
+12. **`migrate task` is now a slot-migration orchestrator** (BREAKING, approved):
+    `migrate task <slot> <src> <dst>` drives the redis-cli `--cluster reshard`
+    protocol (MIGRATING -> IMPORTING -> GETKEYSINSLOT/MIGRATE drain -> NODE ->
+    STABLE, node-ids are `md5_with40(addr)`). The raft `migrate_task` value is
+    a single JSON task document (`migrate list` returns it); Go stored an
+    underscore-joined task string. The data plane gained real
+    `MIGRATE host port "" 0 timeout KEYS ...` + `RESTORE` transport
+    (absolute-ms TTLs, `ABSTTL` accepted; `migrate`-reply texts differ from
+    Go's registration-only replies).
+
 ## Preserved Go quirks (byte-compatible)
 
 - `MGET`/`MSET` route by the **first key only** (all keys go to the first key's node).
 - `cluster test` returns the hardcoded literal `-MOVED 5465 127.0.0.1:32681`.
 - Slot range routing uses inclusive upper bound: `slot <= (i+1)*per`, `per = 16384/len`.
-- `migrate task` overwrites `migrate_task` unconditionally.
+- `migrate task` overwrites `migrate_task` unconditionally (the value is a
+  JSON task document since the orchestration rewrite, see deviation 12).
 - `epoch = term + commit_index` concatenated as strings.
 - Cluster-not-ready error text contains the Go typo: `instanes01`.
 - Unknown command reply: `ERR unknown command '<raw-arg-bytes>'` (first arg verbatim).

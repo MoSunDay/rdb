@@ -5,6 +5,7 @@
 //! gate and `-ERR: NOAUTH` text come from the MoSunDay/redcon fork; the
 //! command dispatch/routing pipeline itself lives in `conn.rs`.
 
+pub mod client;
 pub mod codec;
 pub mod conn;
 
@@ -77,6 +78,9 @@ mod tests {
             wait_hub: crate::ds::wait::WaitHub::new(),
             lite: std::sync::Arc::new(crate::lite::new_runtime()),
             sql_ts: std::sync::Arc::new(crate::sql::tx::Oracle::new()),
+            migrating: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
+            importing: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
+            migrate_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             conf: c,
         })
     }

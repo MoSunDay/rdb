@@ -473,9 +473,9 @@ async fn depart_live_follower_then_rejoin_restores_membership() {
 }
 
 /// MIGRATE task/list over a REAL raft: a leader-written task replicates
-/// to the FSM key `migrate_task` and lists back with underscores turned
-/// into spaces on every node; error paths keep the Go quirk of an
-/// ERROR-reply usage message, and a follower's task apply fails.
+/// to the FSM key `migrate_task` and lists back as one JSON bulk on
+/// every node; the empty list keeps the Go quirk of one empty item, and
+/// error paths keep the Go quirk of an ERROR-reply usage message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migrate_task_list_over_real_raft_and_error_paths() {
     use std::time::{Duration, Instant};
@@ -493,11 +493,12 @@ async fn migrate_task_list_over_real_raft_and_error_paths() {
         nodes[leader].ctx()
     );
 
-    // Usage / arity / unknown subcommand: the helper text is an ERROR.
+    // Usage / arity / unknown subcommand: the helper text is an ERROR
+    // (Go quirk kept). Anything not help/task/list is the DATA command,
+    // so a short `migrate bogus x` is its wrong-arity error instead.
     for args in [
         vec![b"migrate".as_slice()],
         vec![b"migrate", b"task", b"a", b"b"],
-        vec![b"migrate", b"bogus", b"x"],
         vec![b"migrate", b"help"],
     ] {
         let r = cmd_one_shot(&nodes[leader].resp, TOKEN, &args).await;
@@ -508,9 +509,14 @@ async fn migrate_task_list_over_real_raft_and_error_paths() {
             nodes[leader].ctx()
         );
     }
+    assert_eq!(
+        cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"migrate", b"bogus", b"x"]).await,
+        b"-ERR wrong number of arguments for 'migrate' command".to_vec(),
+        "migrate DATA command arity\n{}",
+        nodes[leader].ctx()
+    );
 
-    // A follower cannot apply: hashicorp's "not leader" surfaces as the
-    // Go "Raft Apply failed" error.
+    // Bad slot: `migrate task <slot> <src> <dst>` validates the slot.
     assert_eq!(
         cmd_one_shot(
             &nodes[follower].resp,
@@ -518,28 +524,31 @@ async fn migrate_task_list_over_real_raft_and_error_paths() {
             &[b"migrate", b"task", b"no", b"no", b"no"]
         )
         .await,
-        b"-Raft Apply failed".to_vec(),
-        "migrate task on a follower\n{}",
+        b"-ERR Invalid slot".to_vec(),
+        "migrate task with a bad slot\n{}",
         nodes[follower].ctx()
     );
 
-    // Leader write: MIGRATE task src dst count -> +OK, replicated.
+    // Leader write: a REAL one-key reshard of an empty slot (slot 0 is
+    // owned by node0; move it to node1) -> +OK, and the JSON task record
+    // replicates through the raft FSM to every node.
+    let src = &nodes[0].resp;
+    let dst = &nodes[1].resp;
     assert_eq!(
         cmd_one_shot(
             &nodes[leader].resp,
             TOKEN,
-            &[b"migrate", b"task", b"alpha", b"beta", b"gamma"]
+            &[b"migrate", b"task", b"0", src.as_bytes(), dst.as_bytes()]
         )
         .await,
         b"+OK",
         "migrate task on the leader\n{}",
         nodes[leader].ctx()
     );
-    let want = b"*1\r\n$16\r\nalpha beta gamma\r\n".to_vec();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let r = cmd_full_reply(&nodes[follower].resp, TOKEN, &[b"migrate", b"list"], 400).await;
-        if r == want {
+        if contains_bytes(&r, b"\"status\":\"done\"") && contains_bytes(&r, b"\"moved\":0") {
             break;
         }
         assert!(
@@ -549,11 +558,13 @@ async fn migrate_task_list_over_real_raft_and_error_paths() {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    // The leader lists the same task (underscores -> spaces).
-    assert_eq!(
-        cmd_full_reply(&nodes[leader].resp, TOKEN, &[b"migrate", b"list"], 400).await,
-        want,
-        "leader lists the task\n{}",
+    // The leader lists the same JSON task record.
+    let r = cmd_full_reply(&nodes[leader].resp, TOKEN, &[b"migrate", b"list"], 400).await;
+    assert!(
+        contains_bytes(&r, b"\"slot\":0")
+            && contains_bytes(&r, b"\"status\":\"done\"")
+            && contains_bytes(&r, b"\"moved\":0"),
+        "leader lists the task {r:?}\n{}",
         nodes[leader].ctx()
     );
 }

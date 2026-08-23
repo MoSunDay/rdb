@@ -31,7 +31,10 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `string.rs`：GET/SET/DEL/MGET/MSET/PING/QUIT/CONFIG；
   - `cluster.rs`：CLUSTER（init/nodes/test 等，拓扑读 `state::Shared.topology`）；
   - `raft_cmd.rs`：RAFT（help/stats/leader/nodes/set/get）；
-  - `migrate.rs`：MIGRATE（任务经 raft 键 `migrate_task` 复制）。
+  - `migrate.rs`：MIGRATE 数据面（host/port/key/db/timeout + KEYS 批量 dump→ASKING→RESTORE）
+    + `migrate task <slot> <src> <dst>` 编排（SETSLOT MIGRATING/IMPORTING/NODE/STABLE +
+    GETKEYSINSLOT 排空，任务 JSON 经 raft 键 `migrate_task` 复制）；线格式 `ds/dump.rs`，
+    出站客户端 `resp/client.rs`。
   - `keys*.rs`：TYPE/EXISTS/DEL/UNLINK/EXPIRE 族（NX/XX/GT/LT）/TTL/PTTL/PERSIST/SCAN/KEYS/RANDOMKEY/RENAME(NX)（核心状态 `keys_core.rs`，游标类 `keys_scan.rs`）；
   - `json_*.rs`：JSON 全命令（RedisJSON v1 legacy 路径：`$`/`.f`/`['f']`/`[i]`，无通配符）——`json_path.rs` 路径解析与 Value 导航（get/set/remove，字段自动建、数组 len 处追加）、`json_cmd.rs` SET(NX/XX)/GET/DEL/FORGET/TYPE/MGET、`json_str.rs` STRAPPEND/STRLEN/NUMINCRBY、`json_arr.rs` ARRAPPEND/ARRPOP/ARRINDEX/ARRINSERT/ARRLEN/ARRTRIM、`json_obj.rs` OBJKEYS/OBJLEN；多路径 GET 返回扁平数组（偏差见 COMPAT.md）。
   - `vectorset_*.rs`：VectorSet 全命令——`vectorset_cmd.rs` VADD（FP16 blob/VALUES 文本，重加保属性回 0）/VREM/VCARD/VDIM、`vectorset_attr.rs` VSETATTR/VGETATTR、`vectorset_sim.rs` VSIM（暴力 cosine，score=(cos+1)/2，COUNT/WITHSCORES/WITHATTRIBS）；偏差见 COMPAT.md（无 HNSW/EF/FILTER）。

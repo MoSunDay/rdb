@@ -336,7 +336,7 @@ fn queue_command(
         }
         let tag = hash::hash_tag(&argv[1]);
         let (slot, _) = hash::slot_with_prefix(tag);
-        if let Some(line) = command::moved_line(shared, slot) {
+        if let Some(line) = command::redirect_line(shared, slot, &argv[1], conn.asking) {
             codec::append_error(out, &line);
             conn.mark_dirty();
             return;

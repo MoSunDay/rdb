@@ -9,6 +9,7 @@
 //! again.
 
 pub mod codec;
+pub mod dump;
 pub mod expire;
 pub mod hash_ds;
 pub mod json_ds;
