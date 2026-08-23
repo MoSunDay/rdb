@@ -9,9 +9,13 @@
 //! lock window runs on the blocking pool (`catalog_apply` below): the
 //! executor's futures stay `Send`, which the MySQL shim requires.
 //!
-//! Physical rows of a dropped table are intentionally left orphaned:
-//! the catalog tombstone makes them unreachable, and a recreated table
-//! gets a fresh id, so orphans never alias a new table.
+//! Physical rows of a dropped row-engine table are intentionally left
+//! orphaned: the catalog tombstone makes them unreachable, and a
+//! recreated table gets a fresh id, so orphans never alias a new table.
+//! Columnar tables are different: their segment files would accumulate
+//! forever, so DROP also purges the 0x23 metas, the registry entries
+//! and the files (`columnar::commit::drop_table_segments`) once the
+//! catalog drop has landed.
 
 use std::sync::Arc;
 
@@ -108,16 +112,19 @@ async fn create_table(
 }
 
 async fn drop_table(shared: &Shared, name: &str, if_exists: bool) -> SqlResult<ExecOutcome> {
-    if catalog::lookup(shared, name)
-        .map_err(SqlError::from)?
-        .is_none()
-    {
-        if if_exists {
-            return Ok(ExecOutcome::Ok);
+    let schema = match catalog::lookup(shared, name).map_err(SqlError::from)? {
+        Some(s) => s,
+        None => {
+            if if_exists {
+                return Ok(ExecOutcome::Ok);
+            }
+            return Err(SqlError::no_such_table(name));
         }
-        return Err(SqlError::no_such_table(name));
-    }
+    };
     catalog_apply(shared, CatalogMutation::Drop(name.to_string())).await?;
+    if schema.engine.is_columnar() {
+        crate::sql::columnar::commit::drop_table_segments(shared, schema.id).await?;
+    }
     Ok(ExecOutcome::Ok)
 }
 
@@ -391,6 +398,47 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NoSuchTable);
         let ine = parse_statement("DROP TABLE IF EXISTS t").unwrap();
         assert!(matches!(run(&shared, ine).await.unwrap(), ExecOutcome::Ok));
+    }
+
+    #[tokio::test]
+    async fn drop_columnar_table_purges_segments() {
+        let shared = testutil::shared_with(testutil::test_config());
+        run(
+            &shared,
+            parse_statement(
+                "CREATE TABLE cd (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL) ENGINE=columnar",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let schema = catalog::lookup(&shared, "cd").unwrap().unwrap();
+        assert!(schema.engine.is_columnar());
+        // Commit one segment the way the write path does.
+        let rows = vec![vec![
+            crate::sql::storage::schema::Value::Int(1),
+            crate::sql::storage::schema::Value::Null,
+        ]];
+        let meta = crate::sql::columnar::writer::commit_segment(&shared, &schema, 7, 10, &rows)
+            .await
+            .unwrap();
+        let dir = crate::sql::columnar::writer::columnar_dir(&shared.conf);
+        assert!(dir.join(&meta.file).exists());
+        assert_eq!(
+            crate::sql::columnar::registry_of(&shared)
+                .segments(schema.id)
+                .len(),
+            1
+        );
+
+        run(&shared, parse_statement("DROP TABLE cd").unwrap())
+            .await
+            .unwrap();
+        assert!(catalog::lookup(&shared, "cd").unwrap().is_none());
+        assert!(crate::sql::columnar::registry_of(&shared)
+            .segments(schema.id)
+            .is_empty());
+        assert!(!dir.join(&meta.file).exists(), "segment file must be gone");
     }
 
     #[tokio::test]

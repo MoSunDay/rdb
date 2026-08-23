@@ -15,6 +15,14 @@
 //! with `commit_ts <= read_ts` (plus an open txn's staged appends) in
 //! `(commit_ts, segment_id)` order, and dist fans columnar reads out
 //! to every cluster member.
+//! M4 scope: DROP TABLE cleanup -- after the catalog tombstone lands,
+//! `commit::drop_table_segments` deletes every 0x23 meta of the table
+//! (one contiguous scan, one batch), forgets the [`Registry`] entries
+//! and best-effort unlinks the files. This runs only on the node that
+//! executes the DDL (clusters keep the catalog's leader-only model):
+//! segments parked on other members become unreachable orphans behind
+//! the tombstone, exactly like orphaned row bytes, and wait for the
+//! M5 GC sweep.
 pub mod commit;
 pub mod decode;
 pub mod encode;
