@@ -6,7 +6,7 @@ use crate::sql::parse::error::ErrorCode;
 use crate::state::testutil;
 
 fn schema(id: u32, name: &str) -> TableSchema {
-    use crate::sql::storage::schema::{ColumnDef, SqlType};
+    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
     TableSchema {
         id,
         name: name.to_string(),
@@ -23,6 +23,7 @@ fn schema(id: u32, name: &str) -> TableSchema {
             },
         ],
         pk: "id".into(),
+        engine: Engine::Row,
         indexes: vec![],
     }
 }

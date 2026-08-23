@@ -12,6 +12,7 @@ pub enum Statement {
         if_not_exists: bool,
         columns: Vec<ColumnSpec>,
         pk: String,
+        engine: crate::sql::storage::schema::Engine,
     },
     DropTable {
         name: String,

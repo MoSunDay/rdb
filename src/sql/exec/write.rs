@@ -42,6 +42,13 @@ pub async fn insert(
         unreachable!("dispatch maps only Insert here");
     };
     let schema = lookup(shared, &table)?;
+    if schema.engine.is_columnar() {
+        // M2 replaces this with the columnar flush path.
+        return Err(SqlError::new(
+            ErrorCode::NotSupported,
+            format!("columnar table '{table}': write path not yet enabled"),
+        ));
+    }
     if rows.is_empty() {
         return Ok(ExecOutcome::Affected(0));
     }
@@ -118,6 +125,14 @@ pub async fn update(
         unreachable!("dispatch maps only Update here");
     };
     let schema = lookup(shared, &table)?;
+    if schema.engine.is_columnar() {
+        return Err(SqlError::new(
+            ErrorCode::NotSupported,
+            format!(
+                "columnar table '{table}' is append-only in this version: UPDATE is not supported"
+            ),
+        ));
+    }
     let scope = single_table_scope(&schema);
     for (col, e) in &assignments {
         schema.column_index(col).ok_or_else(|| bad_field(col))?;
@@ -275,6 +290,14 @@ pub async fn delete(
         unreachable!("dispatch maps only Delete here");
     };
     let schema = lookup(shared, &table)?;
+    if schema.engine.is_columnar() {
+        return Err(SqlError::new(
+            ErrorCode::NotSupported,
+            format!(
+                "columnar table '{table}' is append-only in this version: DELETE is not supported"
+            ),
+        ));
+    }
     let scope = single_table_scope(&schema);
     if let Some(f) = &filter {
         scan::check_expr(f, &scope)?;

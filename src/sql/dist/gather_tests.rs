@@ -1,6 +1,6 @@
 use super::*;
 use crate::sql::storage::catalog::catalog_key;
-use crate::sql::storage::schema::{ColumnDef, SqlType};
+use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
 use crate::sql::tx;
 use crate::state::testutil;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ fn schema(id: u32, name: &str) -> TableSchema {
             },
         ],
         pk: "id".into(),
+        engine: Engine::Row,
         indexes: vec![],
     }
 }

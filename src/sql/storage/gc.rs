@@ -178,7 +178,7 @@ mod tests {
     use crate::sql::storage::row::{
         encode_row, encode_tombstone, pk_encode, row_slot, version_key, visible_value,
     };
-    use crate::sql::storage::schema::{ColumnDef, SqlType, TableSchema, Value};
+    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType, TableSchema, Value};
     use crate::state::testutil;
 
     fn schema(id: u32) -> TableSchema {
@@ -198,6 +198,7 @@ mod tests {
                 },
             ],
             pk: "id".into(),
+            engine: Engine::Row,
             indexes: vec![],
         }
     }

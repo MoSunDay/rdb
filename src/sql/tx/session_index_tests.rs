@@ -8,7 +8,7 @@ use crate::sql::parse::error::ErrorCode;
 /// Schema with one secondary (v) + one unique (n) index for the
 /// commit-maintenance tests.
 fn indexed_schema(id: u32, name: &str) -> TableSchema {
-    use crate::sql::storage::schema::{ColumnDef, IndexDef, SqlType};
+    use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, SqlType};
     TableSchema {
         id,
         name: name.to_string(),
@@ -30,6 +30,7 @@ fn indexed_schema(id: u32, name: &str) -> TableSchema {
             },
         ],
         pk: "id".into(),
+        engine: Engine::Row,
         indexes: vec![
             IndexDef {
                 id: 1,
