@@ -241,9 +241,9 @@ async fn ddl_dml_select_full_flow() {
     };
     assert!(first.contains("users"), "plan mentions the table: {first}");
 
-    // ---- USE / SET tolerated ----
+    // ---- USE / cosmetic SET tolerated (session settings rejected) ----
     c.query_drop("USE rdb").await.expect("use");
-    c.query_drop("SET autocommit = 1").await.expect("set");
+    c.query_drop("SET sql_mode = ''").await.expect("set");
     let got = rows(&mut c, "SHOW TABLES").await;
     assert_eq!(got, vec![vec![s("users")]]);
 

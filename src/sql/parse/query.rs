@@ -14,8 +14,13 @@ pub(crate) fn translate_query(q: &SqlQuery) -> SqlResult<Query> {
     if q.with.is_some() {
         return Err(SqlError::unsupported("CTE (WITH)"));
     }
-    if !q.locks.is_empty() && !q.locks.iter().all(|l| l.nonblock.is_none()) {
-        return Err(SqlError::unsupported("FOR UPDATE NOWAIT / SKIP LOCKED"));
+    if !q.locks.is_empty() {
+        // Locking reads would silently degrade to plain snapshot reads;
+        // reject loudly until pessimistic locks exist (the snapshot +
+        // commit-time write-write validation is the supported story).
+        return Err(SqlError::unsupported(
+            "SELECT ... FOR UPDATE / FOR SHARE (locking reads)",
+        ));
     }
     let items: Vec<SelectItem> = sel
         .projection
@@ -34,10 +39,6 @@ pub(crate) fn translate_query(q: &SqlQuery) -> SqlResult<Query> {
         sqlparser::ast::GroupByExpr::All(_) => return Err(SqlError::unsupported("GROUP BY ALL")),
     };
     let distinct = matches!(&sel.distinct, Some(sqlparser::ast::Distinct::Distinct));
-    let for_update = q
-        .locks
-        .iter()
-        .any(|l| matches!(l.lock_type, sqlparser::ast::LockType::Update));
     let (limit, offset) = translate_limit_clause(&q.limit_clause)?;
     Ok(Query {
         items,
@@ -55,7 +56,6 @@ pub(crate) fn translate_query(q: &SqlQuery) -> SqlResult<Query> {
         limit,
         offset,
         distinct,
-        for_update,
     })
 }
 

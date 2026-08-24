@@ -19,12 +19,25 @@
 //! One sweep deletes at most [`MAX_DELETES_PER_SWEEP`] versions (bounded
 //! work); [`run_gc_loop`] re-runs every ~30s and catches up. Deletes go
 //! out in one synced `WriteBatch`, mirroring the expire sampler.
+//!
+//! DROPPED TABLES: a DROP TABLE leaves its row versions and index
+//! entries physically behind (the catalog tombstone only makes them
+//! unreachable; ids are never reused, so nothing aliases them). Every
+//! node's background sweep also consults the replicated catalog's
+//! dropped-id set: all versions of a dropped table's pk groups are
+//! garbage regardless of the watermark (there are no readers by
+//! definition), and its 0x21/0x22 index entries are deleted as they are
+//! met. Columnar segments have their own sweep ([`crate::sql::columnar`]
+//! M5) with the same catalog-driven rule.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rocksdb::WriteBatch;
 
+use crate::sql::index::keys;
+use crate::sql::storage::catalog;
 use crate::sql::storage::row::{parse_version_key, HEADER_TOMBSTONE};
 use crate::state::Shared;
 use crate::store::ops;
@@ -45,6 +58,11 @@ struct GroupCursor {
     /// Whether the anchor (newest version with `ts <= wm`) of the
     /// current group has been seen yet.
     anchor_seen: bool,
+    /// True while the current group belongs to a dropped table: every
+    /// version of the group is unreachable and is deleted (the dropped
+    /// id set may grow between rounds, so this is re-derived on every
+    /// group transition).
+    dropped_group: bool,
 }
 
 /// Fold one parsed version into the sweep; `Some(key)` = delete it.
@@ -56,6 +74,7 @@ struct GroupCursor {
 fn fold_version(
     cur: &mut GroupCursor,
     wm: u64,
+    dropped: &HashSet<u32>,
     key: &[u8],
     parsed: (u16, u32, Vec<u8>, u64),
     val: &[u8],
@@ -68,6 +87,12 @@ fn fold_version(
     if !same_group {
         cur.group = Some((slot, table_id, pk));
         cur.anchor_seen = false;
+        cur.dropped_group = dropped.contains(&table_id);
+    }
+    if cur.dropped_group {
+        // Dropped table: no snapshot can ever read these versions, so
+        // even the newest and prepared ones are garbage.
+        return Some(key.to_vec());
     }
     if ts > wm {
         return None;
@@ -97,14 +122,16 @@ fn slot_space_end() -> Vec<u8> {
 }
 
 /// One GC pass over the SQL row version space: delete every version made
-/// invisible by `watermark`. Returns the number of versions deleted;
-/// scan/write failures log and delete nothing.
-pub fn sweep(store: &Store, watermark: u64) -> usize {
-    sweep_capped(store, watermark, MAX_DELETES_PER_SWEEP)
+/// invisible by `watermark`, plus everything left by tables in
+/// `dropped` (dropped-table rows and 0x21/0x22 index entries). Returns
+/// the number of versions deleted; scan/write failures log and delete
+/// nothing.
+pub fn sweep(store: &Store, watermark: u64, dropped: &HashSet<u32>) -> usize {
+    sweep_capped(store, watermark, dropped, MAX_DELETES_PER_SWEEP)
 }
 
 /// Testable core of [`sweep`] with an explicit delete cap.
-pub fn sweep_capped(store: &Store, watermark: u64, cap: usize) -> usize {
+pub fn sweep_capped(store: &Store, watermark: u64, dropped: &HashSet<u32>, cap: usize) -> usize {
     // Same walk as exec::scan::visible_rows: forward from "0/" over the
     // whole slot space, filtering through parse_version_key. SQL row
     // versions INTERLEAVE with the RESP families inside every slot
@@ -119,9 +146,21 @@ pub fn sweep_capped(store: &Store, watermark: u64, cap: usize) -> usize {
             return false; // past the last slot: no SQL rows beyond
         }
         let Some(parsed) = parse_version_key(key) else {
+            // 0x21/0x22 index entries of dropped tables are unreachable
+            // garbage; delete them without touching the version cursor
+            // (index keys can never split a pk version group: within a
+            // slot+table every row key sorts before all index keys).
+            if let Some((_, tid, _, _)) = keys::parse_index_key(key) {
+                if dropped.contains(&tid) {
+                    dead.push(key.to_vec());
+                    if dead.len() >= cap {
+                        return false;
+                    }
+                }
+            }
             return true; // RESP / index key riding the same slots
         };
-        if let Some(k) = fold_version(&mut cur, watermark, key, parsed, val) {
+        if let Some(k) = fold_version(&mut cur, watermark, dropped, key, parsed, val) {
             dead.push(k);
             if dead.len() >= cap {
                 return false; // capped: next sweep resumes from "0/"
@@ -159,8 +198,13 @@ pub async fn run_gc_loop(shared: Arc<Shared>) {
     loop {
         ticker.tick().await;
         let wm = shared.sql_ts.watermark();
-        let store = Arc::clone(&shared.store);
-        if let Err(e) = tokio::task::spawn_blocking(move || sweep(&store, wm)).await {
+        let gc_shared = Arc::clone(&shared);
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            let dropped: HashSet<u32> = catalog::dropped_ids(&gc_shared).into_iter().collect();
+            sweep(&gc_shared.store, wm, &dropped)
+        })
+        .await
+        {
             eprintln!("[sql-gc] sweep task failed: {e}");
         }
     }
@@ -248,7 +292,7 @@ mod tests {
         put(&shared, &s, 1, 1, Some("v1"));
         put(&shared, &s, 1, 2, Some("v2"));
         put(&shared, &s, 1, 3, None);
-        assert_eq!(sweep(&shared.store, 3), 3);
+        assert_eq!(sweep(&shared.store, 3, &HashSet::new()), 3);
         assert!(versions_of(&shared, &s, 1).is_empty());
     }
 
@@ -259,7 +303,7 @@ mod tests {
         put(&shared, &s, 1, 1, Some("v1"));
         put(&shared, &s, 1, 2, Some("v2"));
         put(&shared, &s, 1, 3, None);
-        assert_eq!(sweep(&shared.store, 2), 1);
+        assert_eq!(sweep(&shared.store, 2, &HashSet::new()), 1);
         assert_eq!(ts_of(&versions_of(&shared, &s, 1)), vec![3, 2]);
         // A reader at read_ts=2 still resolves to the kept ts2 row.
         let expected = encode_row(&s, &[Value::Int(1), Value::Str("v2".into())]).unwrap();
@@ -275,7 +319,7 @@ mod tests {
         let s = schema(7);
         put(&shared, &s, 1, 1, Some("v1"));
         put(&shared, &s, 1, 2, Some("v2"));
-        assert_eq!(sweep(&shared.store, 0), 0);
+        assert_eq!(sweep(&shared.store, 0, &HashSet::new()), 0);
         assert_eq!(ts_of(&versions_of(&shared, &s, 1)), vec![2, 1]);
     }
 
@@ -286,7 +330,7 @@ mod tests {
         for ts in 1..=4u64 {
             put(&shared, &s, 1, ts, Some("v"));
         }
-        assert_eq!(sweep(&shared.store, 2), 1); // only ts1 (below the anchor)
+        assert_eq!(sweep(&shared.store, 2, &HashSet::new()), 1); // only ts1 (below the anchor)
         assert_eq!(ts_of(&versions_of(&shared, &s, 1)), vec![4, 3, 2]);
     }
 
@@ -298,9 +342,9 @@ mod tests {
             put(&shared, &s, 1, ts, Some("v"));
         }
         // anchor ts4 kept; ts3+ts2 fill the cap; ts1 waits for the next sweep.
-        assert_eq!(sweep_capped(&shared.store, 4, 2), 2);
+        assert_eq!(sweep_capped(&shared.store, 4, &HashSet::new(), 2), 2);
         assert_eq!(ts_of(&versions_of(&shared, &s, 1)), vec![4, 1]);
-        assert_eq!(sweep_capped(&shared.store, 4, 2), 1);
+        assert_eq!(sweep_capped(&shared.store, 4, &HashSet::new(), 2), 1);
         assert_eq!(ts_of(&versions_of(&shared, &s, 1)), vec![4]);
     }
 
@@ -317,7 +361,7 @@ mod tests {
         put(&shared, &s, 2, 3, Some("b3"));
         // wm=3: pk1's tombstone anchor wipes its group (3 deletes);
         // pk2 keeps its live anchor (2 deletes).
-        assert_eq!(sweep(&shared.store, 3), 5);
+        assert_eq!(sweep(&shared.store, 3, &HashSet::new()), 5);
         assert!(versions_of(&shared, &s, 1).is_empty());
         assert_eq!(ts_of(&versions_of(&shared, &s, 2)), vec![3]);
     }
@@ -333,7 +377,7 @@ mod tests {
         put(&shared, &b, 1, 2, None);
         // wm=2: table a keeps its live anchor (ts1 dies); table b's
         // tombstone anchor takes the whole group out.
-        assert_eq!(sweep(&shared.store, 2), 3);
+        assert_eq!(sweep(&shared.store, 2, &HashSet::new()), 3);
         assert_eq!(ts_of(&versions_of(&shared, &a, 1)), vec![2]);
         assert!(versions_of(&shared, &b, 1).is_empty());
     }
@@ -346,7 +390,10 @@ mod tests {
         put(&shared, &s, 1, 2, Some("v2"));
         put(&shared, &s, 1, 5, Some("v5"));
         shared.sql_ts.register_snapshot(2); // BEGIN at read_ts=2
-        assert_eq!(sweep(&shared.store, shared.sql_ts.watermark()), 1);
+        assert_eq!(
+            sweep(&shared.store, shared.sql_ts.watermark(), &HashSet::new()),
+            1
+        );
         let left = versions_of(&shared, &s, 1);
         assert_eq!(ts_of(&left), vec![5, 2]);
         let (val, ts) = visible_value(left.iter().map(|(t, v)| (*t, v.as_slice())), 2).unwrap();
@@ -370,10 +417,76 @@ mod tests {
         ops::batch_write(&shared.store, batch).unwrap();
         put(&shared, &s, 1, 1, Some("v1"));
         put(&shared, &s, 1, 2, Some("v2"));
-        assert_eq!(sweep(&shared.store, 2), 1);
+        assert_eq!(sweep(&shared.store, 2, &HashSet::new()), 1);
         assert_eq!(
             ops::get_physical(&shared.store, &resp_key).unwrap(),
             Some(b"v".to_vec())
         );
+    }
+
+    #[test]
+    fn dropped_table_rows_deleted_beyond_watermark() {
+        let shared = shared();
+        let s = schema(7);
+        put(&shared, &s, 1, 1, Some("v1"));
+        put(&shared, &s, 1, 2, Some("v2"));
+        put(&shared, &s, 1, 3, None); // newest is a tombstone
+        let dropped: HashSet<u32> = [7].into();
+        // Watermark 2: the ts3 tombstone is above it, yet the whole
+        // dropped group (every version, any header) must go.
+        assert_eq!(sweep(&shared.store, 2, &dropped), 3);
+        assert!(versions_of(&shared, &s, 1).is_empty());
+    }
+
+    #[test]
+    fn dropped_table_rows_deleted_with_live_anchor() {
+        let shared = shared();
+        let s = schema(7);
+        put(&shared, &s, 1, 1, Some("v1"));
+        put(&shared, &s, 1, 2, Some("v2")); // would be the live anchor
+        let dropped: HashSet<u32> = [7].into();
+        assert_eq!(sweep(&shared.store, 2, &dropped), 2);
+        assert!(versions_of(&shared, &s, 1).is_empty());
+    }
+
+    #[test]
+    fn dropped_table_does_not_touch_other_tables() {
+        let shared = shared();
+        let a = schema(7);
+        let b = schema(8);
+        put(&shared, &a, 1, 1, Some("a1"));
+        put(&shared, &b, 1, 1, Some("b1"));
+        put(&shared, &b, 1, 2, Some("b2"));
+        let dropped: HashSet<u32> = [7].into();
+        // a's dropped version + b's shadowed ts1 version.
+        assert_eq!(sweep(&shared.store, 2, &dropped), 2);
+        assert!(versions_of(&shared, &a, 1).is_empty());
+        assert_eq!(ts_of(&versions_of(&shared, &b, 1)), vec![2]);
+    }
+
+    #[test]
+    fn dropped_table_index_entries_deleted() {
+        use crate::sql::index::keys::{secondary_key, unique_key};
+        let shared = shared();
+        // One secondary and one unique entry under the dropped table.
+        let col_key = crate::sql::storage::codec::encode_key(&Value::Str("x".into())).unwrap();
+        let pk_key = pk_encode(&Value::Int(1)).unwrap();
+        let mut batch = WriteBatch::default();
+        batch.put(secondary_key(7, 0, &col_key, &pk_key), b"".as_slice());
+        batch.put(unique_key(7, 1, &col_key), &pk_key);
+        ops::batch_write(&shared.store, batch).unwrap();
+        let dropped: HashSet<u32> = [7].into();
+        assert_eq!(sweep(&shared.store, 1, &dropped), 2);
+        let mut leftovers = 0usize;
+        ops::for_each_from(&shared.store, b"0/", false, &mut |key, _| {
+            if let Some((_, tid, _, _)) = keys::parse_index_key(key) {
+                if tid == 7 {
+                    leftovers += 1;
+                }
+            }
+            true
+        })
+        .unwrap();
+        assert_eq!(leftovers, 0);
     }
 }

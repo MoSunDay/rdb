@@ -203,7 +203,7 @@ async fn gather_merges_bands_disjointly() {
         ..Default::default()
     };
     tx::stage_upsert(&mut txn, &s, row_of(99, "staged")).unwrap();
-    tx::stage_delete(&mut txn, &s, row::pk_encode(&Value::Int(1)).unwrap());
+    tx::stage_delete(&mut txn, &s, row::pk_encode(&Value::Int(1)).unwrap()).unwrap();
     let src = materialize(&a, &tref("g"), 10, Some(&txn), None)
         .await
         .unwrap();

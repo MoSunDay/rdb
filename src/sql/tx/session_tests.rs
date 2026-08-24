@@ -97,7 +97,7 @@ fn staging_collapses_to_last_write_per_pk() {
         txn.writes.get(&(1, pk_key(1))),
         Some(&TxnWrite::Row(row_of(1, "second")))
     );
-    stage_delete(&mut txn, &s, pk_key(1));
+    stage_delete(&mut txn, &s, pk_key(1)).unwrap();
     assert_eq!(txn.writes.get(&(1, pk_key(1))), Some(&TxnWrite::Tombstone));
     assert_eq!(txn.writes.len(), 1);
 }
@@ -117,7 +117,7 @@ fn merge_rows_substitutes_deletes_and_injects() {
         ..Default::default()
     };
     stage_upsert(&mut txn, &s, row_of(2, "TWO")).unwrap();
-    stage_delete(&mut txn, &s, pk_key(3));
+    stage_delete(&mut txn, &s, pk_key(3)).unwrap();
     stage_upsert(&mut txn, &s, row_of(5, "five")).unwrap();
 
     assert_eq!(
@@ -257,7 +257,7 @@ async fn commit_persists_versions_and_releases_snapshot() {
     let oracle = &shared.sql_ts;
     let mut txn = begin(oracle);
     stage_upsert(&mut txn, &s, row_of(1, "one")).unwrap();
-    stage_delete(&mut txn, &s, pk_key(2));
+    stage_delete(&mut txn, &s, pk_key(2)).unwrap();
 
     commit(&shared, txn).await.expect("commit");
     assert_eq!(oracle.watermark(), oracle.now(), "snapshot released");
@@ -408,7 +408,7 @@ async fn explicit_txn_flushes_all_appends_as_one_segment() {
 }
 
 #[tokio::test]
-async fn mixed_txn_commits_row_versions_and_segment_meta_together() {
+async fn mixed_engine_txn_is_rejected_before_commit() {
     let shared = shared();
     let row_t = schema(13, "rt");
     let col_t = columnar_schema(14, "ctm");
@@ -421,6 +421,50 @@ async fn mixed_txn_commits_row_versions_and_segment_meta_together() {
     sql_insert(&shared, &mut sess, "INSERT INTO rt (id, v) VALUES (1, 'r')")
         .await
         .unwrap();
+    let err = sql_insert(
+        &shared,
+        &mut sess,
+        "INSERT INTO ctm (id, v) VALUES (5, 'c')",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotSupported);
+    assert!(err.msg.contains("cannot mix row-store and columnar writes"));
+    // The rejected append staged nothing; the txn's own-engine write
+    // is still committable.
+    commit(&shared, sess.txn.take().unwrap()).await.unwrap();
+    let visible =
+        crate::sql::exec::scan::visible_rows(&shared.store, &row_t, shared.sql_ts.now()).unwrap();
+    assert_eq!(visible, vec![row_of(1, "r")]);
+    assert!(crate::sql::columnar::registry_of(&shared)
+        .segments(col_t.id)
+        .is_empty());
+}
+
+#[tokio::test]
+async fn row_and_columnar_txns_each_persist_their_own_engine() {
+    let shared = shared();
+    let row_t = schema(13, "rt");
+    let col_t = columnar_schema(14, "ctm");
+    seed_catalog(&shared, &row_t);
+    seed_catalog(&shared, &col_t);
+    // row txn: a live MVCC version visible at the post-commit ts
+    let mut sess = crate::sql::exec::SqlSession {
+        txn: Some(begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    sql_insert(&shared, &mut sess, "INSERT INTO rt (id, v) VALUES (1, 'r')")
+        .await
+        .unwrap();
+    commit(&shared, sess.txn.take().unwrap()).await.unwrap();
+    let visible =
+        crate::sql::exec::scan::visible_rows(&shared.store, &row_t, shared.sql_ts.now()).unwrap();
+    assert_eq!(visible, vec![row_of(1, "r")]);
+    // columnar txn: one Live meta in BOTH the store and the registry
+    let mut sess = crate::sql::exec::SqlSession {
+        txn: Some(begin(&shared.sql_ts)),
+        ..Default::default()
+    };
     sql_insert(
         &shared,
         &mut sess,
@@ -429,11 +473,6 @@ async fn mixed_txn_commits_row_versions_and_segment_meta_together() {
     .await
     .unwrap();
     commit(&shared, sess.txn.take().unwrap()).await.unwrap();
-    // row side: a live MVCC version visible at the post-commit ts
-    let visible =
-        crate::sql::exec::scan::visible_rows(&shared.store, &row_t, shared.sql_ts.now()).unwrap();
-    assert_eq!(visible, vec![row_of(1, "r")]);
-    // columnar side: one Live meta in BOTH the store and the registry
     let segs = crate::sql::columnar::registry_of(&shared).segments(col_t.id);
     assert_eq!(segs.len(), 1);
     let raw = crate::store::ops::get_physical(
