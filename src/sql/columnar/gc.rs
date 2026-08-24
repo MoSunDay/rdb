@@ -6,7 +6,12 @@
 //! - undecodable meta or malformed key -> garbage;
 //! - meta whose table is no longer in the raft catalog -> garbage
 //!   (crash between the catalog tombstone and the meta-delete batch
-//!   of `drop_table_segments`, or a decide(commit) that raced a DROP);
+//!   of `drop_table_segments`, or a decide(commit) that raced a DROP).
+//!   An EMPTY catalog view proves nothing (right after a restart the
+//!   FSM/topology view may not have loaded while on-disk metas
+//!   predate it), so while the view holds no table at all every
+//!   decodable meta is kept for the round; an unreadable catalog
+//!   entry is likewise "unknown, not gone" and its metas are kept;
 //! - `Prepared` meta referenced by NO in-doubt 2PC marker -> garbage
 //!   once its file is missing or older than [`ORPHAN_MIN_AGE`] (a
 //!   crash after Prepare, before Decide). A marker-referenced meta
@@ -75,10 +80,18 @@ fn sweep_core(
         return Ok(SweepStats::default());
     }
     let in_doubt: BTreeSet<Vec<u8>> = participant::in_doubt_keys(store).into_iter().collect();
+    // Absence in the catalog view only proves a DROP once the view is
+    // populated. Right after a restart (slow FSM restore, late topology
+    // sync) the view is empty while this node's segment metas predate
+    // it; sweeping them as "table gone" would silently delete every
+    // meta -- the source of truth -- so keep every decodable meta this
+    // round and retry once the view has loaded.
+    let view_empty = catalog::list_tables_raft(raft).is_empty();
     let mut garbage: Vec<Vec<u8>> = Vec::new();
     let mut garbage_ids: Vec<(u32, u64)> = Vec::new();
     let mut kept_live: Vec<SegmentMeta> = Vec::new();
     let mut referenced: BTreeSet<String> = BTreeSet::new();
+    let mut metas_seen: u64 = 0;
     ops::for_each_from(store, &[KIND_SQL_SEGMENT], false, &mut |key, value| {
         if key.first() != Some(&KIND_SQL_SEGMENT) {
             return false; // past the 0x23 region
@@ -90,12 +103,22 @@ fn sweep_core(
                 return true;
             }
         };
+        metas_seen += 1;
         // Tables gone from the catalog: drop crashed before the
-        // meta-delete batch, or a decide(commit) raced a DROP.
-        if !matches!(catalog::lookup_raft(raft, &meta.table_name), Ok(Some(_))) {
-            garbage.push(key.to_vec());
-            garbage_ids.push(id);
-            return true;
+        // meta-delete batch, or a decide(commit) raced a DROP. An
+        // unreadable entry (Err) is unknown, not gone: keep.
+        match catalog::lookup_raft(raft, &meta.table_name) {
+            Ok(Some(_)) => {}
+            Ok(None) if !view_empty => {
+                garbage.push(key.to_vec());
+                garbage_ids.push(id);
+                return true;
+            }
+            Ok(None) => {} // empty view: keep, retry next round
+            Err(e) => eprintln!(
+                "[columnar-gc] catalog entry for {} unreadable ({e}); keeping its metas",
+                meta.table_name
+            ),
         }
         if meta.state == SegmentState::Prepared
             && !in_doubt.contains(key)
@@ -111,6 +134,11 @@ fn sweep_core(
         }
         true
     })?;
+    if view_empty && metas_seen > 0 {
+        eprintln!(
+            "[columnar-gc] catalog view empty with {metas_seen} segment metas present; kept all for this round"
+        );
+    }
     if !garbage.is_empty() {
         let mut batch = WriteBatch::default();
         for key in &garbage {
