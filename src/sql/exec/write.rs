@@ -166,7 +166,7 @@ async fn insert_columnar(
             ));
         }
         for values in rows {
-            tx::stage_append(txn, &schema.name, values);
+            tx::stage_append(txn, &schema.name, values)?;
         }
         return Ok(ExecOutcome::Affected(n));
     }
@@ -249,7 +249,7 @@ pub async fn update(
         let n = plans.len() as u64;
         for p in plans {
             if let Some(old_key) = p.tombstone_old_pk {
-                tx::stage_delete(txn, &schema, old_key);
+                tx::stage_delete(txn, &schema, old_key)?;
             }
             tx::stage_upsert(txn, &schema, p.values)?;
         }
@@ -385,7 +385,7 @@ pub async fn delete(
     }
     if let Some(txn) = sess.txn.as_mut() {
         for r in matched {
-            tx::stage_delete(txn, &schema, pk_key_of(&schema, &r)?);
+            tx::stage_delete(txn, &schema, pk_key_of(&schema, &r)?)?;
         }
         return Ok(ExecOutcome::Affected(n));
     }

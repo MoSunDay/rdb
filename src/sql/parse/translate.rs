@@ -274,8 +274,63 @@ fn translate(stmt: SqlStatement) -> SqlResult<Statement> {
                 Err(SqlError::unsupported("SHOW variables"))
             }
         }
-        SqlStatement::Set(_) => Ok(Statement::SetIgnored),
+        SqlStatement::Set(set) => translate_set(set),
         other => Err(SqlError::unsupported(format!("{other}"))),
+    }
+}
+
+/// Session-state SET statements are rejected loudly (silently
+/// ignoring them would mislead clients about autocommit/isolation
+/// semantics); cosmetic assignments (`sql_mode`, `wait_timeout`, ...)
+/// are accepted and ignored.
+fn translate_set(set: sqlparser::ast::Set) -> SqlResult<Statement> {
+    use sqlparser::ast::Set as SqlSet;
+    match set {
+        SqlSet::SetNames { .. }
+        | SqlSet::SetNamesDefault {}
+        | SqlSet::SetTransaction { .. }
+        | SqlSet::SetTimeZone { .. }
+        | SqlSet::SetRole { .. }
+        | SqlSet::SetSessionAuthorization(_)
+        | SqlSet::SetSessionParam(_)
+        | SqlSet::ParenthesizedAssignments { .. } => Err(SqlError::unsupported(format!(
+            "{set} (session/transaction settings)"
+        ))),
+        SqlSet::SingleAssignment { ref variable, .. } => reject_session_var(variable, &set),
+        SqlSet::MultipleAssignments {
+            ref assignments, ..
+        } => {
+            for a in assignments {
+                reject_session_var(&a.name, &set)?;
+            }
+            Ok(Statement::SetIgnored)
+        }
+    }
+}
+
+/// Reject assignments to variables that change session/transaction
+/// semantics; anything else is cosmetic and ignored.
+fn reject_session_var(
+    variable: &sqlparser::ast::ObjectName,
+    set: &sqlparser::ast::Set,
+) -> SqlResult<Statement> {
+    let name = variable.to_string().to_ascii_lowercase();
+    let sensitive = [
+        "autocommit",
+        "isolation",
+        "session",
+        "time_zone",
+        "names",
+        "charset",
+    ]
+    .iter()
+    .any(|k| name.contains(k));
+    if sensitive {
+        Err(SqlError::unsupported(format!(
+            "{set} (session/transaction settings)"
+        )))
+    } else {
+        Ok(Statement::SetIgnored)
     }
 }
 

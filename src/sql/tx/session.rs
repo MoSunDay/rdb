@@ -28,7 +28,7 @@ use rocksdb::WriteBatch;
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog;
 use crate::sql::storage::row;
-use crate::sql::storage::schema::{TableSchema, Value};
+use crate::sql::storage::schema::{Engine, TableSchema, Value};
 use crate::sql::tx::Oracle;
 use crate::state::Shared;
 use crate::store::ops;
@@ -53,6 +53,9 @@ pub struct Txn {
     pub writes: BTreeMap<TxnKey, TxnWrite>,
     /// Columnar appends per table name, staged at INSERT, flushed at COMMIT.
     pub appends: BTreeMap<String, Vec<Vec<Value>>>,
+    /// Engine of the first staged write; later stages of the other
+    /// engine are rejected (one transaction touches one engine).
+    pub mode: Option<Engine>,
 }
 
 /// BEGIN: pin the latest committed timestamp and register the snapshot
@@ -64,30 +67,59 @@ pub fn begin(oracle: &Oracle) -> Txn {
         read_ts,
         writes: BTreeMap::new(),
         appends: BTreeMap::new(),
+        mode: None,
     }
 }
 
 /// Stage one full-width row into the columnar append buffer of its
 /// table (INSERT on a columnar table; append-only, no pk dedup).
-pub fn stage_append(txn: &mut Txn, table_name: &str, values: Vec<Value>) {
+/// Rejects a transaction that already staged row-store writes: one
+/// transaction touches exactly one engine.
+pub fn stage_append(txn: &mut Txn, table_name: &str, values: Vec<Value>) -> SqlResult<()> {
+    check_engine(txn, Engine::Columnar)?;
+    txn.mode = Some(Engine::Columnar);
     txn.appends
         .entry(table_name.to_string())
         .or_default()
         .push(values);
+    Ok(())
 }
 
 /// Stage a full-width row (INSERT, or the new-pk half of a pk-moving
-/// UPDATE). Later stages of the same pk replace earlier ones.
+/// UPDATE). Later stages of the same pk replace earlier ones. Rejects
+/// a transaction that already staged columnar appends.
 pub fn stage_upsert(txn: &mut Txn, schema: &TableSchema, values: Vec<Value>) -> SqlResult<()> {
+    check_engine(txn, Engine::Row)?;
+    txn.mode = Some(Engine::Row);
     let pk = row::pk_encode(pk_value(schema, &values)).map_err(SqlError::from)?;
     txn.writes.insert((schema.id, pk), TxnWrite::Row(values));
     Ok(())
 }
 
 /// Stage a delete marker for one pk (DELETE, or the old-pk half of a
-/// pk-moving UPDATE).
-pub fn stage_delete(txn: &mut Txn, schema: &TableSchema, pk_key: Vec<u8>) {
+/// pk-moving UPDATE). Rejects a transaction that already staged
+/// columnar appends.
+pub fn stage_delete(txn: &mut Txn, schema: &TableSchema, pk_key: Vec<u8>) -> SqlResult<()> {
+    check_engine(txn, Engine::Row)?;
+    txn.mode = Some(Engine::Row);
     txn.writes.insert((schema.id, pk_key), TxnWrite::Tombstone);
+    Ok(())
+}
+
+/// Enforce the one-engine-per-transaction rule at the single staging
+/// choke point every write path funnels through.
+fn check_engine(txn: &Txn, engine: Engine) -> SqlResult<()> {
+    match txn.mode {
+        None => Ok(()),
+        Some(m) if m == engine => Ok(()),
+        Some(m) => Err(SqlError::new(
+            ErrorCode::NotSupported,
+            format!(
+                "a transaction cannot mix row-store and columnar writes                  (already staged a {} write)",
+                if m.is_columnar() { "columnar" } else { "row-store" }
+            ),
+        )),
+    }
 }
 
 /// Own-write visibility: overlay the staged writes of `schema.id` on

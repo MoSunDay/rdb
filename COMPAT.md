@@ -335,8 +335,13 @@ The Rust tree adds a SQL data plane the Go implementation never had. Summary of 
 contract; module map lives in `agents/rust/sql.md`.
 
 - **Access**: `mysql_bind` listener (opensrv-mysql; native-password only, `mysql_user`/
-  `mysql_password` from config; any other account is rejected at handshake). USE/SET are
-  tolerated no-ops; `SELECT @@var` is intercepted server-side.
+  `mysql_password` from config; any other account is rejected at handshake). USE and
+  cosmetic SET (`sql_mode`, `wait_timeout`, ...) are tolerated no-ops; SET statements
+  that change session/transaction semantics (autocommit, isolation level, NAMES, SESSION
+  TRANSACTION, TIME_ZONE, ROLE, ...) are REJECTED loudly (MySQL 1235) rather than
+  silently ignored, and `SELECT ... FOR UPDATE / FOR SHARE` (locking reads) is rejected
+  the same way — snapshot isolation + commit-time write-write validation is the only
+  supported concurrency story. `SELECT @@var` is intercepted server-side.
 - **MVCC rows**: physical key `<slot>/ 0x20 table_id(BE u32) pk_key ts(BE !ts)` — newest
   version first per pk; value = header (0x01 live, 0x00 tombstone, 0x02 2PC-prepared) +
   null bitmap + typed payloads. Slot = `crc16(table_id BE ++ pk_key) % 16384` (same 16384
@@ -350,6 +355,9 @@ contract; module map lives in `agents/rust/sql.md`.
   txn read_ts (registered with the oracle), writes staged in a per-session write set,
   first-committer-wins write-write validation (MySQL error 1213). DDL inside a txn is
   rejected. Disconnect rolls back. Autocommit statements skip staging (single batch).
+  One transaction writes ONE engine: staging a row-store write after a columnar append
+  (or vice versa) is rejected at the statement (MySQL 1235, "a transaction cannot mix
+  row-store and columnar writes"); mixed reads across engines remain legal.
 - **Secondary indexes**: `0x21` secondary (`slot/ 0x21 table_id col_pos key(val) pk`), `0x22`
   unique (`slot/ 0x22 table_id col_pos key(val)` -> pk). Index slot = `crc16(table_id ++
   col_pos)` so one index is contiguous in one slot band. NULLs unindexed. Unique is
@@ -370,7 +378,11 @@ contract; module map lives in `agents/rust/sql.md`.
   results). JOINs and index paths stay local-only (v1).
 - **GC**: a 30s sweep deletes versions at or below the oracle watermark except each pk's
   newest (live) anchor; tombstone anchors take their whole prefix with them. Prepared
-  (0x02) versions are never swept.
+  (0x02) versions are never swept. DROPPED tables are reclaimed too: every node's sweep
+  reads the raft catalog's dropped-id set (the DROP tombstone value carries the dropped
+  table's id) and deletes ALL versions and `0x21`/`0x22` index entries of those ids —
+  ids are never reused (allocation is max(live, dropped)+1, monotone across restarts),
+  so a recreated table can never alias orphaned rows and the bytes are pure garbage.
 
 ## Columnar table engine (Rust-only)
 
@@ -407,7 +419,9 @@ immutable once published.
   the executing (leader) node purges, segments on other members become unreachable orphans
   behind the tombstone, reclaimed by the M5 GC sweep (`sql::columnar::gc`: 30s rounds;
   unreferenced files are only unlinked past a 1h age floor; an empty raft catalog view
-  keeps every segment meta for the round).
+  keeps every segment meta for the round). The row store mirrors this exactly: only the
+  executing (leader) node purges eagerly, and every node's MVCC GC sweep (above)
+  reclaims the orphaned row versions and index entries of dropped tables within ~30s.
 - **Slot migration**: segments are files outside the slot-keyed keyspace and do NOT move
   with their slot band: after a reshard, pre-existing segments stay on the node that
   committed them (reads fan out to every member, so they remain visible); new segments

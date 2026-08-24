@@ -158,7 +158,10 @@ mod tests {
             stmt("SHOW COLUMNS FROM t"),
             Statement::ShowColumns(_)
         ));
-        assert!(matches!(stmt("SET autocommit = 1"), Statement::SetIgnored));
+        assert!(parse_statement("SET autocommit = 1").is_err());
+        assert!(parse_statement("SET NAMES utf8mb4").is_err());
+        assert!(parse_statement("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED").is_err());
+        assert!(matches!(stmt("SET sql_mode = ''"), Statement::SetIgnored));
         assert!(matches!(
             stmt("EXPLAIN SELECT * FROM t"),
             Statement::Explain(_)
@@ -206,11 +209,13 @@ mod tests {
     }
 
     #[test]
-    fn for_update_flag() {
-        let Statement::Select(q) = stmt("SELECT * FROM t WHERE id = 1 FOR UPDATE") else {
-            panic!("shape");
-        };
-        assert!(q.for_update);
+    fn for_update_rejected() {
+        // Locking reads must fail loudly, not silently degrade to a
+        // plain snapshot read.
+        let e = parse_statement("SELECT * FROM t WHERE id = 1 FOR UPDATE").expect_err("u");
+        assert!(e.msg.contains("FOR UPDATE"), "{e}");
+        let e = parse_statement("SELECT * FROM t FOR SHARE").expect_err("u");
+        assert!(e.msg.contains("FOR SHARE"), "{e}");
     }
 
     #[test]

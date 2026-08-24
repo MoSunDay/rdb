@@ -40,11 +40,14 @@ impl CatalogTxn<'_> {
         state::raft_apply_await(ticket).await
     }
 
-    /// Remove a table's schema (tombstone: `""` marks dropped).
-    pub async fn drop(self, table: &str) -> Result<(), String> {
+    /// Remove a table's schema. The tombstone value carries the dropped
+    /// table's id (a bare decimal, never valid TableSchema JSON), so id
+    /// allocation stays monotone across drop+recreate cycles even after
+    /// restarts; readers treat unparseable values as absent.
+    pub async fn drop(self, table: &str, id: u32) -> Result<(), String> {
         let entry = RaftLogEntryData {
             key: catalog_key(table),
-            value: String::new(),
+            value: id.to_string(),
         };
         let ticket = state::raft_apply_start(self.raft, &entry)?;
         state::raft_apply_await(ticket).await
@@ -78,11 +81,19 @@ pub fn lookup_raft(
 ) -> Result<Option<TableSchema>, String> {
     let raw = state::raft_get(&raft.read().unwrap(), &catalog_key(table));
     if raw.is_empty() {
+        return Ok(None); // pre-upgrade `""` tombstone: absent
+    }
+    if let Ok(schema) = serde_json::from_str::<TableSchema>(&raw) {
+        return Ok(Some(schema));
+    }
+    // A bare decimal is the dropped-table tombstone (its id) and reads
+    // as absent. Anything else is a genuinely corrupt entry and errors:
+    // the M5 columnar GC relies on that distinction ("unreadable =
+    // unknown, keep its metas").
+    if raw.parse::<u32>().is_ok() {
         return Ok(None);
     }
-    serde_json::from_str(&raw)
-        .map(Some)
-        .map_err(|e| format!("corrupt catalog entry for {table}: {e}"))
+    Err(format!("corrupt catalog entry for {table}"))
 }
 
 /// All live schemas, ordered by name. `Shared`-shaped wrapper over
@@ -130,14 +141,57 @@ where
     }
 }
 
-/// Next free table id (max+1); callers hold the DDL serialization.
+/// Next free table id: max of the live and dropped (tombstoned) ids
+/// plus one, so ids stay monotone across drop+recreate cycles even
+/// after restarts. Callers hold the DDL serialization.
 pub fn next_table_id(shared: &Arc<Shared>) -> u32 {
-    list_tables(shared).iter().map(|s| s.id).max().unwrap_or(0) + 1
+    let live_max = list_tables(shared).iter().map(|s| s.id).max().unwrap_or(0);
+    let dropped_max = dropped_ids(shared).into_iter().max().unwrap_or(0);
+    live_max.max(dropped_max) + 1
 }
 
 /// Next free index id within a table.
 pub fn next_index_id(schema: &TableSchema) -> u32 {
     schema.indexes.iter().map(|i| i.id).max().unwrap_or(0) + 1
+}
+
+/// Ids of every dropped table still carrying a tombstone (value =
+/// decimal id). Together with the live set they keep id allocation
+/// monotone: an id is either live, tombstoned, or never issued.
+pub fn dropped_ids_raft(raft: &std::sync::RwLock<RaftState>) -> Vec<u32> {
+    let raft = raft.read().unwrap();
+    let mut out = Vec::new();
+    let entries: Vec<(String, String)> = match &raft.live_kv {
+        Some(kv) => {
+            if let Ok(map) = kv.read() {
+                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        None => raft
+            .kv
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    for (k, v) in entries {
+        if !k.starts_with(CATALOG_PREFIX) || v.is_empty() {
+            continue;
+        }
+        if serde_json::from_str::<TableSchema>(&v).is_ok() {
+            continue; // live schema
+        }
+        if let Ok(id) = v.parse::<u32>() {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// `Shared`-shaped wrapper over [`dropped_ids_raft`].
+pub fn dropped_ids(shared: &Shared) -> Vec<u32> {
+    dropped_ids_raft(&shared.raft)
 }
 
 #[cfg(test)]

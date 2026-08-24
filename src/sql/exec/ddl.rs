@@ -58,10 +58,11 @@ pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
     }
 }
 
-/// One catalog mutation to apply under the DDL lock.
+/// One catalog mutation to apply under the DDL lock. Drop carries the
+/// schema: its id becomes the tombstone value (monotone id allocation).
 enum CatalogMutation {
     Put(TableSchema),
-    Drop(String),
+    Drop(TableSchema),
 }
 
 /// Run `begin` + the txn method while holding the raft write guard, on
@@ -74,7 +75,7 @@ async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<
         let txn: CatalogTxn<'_> = catalog::begin(&mut guard).map_err(SqlError::from)?;
         match mutation {
             CatalogMutation::Put(schema) => handle.block_on(txn.put(&schema)),
-            CatalogMutation::Drop(name) => handle.block_on(txn.drop(&name)),
+            CatalogMutation::Drop(schema) => handle.block_on(txn.drop(&schema.name, schema.id)),
         }
         .map_err(SqlError::from)
     })
@@ -121,7 +122,7 @@ async fn drop_table(shared: &Shared, name: &str, if_exists: bool) -> SqlResult<E
             return Err(SqlError::no_such_table(name));
         }
     };
-    catalog_apply(shared, CatalogMutation::Drop(name.to_string())).await?;
+    catalog_apply(shared, CatalogMutation::Drop(schema.clone())).await?;
     if schema.engine.is_columnar() {
         crate::sql::columnar::commit::drop_table_segments(shared, schema.id).await?;
     }
@@ -263,12 +264,13 @@ fn lookup_table(shared: &Shared, table: &str) -> SqlResult<TableSchema> {
 /// catalog::next_table_id takes `&Arc<Shared>`; the executor works with
 /// a plain `&Shared`, so mirror its one-line max+1 here.
 fn alloc_table_id(shared: &Shared) -> u32 {
-    catalog::list_tables(shared)
+    let live_max = catalog::list_tables(shared)
         .iter()
         .map(|s| s.id)
         .max()
-        .unwrap_or(0)
-        + 1
+        .unwrap_or(0);
+    let dropped_max = catalog::dropped_ids(shared).into_iter().max().unwrap_or(0);
+    live_max.max(dropped_max) + 1
 }
 
 /// Validate a CREATE TABLE body and build its schema (id supplied by

@@ -96,7 +96,7 @@ async fn commit_maintains_index_entries() {
     );
 
     let mut txn = begin(oracle);
-    stage_delete(&mut txn, &s, pk_key(1));
+    stage_delete(&mut txn, &s, pk_key(1)).unwrap();
     commit(&shared, txn).await.expect("commit");
     assert!(
         index::lookup_pks(&shared.store, &s, &iv, &Value::Str("b".into()))

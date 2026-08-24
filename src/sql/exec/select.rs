@@ -29,8 +29,9 @@ pub async fn run(
     sess: &SqlSession,
     q: Query,
 ) -> SqlResult<(Vec<ColMeta>, Vec<Vec<Value>>)> {
-    // FOR UPDATE degrades to a plain snapshot read in M1; the explicit
-    // txn's write-write validation at COMMIT supplies the serialization.
+    // Locking reads (FOR UPDATE / FOR SHARE) are rejected at translate;
+    // the explicit txn's write-write validation at COMMIT supplies the
+    // serialization for snapshot reads.
     let (read_ts, txn) = match sess.txn.as_ref() {
         Some(t) => (t.read_ts, Some(t)),
         None => (shared.sql_ts.now(), None),
