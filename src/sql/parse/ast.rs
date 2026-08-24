@@ -80,8 +80,6 @@ pub struct Query {
     pub limit: Option<u64>,
     pub offset: u64,
     pub distinct: bool,
-    /// SELECT ... FOR UPDATE: readers latch matching rows until commit.
-    pub for_update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

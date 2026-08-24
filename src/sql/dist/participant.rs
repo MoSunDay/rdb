@@ -12,7 +12,7 @@
 //! same bytes, a retried Decide finds the marker gone (already
 //! applied) and just re-records the outcome.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,17 @@ pub fn vote(
     entries: &[Entry],
     segments: &[crate::sql::columnar::commit::PendingSegment],
 ) -> Result<Vote, String> {
+    // Unique-entry validation mirrors the local `check_unique`: keys
+    // this batch VACATES (UniqueDel) are exempt from the store check
+    // (their on-disk owner is leaving in the same batch, e.g. a value
+    // swap between two rows of one UPDATE), and two different pks
+    // claiming the SAME key inside this batch are a duplicate.
+    let vacated: BTreeSet<&[u8]> = entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::UniqueDel)
+        .map(|e| e.key.as_slice())
+        .collect();
+    let mut claimed: BTreeMap<&[u8], &[u8]> = BTreeMap::new();
     for e in entries {
         match e.kind {
             EntryKind::RowPrepared => {
@@ -130,6 +141,18 @@ pub fn vote(
                 }
             }
             EntryKind::UniquePut => {
+                if let Some(first) = claimed.get(e.key.as_slice()) {
+                    if *first != e.value.as_slice() {
+                        return Ok(Vote::No(
+                            "dup: unique value already owned by another row".to_string(),
+                        ));
+                    }
+                } else {
+                    claimed.insert(e.key.as_slice(), e.value.as_slice());
+                }
+                if vacated.contains(e.key.as_slice()) {
+                    continue; // the batch itself removes the old owner
+                }
                 if let Some(owner) = ops::get_physical(store, &e.key)?.filter(|v| !v.is_empty()) {
                     if owner != e.value {
                         return Ok(Vote::No(
