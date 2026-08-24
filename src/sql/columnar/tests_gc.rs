@@ -149,6 +149,12 @@ async fn dropped_table_metas_and_files_swept() {
     let gone = commit_one(&shared).await;
     // Crash simulation: the catalog tombstone landed but
     // drop_table_segments' meta-delete batch never ran.
+    // A witness table keeps the catalog view non-empty: only an EMPTY
+    // view suspends the table-existence classification.
+    let mut witness = columnar_schema();
+    witness.id = TABLE_ID + 1;
+    witness.name = "witness".into();
+    seed(&shared, &witness);
     shared
         .raft
         .write()
@@ -228,4 +234,51 @@ async fn registry_self_heals_live_metas() {
         SweepStats::default()
     );
     assert_eq!(registry_of(&shared).segments(TABLE_ID), vec![kept]);
+}
+
+#[tokio::test]
+async fn empty_catalog_view_keeps_every_meta() {
+    let shared = shared();
+    // No seed: the raft view is empty while the segment meta predates
+    // the restart. Absence of view must not read as a DROP.
+    let kept = commit_one(&shared).await;
+    let dir = writer::columnar_dir(&shared.conf);
+    std::fs::write(dir.join("stray.col"), b"junk").unwrap();
+    let stats = gc::sweep(&shared, Duration::ZERO).unwrap();
+    assert_eq!(
+        stats,
+        SweepStats {
+            metas_deleted: 0,
+            files_deleted: 1
+        }
+    );
+    assert!(stored_meta(&shared).is_some(), "meta kept on empty view");
+    assert!(dir.join(&kept.file).exists(), "file kept on empty view");
+    assert!(!dir.join("stray.col").exists(), "stray file still swept");
+}
+
+#[tokio::test]
+async fn unreadable_catalog_entry_keeps_metas() {
+    let shared = shared();
+    let mut witness = columnar_schema();
+    witness.id = TABLE_ID + 1;
+    witness.name = "witness".into();
+    seed(&shared, &witness);
+    commit_one(&shared).await;
+    // Corrupt ONLY the target table's entry; the witness keeps the
+    // view non-empty so this exercises the Err arm, not the guard.
+    shared
+        .raft
+        .write()
+        .unwrap()
+        .kv
+        .insert(catalog::catalog_key(TABLE_NAME), "{not json".to_string());
+    assert_eq!(
+        gc::sweep(&shared, Duration::ZERO).unwrap(),
+        SweepStats::default()
+    );
+    assert!(
+        stored_meta(&shared).is_some(),
+        "meta kept on unreadable entry"
+    );
 }
