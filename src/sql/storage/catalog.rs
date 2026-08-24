@@ -85,9 +85,16 @@ pub fn lookup_raft(
         .map_err(|e| format!("corrupt catalog entry for {table}: {e}"))
 }
 
-/// All live schemas, ordered by name.
+/// All live schemas, ordered by name. `Shared`-shaped wrapper over
+/// [`list_tables_raft`].
 pub fn list_tables(shared: &Shared) -> Vec<TableSchema> {
-    let raft = shared.raft.read().unwrap();
+    list_tables_raft(&shared.raft)
+}
+
+/// Raft-handle shaped schema listing for call sites that run with no
+/// `Shared` (the columnar GC sweep parks on the blocking pool).
+pub fn list_tables_raft(raft: &std::sync::RwLock<RaftState>) -> Vec<TableSchema> {
+    let raft = raft.read().unwrap();
     let mut out = Vec::new();
     // live_kv is the FSM view on a real node; the leader-local `kv` map
     // is the stub/apply-time source and stands in when there is no FSM

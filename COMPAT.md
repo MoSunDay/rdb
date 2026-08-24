@@ -405,7 +405,14 @@ immutable once published.
   every `0x23` meta of the table in one contiguous scan + one batch, forgets the registry
   entries and best-effort unlinks the files. Cluster-wide this mirrors the row store: only
   the executing (leader) node purges, segments on other members become unreachable orphans
-  behind the tombstone, reclaimed by the planned M5 GC sweep.
+  behind the tombstone, reclaimed by the M5 GC sweep (`sql::columnar::gc`: 30s rounds;
+  unreferenced files are only unlinked past a 1h age floor; an empty raft catalog view
+  keeps every segment meta for the round).
+- **Slot migration**: segments are files outside the slot-keyed keyspace and do NOT move
+  with their slot band: after a reshard, pre-existing segments stay on the node that
+  committed them (reads fan out to every member, so they remain visible); new segments
+  are placed by current slot ownership, and a node owning no slot band rejects columnar
+  INSERTs ("no eligible slot band").
 
 ## Runtime verification (this tree)
 
@@ -415,4 +422,4 @@ immutable once published.
 - HA: leader kill -9 → new leader in ~6s → writes commit → node restart rejoins as follower
   and catches up (verified both pre- and post-failover keys).
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test
-  --workspace` green (123 tests).
+  --workspace` green (862 tests).
