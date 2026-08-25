@@ -156,7 +156,10 @@ async fn join_qualified_columns_and_ambiguity() {
         panic!("select");
     };
     let read_ts = shared.sql_ts.now();
-    let _ = scan::materialize(&shared, &q.from, read_ts, None, None).unwrap();
+    let ctes = crate::sql::exec::relation::CteScope::default();
+    let _ = scan::materialize(&shared, &q.from, read_ts, None, None, &ctes)
+        .await
+        .unwrap();
     let err = run(&shared, &SqlSession::default(), q).await.unwrap_err();
     assert!(err.msg.contains("ambiguous column 'id'"), "{}", err.msg);
     // unknown column

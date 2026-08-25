@@ -29,6 +29,9 @@ pub(crate) fn translate_expr(e: &SqlExpr) -> SqlResult<Expr> {
             _ => Expr::Lit(translate_value(v)?),
         },
         S::Nested(inner) => translate_expr(inner)?,
+        S::Subquery(inner) => Expr::Subquery(Box::new(
+            crate::sql::parse::query::translate_compound(inner)?,
+        )),
         S::BinaryOp { left, op, right } => Expr::BinaryOp {
             left: Box::new(translate_expr(left)?),
             op: translate_binop(op)?,
@@ -57,6 +60,15 @@ pub(crate) fn translate_expr(e: &SqlExpr) -> SqlResult<Expr> {
                 .iter()
                 .map(translate_expr)
                 .collect::<SqlResult<Vec<_>>>()?,
+            negated: *negated,
+        },
+        S::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(translate_expr(expr)?),
+            query: Box::new(crate::sql::parse::query::translate_compound(subquery)?),
             negated: *negated,
         },
         S::Between {

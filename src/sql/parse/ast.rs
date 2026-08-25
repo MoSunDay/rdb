@@ -78,6 +78,10 @@ pub enum Statement {
     ShowIndexes(String),
     /// SET ...: accepted and ignored (no session variables in v1).
     SetIgnored,
+    /// A compound query: optional CTEs, a set-operation body
+    /// (UNION [ALL]) or a single SELECT, plus trailing ORDER BY /
+    /// LIMIT that apply to the whole compound.
+    SelectCompound(Box<CompoundQuery>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,12 +118,55 @@ pub enum LockRead {
     ForShare,
 }
 
+/// Top-level query expression: CTE scope, set-operation body, and
+/// the trailing ORDER BY / LIMIT / OFFSET owned by the outermost
+/// query (inner operands carry none).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundQuery {
+    /// `WITH name AS (...)` definitions visible to the body (and to
+    /// later definitions); `RECURSIVE` is rejected at parse time.
+    pub ctes: Vec<Cte>,
+    pub body: QueryBody,
+    pub order_by: Vec<OrderKey>,
+    pub limit: Option<u64>,
+    pub offset: u64,
+}
+
+/// Set-operation tree over plain SELECTs. Only UNION [ALL] is
+/// supported (INTERSECT / EXCEPT / MINUS reject at parse time).
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryBody {
+    Select(Box<Query>),
+    /// A parenthesized full query `(SELECT ... ORDER BY ... LIMIT
+    /// ...)`: evaluated as its own compound, own trailing clauses.
+    Nested(Box<CompoundQuery>),
+    Union {
+        left: Box<QueryBody>,
+        right: Box<QueryBody>,
+        /// `UNION ALL` keeps duplicates; plain `UNION` dedups.
+        all: bool,
+    },
+}
+
+/// One non-recursive common table expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    /// Optional column alias list (`WITH x (a, b) AS ...`); applied
+    /// positionally to the CTE output columns.
+    pub column_aliases: Vec<String>,
+    pub query: Box<CompoundQuery>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableRef {
     Table {
         name: String,
         alias: Option<String>,
     },
+    /// `SELECT 1` / `SELECT (subquery)`: no FROM clause. Materializes
+    /// as exactly one empty row with an empty resolution scope.
+    NoTable,
     Join {
         left: Box<TableRef>,
         right: Box<TableRef>,
@@ -130,6 +177,12 @@ pub enum TableRef {
         /// of both sides, resolved at materialization time (the AST
         /// layer knows no schemas).
         using: Vec<String>,
+    },
+    /// Derived table: `FROM (SELECT ...) alias`. Materialized once
+    /// per query into an in-memory relation.
+    Derived {
+        query: Box<CompoundQuery>,
+        alias: String,
     },
 }
 
@@ -189,6 +242,16 @@ pub enum Expr {
     InList {
         expr: Box<Expr>,
         list: Vec<Expr>,
+        negated: bool,
+    },
+    /// Scalar subquery `(SELECT ...)`: single column, at most one
+    /// row (empty -> NULL). Pre-materialized before row evaluation.
+    Subquery(Box<CompoundQuery>),
+    /// `expr [NOT] IN (SELECT ...)`: pre-materialized into an
+    /// `InList` before row evaluation (uncorrelated only).
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<CompoundQuery>,
         negated: bool,
     },
     Between {

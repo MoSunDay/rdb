@@ -2,6 +2,7 @@
 //! scan.rs stays under the 400-line budget for new files).
 
 use super::*;
+use crate::sql::exec::relation::CteScope;
 use crate::sql::storage::schema::{ColumnDef, Engine};
 use crate::state::testutil;
 
@@ -102,8 +103,8 @@ fn visible_rows_are_ordered_by_pk() {
     assert_eq!(pks, vec![1, 2, 3]);
 }
 
-#[test]
-fn materialize_single_table_reads_catalog() {
+#[tokio::test]
+async fn materialize_single_table_reads_catalog() {
     let shared = shared();
     let s = schema(7, "t");
     seed_catalog(&shared, &s);
@@ -119,7 +120,9 @@ fn materialize_single_table_reads_catalog() {
         5,
         None,
         None,
+        &CteScope::default(),
     )
+    .await
     .unwrap();
     assert_eq!(src.rows, vec![row_of(1, "a"), row_of(2, "b")]);
     assert_eq!(src.scope.sides.len(), 1);
@@ -136,12 +139,14 @@ fn materialize_single_table_reads_catalog() {
         5,
         None,
         None,
-    );
+        &CteScope::default(),
+    )
+    .await;
     assert!(missing.is_err());
 }
 
-#[test]
-fn materialize_nested_loop_join_with_on() {
+#[tokio::test]
+async fn materialize_nested_loop_join_with_on() {
     let shared = shared();
     let u = schema(1, "u");
     let o = TableSchema {
@@ -170,7 +175,9 @@ fn materialize_nested_loop_join_with_on() {
     let crate::sql::parse::ast::Statement::Select(q) = parsed else {
         panic!("shape")
     };
-    let src = materialize(&shared, &q.from, 10, None, None).unwrap();
+    let src = materialize(&shared, &q.from, 10, None, None, &CteScope::default())
+        .await
+        .unwrap();
     assert_eq!(src.rows.len(), 2); // both o-rows match u.id=1
     assert_eq!(src.scope.row_width(), 3);
     assert_eq!(src.scope.resolve(Some("u"), "id"), Some(0));
@@ -190,7 +197,9 @@ fn materialize_nested_loop_join_with_on() {
         on: None,
         using: Vec::new(),
     };
-    let src = materialize(&shared, &cross, 10, None, None).unwrap();
+    let src = materialize(&shared, &cross, 10, None, None, &CteScope::default())
+        .await
+        .unwrap();
     assert_eq!(src.rows.len(), 4);
 }
 
@@ -263,20 +272,28 @@ fn seed_join_sides(shared: &Shared) {
     put_version(shared, &r, 3, 1, Some(row_of(3, "z")));
 }
 
-fn join_rows(kind: JoinKind, on: Option<Expr>, using: &[&str]) -> Vec<Vec<Value>> {
+async fn join_rows(kind: JoinKind, on: Option<Expr>, using: &[&str]) -> Vec<Vec<Value>> {
     let shared = shared();
     seed_join_sides(&shared);
-    materialize(&shared, &join_ref(kind, on, using), 2, None, None)
-        .unwrap()
-        .rows
+    materialize(
+        &shared,
+        &join_ref(kind, on, using),
+        2,
+        None,
+        None,
+        &CteScope::default(),
+    )
+    .await
+    .unwrap()
+    .rows
 }
 
-#[test]
-fn left_join_null_extends_unmatched_left_rows() {
+#[tokio::test]
+async fn left_join_null_extends_unmatched_left_rows() {
     // on l.id = r.id: (1,a,1,x) and (2,b,NULL,NULL).
     let on = Some(parse_filter("l.id = r.id"));
     assert_eq!(
-        join_rows(JoinKind::Left, on, &[]),
+        join_rows(JoinKind::Left, on, &[]).await,
         vec![
             vec![vint(1), vs("a"), vint(1), vs("x")],
             vec![vint(2), vs("b"), Value::Null, Value::Null],
@@ -284,12 +301,12 @@ fn left_join_null_extends_unmatched_left_rows() {
     );
 }
 
-#[test]
-fn right_join_null_extends_unmatched_right_rows() {
+#[tokio::test]
+async fn right_join_null_extends_unmatched_right_rows() {
     // on l.id = r.id: (1,a,1,x) and (NULL,NULL,3,z).
     let on = Some(parse_filter("l.id = r.id"));
     assert_eq!(
-        join_rows(JoinKind::Right, on, &[]),
+        join_rows(JoinKind::Right, on, &[]).await,
         vec![
             vec![vint(1), vs("a"), vint(1), vs("x")],
             vec![Value::Null, Value::Null, vint(3), vs("z")],
@@ -297,11 +314,11 @@ fn right_join_null_extends_unmatched_right_rows() {
     );
 }
 
-#[test]
-fn full_join_keeps_both_sides_unmatched() {
+#[tokio::test]
+async fn full_join_keeps_both_sides_unmatched() {
     let on = Some(parse_filter("l.id = r.id"));
     assert_eq!(
-        join_rows(JoinKind::Full, on, &[]),
+        join_rows(JoinKind::Full, on, &[]).await,
         vec![
             vec![vint(1), vs("a"), vint(1), vs("x")],
             vec![vint(2), vs("b"), Value::Null, Value::Null],
@@ -310,16 +327,16 @@ fn full_join_keeps_both_sides_unmatched() {
     );
 }
 
-#[test]
-fn using_compares_named_columns_cell_wise() {
+#[tokio::test]
+async fn using_compares_named_columns_cell_wise() {
     // USING (id): matches id=1 only; NULL never matches.
     assert_eq!(
-        join_rows(JoinKind::Inner, None, &["id"]),
+        join_rows(JoinKind::Inner, None, &["id"]).await,
         vec![vec![vint(1), vs("a"), vint(1), vs("x")]]
     );
     // LEFT USING keeps l's unmatched row.
     assert_eq!(
-        join_rows(JoinKind::Left, None, &["id"]),
+        join_rows(JoinKind::Left, None, &["id"]).await,
         vec![
             vec![vint(1), vs("a"), vint(1), vs("x")],
             vec![vint(2), vs("b"), Value::Null, Value::Null],
@@ -327,13 +344,13 @@ fn using_compares_named_columns_cell_wise() {
     );
 }
 
-#[test]
-fn cross_join_is_full_product() {
-    assert_eq!(join_rows(JoinKind::Cross, None, &[]).len(), 4);
+#[tokio::test]
+async fn cross_join_is_full_product() {
+    assert_eq!(join_rows(JoinKind::Cross, None, &[]).await.len(), 4);
 }
 
-#[test]
-fn using_unknown_column_fails_with_bad_field() {
+#[tokio::test]
+async fn using_unknown_column_fails_with_bad_field() {
     let shared = shared();
     seed_join_sides(&shared);
     let err = materialize(
@@ -342,7 +359,9 @@ fn using_unknown_column_fails_with_bad_field() {
         2,
         None,
         None,
+        &CteScope::default(),
     )
+    .await
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadField);
 }

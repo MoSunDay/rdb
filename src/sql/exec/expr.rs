@@ -38,6 +38,12 @@ pub fn eval<S: ColumnScope>(e: &Expr, scope: &S, row: &[Value]) -> SqlResult<Val
             ErrorCode::NotSupported,
             "unbound placeholder".to_string(),
         )),
+        // Subqueries are pre-materialized by `exec::subquery`; one
+        // reaching eval means the rewrite was skipped.
+        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::new(
+            ErrorCode::NotSupported,
+            "internal: unrewritten subquery reached evaluation",
+        )),
         Expr::Col { table, name } => {
             let idx = scope.resolve(table.as_deref(), name).ok_or_else(|| {
                 SqlError::new(ErrorCode::BadField, format!("unknown column '{name}'"))

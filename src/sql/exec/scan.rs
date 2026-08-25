@@ -121,6 +121,9 @@ pub fn check_expr(e: &Expr, scope: &FromScope) -> SqlResult<()> {
             Ok(())
         }
         Expr::Lit(_) | Expr::Placeholder => Ok(()),
+        // Subqueries hoist out before any scope validation; their own
+        // bodies validate against their own FROM scopes.
+        Expr::Subquery(_) | Expr::InSubquery { .. } => Ok(()),
         Expr::BinaryOp { left, right, .. } => {
             check_expr(left, scope)?;
             check_expr(right, scope)
@@ -283,15 +286,26 @@ fn rows_by_pks(
 /// column is read through the index instead (pks from the planner, one
 /// seek per pk); the residual WHERE still applies afterwards, and the
 /// txn overlay unions in staged rows the index cannot see.
-pub fn materialize(
+pub async fn materialize(
     shared: &Shared,
     tref: &TableRef,
     read_ts: u64,
     txn: Option<&crate::sql::tx::Txn>,
     filter: Option<&Expr>,
+    ctes: &crate::sql::exec::relation::CteScope,
 ) -> SqlResult<Source> {
     match tref {
+        TableRef::NoTable => Ok(Source {
+            scope: FromScope::default(),
+            rows: vec![Vec::new()],
+        }),
         TableRef::Table { name, alias } => {
+            // CTE names shadow catalog tables (checked first, like
+            // MySQL's name resolution order).
+            if let Some(rel) = ctes.lookup(name) {
+                let alias = alias.as_deref().unwrap_or(name);
+                return Ok(rel.clone().into_source(alias));
+            }
             let schema = catalog::lookup(shared, name)
                 .map_err(SqlError::from)?
                 .ok_or_else(|| SqlError::no_such_table(name))?;
@@ -327,9 +341,18 @@ pub fn materialize(
             on,
             using,
         } => {
-            let l = materialize(shared, left, read_ts, txn, None)?;
-            let r = materialize(shared, right, read_ts, txn, None)?;
+            let l = Box::pin(materialize(shared, left, read_ts, txn, None, ctes)).await?;
+            let r = Box::pin(materialize(shared, right, read_ts, txn, None, ctes)).await?;
             join_sources(l, r, *kind, on.as_ref(), using)
+        }
+        // Derived table: materialized here, on the executing node;
+        // its own FROM may still scatter-gather if it is clustered.
+        TableRef::Derived { query, alias } => {
+            let rel = Box::pin(crate::sql::exec::set_ops::run_compound(
+                shared, read_ts, txn, query, ctes,
+            ))
+            .await?;
+            Ok(rel.into_source(alias))
         }
     }
 }

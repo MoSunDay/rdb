@@ -20,6 +20,27 @@ fn translate_factor(f: &TableFactor) -> SqlResult<TableRef> {
             name: object_name(name)?,
             alias: alias.as_ref().map(|a| a.name.value.clone()),
         }),
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            ..
+        } => {
+            if *lateral {
+                return Err(SqlError::unsupported("LATERAL derived tables"));
+            }
+            let Some(alias) = alias else {
+                return Err(SqlError::unsupported(
+                    "derived table without alias (MySQL requires one)",
+                ));
+            };
+            let cq = crate::sql::parse::query::translate_compound(subquery)?;
+            let _ = &cq;
+            Ok(TableRef::Derived {
+                query: Box::new(cq),
+                alias: alias.name.value.clone(),
+            })
+        }
         other => Err(SqlError::unsupported(format!(
             "FROM factor {other} (subqueries are not supported)"
         ))),
