@@ -40,6 +40,7 @@ fn columnar_schema() -> TableSchema {
             },
         ],
         pk: "id".into(),
+        auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],
     }
