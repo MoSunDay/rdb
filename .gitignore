@@ -8,3 +8,4 @@ scrtips/auto_config/output
 scrtips/auto_install.sh
 /target/
 link_repos
+.worktrees/
