@@ -197,9 +197,78 @@ pub fn dropped_ids(shared: &Shared) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
+    use crate::state::testutil;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn catalog_key_shape() {
         assert_eq!(catalog_key("users"), "sql_catalog/users");
+    }
+
+    fn schema_json(id: u32, name: &str) -> String {
+        serde_json::to_string(&TableSchema {
+            id,
+            name: name.to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                sql_type: SqlType::Int,
+                nullable: false,
+            }],
+            pk: "id".to_string(),
+            engine: Engine::Row,
+            indexes: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn shared_with_kv(entries: Vec<(String, String)>) -> Arc<Shared> {
+        let shared = Arc::new(testutil::shared_with(testutil::test_config()));
+        {
+            let mut raft = shared.raft.write().unwrap();
+            for (k, v) in entries {
+                raft.kv.insert(k, v);
+            }
+        }
+        shared
+    }
+
+    /// Id allocation is monotone over BOTH id sources on the stub kv
+    /// view: live schemas and decimal drop tombstones. Empty values
+    /// (pre-upgrade "" tombstones) and non-catalog keys never feed it.
+    #[test]
+    fn next_table_id_is_monotone_over_stub_kv_tombstones() {
+        let shared = shared_with_kv(vec![
+            (catalog_key("live"), schema_json(5, "live")),
+            (catalog_key("gone"), "3".to_string()),
+            (catalog_key("gone_hi"), "9".to_string()),
+            (catalog_key("legacy"), String::new()),
+            ("other/42".to_string(), "42".to_string()),
+        ]);
+        let mut dropped = dropped_ids(&shared);
+        dropped.sort_unstable();
+        assert_eq!(dropped, vec![3, 9]);
+        assert_eq!(next_table_id(&shared), 10, "max(live=5, dropped=9) + 1");
+        assert_eq!(next_table_id(&shared_with_kv(Vec::new())), 1);
+    }
+
+    /// Real nodes (and any restart) read the FSM `live_kv` map, not the
+    /// stub kv: tombstones must stay visible to id allocation there.
+    #[test]
+    fn dropped_ids_reads_the_fsm_live_kv_view() {
+        let map: crate::rcache::fsm::KvMap = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        {
+            let mut m = map.write().unwrap();
+            m.insert(catalog_key("t"), schema_json(2, "t"));
+            m.insert(catalog_key("dropped"), "7".to_string());
+            m.insert("unrelated".to_string(), "99".to_string());
+        }
+        let raft = std::sync::RwLock::new(RaftState {
+            live_kv: Some(map),
+            ..Default::default()
+        });
+        assert_eq!(dropped_ids_raft(&raft), vec![7]);
+        assert_eq!(list_tables_raft(&raft).len(), 1, "live schema still listed");
     }
 }

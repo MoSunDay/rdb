@@ -493,4 +493,55 @@ mod tests {
             ExecOutcome::Ok
         ));
     }
+
+    /// Monotone table ids (audit fix): DROP writes the dropped id as
+    /// the tombstone value, so a re-created table -- same name or any
+    /// other -- never reuses an issued id and can never alias the old
+    /// table's orphaned row bytes. Runs the real CREATE/DROP path.
+    #[tokio::test]
+    async fn table_ids_stay_monotone_across_drop_recreate() {
+        let shared = testutil::shared_with(testutil::test_config());
+        let create_t = "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)";
+        run(&shared, parse_statement(create_t).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(catalog::lookup(&shared, "t").unwrap().unwrap().id, 1);
+
+        // same name, fresh id: the orphan-alias guard itself
+        run(&shared, parse_statement("DROP TABLE t").unwrap())
+            .await
+            .unwrap();
+        run(&shared, parse_statement(create_t).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog::lookup(&shared, "t").unwrap().unwrap().id,
+            2,
+            "re-created table must not reuse the dropped id"
+        );
+
+        // ids keep counting past live AND tombstoned ids
+        run(
+            &shared,
+            parse_statement("CREATE TABLE u (id BIGINT PRIMARY KEY)").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog::lookup(&shared, "u").unwrap().unwrap().id, 3);
+        run(&shared, parse_statement("DROP TABLE u").unwrap())
+            .await
+            .unwrap();
+        run(
+            &shared,
+            parse_statement("CREATE TABLE v (id BIGINT PRIMARY KEY)").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog::lookup(&shared, "v").unwrap().unwrap().id, 4);
+
+        // Tombstones live under the table-name key, so re-creating "t"
+        // replaced id 1's tombstone with the live id-2 schema -- safe,
+        // because 2 now bounds allocation. Only u's tombstone survives.
+        assert_eq!(catalog::dropped_ids(&shared), vec![3]);
+    }
 }
