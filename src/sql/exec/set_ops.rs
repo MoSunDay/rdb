@@ -118,6 +118,7 @@ fn union_relations(l: Relation, r: Relation, all: bool) -> SqlResult<Relation> {
     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(l.rows.len() + r.rows.len());
     rows.extend(l.rows.iter().cloned());
     rows.extend(r.rows.iter().cloned());
+    widen_cells(&columns, &mut rows)?;
     if !all {
         rows.sort_by(|a, b| row_cmp(a, b));
         rows.dedup_by(|a, b| row_cmp(a, b) == std::cmp::Ordering::Equal);
@@ -147,11 +148,36 @@ fn widen(a: SqlType, b: SqlType) -> SqlResult<SqlType> {
     match (a, b) {
         (x, y) if x == y => Ok(x),
         (Int, Double) | (Double, Int) => Ok(Double),
+        // A date column under a datetime column widens to datetime, so
+        // dedup ordering and rendering use full precision.
+        (Date, DateTime) | (DateTime, Date) => Ok(DateTime),
         (a, b) => Err(SqlError::new(
             ErrorCode::NotSupported,
             format!("UNION of incompatible column types {a:?} and {b:?}"),
         )),
     }
+}
+
+/// Normalize cells widened by [`widen`]: Date cells of a column typed
+/// DateTime lift to midnight microseconds. (Int cells of a widened
+/// Double column flow through untouched, as they always have.)
+fn widen_cells(columns: &[crate::sql::exec::ColMeta], rows: &mut [Vec<Value>]) -> SqlResult<()> {
+    for row in rows {
+        for (col, cell) in columns.iter().zip(row.iter_mut()) {
+            if let (Value::Date(d), SqlType::DateTime) = (&*cell, col.sql_type) {
+                *cell = Value::DateTime(
+                    d.checked_mul(crate::sql::temporal::MICROS_PER_DAY)
+                        .ok_or_else(|| {
+                            SqlError::new(
+                                ErrorCode::NotSupported,
+                                format!("date {d} out of DATETIME range"),
+                            )
+                        })?,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Trailing ORDER BY / LIMIT of the compound: keys resolve against
@@ -289,5 +315,50 @@ mod tests {
         );
         let l1 = rel(vec![col("a", SqlType::Int)], vec![vec![Value::Int(1)]]);
         assert!(union_relations(l1, rs, true).is_err());
+    }
+
+    #[test]
+    fn union_widens_date_to_datetime_and_lifts_cells() {
+        use crate::sql::temporal::MICROS_PER_DAY;
+        let day = rel(
+            vec![col("d", SqlType::Date)],
+            vec![vec![Value::Date(19_782)]],
+        );
+        let stamp = rel(
+            vec![col("t", SqlType::DateTime)],
+            vec![vec![Value::DateTime(19_783 * MICROS_PER_DAY)]],
+        );
+        // date | datetime -> datetime, and the Date cell lifts to
+        // midnight microseconds so rendering keeps full precision.
+        let out = union_relations(day.clone(), stamp.clone(), true).unwrap();
+        assert_eq!(out.columns[0].sql_type, SqlType::DateTime);
+        assert_eq!(
+            out.rows.as_slice(),
+            &[
+                vec![Value::DateTime(19_782 * MICROS_PER_DAY)],
+                vec![Value::DateTime(19_783 * MICROS_PER_DAY)]
+            ]
+        );
+        // operand order does not matter
+        let out = union_relations(stamp, day, true).unwrap();
+        assert_eq!(out.columns[0].sql_type, SqlType::DateTime);
+        // plain UNION dedups the widened midnight pair
+        let l = rel(
+            vec![col("d", SqlType::Date)],
+            vec![vec![Value::Date(19_782)]],
+        );
+        let r = rel(
+            vec![col("t", SqlType::DateTime)],
+            vec![vec![Value::DateTime(19_782 * MICROS_PER_DAY)]],
+        );
+        let out = union_relations(l, r, false).unwrap();
+        assert_eq!(
+            out.rows.as_slice(),
+            &[vec![Value::DateTime(19_782 * MICROS_PER_DAY)]]
+        );
+        // temporal never mixes with numerics or text
+        let nums = rel(vec![col("n", SqlType::Int)], vec![vec![Value::Int(1)]]);
+        let l = rel(vec![col("d", SqlType::Date)], vec![vec![Value::Date(0)]]);
+        assert!(union_relations(l, nums, true).is_err());
     }
 }

@@ -144,6 +144,8 @@ fn type_name(t: SqlType) -> &'static str {
         SqlType::Bool => "bool",
         SqlType::Int => "bigint",
         SqlType::Double => "double",
+        SqlType::Date => "date",
+        SqlType::DateTime => "datetime",
         SqlType::VarChar => "varchar",
         SqlType::Blob => "blob",
     }

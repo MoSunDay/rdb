@@ -28,6 +28,22 @@ pub(crate) fn translate_expr(e: &SqlExpr) -> SqlResult<Expr> {
             sqlparser::ast::Value::Placeholder(p) if p == "?" => Expr::Placeholder,
             _ => Expr::Lit(translate_value(v)?),
         },
+        // DATE '...' / DATETIME '...' / TIMESTAMP '...' literals ride as
+        // plain strings; the engine coerces on use (coerce/cmp parse).
+        S::TypedString(ts) => match &ts.data_type {
+            sqlparser::ast::DataType::Date
+            | sqlparser::ast::DataType::Datetime(_)
+            | sqlparser::ast::DataType::Timestamp(_, _) => {
+                Expr::Lit(Value::Str(ts.value.clone().into_string().ok_or_else(
+                    || SqlError::parse("typed literal must be a string"),
+                )?))
+            }
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "typed string literal {other} (v1: DATE/DATETIME/TIMESTAMP)"
+                )))
+            }
+        },
         S::Nested(inner) => translate_expr(inner)?,
         S::Subquery(inner) => Expr::Subquery(Box::new(
             crate::sql::parse::query::translate_compound(inner)?,
