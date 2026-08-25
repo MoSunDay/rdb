@@ -25,6 +25,7 @@ fn all_types_schema() -> TableSchema {
             col("x", SqlType::Blob, true),
         ],
         pk: "id".into(),
+        auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
     }
@@ -36,6 +37,7 @@ fn int_schema() -> TableSchema {
         name: "ints".into(),
         columns: vec![col("id", SqlType::Int, false)],
         pk: "id".into(),
+        auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
     }
@@ -50,6 +52,7 @@ fn str_schema(nullable: bool) -> TableSchema {
             col("s", SqlType::VarChar, nullable),
         ],
         pk: "id".into(),
+        auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
     }

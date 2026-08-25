@@ -370,6 +370,8 @@ fn eval_func(name: &str, args: &[Value]) -> SqlResult<Value> {
             )),
         },
         ("version", []) => Ok(Value::Str(env!("CARGO_PKG_VERSION").to_string())),
+        // AUTO_INCREMENT session function; see exec/sequence.rs.
+        ("last_insert_id", args) => crate::sql::exec::sequence::last_insert_id_value(args),
         _ => Err(SqlError::new(
             ErrorCode::NotSupported,
             format!("unknown function {name}"),
