@@ -37,6 +37,9 @@ pub enum ErrorCode {
     /// another live transaction (MySQL 1205; rdb fails fast instead of
     /// waiting out `innodb_lock_wait_timeout`).
     LockWaitTimeout,
+    /// MySQL 1075/1063: bad AUTO_INCREMENT table definition (more than
+    /// one auto column, non-integer type, or not defined as a key).
+    WrongAutoKey,
     Unknown,
 }
 
@@ -86,6 +89,10 @@ impl SqlError {
             // 1205 (ER_LOCK_WAIT_TIMEOUT): the MySQL lock-wait error
             // clients recognize and retry on.
             ErrorCode::LockWaitTimeout => ErrorKind::ER_LOCK_WAIT_TIMEOUT,
+            // 1075: "there can be only one auto column and it must be
+            // defined as a key" (also used for the 1063-style
+            // incorrect-column-specifier rejection).
+            ErrorCode::WrongAutoKey => ErrorKind::ER_WRONG_AUTO_KEY,
             // 1213: the MySQL serialization-failure error clients retry on.
             ErrorCode::WriteConflict => ErrorKind::ER_LOCK_DEADLOCK,
             ErrorCode::TxnDdl => ErrorKind::ER_NOT_SUPPORTED_YET,

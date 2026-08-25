@@ -28,7 +28,7 @@ use crate::sql::parse::ast::{ColumnSpec, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog::{self, CatalogTxn};
 use crate::sql::storage::row;
-use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, TableSchema};
+use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, SqlType, TableSchema};
 use crate::state::Shared;
 use crate::store::ops;
 
@@ -60,9 +60,11 @@ pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
 
 /// One catalog mutation to apply under the DDL lock. Drop carries the
 /// schema: its id becomes the tombstone value (monotone id allocation).
+/// Kv carries a raw FSM entry (the AUTO_INCREMENT counter lifecycle).
 enum CatalogMutation {
     Put(TableSchema),
     Drop(TableSchema),
+    Kv { key: String, value: String },
 }
 
 /// Run `begin` + the txn method while holding the raft write guard, on
@@ -72,10 +74,11 @@ async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();
-        let txn: CatalogTxn<'_> = catalog::begin(&mut guard).map_err(SqlError::from)?;
+        let txn: CatalogTxn<'_> = catalog::begin(&mut guard, "DDL").map_err(SqlError::from)?;
         match mutation {
             CatalogMutation::Put(schema) => handle.block_on(txn.put(&schema)),
             CatalogMutation::Drop(schema) => handle.block_on(txn.drop(&schema.name, schema.id)),
+            CatalogMutation::Kv { key, value } => handle.block_on(txn.put_kv(&key, &value)),
         }
         .map_err(SqlError::from)
     })
@@ -108,7 +111,21 @@ async fn create_table(
         id: alloc_table_id(shared),
         ..schema
     };
-    catalog_apply(shared, CatalogMutation::Put(schema)).await?;
+    catalog_apply(shared, CatalogMutation::Put(schema.clone())).await?;
+    // Counter lifecycle rides the same replicated path: CREATE seeds
+    // `sql_sequence/<table>` = 1 alongside the schema (lazy default 1
+    // also covers it, but an explicit entry makes cluster state visible
+    // and keeps the invariant "flag set => counter exists").
+    if schema.auto_increment.is_some() {
+        catalog_apply(
+            shared,
+            CatalogMutation::Kv {
+                key: catalog::sequence_key(&schema.name),
+                value: "1".to_string(),
+            },
+        )
+        .await?;
+    }
     Ok(ExecOutcome::Ok)
 }
 
@@ -123,6 +140,18 @@ async fn drop_table(shared: &Shared, name: &str, if_exists: bool) -> SqlResult<E
         }
     };
     catalog_apply(shared, CatalogMutation::Drop(schema.clone())).await?;
+    // Clear the AUTO_INCREMENT counter so a recreated table starts at 1
+    // again ("" is the house tombstone: reads fall back to the default).
+    if schema.auto_increment.is_some() {
+        catalog_apply(
+            shared,
+            CatalogMutation::Kv {
+                key: catalog::sequence_key(&schema.name),
+                value: String::new(),
+            },
+        )
+        .await?;
+    }
     if schema.engine.is_columnar() {
         crate::sql::columnar::commit::drop_table_segments(shared, schema.id).await?;
     }
@@ -291,6 +320,46 @@ pub fn build_schema(
                 format!("primary key column '{pk}' not found"),
             )
         })?;
+    // AUTO_INCREMENT validation (MySQL 1075/1063): at most one auto
+    // column, integer type (TINYINT/SMALLINT/INT/BIGINT all translate
+    // to SqlType::Int; BOOL is a distinct engine type and rejected),
+    // and the column must be the primary key -- the only key the
+    // engine supports, so MySQL's "must be defined as a key" narrows
+    // to "must be THE pk".
+    let auto_cols: Vec<&ColumnSpec> = columns.iter().filter(|c| c.auto_increment).collect();
+    let auto_increment = match auto_cols.as_slice() {
+        [] => None,
+        [one] => {
+            if one.sql_type != SqlType::Int {
+                return Err(SqlError::new(
+                    ErrorCode::WrongAutoKey,
+                    format!(
+                        "Incorrect column specifier for column '{}'; AUTO_INCREMENT \
+                         requires an integer column (TINYINT/SMALLINT/INT/BIGINT)",
+                        one.name
+                    ),
+                ));
+            }
+            if !one.name.eq_ignore_ascii_case(pk) {
+                return Err(SqlError::new(
+                    ErrorCode::WrongAutoKey,
+                    "Incorrect table definition; there can be only one auto column \
+                     and it must be defined as a key"
+                        .to_string(),
+                ));
+            }
+            Some(one.name.clone())
+        }
+        many => {
+            let _ = many;
+            return Err(SqlError::new(
+                ErrorCode::WrongAutoKey,
+                "Incorrect table definition; there can be only one auto column \
+                 and it must be defined as a key"
+                    .to_string(),
+            ));
+        }
+    };
     let mut defs = Vec::with_capacity(columns.len());
     for (i, c) in columns.iter().enumerate() {
         if defs
@@ -315,6 +384,7 @@ pub fn build_schema(
         name: name.to_string(),
         columns: defs,
         pk: columns[pk_idx].name.clone(),
+        auto_increment,
         engine,
         indexes: Vec::new(),
     })
@@ -364,6 +434,87 @@ mod tests {
         assert!(!s.columns[0].nullable, "pk coerced NOT NULL");
         assert!(s.columns[1].nullable);
         assert!(!s.columns[2].nullable, "declared NOT NULL stays");
+    }
+
+    fn ai_spec(name: &str, ty: crate::sql::storage::schema::SqlType) -> ColumnSpec {
+        ColumnSpec {
+            auto_increment: true,
+            ..spec(name, ty, true)
+        }
+    }
+
+    /// MySQL 1075/1063 rules: at most one AUTO_INCREMENT column, integer
+    /// type, and it must be the (single-column) primary key.
+    #[test]
+    fn build_schema_validates_auto_increment() {
+        use crate::sql::storage::schema::SqlType;
+        // legal: one integer AI column that is the pk
+        let cols = [
+            ai_spec("id", SqlType::Int),
+            spec("v", SqlType::VarChar, true),
+        ];
+        let s = build_schema(1, "t", &cols, "id", Engine::Row).unwrap();
+        assert_eq!(s.auto_increment.as_deref(), Some("id"));
+        assert_eq!(s.auto_increment_index(), Some(0));
+
+        // two AI columns -> 1075
+        let dup = [
+            ai_spec("id", SqlType::Int),
+            ai_spec("seq", SqlType::Int),
+            spec("v", SqlType::VarChar, true),
+        ];
+        let err = build_schema(0, "t", &dup, "id", Engine::Row).unwrap_err();
+        assert_eq!(err.code, ErrorCode::WrongAutoKey);
+        assert!(err.msg.contains("only one auto column"));
+
+        // non-integer AI column -> incorrect column specifier
+        let varchar = [
+            ai_spec("id", SqlType::VarChar),
+            spec("v", SqlType::Int, true),
+        ];
+        let err = build_schema(0, "t", &varchar, "id", Engine::Row).unwrap_err();
+        assert_eq!(err.code, ErrorCode::WrongAutoKey);
+        assert!(err.msg.contains("Incorrect column specifier"));
+
+        // AI column not part of the (only supported) key -> 1075
+        let not_pk = [
+            spec("id", SqlType::Int, false),
+            ai_spec("seq", SqlType::Int),
+        ];
+        let err = build_schema(0, "t", &not_pk, "id", Engine::Row).unwrap_err();
+        assert_eq!(err.code, ErrorCode::WrongAutoKey);
+        assert!(err.msg.contains("must be defined as a key"));
+    }
+
+    /// CREATE TABLE persists the schema flag AND the initial next-value
+    /// counter (raft FSM entry `sql_sequence/<table>` = "1"); DROP clears
+    /// it so a recreated table starts from 1 again.
+    #[tokio::test]
+    async fn create_auto_increment_table_persists_counter() {
+        let shared = testutil::shared_with(testutil::test_config());
+        run(
+            &shared,
+            parse_statement(
+                "CREATE TABLE ai (id BIGINT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64) NULL)",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let s = catalog::lookup(&shared, "ai").unwrap().expect("created");
+        assert_eq!(s.auto_increment.as_deref(), Some("id"));
+        let raw = crate::state::raft_get(
+            &shared.raft.read().unwrap(),
+            &catalog::sequence_key(&s.name),
+        );
+        assert_eq!(raw, "1", "counter persisted alongside the schema");
+
+        run(&shared, parse_statement("DROP TABLE ai").unwrap())
+            .await
+            .unwrap();
+        let raw =
+            crate::state::raft_get(&shared.raft.read().unwrap(), &catalog::sequence_key("ai"));
+        assert_eq!(raw, "", "drop clears the counter (recreate starts at 1)");
     }
 
     #[tokio::test]

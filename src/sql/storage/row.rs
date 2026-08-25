@@ -339,6 +339,7 @@ mod tests {
                 },
             ],
             pk: "id".into(),
+            auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
         }
