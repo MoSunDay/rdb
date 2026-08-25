@@ -1,8 +1,8 @@
-//! FROM-clause translation: tables and INNER JOINs.
+//! FROM-clause translation: tables, derived tables and joins.
 
 use sqlparser::ast::{JoinConstraint, JoinOperator, TableFactor, TableWithJoins};
 
-use crate::sql::parse::ast::{Expr, TableRef};
+use crate::sql::parse::ast::{Expr, JoinKind, TableRef};
 use crate::sql::parse::error::{SqlError, SqlResult};
 use crate::sql::parse::translate::{object_name, translate_expr};
 
@@ -32,28 +32,67 @@ fn translate_join(left: TableRef, join: &sqlparser::ast::Join) -> SqlResult<Tabl
         join_operator,
         ..
     } = join;
-    let (right, on) = match join_operator {
+    let (right, kind, on, using) = match join_operator {
         JoinOperator::Inner(constraint) | JoinOperator::Join(constraint) => {
-            (translate_factor(relation)?, constraint_expr(constraint)?)
+            let (on, using) = constraint_parts(constraint)?;
+            (translate_factor(relation)?, JoinKind::Inner, on, using)
         }
-        other => {
-            let _ = other;
-            return Err(SqlError::unsupported("only INNER JOIN"));
+        JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+            let (on, using) = constraint_parts(constraint)?;
+            (translate_factor(relation)?, JoinKind::Left, on, using)
+        }
+        JoinOperator::Right(constraint) | JoinOperator::RightOuter(constraint) => {
+            let (on, using) = constraint_parts(constraint)?;
+            (translate_factor(relation)?, JoinKind::Right, on, using)
+        }
+        JoinOperator::FullOuter(constraint) => {
+            let (on, using) = constraint_parts(constraint)?;
+            (translate_factor(relation)?, JoinKind::Full, on, using)
+        }
+        JoinOperator::CrossJoin(constraint) => {
+            // CROSS JOIN takes no condition; sqlparser may still park a
+            // constraint there (non-standard), which we must not lose.
+            let (on, using) = constraint_parts(constraint)?;
+            (translate_factor(relation)?, JoinKind::Cross, on, using)
+        }
+        JoinOperator::Semi(_)
+        | JoinOperator::LeftSemi(_)
+        | JoinOperator::RightSemi(_)
+        | JoinOperator::Anti(_)
+        | JoinOperator::LeftAnti(_)
+        | JoinOperator::RightAnti(_)
+        | JoinOperator::StraightJoin(_)
+        | JoinOperator::CrossApply
+        | JoinOperator::OuterApply
+        | JoinOperator::AsOf { .. }
+        | JoinOperator::ArrayJoin
+        | JoinOperator::LeftArrayJoin
+        | JoinOperator::InnerArrayJoin => {
+            return Err(SqlError::unsupported("SEMI/ANTI/STRAIGHT/APPLY joins"))
         }
     };
     Ok(TableRef::Join {
         left: Box::new(left),
         right: Box::new(right),
+        kind,
         on,
+        using,
     })
 }
 
-fn constraint_expr(c: &JoinConstraint) -> SqlResult<Option<Expr>> {
+/// ON expr and USING column list of one join constraint (ON and USING
+/// are mutually exclusive per grammar; NATURAL needs schema knowledge
+/// and stays rejected).
+fn constraint_parts(c: &JoinConstraint) -> SqlResult<(Option<Expr>, Vec<String>)> {
     match c {
-        JoinConstraint::On(e) => translate_expr(e).map(Some),
-        JoinConstraint::None => Ok(None),
-        JoinConstraint::Using(_) | JoinConstraint::Natural => {
-            Err(SqlError::unsupported("JOIN ... USING / NATURAL JOIN"))
-        }
+        JoinConstraint::On(e) => Ok((translate_expr(e).map(Some)?, Vec::new())),
+        JoinConstraint::None => Ok((None, Vec::new())),
+        JoinConstraint::Using(cols) => Ok((
+            None,
+            cols.iter()
+                .map(object_name)
+                .collect::<SqlResult<Vec<_>>>()?,
+        )),
+        JoinConstraint::Natural => Err(SqlError::unsupported("NATURAL JOIN")),
     }
 }
