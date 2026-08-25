@@ -24,7 +24,9 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
 - `tx/`：`ts.rs`（Oracle：本地原子 / 集群模式切换）、`global.rs`（raft 块授权：
   `sql_ts_cursor` 先持久后发放、4096 块、HTTP `/sql/ts`、降级单调回退）、`nodes.rs`
   （`sql_nodes` 注册表：raft addr → 各 bind）、`session.rs`（快照事务：写集暂存、
-  own-write 叠合、首提交者胜冲突检测、索引维护入提交批）。
+  own-write 叠合、首提交者胜冲突检测、索引维护入提交批、SAVEPOINT 栈——marker 快照
+  整张写集 + append 长度 + 当时 latch）、`latch.rs`（锁读注册表：`(table_id,pk)`
+  进程级、all-or-nothing、同 owner 重入、冲突 1205 快败、多节点 veto）。
 - `index/`：二级/唯一索引键（`keys.rs`，索引 slot=`crc16(table_id++col_pos)`）、
   行变迁→索引操作推导与维护（`maintain.rs`、`mod.rs` 查找/范围/唯一属主）。
 - `plan/`：单表访问路径（IndexLookup vs SeqScan，sargable =/IN/BETWEEN，>1000 pk 回退）。
@@ -50,9 +52,10 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   `commit_ts ≤ read_ts`，prepared 段不入注册表即不可见；段元数据与行写同批原子发布。
 
 ## 测试地图
-- 单元：各模块旁 `*_tests.rs`（tx/global、index、plan、exec/*、storage/gc）。
+- 单元：各模块旁 `*_tests.rs`（tx/global、tx/savepoint、index、plan、exec/*、storage/gc）。
 - 进程级 e2e（`tests/`）：`sql_e2e.rs`（握手/DDL/DML/SELECT 全链）、
   `sql_txn_e2e.rs`（快照隔离/冲突）、`sql_index_e2e.rs`（索引/唯一/计划）、
   `sql_oracle_cluster_e2e.rs`（进程内 3 节点全局 ts）、`sql_2pc_e2e.rs` 与
   `sql_dist_read_e2e.rs`（3 进程 2PC 写与 scatter-gather 读）、
-  `columnar_e2e.rs`（列存单机 + 3 节点集群扇出读）。
+  `columnar_e2e.rs`（列存单机 + 3 节点集群扇出读）、
+  `txn_semantics_e2e.rs`（SAVEPOINT 可见性 / @@transaction_isolation / 锁读冲突）。

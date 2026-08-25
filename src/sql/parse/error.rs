@@ -30,6 +30,13 @@ pub enum ErrorCode {
     /// whole query (v1 never serves partial results); HA failover of
     /// SQL reads is future work.
     NodeUnreachable,
+    /// ROLLBACK TO / RELEASE of a savepoint that does not exist
+    /// (MySQL 1305: `SAVEPOINT x does not exist`).
+    UnknownSavepoint,
+    /// A locking read (FOR UPDATE / FOR SHARE) hit a row latch held by
+    /// another live transaction (MySQL 1205; rdb fails fast instead of
+    /// waiting out `innodb_lock_wait_timeout`).
+    LockWaitTimeout,
     Unknown,
 }
 
@@ -73,6 +80,12 @@ impl SqlError {
             // 1027 (ER_FILE_USED): reads must not silently degrade to
             // partial results when a band owner cannot be reached.
             ErrorCode::NodeUnreachable => ErrorKind::ER_FILE_USED,
+            // 1305 (ER_SP_DOES_NOT_EXIST): MySQL's code for unknown
+            // savepoints ("SAVEPOINT %s does not exist").
+            ErrorCode::UnknownSavepoint => ErrorKind::ER_SP_DOES_NOT_EXIST,
+            // 1205 (ER_LOCK_WAIT_TIMEOUT): the MySQL lock-wait error
+            // clients recognize and retry on.
+            ErrorCode::LockWaitTimeout => ErrorKind::ER_LOCK_WAIT_TIMEOUT,
             // 1213: the MySQL serialization-failure error clients retry on.
             ErrorCode::WriteConflict => ErrorKind::ER_LOCK_DEADLOCK,
             ErrorCode::TxnDdl => ErrorKind::ER_NOT_SUPPORTED_YET,

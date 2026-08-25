@@ -337,11 +337,13 @@ contract; module map lives in `agents/rust/sql.md`.
 - **Access**: `mysql_bind` listener (opensrv-mysql; native-password only, `mysql_user`/
   `mysql_password` from config; any other account is rejected at handshake). USE and
   cosmetic SET (`sql_mode`, `wait_timeout`, ...) are tolerated no-ops; SET statements
-  that change session/transaction semantics (autocommit, isolation level, NAMES, SESSION
-  TRANSACTION, TIME_ZONE, ROLE, ...) are REJECTED loudly (MySQL 1235) rather than
-  silently ignored, and `SELECT ... FOR UPDATE / FOR SHARE` (locking reads) is rejected
-  the same way — snapshot isolation + commit-time write-write validation is the only
-  supported concurrency story. `SELECT @@var` is intercepted server-side.
+  that change session/transaction semantics (autocommit, NAMES, TIME_ZONE, ROLE, ...)
+  are REJECTED loudly (MySQL 1235) rather than silently ignored. `SET [SESSION]
+  TRANSACTION ISOLATION LEVEL ...` is accepted and echoed per session by
+  `@@transaction_isolation`/`@@tx_isolation` (default `REPEATABLE-READ`, MySQL's
+  default — and factually the engine's only isolation, since snapshot reads are
+  repeatable); the engine never changes behavior on it. `SELECT @@var` is intercepted
+  server-side.
 - **MVCC rows**: physical key `<slot>/ 0x20 table_id(BE u32) pk_key ts(BE !ts)` — newest
   version first per pk; value = header (0x01 live, 0x00 tombstone, 0x02 2PC-prepared) +
   null bitmap + typed payloads. Slot = `crc16(table_id BE ++ pk_key) % 16384` (same 16384
@@ -355,9 +357,26 @@ contract; module map lives in `agents/rust/sql.md`.
   txn read_ts (registered with the oracle), writes staged in a per-session write set,
   first-committer-wins write-write validation (MySQL error 1213). DDL inside a txn is
   rejected. Disconnect rolls back. Autocommit statements skip staging (single batch).
+  `SAVEPOINT`/`ROLLBACK TO`/`RELEASE SAVEPOINT` operate on the staged write set (a bare
+  SAVEPOINT opens an implicit txn): a marker snapshots the whole write map + append-buffer
+  lengths + latches held at that moment; `ROLLBACK TO` restores that state, keeps the
+  marker (repeatable) and pre-marker latches, and releases post-marker latches with the
+  undone writes; `RELEASE` drops the marker and every later one; a reused name shadows
+  (case-insensitive, latest wins); unknown names are 1305.
   One transaction writes ONE engine: staging a row-store write after a columnar append
   (or vice versa) is rejected at the statement (MySQL 1235, "a transaction cannot mix
   row-store and columnar writes"); mixed reads across engines remain legal.
+- **Locking reads**: `SELECT ... FOR UPDATE / FOR SHARE [OF tbl]` latches the matched
+  (post-filter) rows in a node-local registry keyed `(table_id, pk)`. FOR UPDATE is
+  exclusive, FOR SHARE composes; re-acquiring with the same owner — including a FOR
+  SHARE -> FOR UPDATE upgrade inside one txn — is a no-op (MySQL own-lock upgrade).
+  Acquisition is all-or-nothing per statement and conflicts fail FAST with MySQL 1205
+  ("Lock wait timeout exceeded; try restarting transaction"): rdb never blocks, has no
+  lock-timeout knob and no deadlock detection, and `NOWAIT`/`SKIP LOCKED` are rejected
+  (1235). Explicit-txn latches release at COMMIT/ROLLBACK; autocommit locking reads are
+  ephemeral (released at statement end). Multi-node clusters veto the statement (1235):
+  latches are process-local and the gather path cannot lock remote bands — the statement
+  is refused rather than silently degraded.
 - **Secondary indexes**: `0x21` secondary (`slot/ 0x21 table_id col_pos key(val) pk`), `0x22`
   unique (`slot/ 0x22 table_id col_pos key(val)` -> pk). Index slot = `crc16(table_id ++
   col_pos)` so one index is contiguous in one slot band. NULLs unindexed. Unique is

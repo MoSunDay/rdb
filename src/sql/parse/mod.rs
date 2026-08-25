@@ -255,12 +255,39 @@ mod tests {
 
     #[test]
     fn for_update_rejected() {
-        // Locking reads must fail loudly, not silently degrade to a
-        // plain snapshot read.
-        let e = parse_statement("SELECT * FROM t WHERE id = 1 FOR UPDATE").expect_err("u");
-        assert!(e.msg.contains("FOR UPDATE"), "{e}");
-        let e = parse_statement("SELECT * FROM t FOR SHARE").expect_err("u");
-        assert!(e.msg.contains("FOR SHARE"), "{e}");
+        // NOWAIT / SKIP LOCKED stay unsupported: the engine fails
+        // fast on latch conflicts instead of skipping/waiting.
+        let e = parse_statement("SELECT * FROM t WHERE id = 1 FOR UPDATE NOWAIT").expect_err("u");
+        assert!(e.msg.contains("NOWAIT"), "{e}");
+        let e = parse_statement("SELECT * FROM t FOR SHARE SKIP LOCKED").expect_err("u");
+        assert!(e.msg.contains("SKIP LOCKED"), "{e}");
+    }
+
+    #[test]
+    fn locking_reads_translate_into_query_lock() {
+        let Statement::Select(q) = stmt("SELECT * FROM t WHERE id = 1 FOR UPDATE") else {
+            panic!("select");
+        };
+        assert_eq!(q.lock, Some(LockRead::ForUpdate));
+        // same result shape: the lock is metadata on the same Query.
+        assert_eq!(q.items.len(), 1);
+
+        let Statement::Select(q) = stmt("SELECT id FROM t FOR SHARE") else {
+            panic!("select");
+        };
+        assert_eq!(q.lock, Some(LockRead::ForShare));
+
+        // no clause -> None; `FOR UPDATE OF t` naming the FROM table is
+        // the same lock; OF naming anything else is rejected loudly.
+        let Statement::Select(q) = stmt("SELECT id FROM t") else {
+            panic!("select");
+        };
+        assert_eq!(q.lock, None);
+        let Statement::Select(q) = stmt("SELECT id FROM t FOR UPDATE OF t") else {
+            panic!("select");
+        };
+        assert_eq!(q.lock, Some(LockRead::ForUpdate));
+        assert!(parse_statement("SELECT id FROM t FOR UPDATE OF other").is_err());
     }
 
     #[test]

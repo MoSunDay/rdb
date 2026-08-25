@@ -140,12 +140,28 @@ async fn dispatch(
             sess.isolation = Some(level.replace(' ', "-"));
             Ok(ExecOutcome::Ok)
         }
-        // Savepoint machinery arrives with the staged-writes snapshot
-        // stack; until then these fail loudly instead of degrading.
-        Statement::Savepoint(_)
-        | Statement::RollbackTo { .. }
-        | Statement::ReleaseSavepoint { .. } => Err(SqlError::unsupported(
-            "SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT",
-        )),
+        // SAVEPOINT family: real semantics over the staged write set.
+        // MySQL starts an implicit transaction for a bare SAVEPOINT.
+        Statement::Savepoint(name) => {
+            if sess.txn.is_none() {
+                sess.txn = Some(tx::begin(&shared.sql_ts));
+            }
+            tx::savepoint(sess.txn.as_mut().expect("txn begun above"), &name);
+            Ok(ExecOutcome::Ok)
+        }
+        Statement::RollbackTo { name } => match sess.txn.as_mut() {
+            Some(txn) => {
+                tx::rollback_to(txn, &name)?;
+                Ok(ExecOutcome::Ok)
+            }
+            None => Err(tx::unknown_savepoint(&name)),
+        },
+        Statement::ReleaseSavepoint { name } => match sess.txn.as_mut() {
+            Some(txn) => {
+                tx::release_savepoint(txn, &name)?;
+                Ok(ExecOutcome::Ok)
+            }
+            None => Err(tx::unknown_savepoint(&name)),
+        },
     }
 }

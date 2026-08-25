@@ -14,12 +14,9 @@ pub(crate) fn translate_query(q: &SqlQuery) -> SqlResult<Query> {
     if q.with.is_some() {
         return Err(SqlError::unsupported("CTE (WITH)"));
     }
-    if !q.locks.is_empty() {
-        // Locking reads would silently degrade to plain snapshot reads;
-        // reject loudly until pessimistic locks exist (the snapshot +
-        // commit-time write-write validation is the supported story).
+    if q.locks.len() > 1 {
         return Err(SqlError::unsupported(
-            "SELECT ... FOR UPDATE / FOR SHARE (locking reads)",
+            "multiple locking clauses (FOR UPDATE / FOR SHARE)",
         ));
     }
     let items: Vec<SelectItem> = sel
@@ -31,6 +28,7 @@ pub(crate) fn translate_query(q: &SqlQuery) -> SqlResult<Query> {
         return Err(SqlError::unsupported("comma cross joins / missing FROM"));
     }
     let from = translate_table_with_joins(&sel.from[0])?;
+    let lock = translate_lock(q.locks.first(), &from)?;
     let group_by = match &sel.group_by {
         sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs
             .iter()
@@ -56,7 +54,42 @@ pub(crate) fn translate_query(q: &SqlQuery) -> SqlResult<Query> {
         limit,
         offset,
         distinct,
+        lock,
     })
+}
+
+/// `FOR UPDATE` / `FOR SHARE` -> [`LockRead`] metadata on the Query.
+/// `NOWAIT` / `SKIP LOCKED` stay rejected (the executor fails fast on
+/// latch conflicts; it never waits or skips). `FOR ... OF tbl` is the
+/// same lock when it names the single FROM table, anything else is
+/// rejected loudly rather than half-applied.
+fn translate_lock(
+    lc: Option<&sqlparser::ast::LockClause>,
+    from: &TableRef,
+) -> SqlResult<Option<LockRead>> {
+    let Some(lc) = lc else {
+        return Ok(None);
+    };
+    if let Some(nb) = &lc.nonblock {
+        return Err(SqlError::unsupported(match nb {
+            sqlparser::ast::NonBlock::Nowait => "NOWAIT",
+            sqlparser::ast::NonBlock::SkipLocked => "SKIP LOCKED",
+        }));
+    }
+    if let Some(of) = &lc.of {
+        let TableRef::Table { name, .. } = from else {
+            return Err(SqlError::unsupported("FOR UPDATE / FOR SHARE OF in joins"));
+        };
+        if !of.to_string().eq_ignore_ascii_case(name) {
+            return Err(SqlError::unsupported(format!(
+                "FOR UPDATE / FOR SHARE OF {of} (does not name the FROM table)"
+            )));
+        }
+    }
+    Ok(Some(match lc.lock_type {
+        sqlparser::ast::LockType::Update => LockRead::ForUpdate,
+        sqlparser::ast::LockType::Share => LockRead::ForShare,
+    }))
 }
 
 fn translate_limit_clause(
