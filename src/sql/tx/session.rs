@@ -44,11 +44,30 @@ pub enum TxnWrite {
     Tombstone,
 }
 
+/// One `SAVEPOINT name` marker. It snapshots the staged write set in
+/// full (a later stage can OVERWRITE a pre-marker pk in place, so a
+/// bare length truncation could not restore the pre-marker state),
+/// records the append-buffer lengths (appends are append-only, so
+/// lengths restore exactly), and the latch keys held at creation --
+/// `ROLLBACK TO` keeps those and releases latches taken after it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Savepoint {
+    pub name: String,
+    pub writes: BTreeMap<TxnKey, TxnWrite>,
+    /// table name -> staged append count at marker time.
+    pub appends: BTreeMap<String, usize>,
+    /// Latch keys this txn held when the marker was set.
+    pub latches: Vec<crate::sql::tx::latch::LatchKey>,
+}
+
 /// One open snapshot transaction: pure state, no behavior attached.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Txn {
     /// Snapshot pin: reads see versions with `ts <= read_ts`.
     pub read_ts: u64,
+    /// Unique id of this txn (latch-registry owner). `Txn::default()`
+    /// keeps 0 and never takes latches; real BEGINs allocate above it.
+    pub id: u64,
     /// Staged writes; at most one entry per (table, pk).
     pub writes: BTreeMap<TxnKey, TxnWrite>,
     /// Columnar appends per table name, staged at INSERT, flushed at COMMIT.
@@ -56,6 +75,9 @@ pub struct Txn {
     /// Engine of the first staged write; later stages of the other
     /// engine are rejected (one transaction touches one engine).
     pub mode: Option<Engine>,
+    /// SAVEPOINT markers in creation order; a repeated name shadows
+    /// (lookups find the LAST marker of that name).
+    pub savepoints: Vec<Savepoint>,
 }
 
 /// BEGIN: pin the latest committed timestamp and register the snapshot
@@ -65,9 +87,11 @@ pub fn begin(oracle: &Oracle) -> Txn {
     oracle.register_snapshot(read_ts);
     Txn {
         read_ts,
+        id: crate::sql::tx::latch::next_owner_id(),
         writes: BTreeMap::new(),
         appends: BTreeMap::new(),
         mode: None,
+        savepoints: Vec::new(),
     }
 }
 
@@ -103,6 +127,79 @@ pub fn stage_delete(txn: &mut Txn, schema: &TableSchema, pk_key: Vec<u8>) -> Sql
     check_engine(txn, Engine::Row)?;
     txn.mode = Some(Engine::Row);
     txn.writes.insert((schema.id, pk_key), TxnWrite::Tombstone);
+    Ok(())
+}
+
+// ---- SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT (MySQL semantics) ----
+
+/// MySQL 1305: `SAVEPOINT {name} does not exist`.
+pub fn unknown_savepoint(name: &str) -> SqlError {
+    SqlError::new(
+        ErrorCode::UnknownSavepoint,
+        format!("SAVEPOINT {name} does not exist"),
+    )
+}
+
+/// `SAVEPOINT name`: record a marker over the current staged state.
+/// Reusing an existing name is legal and SHADOWS the old marker (the
+/// most recent marker of a name wins; the old one stays in the stack
+/// but is unreachable by name until the newer one is dropped).
+pub fn savepoint(txn: &mut Txn, name: &str) {
+    txn.savepoints.push(Savepoint {
+        name: name.to_string(),
+        writes: txn.writes.clone(),
+        appends: txn
+            .appends
+            .iter()
+            .map(|(t, rows)| (t.clone(), rows.len()))
+            .collect(),
+        latches: crate::sql::tx::latch::held_by(txn.id),
+    });
+}
+
+/// Position of the NEWEST marker named `name` (savepoint names are
+/// case-insensitive, like MySQL identifiers).
+fn marker_of(txn: &Txn, name: &str) -> Option<usize> {
+    txn.savepoints
+        .iter()
+        .rposition(|s| s.name.eq_ignore_ascii_case(name))
+}
+
+/// `ROLLBACK TO [SAVEPOINT] name`: restore the staged write set and
+/// append buffers to the marker's snapshot. The txn itself stays open,
+/// the marker itself is KEPT, and every savepoint created after it is
+/// dropped (MySQL semantics). Row latches taken BEFORE the savepoint
+/// are kept (MySQL keeps locks acquired before the savepoint); ones
+/// taken after it are released with the undone writes.
+pub fn rollback_to(txn: &mut Txn, name: &str) -> SqlResult<()> {
+    let pos = marker_of(txn, name).ok_or_else(|| unknown_savepoint(name))?;
+    let marker = txn.savepoints[pos].clone();
+    txn.writes = marker.writes.clone();
+    // appends are append-only: truncating each table's buffer to its
+    // marker-time length restores the exact staged prefix; tables the
+    // marker never saw disappear entirely.
+    let lens = marker.appends.clone();
+    txn.appends.retain(|t, _| lens.contains_key(t));
+    for (t, rows) in txn.appends.iter_mut() {
+        let len = lens.get(t).copied().unwrap_or(0);
+        rows.truncate(len);
+    }
+    txn.savepoints.truncate(pos + 1);
+    let keep: std::collections::BTreeSet<_> = marker.latches.into_iter().collect();
+    let stale: Vec<_> = crate::sql::tx::latch::held_by(txn.id)
+        .into_iter()
+        .filter(|k| !keep.contains(k))
+        .collect();
+    crate::sql::tx::latch::release_keys(txn.id, &stale);
+    Ok(())
+}
+
+/// `RELEASE [SAVEPOINT] name`: forget the marker and every savepoint
+/// created after it. Nothing staged is undone (RELEASE is bookkeeping
+/// only, per MySQL).
+pub fn release_savepoint(txn: &mut Txn, name: &str) -> SqlResult<()> {
+    let pos = marker_of(txn, name).ok_or_else(|| unknown_savepoint(name))?;
+    txn.savepoints.truncate(pos);
     Ok(())
 }
 
@@ -242,6 +339,9 @@ pub fn build_commit_batch(
 pub async fn commit(shared: &Shared, txn: Txn) -> SqlResult<()> {
     let out = commit_inner(shared, &txn).await;
     shared.sql_ts.unregister_snapshot(txn.read_ts);
+    // Every exit path releases the txn's row latches (success,
+    // conflict, io error): a failed commit must not strand locks.
+    crate::sql::tx::latch::release_owner(txn.id);
     out
 }
 
@@ -350,6 +450,8 @@ pub fn commit_index_ops(
 /// discard the staged writes -- none of them ever reached the store.
 pub fn rollback(oracle: &Oracle, txn: Txn) {
     oracle.unregister_snapshot(txn.read_ts);
+    // Savepoints and row latches die with the txn.
+    crate::sql::tx::latch::release_owner(txn.id);
 }
 
 fn pk_value<'a>(schema: &TableSchema, values: &'a [Value]) -> &'a Value {
@@ -363,6 +465,10 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod session_tests;
+
+#[cfg(test)]
+#[path = "savepoint_tests.rs"]
+mod savepoint_tests;
 
 #[cfg(test)]
 #[path = "session_index_tests.rs"]

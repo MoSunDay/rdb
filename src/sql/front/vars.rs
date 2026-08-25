@@ -54,8 +54,18 @@ pub fn parse_sysvar_query(sql: &str) -> Option<Vec<String>> {
     Some(names)
 }
 
+/// Session-scoped values that override the static defaults: whatever
+/// the connection last persisted via
+/// `SET [SESSION|GLOBAL] TRANSACTION ISOLATION LEVEL ...` (stored
+/// hyphenated, e.g. `READ-COMMITTED`). Statement-scoped levels never
+/// reach here (rejected at parse).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionVars {
+    pub isolation: Option<String>,
+}
+
 /// Value of one known system variable (names lowercased by the parser).
-pub fn sysvar_value(name: &str, version: &str) -> Option<Value> {
+pub fn sysvar_value(name: &str, version: &str, session: &SessionVars) -> Option<Value> {
     match name {
         "max_allowed_packet" => Some(Value::Int(MAX_ALLOWED_PACKET)),
         "wait_timeout" | "interactive_timeout" => Some(Value::Int(28_800)),
@@ -72,19 +82,31 @@ pub fn sysvar_value(name: &str, version: &str) -> Option<Value> {
         "character_set_client" | "character_set_connection" | "character_set_results" => {
             Some(Value::Str("utf8mb4".to_string()))
         }
-        // M1 is autocommit per-statement snapshot reads.
-        "transaction_isolation" | "tx_isolation" => Some(Value::Str("READ-COMMITTED".to_string())),
+        // MySQL's default is REPEATABLE READ and the engine's one
+        // isolation (snapshot reads) IS repeatable read -- every
+        // accepted level maps onto it. An unset session reports the
+        // default; a session-persisted level echoes back verbatim.
+        "transaction_isolation" | "tx_isolation" => Some(Value::Str(
+            session
+                .isolation
+                .clone()
+                .unwrap_or_else(|| "REPEATABLE-READ".to_string()),
+        )),
         _ => None,
     }
 }
 
 /// Rowset for a parsed @@-query; unknown variables error out like MySQL's
 /// `Unknown system variable 'x'` (clients show the message verbatim).
-pub fn sysvar_outcome(names: &[String], version: &str) -> SqlResult<ExecOutcome> {
+pub fn sysvar_outcome(
+    names: &[String],
+    version: &str,
+    session: &SessionVars,
+) -> SqlResult<ExecOutcome> {
     let mut row = Vec::with_capacity(names.len());
     let mut columns = Vec::with_capacity(names.len());
     for name in names {
-        let value = sysvar_value(name, version).ok_or_else(|| {
+        let value = sysvar_value(name, version, session).ok_or_else(|| {
             SqlError::new(
                 ErrorCode::Unknown,
                 format!("Unknown system variable '{name}'"),
@@ -152,7 +174,8 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let out = sysvar_outcome(&names, "8.0.32-rdb").expect("known vars");
+        let out =
+            sysvar_outcome(&names, "8.0.32-rdb", &SessionVars::default()).expect("known vars");
         let ExecOutcome::Rows { columns, rows } = out else {
             panic!("rows");
         };
@@ -165,7 +188,47 @@ mod tests {
     #[test]
     fn unknown_variable_errors() {
         let names = vec!["no_such_var".to_string()];
-        let err = sysvar_outcome(&names, "8.0.32-rdb").expect_err("unknown");
+        let err =
+            sysvar_outcome(&names, "8.0.32-rdb", &SessionVars::default()).expect_err("unknown");
         assert!(err.msg.contains("Unknown system variable"), "{}", err.msg);
+    }
+
+    #[test]
+    fn isolation_defaults_to_mysql_repeatable_read() {
+        for name in ["transaction_isolation", "tx_isolation"] {
+            let names = vec![name.to_string()];
+            let out =
+                sysvar_outcome(&names, "8.0.32-rdb", &SessionVars::default()).expect("known var");
+            let ExecOutcome::Rows { rows, .. } = out else {
+                panic!("rows");
+            };
+            // MySQL's default (and the engine's single isolation:
+            // snapshot reads = REPEATABLE READ).
+            assert_eq!(rows[0][0], Value::Str("REPEATABLE-READ".to_string()));
+        }
+    }
+
+    #[test]
+    fn isolation_round_trips_every_session_level() {
+        for level in [
+            "READ-UNCOMMITTED",
+            "READ-COMMITTED",
+            "REPEATABLE-READ",
+            "SERIALIZABLE",
+        ] {
+            let names = vec!["transaction_isolation".to_string()];
+            let sess = SessionVars {
+                isolation: Some(level.to_string()),
+            };
+            let out = sysvar_outcome(&names, "8.0.32-rdb", &sess).expect("known var");
+            let ExecOutcome::Rows { rows, .. } = out else {
+                panic!("rows");
+            };
+            assert_eq!(
+                rows[0][0],
+                Value::Str(level.to_string()),
+                "{level} must round-trip"
+            );
+        }
     }
 }

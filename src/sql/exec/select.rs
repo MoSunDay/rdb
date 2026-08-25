@@ -19,6 +19,7 @@ use crate::sql::parse::ast::{
 use crate::sql::parse::error::SqlResult;
 use crate::sql::plan;
 use crate::sql::storage::schema::{SqlType, Value};
+use crate::sql::tx::latch;
 use crate::state::Shared;
 
 /// Execute a SELECT as a snapshot read. Autocommit reads run at the
@@ -29,9 +30,12 @@ pub async fn run(
     sess: &SqlSession,
     q: Query,
 ) -> SqlResult<(Vec<ColMeta>, Vec<Vec<Value>>)> {
-    // Locking reads (FOR UPDATE / FOR SHARE) are rejected at translate;
-    // the explicit txn's write-write validation at COMMIT supplies the
-    // serialization for snapshot reads.
+    // Locking reads (FOR UPDATE / FOR SHARE) latch matched rows in
+    // this process only -- a cluster gather cannot hold latches on
+    // remote bands, so those topologies veto the statement loudly.
+    if q.lock.is_some() && gather::headline(shared, &q.from).is_some() {
+        return Err(latch::cluster_veto());
+    }
     let (read_ts, txn) = match sess.txn.as_ref() {
         Some(t) => (t.read_ts, Some(t)),
         None => (shared.sql_ts.now(), None),
@@ -39,7 +43,28 @@ pub async fn run(
     // Multi-node clusters read scatter-gather (falls back to the local
     // scan path for joins / single-node topologies).
     let src = gather::materialize(shared, &q.from, read_ts, txn, q.filter.as_ref()).await?;
-    execute_query(&q, &src)
+    // ---- locking-read hook (isolated block; nothing below changes) ----
+    // Explicit txn: latches carry the txn's id and release at COMMIT /
+    // ROLLBACK (or ROLLBACK TO, keeping pre-savepoint ones). Autocommit:
+    // an ephemeral owner releases at statement end, so the statement is
+    // a plain read that only fails fast on live conflicts.
+    let stmt_scope: Option<u64> = match (q.lock, sess.txn.as_ref()) {
+        (Some(lock), Some(t)) => {
+            latch::lock_matched(shared, &src, q.filter.as_ref(), lock, t.id)?;
+            None
+        }
+        (Some(lock), None) => {
+            let id = latch::next_owner_id();
+            latch::lock_matched(shared, &src, q.filter.as_ref(), lock, id)?;
+            Some(id)
+        }
+        (None, _) => None,
+    };
+    let out = execute_query(&q, &src);
+    if let Some(id) = stmt_scope {
+        latch::release_owner(id);
+    }
+    out
 }
 
 /// EXPLAIN: render a plan rowset (see `render.rs`). The headline
