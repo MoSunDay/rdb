@@ -4,7 +4,7 @@
 //! touches storage or evaluates anything.
 
 use crate::sql::exec::{ColMeta, ExecOutcome};
-use crate::sql::parse::ast::{BinOp, Expr, Query, SelectItem, Statement, TableRef};
+use crate::sql::parse::ast::{BinOp, Expr, JoinKind, Query, SelectItem, Statement, TableRef};
 use crate::sql::parse::error::SqlResult;
 use crate::sql::storage::schema::{SqlType, Value};
 
@@ -227,8 +227,16 @@ pub(crate) fn from_display(t: &TableRef) -> String {
             Some(a) => format!("{name} AS {a}"),
             None => name.clone(),
         },
-        TableRef::Join { left, right, .. } => {
-            format!("({} JOIN {})", from_display(left), from_display(right))
+        TableRef::Join {
+            left, right, kind, ..
+        } => {
+            let kw = match kind {
+                JoinKind::Inner | JoinKind::Cross => "JOIN",
+                JoinKind::Left => "LEFT JOIN",
+                JoinKind::Right => "RIGHT JOIN",
+                JoinKind::Full => "FULL JOIN",
+            };
+            format!("({} {kw} {})", from_display(left), from_display(right))
         }
     }
 }
@@ -236,7 +244,10 @@ pub(crate) fn from_display(t: &TableRef) -> String {
 /// Collect every join condition of a FROM tree (left to right) so the
 /// plan shows the nested-loop predicates.
 fn collect_join_ons(t: &TableRef, out: &mut Vec<Expr>) {
-    if let TableRef::Join { left, right, on } = t {
+    if let TableRef::Join {
+        left, right, on, ..
+    } = t
+    {
         collect_join_ons(left, out);
         if let Some(e) = on {
             out.push(e.clone());

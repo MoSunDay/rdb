@@ -53,6 +53,24 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    /// `SAVEPOINT name` (no-op without an open txn; MySQL errors only
+    /// on ROLLBACK TO -- same laxness here).
+    Savepoint(String),
+    /// `ROLLBACK TO [SAVEPOINT] name`: undo staged writes back to the
+    /// savepoint's snapshot of the write set, keep the txn open.
+    RollbackTo {
+        name: String,
+    },
+    /// `RELEASE [SAVEPOINT] name`: forget the savepoint (no row undo).
+    ReleaseSavepoint {
+        name: String,
+    },
+    /// `SET [SESSION|GLOBAL] TRANSACTION ISOLATION LEVEL ...`: accepted
+    /// and mapped onto the engine's snapshot isolation, which already
+    /// provides REPEATABLE READ (the MySQL default) semantics.
+    SetIsolation {
+        level: String,
+    },
     Use(String),
     ShowTables,
     ShowColumns(String),
@@ -67,6 +85,9 @@ pub struct ColumnSpec {
     pub name: String,
     pub sql_type: crate::sql::storage::schema::SqlType,
     pub nullable: bool,
+    /// MySQL `AUTO_INCREMENT`: server-side value allocation on INSERT
+    /// when the column is omitted (or NULL/0 is supplied).
+    pub auto_increment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,8 +112,25 @@ pub enum TableRef {
     Join {
         left: Box<TableRef>,
         right: Box<TableRef>,
+        kind: JoinKind,
+        /// Join condition; `None` for cross joins.
         on: Option<Expr>,
+        /// `JOIN ... USING (cols)`: equality on each same-named column
+        /// of both sides, resolved at materialization time (the AST
+        /// layer knows no schemas).
+        using: Vec<String>,
     },
+}
+
+/// The join flavors the executor understands (OUTER sides null-extend).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    /// Explicit `CROSS JOIN`: same evaluation as `Inner` with no ON.
+    Cross,
 }
 
 #[derive(Debug, Clone, PartialEq)]

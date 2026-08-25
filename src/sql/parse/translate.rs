@@ -247,7 +247,21 @@ fn translate(stmt: SqlStatement) -> SqlResult<Statement> {
         }
         SqlStatement::StartTransaction { .. } => Ok(Statement::Begin),
         SqlStatement::Commit { .. } => Ok(Statement::Commit),
-        SqlStatement::Rollback { .. } => Ok(Statement::Rollback),
+        SqlStatement::Rollback { chain, savepoint } => {
+            if chain {
+                return Err(SqlError::unsupported("ROLLBACK AND CHAIN"));
+            }
+            match savepoint {
+                None => Ok(Statement::Rollback),
+                Some(name) => Ok(Statement::RollbackTo {
+                    name: name.value.clone(),
+                }),
+            }
+        }
+        SqlStatement::Savepoint { name } => Ok(Statement::Savepoint(name.value.clone())),
+        SqlStatement::ReleaseSavepoint { name } => Ok(Statement::ReleaseSavepoint {
+            name: name.value.clone(),
+        }),
         SqlStatement::Use(u) => match u {
             sqlparser::ast::Use::Database(db) | sqlparser::ast::Use::Object(db) => {
                 Ok(Statement::Use(object_name(&db)?))
@@ -286,9 +300,9 @@ fn translate(stmt: SqlStatement) -> SqlResult<Statement> {
 fn translate_set(set: sqlparser::ast::Set) -> SqlResult<Statement> {
     use sqlparser::ast::Set as SqlSet;
     match set {
+        SqlSet::SetTransaction { modes, .. } => translate_set_transaction(&modes),
         SqlSet::SetNames { .. }
         | SqlSet::SetNamesDefault {}
-        | SqlSet::SetTransaction { .. }
         | SqlSet::SetTimeZone { .. }
         | SqlSet::SetRole { .. }
         | SqlSet::SetSessionAuthorization(_)
@@ -310,6 +324,39 @@ fn translate_set(set: sqlparser::ast::Set) -> SqlResult<Statement> {
 
 /// Reject assignments to variables that change session/transaction
 /// semantics; anything else is cosmetic and ignored.
+/// `SET [SESSION|GLOBAL] TRANSACTION ...`: only ISOLATION LEVEL is
+/// accepted (the engine's snapshot isolation already IS repeatable
+/// read, MySQL's default); access modes and snapshots are rejected.
+fn translate_set_transaction(modes: &[sqlparser::ast::TransactionMode]) -> SqlResult<Statement> {
+    use sqlparser::ast::{TransactionAccessMode, TransactionIsolationLevel, TransactionMode};
+    let mut level: Option<String> = None;
+    for m in modes {
+        match m {
+            TransactionMode::IsolationLevel(l) => {
+                let name = match l {
+                    TransactionIsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
+                    TransactionIsolationLevel::ReadCommitted => "READ COMMITTED",
+                    TransactionIsolationLevel::RepeatableRead => "REPEATABLE READ",
+                    TransactionIsolationLevel::Serializable => "SERIALIZABLE",
+                    TransactionIsolationLevel::Snapshot => "SNAPSHOT",
+                };
+                level = Some(name.to_string());
+            }
+            TransactionMode::AccessMode(TransactionAccessMode::ReadOnly) => {
+                return Err(SqlError::unsupported("READ ONLY transactions"))
+            }
+            // READ WRITE is the engine's only mode; accepting the
+            // explicit keyword is a no-op.
+            TransactionMode::AccessMode(TransactionAccessMode::ReadWrite) => {}
+        }
+    }
+    match level {
+        // A no-isolation `SET TRANSACTION READ WRITE` is harmless.
+        None => Ok(Statement::SetIgnored),
+        Some(level) => Ok(Statement::SetIsolation { level }),
+    }
+}
+
 fn reject_session_var(
     variable: &sqlparser::ast::ObjectName,
     set: &sqlparser::ast::Set,
@@ -453,6 +500,7 @@ fn translate_column(col: &SqlColumnDef) -> SqlResult<(ColumnSpec, bool)> {
     let sql_type = translate_type(&col.data_type)?;
     let mut nullable = true;
     let mut pk = false;
+    let mut auto_increment = false;
     for opt in &col.options {
         match &opt.option {
             ColumnOption::Null => nullable = true,
@@ -465,7 +513,10 @@ fn translate_column(col: &SqlColumnDef) -> SqlResult<(ColumnSpec, bool)> {
             ColumnOption::Default(_) => {} // defaults are client-evaluated in v1
             ColumnOption::Comment(_) => {}
             ColumnOption::DialectSpecific(_)
-                if opt.to_string().eq_ignore_ascii_case("AUTO_INCREMENT") => {}
+                if opt.to_string().eq_ignore_ascii_case("AUTO_INCREMENT") =>
+            {
+                auto_increment = true;
+            }
             _ => {
                 return Err(SqlError::unsupported(format!(
                     "column option {}",
@@ -479,6 +530,7 @@ fn translate_column(col: &SqlColumnDef) -> SqlResult<(ColumnSpec, bool)> {
             name: col.name.value.clone(),
             sql_type,
             nullable,
+            auto_increment,
         },
         pk,
     ))

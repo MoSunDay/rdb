@@ -11,9 +11,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::sql::exec::expr::{eval, truthy, ColumnScope};
+use crate::sql::exec::expr::{cmp_values, eval, truthy, ColumnScope};
 use crate::sql::index;
-use crate::sql::parse::ast::{Expr, TableRef};
+use crate::sql::parse::ast::{Expr, JoinKind, TableRef};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::plan;
 use crate::sql::storage::catalog;
@@ -320,21 +320,41 @@ pub fn materialize(
             scope.sides.push(table_side(&schema, alias));
             Ok(Source { scope, rows })
         }
-        TableRef::Join { left, right, on } => {
+        TableRef::Join {
+            left,
+            right,
+            kind,
+            on,
+            using,
+        } => {
             let l = materialize(shared, left, read_ts, txn, None)?;
             let r = materialize(shared, right, read_ts, txn, None)?;
-            join_sources(l, r, on.as_ref())
+            join_sources(l, r, *kind, on.as_ref(), using)
         }
     }
 }
 
-/// Nested-loop combination of two materialized sides: every (l, r)
-/// pair whose ON condition holds, cross join when ON is absent (left
-/// side's columns first). Shared by the single-node `materialize` and
-/// the cluster gather path, so the join loop is identical wherever a
-/// side's rows came from.
-pub fn join_sources(l: Source, r: Source, on: Option<&Expr>) -> SqlResult<Source> {
+/// Nested-loop combination of two materialized sides (left side's
+/// columns first): every (l, r) pair whose ON condition holds; OUTER
+/// kinds null-extend the unmatched side; no condition = cross join.
+/// Shared by the single-node `materialize` and the cluster gather
+/// path, so the join loop is identical wherever a side's rows came
+/// from. `USING (cols)` compares the named columns cell-by-cell after
+/// resolving each exactly once per side.
+pub fn join_sources(
+    l: Source,
+    r: Source,
+    kind: JoinKind,
+    on: Option<&Expr>,
+    using: &[String],
+) -> SqlResult<Source> {
     let left_width = l.scope.row_width();
+    let right_width = r.scope.row_width();
+    if on.is_some() && !using.is_empty() {
+        return Err(SqlError::unsupported("JOIN ... ON together with USING"));
+    }
+    // Offsets address the COMBINED row (left cells, then right cells).
+    let using_pairs = resolve_using(using, &l.scope, &r.scope, left_width)?;
     let mut scope = l.scope;
     for mut side in r.scope.sides {
         side.offset += left_width;
@@ -343,8 +363,17 @@ pub fn join_sources(l: Source, r: Source, on: Option<&Expr>) -> SqlResult<Source
     if let Some(cond) = on {
         check_expr(cond, &scope)?;
     }
+    let using_hit = |combined: &[Value]| -> bool {
+        using_pairs.iter().all(|(li, ri)| {
+            matches!(
+                (combined.get(*li), combined.get(*ri)),
+                (Some(a), Some(b)) if matches!(cmp_values(a, b), Ok(std::cmp::Ordering::Equal))
+            )
+        })
+    };
     let mut rows = Vec::with_capacity(l.rows.len().saturating_mul(r.rows.len()));
     for lr in &l.rows {
+        let mut matched = false;
         for rr in &r.rows {
             let mut combined = lr.clone();
             combined.extend_from_slice(rr);
@@ -354,10 +383,103 @@ pub fn join_sources(l: Source, r: Source, on: Option<&Expr>) -> SqlResult<Source
                     continue;
                 }
             }
+            if !using_pairs.is_empty() && !using_hit(&combined) {
+                continue;
+            }
+            matched = true;
             rows.push(combined);
+        }
+        if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
+            rows.push(null_extended(lr, right_width));
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        // Second pass over the right side: rows that matched no left
+        // row null-extend LEFTWARDS (prefix columns NULL, right row
+        // verbatim). Match flags are recomputed -- nested loops make
+        // OUTER joins quadratic, the accepted v1 join cost.
+        let mut seen = vec![false; r.rows.len()];
+        for lr in &l.rows {
+            for (ri, rr) in r.rows.iter().enumerate() {
+                if seen[ri] {
+                    continue;
+                }
+                let mut combined = lr.clone();
+                combined.extend_from_slice(rr);
+                let mut hit = match on {
+                    Some(c) => truthy(&eval(c, &scope, &combined)?)?,
+                    None => true,
+                };
+                if hit && !using_pairs.is_empty() {
+                    hit = using_hit(&combined);
+                }
+                if hit {
+                    seen[ri] = true;
+                }
+            }
+        }
+        for (ri, rr) in r.rows.iter().enumerate() {
+            if !seen[ri] {
+                let mut row = vec![Value::Null; left_width];
+                row.extend_from_slice(rr);
+                rows.push(row);
+            }
         }
     }
     Ok(Source { scope, rows })
+}
+
+/// One NULL-padded copy of `row` for an unmatched OUTER side.
+fn null_extended(row: &[Value], width: usize) -> Vec<Value> {
+    let mut out = row.to_vec();
+    out.extend(std::iter::repeat_n(Value::Null, width));
+    out
+}
+
+/// `(left_cell, right_cell)` offsets of each USING column inside the
+/// COMBINED row: every named column must resolve exactly once on each
+/// side (ambiguity and unknown columns surface before any row work).
+fn resolve_using(
+    using: &[String],
+    l: &FromScope,
+    r: &FromScope,
+    right_offset: usize,
+) -> SqlResult<Vec<(usize, usize)>> {
+    let mut pairs = Vec::with_capacity(using.len());
+    for name in using {
+        let lh: Vec<usize> = l
+            .sides
+            .iter()
+            .filter_map(|s| {
+                s.columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(name))
+                    .map(|p| s.offset + p)
+            })
+            .collect();
+        let rh: Vec<usize> = r
+            .sides
+            .iter()
+            .filter_map(|s| {
+                s.columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(name))
+                    .map(|p| s.offset + p)
+            })
+            .collect();
+        match (lh.as_slice(), rh.as_slice()) {
+            ([li], [ri]) => pairs.push((*li, *ri + right_offset)),
+            _ => {
+                return Err(SqlError::new(
+                    ErrorCode::BadField,
+                    format!(
+                        "USING column '{name}' must resolve exactly once on each side of the join"
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(pairs)
 }
 
 /// The FROM-scope side of one plain table reference.

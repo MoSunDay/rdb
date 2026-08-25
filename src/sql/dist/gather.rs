@@ -133,10 +133,17 @@ pub async fn materialize(
     // on the coordinator. A local-only side would silently drop other
     // nodes' rows, so joins never take the single-node fallback while
     // the cluster is ready.
-    if let TableRef::Join { left, right, on } = tref {
+    if let TableRef::Join {
+        left,
+        right,
+        kind,
+        on,
+        using,
+    } = tref
+    {
         let l = Box::pin(materialize(shared, left, read_ts, txn, None)).await?;
         let r = Box::pin(materialize(shared, right, read_ts, txn, None)).await?;
-        return scan::join_sources(l, r, on.as_ref());
+        return scan::join_sources(l, r, *kind, on.as_ref(), using);
     }
     // Columnar tables: segments commit where the txn closed, so a
     // ready multi-node cluster fans out to EVERY member (no slot

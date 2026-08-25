@@ -49,6 +49,10 @@ pub struct SqlSession {
     /// Open BEGIN..COMMIT/ROLLBACK transaction, if any: a pinned
     /// snapshot plus the staged write set (see [`crate::sql::tx`]).
     pub txn: Option<crate::sql::tx::Txn>,
+    /// Last `SET TRANSACTION ISOLATION LEVEL` (hyphenated MySQL form);
+    /// `None` = the engine default, REPEATABLE-READ. The engine maps
+    /// every accepted level onto its snapshot isolation.
+    pub isolation: Option<String>,
 }
 
 /// Execute one statement against the shared engine state.
@@ -130,5 +134,18 @@ async fn dispatch(
             Ok(ExecOutcome::Ok)
         }
         Statement::SetIgnored => Ok(ExecOutcome::Ok),
+        Statement::SetIsolation { level } => {
+            // Stored for `@@transaction_isolation` reporting; the
+            // engine runs one isolation (snapshot = REPEATABLE READ).
+            sess.isolation = Some(level.replace(' ', "-"));
+            Ok(ExecOutcome::Ok)
+        }
+        // Savepoint machinery arrives with the staged-writes snapshot
+        // stack; until then these fail loudly instead of degrading.
+        Statement::Savepoint(_)
+        | Statement::RollbackTo { .. }
+        | Statement::ReleaseSavepoint { .. } => Err(SqlError::unsupported(
+            "SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT",
+        )),
     }
 }

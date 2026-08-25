@@ -160,12 +160,57 @@ mod tests {
         ));
         assert!(parse_statement("SET autocommit = 1").is_err());
         assert!(parse_statement("SET NAMES utf8mb4").is_err());
-        assert!(parse_statement("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED").is_err());
+        // Isolation declarations are accepted and mapped onto the
+        // engine's snapshot isolation (REPEATABLE READ semantics).
+        assert!(matches!(
+            stmt("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+            Statement::SetIsolation { level } if level == "READ COMMITTED"
+        ));
+        assert!(matches!(
+            stmt("SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            Statement::SetIsolation { level } if level == "SERIALIZABLE"
+        ));
+        assert!(parse_statement("SET TRANSACTION READ ONLY").is_err());
         assert!(matches!(stmt("SET sql_mode = ''"), Statement::SetIgnored));
         assert!(matches!(
             stmt("EXPLAIN SELECT * FROM t"),
             Statement::Explain(_)
         ));
+    }
+
+    #[test]
+    fn savepoint_and_outer_joins_translate() {
+        assert!(matches!(stmt("SAVEPOINT sp1"), Statement::Savepoint(n) if n == "sp1"));
+        assert!(matches!(
+            stmt("ROLLBACK TO SAVEPOINT sp1"),
+            Statement::RollbackTo { name } if name == "sp1"
+        ));
+        assert!(matches!(
+            stmt("RELEASE SAVEPOINT sp1"),
+            Statement::ReleaseSavepoint { name } if name == "sp1"
+        ));
+        let Statement::Select(q) = stmt("SELECT * FROM t1 LEFT JOIN t2 ON t1.id = t2.id") else {
+            panic!("left join select");
+        };
+        let TableRef::Join { kind, .. } = q.from else {
+            panic!("join");
+        };
+        assert_eq!(kind, JoinKind::Left);
+        let Statement::Select(q) = stmt("SELECT * FROM t1 CROSS JOIN t2") else {
+            panic!("cross join select");
+        };
+        let TableRef::Join { kind, using, .. } = q.from else {
+            panic!("join");
+        };
+        assert_eq!(kind, JoinKind::Cross);
+        assert!(using.is_empty());
+        let Statement::Select(q) = stmt("SELECT * FROM t1 JOIN t2 USING (id)") else {
+            panic!("using select");
+        };
+        let TableRef::Join { using, .. } = q.from else {
+            panic!("join");
+        };
+        assert_eq!(using, vec!["id".to_string()]);
     }
 
     #[test]

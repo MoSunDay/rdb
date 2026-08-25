@@ -107,7 +107,9 @@ fn gatherable_needs_cluster_and_plain_table() {
     let join = TableRef::Join {
         left: Box::new(tref("g")),
         right: Box::new(tref("g")),
+        kind: crate::sql::parse::ast::JoinKind::Inner,
         on: None,
+        using: Vec::new(),
     };
     assert!(gatherable(&a, &join).is_none());
     // Plain table over 3 owners -> 3 bands.
