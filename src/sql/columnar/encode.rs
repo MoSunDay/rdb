@@ -44,6 +44,10 @@ fn cmp_vals(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Double(x), Value::Double(y)) => Some(x.partial_cmp(y).unwrap_or(Ordering::Equal)),
+        // Temporal values compare within their own type only (a DATE and
+        // a DATETIME never share a column, so cross-type is None).
+        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
         (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Bytes(y)) => Some(x.as_bytes().cmp(y.as_slice())),
@@ -94,6 +98,9 @@ fn push_payload(out: &mut Vec<u8>, v: &Value) {
         Value::Bool(b) => out.push(*b as u8),
         Value::Int(i) => out.extend_from_slice(&i.to_be_bytes()),
         Value::Double(d) => out.extend_from_slice(&d.to_bits().to_be_bytes()),
+        // Temporal PLAIN payloads are 8B BE integers, same as Int.
+        Value::Date(i) => out.extend_from_slice(&i.to_be_bytes()),
+        Value::DateTime(i) => out.extend_from_slice(&i.to_be_bytes()),
         Value::Str(s) => {
             out.extend_from_slice(&(s.len() as u32).to_be_bytes());
             out.extend_from_slice(s.as_bytes());

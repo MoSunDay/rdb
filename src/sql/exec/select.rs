@@ -388,7 +388,18 @@ fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
                 }
             }
         },
-        Expr::Func { .. } | Expr::Placeholder => SqlType::VarChar,
+        // Scalar functions are heterogeneous (strings dominate), so an
+        // unknown one types as VarChar; the few typed builtins are
+        // pinned here. Metadata only -- evaluation stays dynamic.
+        Expr::Func { name, .. } => match name.to_lowercase().as_str() {
+            "last_insert_id" | "length" | "char_length" => SqlType::Int,
+            "now" | "current_timestamp" | "sysdate" | "localtime" | "localtimestamp" => {
+                SqlType::DateTime
+            }
+            "curdate" | "current_date" => SqlType::Date,
+            _ => SqlType::VarChar,
+        },
+        Expr::Placeholder => SqlType::VarChar, // unknown until bind
     }
 }
 

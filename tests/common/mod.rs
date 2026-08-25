@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use mysql_async::prelude::Queryable;
+
 /// Fake raft token for the e2e configs (NEVER the real one from
 /// /root/rdb/config -- no secrets in the repo).
 pub mod lite;
@@ -335,6 +337,42 @@ pub async fn wait_mysql_ready(node: &ProcNode, secs: u64) {
             node.ctx()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Open a mysql_async connection to the node's MySQL frontend as
+/// `root`/`pass`, retrying while the port settles. Retries only IO
+/// errors: handshake/auth failures fail fast.
+pub async fn mysql_root_conn(node: &ProcNode, pass: &str) -> mysql_async::Conn {
+    let port: u16 = node.mysql.rsplit(':').next().unwrap().parse().unwrap();
+    let opts = || {
+        mysql_async::OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(port)
+            .user(Some("root"))
+            .pass(Some(pass))
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match mysql_async::Conn::new(opts()).await {
+            Ok(c) => return c,
+            Err(mysql_async::Error::Io(_)) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(200)).await
+            }
+            Err(e) => panic!("mysql connect: {e}"),
+        }
+    }
+}
+
+/// The server error a statement failed with (panics on success or on a
+/// non-server error).
+pub async fn mysql_server_error(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+) -> mysql_async::ServerError {
+    match conn.query::<mysql_async::Row, _>(sql).await {
+        Err(mysql_async::Error::Server(e)) => e,
+        other => panic!("expected server error for {sql}, got {other:?}"),
     }
 }
 

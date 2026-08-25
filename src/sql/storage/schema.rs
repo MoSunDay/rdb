@@ -1,9 +1,10 @@
 //! SQL table schemas: the catalog payload replicated through raft.
 //!
 //! Pure data types only; loading/persisting lives in `catalog.rs`, physical
-//! row encoding in `row.rs`. Types are deliberately narrowed for v1
-//! (no DECIMAL/DATE/TIME): the parser rejects wider SQL types with a clear
-//! unsupported error instead of mis-storing them.
+//! row encoding in `row.rs`. Types are deliberately narrowed for v1: the
+//! temporal domain is DATE/DATETIME (TIMESTAMP parses as DATETIME) via
+//! `temporal`, while DECIMAL/TIME are still rejected at parse time with a
+//! clear unsupported error instead of mis-storing them.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,8 @@ pub enum SqlType {
     Bool,
     Int,
     Double,
+    Date,
+    DateTime,
     VarChar,
     Blob,
 }
@@ -25,6 +28,10 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Double(f64),
+    /// Days since 1970-01-01 (see `temporal`).
+    Date(i64),
+    /// Microseconds since the epoch (see `temporal`).
+    DateTime(i64),
     Str(String),
     Bytes(Vec<u8>),
 }
@@ -37,6 +44,8 @@ impl Value {
             Value::Bool(_) => Some(SqlType::Bool),
             Value::Int(_) => Some(SqlType::Int),
             Value::Double(_) => Some(SqlType::Double),
+            Value::Date(_) => Some(SqlType::Date),
+            Value::DateTime(_) => Some(SqlType::DateTime),
             Value::Str(_) => Some(SqlType::VarChar),
             Value::Bytes(_) => Some(SqlType::Blob),
         }
@@ -150,6 +159,8 @@ impl TableSchema {
             SqlType::Bool => T::MYSQL_TYPE_TINY,
             SqlType::Int => T::MYSQL_TYPE_LONGLONG,
             SqlType::Double => T::MYSQL_TYPE_DOUBLE,
+            SqlType::Date => T::MYSQL_TYPE_DATE,
+            SqlType::DateTime => T::MYSQL_TYPE_DATETIME,
             SqlType::VarChar => T::MYSQL_TYPE_VAR_STRING,
             SqlType::Blob => T::MYSQL_TYPE_BLOB,
         }

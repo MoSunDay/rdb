@@ -40,6 +40,9 @@ pub enum ErrorCode {
     /// MySQL 1075/1063: bad AUTO_INCREMENT table definition (more than
     /// one auto column, non-integer type, or not defined as a key).
     WrongAutoKey,
+    /// MySQL 1292 (ER_TRUNCATED_WRONG_VALUE): a literal cannot be
+    /// interpreted in the column's domain (e.g. "Incorrect DATE value").
+    WrongValue,
     Unknown,
 }
 
@@ -93,6 +96,9 @@ impl SqlError {
             // defined as a key" (also used for the 1063-style
             // incorrect-column-specifier rejection).
             ErrorCode::WrongAutoKey => ErrorKind::ER_WRONG_AUTO_KEY,
+            // 1292: "Incorrect %s value: '%s'" — MySQL's own code for
+            // unparseable temporal (and similar) literals.
+            ErrorCode::WrongValue => ErrorKind::ER_TRUNCATED_WRONG_VALUE,
             // 1213: the MySQL serialization-failure error clients retry on.
             ErrorCode::WriteConflict => ErrorKind::ER_LOCK_DEADLOCK,
             ErrorCode::TxnDdl => ErrorKind::ER_NOT_SUPPORTED_YET,

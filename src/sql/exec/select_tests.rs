@@ -201,3 +201,49 @@ fn explain_headline_prefers_gather_in_cluster_mode() {
         vec!["Gather(bands=3)".to_string(), "SeqScan t".to_string()]
     );
 }
+
+#[test]
+fn result_type_pins_literals_and_typed_functions() {
+    let scope = FromScope::default();
+    let lit = |v| result_type(&Expr::Lit(v), &scope);
+    assert_eq!(lit(Value::Int(1)), SqlType::Int);
+    assert_eq!(lit(Value::Double(1.5)), SqlType::Double);
+    assert_eq!(lit(Value::Str("x".into())), SqlType::VarChar);
+    assert_eq!(lit(Value::Bool(true)), SqlType::Bool);
+    // NULL has no domain of its own; the wire type stays text.
+    assert_eq!(lit(Value::Null), SqlType::VarChar);
+    let func = |name: &str| {
+        result_type(
+            &Expr::Func {
+                name: name.to_string(),
+                args: vec![],
+            },
+            &scope,
+        )
+    };
+    assert_eq!(func("last_insert_id"), SqlType::Int);
+    assert_eq!(func("length"), SqlType::Int);
+    assert_eq!(func("now"), SqlType::DateTime);
+    assert_eq!(func("CURDATE"), SqlType::Date);
+    // everything else stays text: heterogeneous string funcs dominate.
+    assert_eq!(func("concat"), SqlType::VarChar);
+    assert_eq!(func("upper"), SqlType::VarChar);
+    // placeholders are unknown until bind.
+    assert_eq!(result_type(&Expr::Placeholder, &scope), SqlType::VarChar);
+}
+
+#[tokio::test]
+async fn select_now_metadata_is_datetime() {
+    let shared = setup().await;
+    let (meta, rows) = select_all(&shared, "SELECT NOW()").await;
+    assert_eq!(meta[0].sql_type, SqlType::DateTime);
+    assert!(matches!(rows[0][0], Value::DateTime(_)));
+    // literals type by value: 1 -> INT, 'x' -> text (kills the old
+    // "everything is VARCHAR" deviation for typed result columns)
+    let (meta, _) = select_all(&shared, "SELECT 1").await;
+    assert_eq!(meta[0].sql_type, SqlType::Int);
+    let (meta, _) = select_all(&shared, "SELECT 'x'").await;
+    assert_eq!(meta[0].sql_type, SqlType::VarChar);
+    let (meta, _) = select_all(&shared, "SELECT CURDATE()").await;
+    assert_eq!(meta[0].sql_type, SqlType::Date);
+}

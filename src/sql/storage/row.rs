@@ -243,6 +243,9 @@ fn encode_payload(out: &mut Vec<u8>, ty: SqlType, v: &Value) -> Result<(), Strin
         (SqlType::Bool, Value::Bool(b)) => out.push(*b as u8),
         (SqlType::Int, Value::Int(i)) => out.extend_from_slice(&i.to_be_bytes()),
         (SqlType::Double, Value::Double(d)) => out.extend_from_slice(&d.to_bits().to_be_bytes()),
+        // Temporal payloads are 8B BE integers (days / micros).
+        (SqlType::Date, Value::Date(i)) => out.extend_from_slice(&i.to_be_bytes()),
+        (SqlType::DateTime, Value::DateTime(i)) => out.extend_from_slice(&i.to_be_bytes()),
         (SqlType::VarChar, Value::Str(s)) => {
             out.extend_from_slice(&(s.len() as u32).to_be_bytes());
             out.extend_from_slice(s.as_bytes());
@@ -274,6 +277,16 @@ fn decode_payload(mut rest: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String
             let (raw, r) = split8(rest, "double")?;
             rest = r;
             Value::Double(f64::from_bits(u64::from_be_bytes(raw.try_into().unwrap())))
+        }
+        SqlType::Date => {
+            let (raw, r) = split8(rest, "date")?;
+            rest = r;
+            Value::Date(i64::from_be_bytes(raw.try_into().unwrap()))
+        }
+        SqlType::DateTime => {
+            let (raw, r) = split8(rest, "datetime")?;
+            rest = r;
+            Value::DateTime(i64::from_be_bytes(raw.try_into().unwrap()))
         }
         SqlType::VarChar | SqlType::Blob => {
             if rest.len() < 4 {
@@ -359,6 +372,50 @@ mod tests {
         let (header, dec) = decode_version(&s, &enc).expect("decode");
         assert_eq!(header, HEADER_LIVE);
         assert_eq!(dec, row);
+    }
+
+    #[test]
+    fn temporal_row_round_trip() {
+        let s = TableSchema {
+            id: 43,
+            name: "events".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    sql_type: SqlType::Int,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "day".into(),
+                    sql_type: SqlType::Date,
+                    nullable: true,
+                },
+                ColumnDef {
+                    name: "at".into(),
+                    sql_type: SqlType::DateTime,
+                    nullable: true,
+                },
+            ],
+            pk: "id".into(),
+            auto_increment: None,
+            engine: Engine::Row,
+            indexes: vec![],
+        };
+        let rows = vec![
+            vec![Value::Int(1), Value::Date(-1), Value::DateTime(-1)],
+            vec![Value::Int(2), Value::Null, Value::Null],
+            vec![
+                Value::Int(3),
+                Value::Date(19_782), // 2024-02-29
+                Value::DateTime(1_709_208_000_123_456),
+            ],
+        ];
+        for row in &rows {
+            let enc = encode_row(&s, row).expect("encode");
+            let (header, dec) = decode_version(&s, &enc).expect("decode");
+            assert_eq!(header, HEADER_LIVE);
+            assert_eq!(&dec, row);
+        }
     }
 
     #[test]

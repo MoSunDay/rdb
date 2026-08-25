@@ -40,6 +40,14 @@ pub fn encode_typed(value: &Value) -> Vec<u8> {
             out.push(0x03);
             out.extend_from_slice(&d.to_bits().to_be_bytes());
         }
+        Value::Date(i) => {
+            out.push(0x06);
+            out.extend_from_slice(&i.to_be_bytes());
+        }
+        Value::DateTime(i) => {
+            out.push(0x07);
+            out.extend_from_slice(&i.to_be_bytes());
+        }
         Value::Str(s) => {
             out.push(0x04);
             out.extend_from_slice(&(s.len() as u32).to_be_bytes());
@@ -83,6 +91,23 @@ pub fn decode_typed(bytes: &[u8]) -> Result<(Value, &[u8]), String> {
                 rest,
             ))
         }
+        // Temporal payloads are 8B BE integers (days / micros).
+        0x06 => {
+            let (raw, rest) = rest.split_at_checked(8).ok_or("date payload truncated")?;
+            Ok((
+                Value::Date(i64::from_be_bytes(raw.try_into().unwrap())),
+                rest,
+            ))
+        }
+        0x07 => {
+            let (raw, rest) = rest
+                .split_at_checked(8)
+                .ok_or("datetime payload truncated")?;
+            Ok((
+                Value::DateTime(i64::from_be_bytes(raw.try_into().unwrap())),
+                rest,
+            ))
+        }
         0x04 | 0x05 => {
             if rest.len() < 4 {
                 return Err("varlen payload truncated".into());
@@ -112,11 +137,9 @@ pub fn encode_key(value: &Value) -> Result<Vec<u8>, String> {
     Ok(match value {
         Value::Null => vec![0x00],
         Value::Bool(b) => vec![0x01, *b as u8],
-        Value::Int(i) => {
-            let mut v = vec![0x02];
-            v.extend_from_slice(&(*i ^ i64::MIN).to_be_bytes());
-            v
-        }
+        Value::Int(i) => key_int(0x02, *i),
+        Value::Date(i) => key_int(0x06, *i),
+        Value::DateTime(i) => key_int(0x07, *i),
         Value::Double(d) => {
             let bits = d.to_bits();
             // Positive doubles keep the sign bit set (sorts after
@@ -150,6 +173,15 @@ fn key_bytes(tag: u8, bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(v)
 }
 
+/// Fixed-width integer key component (Int/Date/DateTime): tag + 8B BE
+/// sign-flipped payload, so byte order equals value order.
+fn key_int(tag: u8, i: i64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(9);
+    v.push(tag);
+    v.extend_from_slice(&(i ^ i64::MIN).to_be_bytes());
+    v
+}
+
 /// Decode one order-preserving key value of a known type. Returns the value
 /// and the remaining bytes (callers chaining fixed-type keys).
 pub fn decode_key(bytes: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String> {
@@ -163,6 +195,20 @@ pub fn decode_key(bytes: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String> {
             let (raw, r) = rest.split_at_checked(8).ok_or("int key truncated")?;
             (
                 Value::Int(i64::from_be_bytes(raw.try_into().unwrap()) ^ i64::MIN),
+                r,
+            )
+        }
+        (0x06, SqlType::Date) => {
+            let (raw, r) = rest.split_at_checked(8).ok_or("date key truncated")?;
+            (
+                Value::Date(i64::from_be_bytes(raw.try_into().unwrap()) ^ i64::MIN),
+                r,
+            )
+        }
+        (0x07, SqlType::DateTime) => {
+            let (raw, r) = rest.split_at_checked(8).ok_or("datetime key truncated")?;
+            (
+                Value::DateTime(i64::from_be_bytes(raw.try_into().unwrap()) ^ i64::MIN),
                 r,
             )
         }
@@ -255,5 +301,54 @@ mod tests {
         let (v, rest) = decode_key(&enc, SqlType::Int).expect("decode");
         assert_eq!(v, Value::Int(9));
         assert_eq!(rest, &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn temporal_typed_round_trip() {
+        for v in [
+            Value::Date(0),
+            Value::Date(-1),
+            Value::Date(19_782), // 2024-02-29
+            Value::DateTime(0),
+            Value::DateTime(-1),
+            Value::DateTime(1_709_208_000_000_000),
+        ] {
+            let enc = encode_typed(&v);
+            let (back, rest) = decode_typed(&enc).expect("decode");
+            assert_eq!(back, v);
+            assert!(rest.is_empty());
+        }
+    }
+
+    #[test]
+    fn temporal_key_order_preserving_and_no_int_collision() {
+        let day = |i: i64| encode_key(&Value::Date(i)).unwrap();
+        assert!(day(-1) < day(0));
+        assert!(day(0) < day(19_782));
+        assert!(day(i64::MIN) < day(i64::MAX));
+        // Same numeric value under different tags must not collide.
+        assert_ne!(day(7), encode_key(&Value::Int(7)).unwrap());
+        let us = |i: i64| encode_key(&Value::DateTime(i)).unwrap();
+        assert_ne!(us(7), day(7));
+        assert_ne!(us(7), encode_key(&Value::Int(7)).unwrap());
+        // Type-mismatched decodes are rejected.
+        assert!(decode_key(&day(7), SqlType::Int).is_err());
+        assert!(decode_key(&us(7), SqlType::Date).is_err());
+    }
+
+    #[test]
+    fn temporal_key_round_trip_negative_days() {
+        for days in [-719_162i64, -1, 0, 19_782, 2_932_893] {
+            let enc = encode_key(&Value::Date(days)).unwrap();
+            let (back, rest) = decode_key(&enc, SqlType::Date).expect("decode");
+            assert_eq!(back, Value::Date(days));
+            assert!(rest.is_empty());
+        }
+        for us in [-86_400_000_000i64, -1, 0, 1_709_208_000_123_456] {
+            let enc = encode_key(&Value::DateTime(us)).unwrap();
+            let (back, rest) = decode_key(&enc, SqlType::DateTime).expect("decode");
+            assert_eq!(back, Value::DateTime(us));
+            assert!(rest.is_empty());
+        }
     }
 }

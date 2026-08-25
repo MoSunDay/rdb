@@ -11,8 +11,9 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
 
 ## 模块地图
 - `front/`：MySQL 接入——握手/auth（`auth.rs`，用户密码取自 `mysql_*` 配置）、
-  shim（query/prepare/execute 到 `exec::execute` 的桥）、会话变量拦截（`vars.rs`，
-  `SELECT @@var`）、连接收尾回滚未决事务（`serve.rs`）。
+  shim（query/prepare/execute 到 `exec::execute` 的桥）、线协议值转换（`conv.rs`：
+  文本/二进制 cell 双向，含 DATE/DATETIME 二进制 cell 与预编译参数解码）、
+  会话变量拦截（`vars.rs`，`SELECT @@var`）、连接收尾回滚未决事务（`serve.rs`）。
 - `parse/`：sqlparser 驱动的 AST→内部 IR（`translate.rs`），错误码→MySQL 错误号
   （`error.rs`：1213 写写冲突、1062 唯一冲突、1027 节点不可达等）；`query.rs`
   （复合查询翻译：UNION [ALL]/WITH CTE/派生表——INTERSECT/EXCEPT/BY NAME/
@@ -25,8 +26,12 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   含复合计划）、`ddl.rs`（目录写 + 索引回填）、`sequence.rs`
   （AUTO_INCREMENT 分配：leader 串行 RMW + 批量预留 64、`LAST_INSERT_ID()`）。
 - `storage/`：`row.rs`（版本键 `<slot>/ 0x20 table_id pk !ts`、header 0x01/0x00/0x02）、
-  `codec.rs`（typed 编解码 + kind 常量 0x20/0x21/0x22）、`schema.rs`、`catalog.rs`
+  `codec.rs`（typed 编解码 + kind 常量 0x20/0x21/0x22；payload/key 标签 0x06=Date
+  天数、0x07=DateTime 微秒）、`schema.rs`、`catalog.rs`
   （raft 目录 + `sql_sequence/<table>` 自增计数器）、`gc.rs`（水位清扫：仅保留 ≤ 水位的最新 live 锚点，墓碑锚点整组清除）。
+- `temporal.rs` + `temporal_tests.rs`：时间域纯函数——儒略日 civil 数学
+  （`days_from_civil`/`civil_from_days`，checked 运算）、canonical/紧凑字面量解析与
+  格式化（微秒 6 位、为 0 不渲染）、`now_micros`/`today_days`（UTC 墙钟）。
 - `tx/`：`ts.rs`（Oracle：本地原子 / 集群模式切换）、`global.rs`（raft 块授权：
   `sql_ts_cursor` 先持久后发放、4096 块、HTTP `/sql/ts`、降级单调回退）、`nodes.rs`
   （`sql_nodes` 注册表：raft addr → 各 bind）、`session.rs`（快照事务：写集暂存、
@@ -64,5 +69,7 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   `sql_oracle_cluster_e2e.rs`（进程内 3 节点全局 ts）、`sql_2pc_e2e.rs` 与
   `sql_dist_read_e2e.rs`（3 进程 2PC 写与 scatter-gather 读）、
   `auto_increment_e2e.rs`（自增分配/重启续号/3 节点唯一 id）、
+  `sql_types_e2e.rs`（DATE/DATETIME：字面量往返、谓词、类型化元数据、预编译
+  二进制 cell 与参数、唯一索引、UNION 宽化）、
   `columnar_e2e.rs`（列存单机 + 3 节点集群扇出读）、
   `txn_semantics_e2e.rs`（SAVEPOINT 可见性 / @@transaction_isolation / 锁读冲突）。

@@ -396,7 +396,23 @@ contract; module map lives in `agents/rust/sql.md`.
   connection auto-generated and `LAST_INSERT_ID(n)` sets-and-returns n; because
   expression evaluation cannot see the session, the value additionally lives in a
   process-wide atomic mirror — connections in ONE process share it (a deliberate v1
-  deviation), and the result column's metadata is VARCHAR rather than BIGINT.
+  deviation). `LAST_INSERT_ID()` result metadata is BIGINT, like MySQL.
+- **Temporal types**: `DATE` = days since epoch (i64), `DATETIME`/`TIMESTAMP` =
+  microseconds (i64); TIMESTAMP is a plain DATETIME alias (no time-zone semantics) and
+  `(fsp)` is parsed and ignored (full microsecond precision; the fraction renders only
+  when nonzero). Literals accept canonical `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` and compact
+  digit-only forms; Str <-> temporal coercion applies at write and in comparisons, and
+  an Int compares as the compact numeric value. Garbage (and the MySQL zero date
+  `'0000-00-00'`, which is unrepresentable) rejects the whole statement loudly with
+  "Incorrect DATE value: '...'" with MySQL's own errno 1292. No temporal
+  arithmetic; SUM/AVG over temporal is NULL. `NOW()`/`CURRENT_TIMESTAMP()`/`CURDATE()`
+  are typed functions. Wire: text results are canonical strings; the binary protocol
+  emits MYSQL_TYPE_DATE (4-byte) and MYSQL_TYPE_DATETIME (7/11-byte) cells and accepts
+  string or binary date/datetime statement parameters (TIME and DECIMAL stay 1235).
+  Storage codec tags `0x06` (Date) / `0x07` (DateTime) appear in payloads and index
+  keys. Rollout gate: SqlType travels in the catalog JSON, columnar segment
+  footers/meta, and the ColumnarRows RPC — mixed-version clusters cannot decode a new
+  catalog/segment/RPC, so nodes upgrade together.
 - **Planner**: sargable `=`/`IN`/`BETWEEN` on an indexed column -> pk lookup (>1000 pks or
   no index -> SeqScan). In cluster mode the index path is disabled (v1) and EXPLAIN shows
   `Gather(bands=N)` over `SeqScan`.

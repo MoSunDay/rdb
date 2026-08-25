@@ -333,3 +333,93 @@ async fn txn_commit_flushes_and_rollback_discards() {
     let (_, after) = rows(&shared, "SELECT id FROM t ORDER BY id").await;
     assert_eq!(after.len(), 2, "rollback discarded the staged delete");
 }
+
+#[tokio::test]
+async fn temporal_columns_coerce_strings_and_reject_garbage() {
+    let shared = setup().await;
+    ddl::run(
+        &shared,
+        parse_statement(
+            "CREATE TABLE ev (id BIGINT PRIMARY KEY, d DATE NOT NULL, ts DATETIME NULL)",
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        exec(
+            &shared,
+            "INSERT INTO ev (id, d, ts) VALUES (1, '2024-02-29', '2024-02-29 12:13:14')"
+        )
+        .await,
+        ExecOutcome::Affected(1)
+    ));
+    // typed literals and compact ints land in the same domain
+    exec(
+        &shared,
+        "INSERT INTO ev (id, d, ts) VALUES (2, DATE '2024-03-01', 20240301121314)",
+    )
+    .await;
+    let (_, got) = rows(&shared, "SELECT d, ts FROM ev ORDER BY id").await;
+    assert_eq!(got[0][0], Value::Date(19_782));
+    assert_eq!(
+        got[0][1],
+        Value::DateTime(19_782 * crate::sql::temporal::MICROS_PER_DAY + 43_994_000_000)
+    );
+    assert_eq!(got[1][0], Value::Date(19_783));
+    // unparsable strings error loudly instead of storing garbage
+    let err = write(
+        &shared,
+        parse_statement("INSERT INTO ev (id, d) VALUES (3, '2024-02-30')").unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.msg.contains("Incorrect DATE value"), "{err}");
+    // UPDATE coerces through the same path
+    exec(
+        &shared,
+        "UPDATE ev SET ts = '2024-03-05 01:02:03' WHERE id = 1",
+    )
+    .await;
+    let (_, got) = rows(&shared, "SELECT ts FROM ev WHERE id = 1").await;
+    assert_eq!(
+        got[0][0],
+        Value::DateTime(19_787 * crate::sql::temporal::MICROS_PER_DAY + 3_723_000_000)
+    );
+    // MIN/MAX keep the argument's temporal type (no numeric widening)
+    let (meta, got) = rows(&shared, "SELECT MIN(d), MAX(d) FROM ev").await;
+    assert_eq!(meta[0].sql_type, crate::sql::storage::schema::SqlType::Date);
+    assert_eq!(got[0], vec![Value::Date(19_782), Value::Date(19_783)]);
+}
+
+#[tokio::test]
+async fn date_primary_key_round_trips_through_row_codec() {
+    let shared = setup().await;
+    ddl::run(
+        &shared,
+        parse_statement("CREATE TABLE day (d DATE PRIMARY KEY, n INT)").unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        exec(&shared, "INSERT INTO day VALUES ('2024-02-29', 1)").await,
+        ExecOutcome::Affected(1)
+    ));
+    // the physical key encodes the Date pk; the row decodes back typed
+    let schema = catalog::lookup(&shared, "day").unwrap().unwrap();
+    let key = row::pk_encode(&Value::Date(19_782)).unwrap();
+    let raw = newest_raw(&shared, &schema, &key).expect("version present");
+    let (_, vals) = row::decode_version(&schema, &raw).unwrap();
+    assert_eq!(vals, vec![Value::Date(19_782), Value::Int(1)]);
+    // pk UPDATE through a date-string assignment moves the row
+    assert!(matches!(
+        exec(
+            &shared,
+            "UPDATE day SET d = '2024-03-01' WHERE d = '2024-02-29'"
+        )
+        .await,
+        ExecOutcome::Affected(1)
+    ));
+    let (_, got) = rows(&shared, "SELECT d, n FROM day").await;
+    assert_eq!(got, vec![vec![Value::Date(19_783), Value::Int(1)]]);
+}

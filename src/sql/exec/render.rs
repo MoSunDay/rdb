@@ -107,6 +107,9 @@ fn lit_display(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Double(d) => d.to_string(),
+        // Canonical civil spellings, quoted like string literals.
+        Value::Date(d) => format!("'{}'", crate::sql::temporal::format_date(*d)),
+        Value::DateTime(us) => format!("'{}'", crate::sql::temporal::format_datetime(*us)),
         Value::Str(s) => format!("'{s}'"),
         Value::Bytes(b) => format!("x'{}'", hex::encode(b)),
     }

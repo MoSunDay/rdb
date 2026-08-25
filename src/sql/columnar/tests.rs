@@ -157,6 +157,58 @@ fn single_row_round_trip() {
 }
 
 #[test]
+fn temporal_columns_round_trip_plain_with_zonemap() {
+    let schema = TableSchema {
+        id: 10,
+        name: "temps".into(),
+        columns: vec![
+            col("id", SqlType::Int, false),
+            col("day", SqlType::Date, true),
+            col("at", SqlType::DateTime, true),
+        ],
+        pk: "id".into(),
+        auto_increment: None,
+        engine: Engine::Row,
+        indexes: vec![],
+    };
+    let day = |s: &str| Value::Date(crate::sql::temporal::parse_date(s).unwrap());
+    let at = |s: &str| Value::DateTime(crate::sql::temporal::parse_datetime(s).unwrap());
+    let rows: Vec<Vec<Value>> = vec![
+        vec![Value::Int(1), day("1969-12-31"), at("1969-12-31 23:59:59")],
+        vec![Value::Int(2), Value::Null, Value::Null],
+        vec![
+            Value::Int(3),
+            day("2024-02-29"),
+            at("2024-02-29 13:45:59.5"),
+        ],
+    ];
+    let (file, zones) = build_segment(&schema, &rows).unwrap();
+    let (footer, _) = decode::open(&file).unwrap();
+    assert_eq!(footer.num_rows, 3);
+    for (ci, col) in schema.columns.iter().enumerate() {
+        let expected: Vec<Value> = rows.iter().map(|r| r[ci].clone()).collect();
+        assert_eq!(
+            decode::decode_column(&file, &footer.columns[ci], col.sql_type).unwrap(),
+            expected,
+            "column {}",
+            col.name
+        );
+        // Temporal pages are PLAIN (DICT stays string-only).
+        assert!(footer.columns[ci]
+            .pages
+            .iter()
+            .all(|p| p.encoding == ENC_PLAIN));
+    }
+    // Zonemaps fold by the raw i64 (days / micros), NULLs counted.
+    assert_eq!(zones[1].min, day("1969-12-31"));
+    assert_eq!(zones[1].max, day("2024-02-29"));
+    assert_eq!(zones[1].null_count, 1);
+    assert_eq!(zones[2].min, at("1969-12-31 23:59:59"));
+    assert_eq!(zones[2].max, at("2024-02-29 13:45:59.5"));
+    assert_eq!(zones[2].null_count, 1);
+}
+
+#[test]
 fn multi_page_splits_and_ordinals() {
     let schema = int_schema();
     let n = 20_000usize;

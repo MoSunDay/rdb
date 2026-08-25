@@ -73,7 +73,8 @@ mod tests {
     #[test]
     fn unsupported_types_rejected() {
         assert!(parse_statement("CREATE TABLE t (d DECIMAL(10,2), id INT PRIMARY KEY)").is_err());
-        assert!(parse_statement("CREATE TABLE t (d DATE, id INT PRIMARY KEY)").is_err());
+        // DATE used to live here; it parses now (see
+        // temporal_column_types_translate).
     }
 
     #[test]
@@ -127,6 +128,54 @@ mod tests {
         let mut q = stmt("SELECT * FROM t WHERE a = ? AND b IN (?, ?)");
         assert_eq!(placeholder_count(&q), 3);
         bind_placeholders(&mut q, &[Value::Int(1), Value::Int(2), Value::Int(3)]).expect("bind");
+    }
+
+    #[test]
+    fn temporal_column_types_translate() {
+        let Statement::CreateTable { columns, .. } = stmt(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE, dt DATETIME, dt3 DATETIME(3), ts TIMESTAMP, ts6 TIMESTAMP(6))",
+        )
+        else {
+            panic!("shape");
+        };
+        assert_eq!(columns[1].sql_type, SqlType::Date);
+        // fsp is accepted (and ignored): storage is always microseconds.
+        for c in &columns[2..] {
+            assert_eq!(c.sql_type, SqlType::DateTime, "{c:?}");
+        }
+        // TIME / DECIMAL (and the wider temporal family) stay loud
+        // unsupported (1235), never mis-stored. Note: MySQL dialect
+        // maps `TIMESTAMP WITHOUT TIME ZONE` onto plain TIMESTAMP.
+        for bad in [
+            "TIME",
+            "TIME(3)",
+            "DATE32",
+            "DATETIME64(3, 'UTC')",
+            "DECIMAL(10,2)",
+        ] {
+            let e = parse_statement(&format!("CREATE TABLE t (id BIGINT PRIMARY KEY, c {bad})"))
+                .expect_err(bad);
+            assert_eq!(e.code, ErrorCode::NotSupported, "{bad}: {e}");
+            assert!(e.msg.contains("DATE/DATETIME/TIMESTAMP"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn temporal_typed_string_literals() {
+        // DATE '...' / TIMESTAMP '...' ride as plain strings; the
+        // engine coerces them on use (coerce/cmp parse the string).
+        let Statement::Insert { rows, .. } =
+            stmt("INSERT INTO t (d) VALUES (DATE '2024-02-29'), (TIMESTAMP '2024-02-29 12:00:00')")
+        else {
+            panic!("shape");
+        };
+        assert_eq!(rows[0][0], Expr::Lit(Value::Str("2024-02-29".into())));
+        assert_eq!(
+            rows[1][0],
+            Expr::Lit(Value::Str("2024-02-29 12:00:00".into()))
+        );
+        let e = parse_statement("SELECT TIME '12:00:00'").expect_err("typed");
+        assert_eq!(e.code, ErrorCode::NotSupported, "{e}");
     }
 
     #[test]

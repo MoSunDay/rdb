@@ -23,6 +23,7 @@
 use crate::hash::crc16;
 use crate::sql::storage::codec::{decode_key, encode_key, KIND_SQL_INDEX, KIND_SQL_UNIQUE_INDEX};
 use crate::sql::storage::schema::{SqlType, Value};
+use crate::sql::temporal;
 use crate::store::rocksdb::slot_prefix;
 use crate::topology;
 
@@ -120,7 +121,8 @@ pub fn parse_index_key(key: &[u8]) -> Option<(u8, u32, u32, Vec<u8>)> {
 pub fn split_tail(tail: &[u8], ty: SqlType) -> Option<(&[u8], &[u8])> {
     let fixed = match ty {
         SqlType::Bool => 2,
-        SqlType::Int | SqlType::Double => 9,
+        // Date/DateTime ride the same tag + 8B key layout as Int.
+        SqlType::Int | SqlType::Double | SqlType::Date | SqlType::DateTime => 9,
         SqlType::VarChar | SqlType::Blob => tail[1..].iter().position(|&b| b == 0x00)? + 2,
     };
     tail.split_at_checked(fixed)
@@ -147,6 +149,9 @@ pub fn value_display(v: &Value) -> String {
         Value::Bool(b) => format!("{}", *b as u8),
         Value::Int(i) => i.to_string(),
         Value::Double(d) => format!("{d}"),
+        // Canonical civil spellings, quoted like strings.
+        Value::Date(d) => format!("'{}'", temporal::format_date(*d)),
+        Value::DateTime(us) => format!("'{}'", temporal::format_datetime(*us)),
         Value::Str(s) => format!("'{s}'"),
         Value::Bytes(b) => format!("x'{}'", hex::encode(b)),
     }
@@ -192,6 +197,31 @@ mod tests {
         assert_eq!(ck, col_key);
         assert!(pk.is_empty());
         assert_eq!(value_of_tail(&rest, SqlType::Int), Some(Value::Int(-9)));
+    }
+
+    #[test]
+    fn temporal_split_tail_and_display() {
+        // Date/DateTime ride the fixed 9B Int layout in index tails.
+        for (v, ty) in [
+            (Value::Date(-1), SqlType::Date),
+            (Value::Date(19_782), SqlType::Date),
+            (Value::DateTime(1_709_208_000_123_456), SqlType::DateTime),
+        ] {
+            let col_key = encode_key(&v).unwrap();
+            let k = unique_key(42, 3, &col_key);
+            let (_, _, _, rest) = parse_index_key(&k).expect("parse");
+            let (ck, pk) = split_tail(&rest, ty).expect("split");
+            assert_eq!(ck, col_key);
+            assert!(pk.is_empty());
+            assert_eq!(value_of_tail(&rest, ty), Some(v.clone()));
+        }
+        assert_eq!(value_display(&Value::Date(-1)), "'1969-12-31'");
+        assert_eq!(value_display(&Value::Date(19_782)), "'2024-02-29'");
+        let us = crate::sql::temporal::parse_datetime("2024-02-29 13:45:59.5").unwrap();
+        assert_eq!(
+            value_display(&Value::DateTime(us)),
+            "'2024-02-29 13:45:59.500000'"
+        );
     }
 
     #[test]

@@ -99,6 +99,8 @@ fn read_payload(buf: &mut &[u8], ty: SqlType) -> Result<Value, String> {
         SqlType::Double => Value::Double(f64::from_bits(u64::from_be_bytes(
             take(buf, 8)?.try_into().unwrap(),
         ))),
+        SqlType::Date => Value::Date(i64::from_be_bytes(take(buf, 8)?.try_into().unwrap())),
+        SqlType::DateTime => Value::DateTime(i64::from_be_bytes(take(buf, 8)?.try_into().unwrap())),
         SqlType::VarChar => Value::Str(string_from(read_bytes(buf)?)?),
         SqlType::Blob => Value::Bytes(read_bytes(buf)?.to_vec()),
     })
