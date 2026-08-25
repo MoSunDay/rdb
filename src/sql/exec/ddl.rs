@@ -333,6 +333,7 @@ mod tests {
             name: name.to_string(),
             sql_type: ty,
             nullable,
+            auto_increment: false,
         }
     }
 

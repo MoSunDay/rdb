@@ -184,7 +184,9 @@ fn materialize_nested_loop_join_with_on() {
             name: "o".into(),
             alias: None,
         }),
+        kind: crate::sql::parse::ast::JoinKind::Cross,
         on: None,
+        using: Vec::new(),
     };
     let src = materialize(&shared, &cross, 10, None, None).unwrap();
     assert_eq!(src.rows.len(), 4);
@@ -226,4 +228,140 @@ fn resolve_reports_ambiguity() {
     };
     assert_eq!(scope.resolve_checked(Some("b"), "id").unwrap(), 2);
     assert_eq!(scope.resolve(Some("t2"), "v"), Some(3));
+}
+
+// ---------- OUTER JOIN / USING / CROSS (null-extension) ----------
+
+fn join_ref(kind: JoinKind, on: Option<Expr>, using: &[&str]) -> TableRef {
+    TableRef::Join {
+        left: Box::new(TableRef::Table {
+            name: "l".into(),
+            alias: None,
+        }),
+        right: Box::new(TableRef::Table {
+            name: "r".into(),
+            alias: None,
+        }),
+        kind,
+        on,
+        using: using.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// l(id, v): 1/'a', 2/'b'; r(id, w): 1/'x', 3/'z'.
+fn seed_join_sides(shared: &Shared) {
+    let l = schema(1, "l");
+    let r = schema(2, "r");
+    seed_catalog(shared, &l);
+    seed_catalog(shared, &r);
+    put_version(&shared, &l, 1, 1, Some(row_of(1, "a")));
+    put_version(&shared, &l, 2, 1, Some(row_of(2, "b")));
+    put_version(&shared, &r, 1, 1, Some(row_of(1, "x")));
+    put_version(&shared, &r, 3, 1, Some(row_of(3, "z")));
+}
+
+fn join_rows(kind: JoinKind, on: Option<Expr>, using: &[&str]) -> Vec<Vec<Value>> {
+    let shared = shared();
+    seed_join_sides(&shared);
+    materialize(&shared, &join_ref(kind, on, using), 2, None, None)
+        .unwrap()
+        .rows
+}
+
+#[test]
+fn left_join_null_extends_unmatched_left_rows() {
+    // on l.id = r.id: (1,a,1,x) and (2,b,NULL,NULL).
+    let on = Some(parse_filter("l.id = r.id"));
+    assert_eq!(
+        join_rows(JoinKind::Left, on, &[]),
+        vec![
+            vec![vint(1), vs("a"), vint(1), vs("x")],
+            vec![vint(2), vs("b"), Value::Null, Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn right_join_null_extends_unmatched_right_rows() {
+    // on l.id = r.id: (1,a,1,x) and (NULL,NULL,3,z).
+    let on = Some(parse_filter("l.id = r.id"));
+    assert_eq!(
+        join_rows(JoinKind::Right, on, &[]),
+        vec![
+            vec![vint(1), vs("a"), vint(1), vs("x")],
+            vec![Value::Null, Value::Null, vint(3), vs("z")],
+        ]
+    );
+}
+
+#[test]
+fn full_join_keeps_both_sides_unmatched() {
+    let on = Some(parse_filter("l.id = r.id"));
+    assert_eq!(
+        join_rows(JoinKind::Full, on, &[]),
+        vec![
+            vec![vint(1), vs("a"), vint(1), vs("x")],
+            vec![vint(2), vs("b"), Value::Null, Value::Null],
+            vec![Value::Null, Value::Null, vint(3), vs("z")],
+        ]
+    );
+}
+
+#[test]
+fn using_compares_named_columns_cell_wise() {
+    // USING (id): matches id=1 only; NULL never matches.
+    assert_eq!(
+        join_rows(JoinKind::Inner, None, &["id"]),
+        vec![vec![vint(1), vs("a"), vint(1), vs("x")]]
+    );
+    // LEFT USING keeps l's unmatched row.
+    assert_eq!(
+        join_rows(JoinKind::Left, None, &["id"]),
+        vec![
+            vec![vint(1), vs("a"), vint(1), vs("x")],
+            vec![vint(2), vs("b"), Value::Null, Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn cross_join_is_full_product() {
+    assert_eq!(join_rows(JoinKind::Cross, None, &[]).len(), 4);
+}
+
+#[test]
+fn using_unknown_column_fails_with_bad_field() {
+    let shared = shared();
+    seed_join_sides(&shared);
+    let err = materialize(
+        &shared,
+        &join_ref(JoinKind::Inner, None, &["nope"]),
+        2,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadField);
+}
+
+fn vint(n: i64) -> Value {
+    Value::Int(n)
+}
+
+fn vs(s: &str) -> Value {
+    Value::Str(s.to_string())
+}
+
+/// `a AND b`-style ON conditions parsed from SQL (uses the shared
+/// parse pipeline so column refs translate to Col exprs).
+fn parse_filter(sql: &str) -> Expr {
+    let stmt = crate::sql::parse::parse_statement(&format!("SELECT * FROM l JOIN r ON {sql}"))
+        .expect("parse");
+    let crate::sql::parse::ast::Statement::Select(q) = stmt else {
+        panic!("select");
+    };
+    let TableRef::Join { on: Some(e), .. } = &q.from else {
+        panic!("join with ON");
+    };
+    e.clone()
 }
