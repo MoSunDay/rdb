@@ -30,6 +30,9 @@ pub enum ErrorCode {
     /// whole query (v1 never serves partial results); HA failover of
     /// SQL reads is future work.
     NodeUnreachable,
+    /// MySQL 1075/1063: bad AUTO_INCREMENT table definition (more than
+    /// one auto column, non-integer type, or not defined as a key).
+    WrongAutoKey,
     Unknown,
 }
 
@@ -73,6 +76,10 @@ impl SqlError {
             // 1027 (ER_FILE_USED): reads must not silently degrade to
             // partial results when a band owner cannot be reached.
             ErrorCode::NodeUnreachable => ErrorKind::ER_FILE_USED,
+            // 1075: "there can be only one auto column and it must be
+            // defined as a key" (also used for the 1063-style
+            // incorrect-column-specifier rejection).
+            ErrorCode::WrongAutoKey => ErrorKind::ER_WRONG_AUTO_KEY,
             // 1213: the MySQL serialization-failure error clients retry on.
             ErrorCode::WriteConflict => ErrorKind::ER_LOCK_DEADLOCK,
             ErrorCode::TxnDdl => ErrorKind::ER_NOT_SUPPORTED_YET,

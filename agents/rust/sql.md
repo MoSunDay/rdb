@@ -17,10 +17,11 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   （`error.rs`：1213 写写冲突、1062 唯一冲突、1027 节点不可达等）。
 - `exec/`：执行器——`mod.rs`（`execute` 入口 + `SqlSession`）、`write.rs`（DML 与
   写集生成）、`select.rs`/`scan.rs`（FROM 物化 + 事务叠合）、`agg.rs`、`expr.rs`、
-  `show.rs`、`render.rs`（EXPLAIN）、`ddl.rs`（目录写 + 索引回填）。
+  `show.rs`、`render.rs`（EXPLAIN）、`ddl.rs`（目录写 + 索引回填）、`sequence.rs`
+  （AUTO_INCREMENT 分配：leader 串行 RMW + 批量预留 64、`LAST_INSERT_ID()`）。
 - `storage/`：`row.rs`（版本键 `<slot>/ 0x20 table_id pk !ts`、header 0x01/0x00/0x02）、
   `codec.rs`（typed 编解码 + kind 常量 0x20/0x21/0x22）、`schema.rs`、`catalog.rs`
-  （raft 目录）、`gc.rs`（水位清扫：仅保留 ≤ 水位的最新 live 锚点，墓碑锚点整组清除）。
+  （raft 目录 + `sql_sequence/<table>` 自增计数器）、`gc.rs`（水位清扫：仅保留 ≤ 水位的最新 live 锚点，墓碑锚点整组清除）。
 - `tx/`：`ts.rs`（Oracle：本地原子 / 集群模式切换）、`global.rs`（raft 块授权：
   `sql_ts_cursor` 先持久后发放、4096 块、HTTP `/sql/ts`、降级单调回退）、`nodes.rs`
   （`sql_nodes` 注册表：raft addr → 各 bind）、`session.rs`（快照事务：写集暂存、
@@ -55,4 +56,5 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   `sql_txn_e2e.rs`（快照隔离/冲突）、`sql_index_e2e.rs`（索引/唯一/计划）、
   `sql_oracle_cluster_e2e.rs`（进程内 3 节点全局 ts）、`sql_2pc_e2e.rs` 与
   `sql_dist_read_e2e.rs`（3 进程 2PC 写与 scatter-gather 读）、
+  `auto_increment_e2e.rs`（自增分配/重启续号/3 节点唯一 id）、
   `columnar_e2e.rs`（列存单机 + 3 节点集群扇出读）。

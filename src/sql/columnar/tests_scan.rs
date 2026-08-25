@@ -22,6 +22,7 @@ fn columnar_schema(id: u32) -> TableSchema {
             col("tag", SqlType::VarChar, true),
         ],
         pk: "id".into(),
+        auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],
     }
@@ -70,6 +71,7 @@ fn decode_segment_rejects_width_mismatch() {
             col("extra", SqlType::Double, true),
         ],
         pk: "id".into(),
+        auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],
     };

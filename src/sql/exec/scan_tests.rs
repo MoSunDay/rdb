@@ -22,6 +22,7 @@ fn schema(id: u32, name: &str) -> TableSchema {
             },
         ],
         pk: "id".into(),
+        auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
     }
@@ -152,6 +153,7 @@ fn materialize_nested_loop_join_with_on() {
             nullable: false,
         }],
         pk: "uid".into(),
+        auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
     };
@@ -200,6 +202,7 @@ fn resolve_reports_ambiguity() {
         name: "t2".into(),
         columns: s.columns.clone(),
         pk: "id".into(),
+        auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
     };
