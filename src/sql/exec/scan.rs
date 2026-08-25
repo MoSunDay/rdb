@@ -323,32 +323,41 @@ pub fn materialize(
         TableRef::Join { left, right, on } => {
             let l = materialize(shared, left, read_ts, txn, None)?;
             let r = materialize(shared, right, read_ts, txn, None)?;
-            let left_width = l.scope.row_width();
-            let mut scope = l.scope;
-            for mut side in r.scope.sides {
-                side.offset += left_width;
-                scope.sides.push(side);
-            }
-            if let Some(cond) = on {
-                check_expr(cond, &scope)?;
-            }
-            let mut rows = Vec::with_capacity(l.rows.len().saturating_mul(r.rows.len()));
-            for lr in &l.rows {
-                for rr in &r.rows {
-                    let mut combined = lr.clone();
-                    combined.extend_from_slice(rr);
-                    if let Some(cond) = on {
-                        // NULL/Unknown ON conditions drop the pair.
-                        if !truthy(&eval(cond, &scope, &combined)?)? {
-                            continue;
-                        }
-                    }
-                    rows.push(combined);
-                }
-            }
-            Ok(Source { scope, rows })
+            join_sources(l, r, on.as_ref())
         }
     }
+}
+
+/// Nested-loop combination of two materialized sides: every (l, r)
+/// pair whose ON condition holds, cross join when ON is absent (left
+/// side's columns first). Shared by the single-node `materialize` and
+/// the cluster gather path, so the join loop is identical wherever a
+/// side's rows came from.
+pub fn join_sources(l: Source, r: Source, on: Option<&Expr>) -> SqlResult<Source> {
+    let left_width = l.scope.row_width();
+    let mut scope = l.scope;
+    for mut side in r.scope.sides {
+        side.offset += left_width;
+        scope.sides.push(side);
+    }
+    if let Some(cond) = on {
+        check_expr(cond, &scope)?;
+    }
+    let mut rows = Vec::with_capacity(l.rows.len().saturating_mul(r.rows.len()));
+    for lr in &l.rows {
+        for rr in &r.rows {
+            let mut combined = lr.clone();
+            combined.extend_from_slice(rr);
+            if let Some(cond) = on {
+                // NULL/Unknown ON conditions drop the pair.
+                if !truthy(&eval(cond, &scope, &combined)?)? {
+                    continue;
+                }
+            }
+            rows.push(combined);
+        }
+    }
+    Ok(Source { scope, rows })
 }
 
 /// The FROM-scope side of one plain table reference.
