@@ -17,8 +17,40 @@ use crate::state::{self, RaftState, Shared};
 /// FSM key prefix under which schemas are stored.
 pub const CATALOG_PREFIX: &str = "sql_catalog/";
 
+/// FSM key prefix under which per-table AUTO_INCREMENT next-value
+/// counters live (`sql_sequence/<table>` -> decimal next id). Kept out
+/// of `sql_catalog/` so schema listing / tombstone id allocation never
+/// see counter values.
+pub const SEQUENCE_PREFIX: &str = "sql_sequence/";
+
 pub fn catalog_key(table: &str) -> String {
     format!("{CATALOG_PREFIX}{table}")
+}
+
+pub fn sequence_key(table: &str) -> String {
+    format!("{SEQUENCE_PREFIX}{table}")
+}
+
+/// Next AUTO_INCREMENT value of a table: the persisted decimal counter,
+/// or 1 for never-written / cleared (empty) entries. `i64` covers every
+/// integer column width the engine stores (TINYINT..BIGINT all map to
+/// `SqlType::Int`).
+pub fn sequence_next_raft(raft: &std::sync::RwLock<RaftState>, table: &str) -> i64 {
+    sequence_next_state(&raft.read().unwrap(), table)
+}
+
+/// [`sequence_next_raft`] over a bare state handle (callers that
+/// already hold the control-plane guard, e.g. the allocation RMW).
+pub fn sequence_next_state(state: &RaftState, table: &str) -> i64 {
+    state::raft_get(state, &sequence_key(table))
+        .parse::<i64>()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// `Shared`-shaped [`sequence_next_raft`].
+pub fn sequence_next(shared: &Shared, table: &str) -> i64 {
+    sequence_next_raft(&shared.raft, table)
 }
 
 /// DDL mutex holder: serializes schema mutation + table-id allocation on
@@ -52,18 +84,30 @@ impl CatalogTxn<'_> {
         let ticket = state::raft_apply_start(self.raft, &entry)?;
         state::raft_apply_await(ticket).await
     }
+
+    /// One raw FSM entry through the same replicated path (used for the
+    /// AUTO_INCREMENT next-value counter under `sql_sequence/`).
+    pub async fn put_kv(self, key: &str, value: &str) -> Result<(), String> {
+        let entry = RaftLogEntryData {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        let ticket = state::raft_apply_start(self.raft, &entry)?;
+        state::raft_apply_await(ticket).await
+    }
 }
 
 /// Begin a catalog mutation; fails fast on non-leaders, mirroring the RESP
-/// control-plane behavior ("not leader").
-pub fn begin(raft: &mut RaftState) -> Result<CatalogTxn<'_>, String> {
+/// control-plane behavior ("not leader"). `what` names the operation for
+/// the error message ("DDL", "AUTO_INCREMENT allocation", ...).
+pub fn begin<'a>(raft: &'a mut RaftState, what: &str) -> Result<CatalogTxn<'a>, String> {
     if !raft.is_leader {
         let hint = if raft.leader_addr.is_empty() {
             String::new()
         } else {
             format!(" (leader: {})", raft.leader_addr)
         };
-        return Err(format!("DDL requires the raft leader{hint}"));
+        return Err(format!("{what} requires the raft leader{hint}"));
     }
     Ok(CatalogTxn { raft })
 }
@@ -217,6 +261,7 @@ mod tests {
                 nullable: false,
             }],
             pk: "id".to_string(),
+            auto_increment: None,
             engine: Engine::Row,
             indexes: Vec::new(),
         })

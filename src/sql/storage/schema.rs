@@ -90,6 +90,11 @@ pub struct TableSchema {
     pub columns: Vec<ColumnDef>,
     /// Exactly one primary-key column in v1 (enforced at DDL time).
     pub pk: String,
+    /// AUTO_INCREMENT column name, when the table has one (MySQL
+    /// server-side id allocation on INSERT; see `exec/sequence.rs`).
+    /// Old catalog JSON without the field decodes as `None`.
+    #[serde(default)]
+    pub auto_increment: Option<String>,
     #[serde(default)]
     pub engine: Engine,
     #[serde(default)]
@@ -111,6 +116,14 @@ impl TableSchema {
     pub fn pk_index(&self) -> usize {
         self.column_index(&self.pk)
             .expect("schema validated at DDL: pk exists")
+    }
+
+    /// Position of the AUTO_INCREMENT column, if any (the name is
+    /// validated to exist at DDL time, so this never misses).
+    pub fn auto_increment_index(&self) -> Option<usize> {
+        self.auto_increment
+            .as_ref()
+            .and_then(|c| self.column_index(c))
     }
 
     /// Storage type of the primary-key column.
@@ -164,6 +177,7 @@ mod tests {
                 },
             ],
             pk: "id".into(),
+            auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
         }
@@ -182,5 +196,29 @@ mod tests {
         assert_eq!(s.column_index("V"), Some(1));
         assert_eq!(s.pk_index(), 0);
         assert_eq!(s.column_index("nope"), None);
+    }
+
+    /// Pre-AUTO_INCREMENT catalog JSON (no field) must keep loading as
+    /// `None` -- persisted catalogs exist on live clusters.
+    #[test]
+    fn old_catalog_json_without_auto_increment_loads_none() {
+        let js = serde_json::to_string(&demo()).expect("ser");
+        // Strip the field the way an old writer's JSON looks.
+        let old = js.replace(",\"auto_increment\":null", "");
+        let back: TableSchema = serde_json::from_str(&old).expect("de old json");
+        assert_eq!(back.auto_increment, None);
+        assert_eq!(back, demo());
+    }
+
+    #[test]
+    fn auto_increment_round_trip_and_index() {
+        let mut s = demo();
+        s.auto_increment = Some("ID".into());
+        let js = serde_json::to_string(&s).expect("ser");
+        let back: TableSchema = serde_json::from_str(&js).expect("de");
+        assert_eq!(back.auto_increment, Some("ID".into()));
+        // Name lookup stays case-insensitive for the AI column too.
+        assert_eq!(back.auto_increment_index(), Some(0));
+        assert_eq!(demo().auto_increment_index(), None);
     }
 }

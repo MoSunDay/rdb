@@ -16,6 +16,7 @@ use crate::sql::dist;
 use crate::sql::exec::expr::{coerce, eval, SingleTableScope};
 use crate::sql::exec::scan::{self, FromScope};
 use crate::sql::exec::select::{filter_rows, order_rows};
+use crate::sql::exec::sequence;
 use crate::sql::exec::{ExecOutcome, SqlSession};
 use crate::sql::index::maintain::{self, Transition};
 use crate::sql::index::RowSide;
@@ -45,9 +46,21 @@ pub async fn insert(
     if rows.is_empty() {
         return Ok(ExecOutcome::Affected(0));
     }
+    // AUTO_INCREMENT: the slot survives row building as NULL (the NOT
+    // NULL check defers to the allocator); allocation then rewrites it
+    // under the raft-replicated counter (see exec/sequence.rs).
+    let ai = schema.auto_increment_index();
     let mut full_rows = Vec::with_capacity(rows.len());
     for exprs in &rows {
-        full_rows.push(build_insert_row(&schema, &columns, exprs)?);
+        full_rows.push(build_insert_row(&schema, &columns, exprs, ai)?);
+    }
+    if let Some(idx) = ai {
+        let first_auto;
+        (full_rows, first_auto) = sequence::allocate(shared, &schema.name, full_rows, idx).await?;
+        if let Some(first) = first_auto {
+            sess.last_insert_id = first;
+            sequence::note_last_insert_id(first);
+        }
     }
     let n = full_rows.len() as u64;
     if schema.engine.is_columnar() {
@@ -477,11 +490,14 @@ fn matched_rows(
 /// Build one full-width row from an INSERT VALUES tuple: expand the
 /// given columns (missing columns become NULL), evaluate the value
 /// expressions (no row context -- column refs rejected), coerce to the
-/// column types and enforce NOT NULL.
+/// column types and enforce NOT NULL. `ai` is the AUTO_INCREMENT slot:
+/// its NULL check is deferred (the allocator assigns an id right after
+/// and never leaves NULL behind).
 fn build_insert_row(
     schema: &TableSchema,
     columns: &[String],
     exprs: &[Expr],
+    ai: Option<usize>,
 ) -> SqlResult<Vec<Value>> {
     for e in exprs {
         reject_col_refs(e)?;
@@ -526,7 +542,9 @@ fn build_insert_row(
     let mut out = Vec::with_capacity(schema.columns.len());
     for (i, col) in schema.columns.iter().enumerate() {
         let v = coerce(slots[i].take().unwrap_or(Value::Null), col.sql_type)?;
-        check_not_null(&v, &col.name, col.nullable)?;
+        if Some(i) != ai {
+            check_not_null(&v, &col.name, col.nullable)?;
+        }
         out.push(v);
     }
     Ok(out)

@@ -382,6 +382,21 @@ contract; module map lives in `agents/rust/sql.md`.
   col_pos)` so one index is contiguous in one slot band. NULLs unindexed. Unique is
   enforced at write/commit (1062); `CREATE UNIQUE INDEX` pre-checks existing rows (a race
   window vs concurrent writers is accepted and documented in-code). Single-column only.
+- **AUTO_INCREMENT**: one integer pk column per table (MySQL 1075 otherwise). The counter is
+  raft-replicated catalog state (`sql_sequence/<table>` = decimal next value; seeded at 1
+  by CREATE, cleared by DROP), so ids survive restarts and leadership changes. Allocation
+  is a serialized leader-only read-modify-write (same raft write guard as DDL — a
+  non-leader INSERT that must allocate ids fails with "AUTO_INCREMENT allocation requires
+  the raft leader"). Missing column / NULL / 0 auto-assign (MySQL default sql_mode: 0
+  means auto); an explicit value >= the running floor bumps the floor to value+1
+  immediately (later rows of the same statement continue above it); below-floor and
+  non-positive explicit values are kept verbatim (except 0). Every auto-allocating
+  statement reserves a batch of 64 ids ahead (gaps accepted, like MySQL); explicit-only
+  statements persist exactly value+1. `LAST_INSERT_ID()` returns the first id the
+  connection auto-generated and `LAST_INSERT_ID(n)` sets-and-returns n; because
+  expression evaluation cannot see the session, the value additionally lives in a
+  process-wide atomic mirror — connections in ONE process share it (a deliberate v1
+  deviation), and the result column's metadata is VARCHAR rather than BIGINT.
 - **Planner**: sargable `=`/`IN`/`BETWEEN` on an indexed column -> pk lookup (>1000 pks or
   no index -> SeqScan). In cluster mode the index path is disabled (v1) and EXPLAIN shows
   `Gather(bands=N)` over `SeqScan`.
