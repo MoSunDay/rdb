@@ -177,6 +177,9 @@ pub fn has_agg(e: &Expr) -> bool {
     match e {
         Expr::Agg { .. } => true,
         Expr::Lit(_) | Expr::Placeholder | Expr::Col { .. } => false,
+        // Subqueries hoist out before evaluation; their aggregates
+        // belong to the inner query, not this one.
+        Expr::Subquery(_) | Expr::InSubquery { .. } => false,
         Expr::BinaryOp { left, right, .. } => has_agg(left) || has_agg(right),
         Expr::Not(x) | Expr::Neg(x) => has_agg(x),
         Expr::IsNull { expr, .. } => has_agg(expr),

@@ -14,10 +14,15 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   shim（query/prepare/execute 到 `exec::execute` 的桥）、会话变量拦截（`vars.rs`，
   `SELECT @@var`）、连接收尾回滚未决事务（`serve.rs`）。
 - `parse/`：sqlparser 驱动的 AST→内部 IR（`translate.rs`），错误码→MySQL 错误号
-  （`error.rs`：1213 写写冲突、1062 唯一冲突、1027 节点不可达等）。
+  （`error.rs`：1213 写写冲突、1062 唯一冲突、1027 节点不可达等）；`query.rs`
+  （复合查询翻译：UNION [ALL]/WITH CTE/派生表——INTERSECT/EXCEPT/BY NAME/
+  WITH RECURSIVE 1235 大声拒绝）。
 - `exec/`：执行器——`mod.rs`（`execute` 入口 + `SqlSession`）、`write.rs`（DML 与
-  写集生成）、`select.rs`/`scan.rs`（FROM 物化 + 事务叠合）、`agg.rs`、`expr.rs`、
-  `show.rs`、`render.rs`（EXPLAIN）、`ddl.rs`（目录写 + 索引回填）、`sequence.rs`
+  写集生成）、`select.rs`（`run_at` 单一咽喉：子查询改写 + 锁 veto）/`scan.rs`
+  （FROM 物化 + 事务叠合，带 `CteScope`）、`set_ops.rs`（复合查询执行：CTE 物化、
+  UNION 拼装/去重/拓宽）、`relation.rs`（`Relation` + CTE 作用域）、`subquery.rs`
+  （标量/IN 子查询提升改写）、`agg.rs`、`expr.rs`、`show.rs`、`render.rs`（EXPLAIN，
+  含复合计划）、`ddl.rs`（目录写 + 索引回填）、`sequence.rs`
   （AUTO_INCREMENT 分配：leader 串行 RMW + 批量预留 64、`LAST_INSERT_ID()`）。
 - `storage/`：`row.rs`（版本键 `<slot>/ 0x20 table_id pk !ts`、header 0x01/0x00/0x02）、
   `codec.rs`（typed 编解码 + kind 常量 0x20/0x21/0x22）、`schema.rs`、`catalog.rs`

@@ -568,6 +568,10 @@ fn reject_col_refs(e: &Expr) -> SqlResult<()> {
             format!("column '{name}' is not allowed in VALUES"),
         )),
         Expr::Lit(_) | Expr::Placeholder | Expr::Agg { arg: None, .. } => Ok(()),
+        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::new(
+            ErrorCode::NotSupported,
+            "subqueries are not allowed in VALUES",
+        )),
         Expr::Agg { arg: Some(a), .. } => reject_col_refs(a),
         Expr::Func { args, .. } => {
             for a in args {
