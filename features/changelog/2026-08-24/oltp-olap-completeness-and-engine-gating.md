@@ -46,10 +46,14 @@ UPDATE / FOR SHARE` 被静默降级为普通读，破坏 snapshot-isolation 语�
 | dropped 行超 watermark 全删（含 live anchor） | `dropped_*` 4 例 | `src/sql/storage/tests_gc.rs` |
 | dropped 表索引键被清 / 不影响他表 | `dropped_*` 4 例 | `src/sql/storage/tests_gc.rs` |
 | 坏 catalog 条目保留段 meta（三态 Err 分支） | `unreadable_catalog_entry_keeps_metas` | `src/sql/columnar/tests_gc.rs` |
+| DROP→重建 id 单调不复用（含变异验证：回退 live-max 即复现 id 复用） | `table_ids_stay_monotone_across_drop_recreate` | `src/sql/exec/ddl.rs` |
+| 墓碑 id 两个 raft 视图（stub kv / FSM live_kv）均参与分配 | `next_table_id_is_monotone_over_stub_kv_tombstones`、`dropped_ids_reads_the_fsm_live_kv_view` | `src/sql/storage/catalog.rs` |
 | 2PC 并发乱序 | 既有 gather 用例扩展 | `src/sql/dist/gather_tests.rs` |
 
 - 全量回归：`cargo test --workspace` → **855 passed / 0 failed**
   （lib 692 + main 4 + e2e 159；仓库实际总数，非原预估 864）
+- 复核补证（表 id 单调化定向验证 +3 用例）后重跑：**872 passed /
+  0 failed**（lib 695 + main 4 + e2e 173），clippy/fmt 干净
 - clippy：`cargo clippy --all-targets` → 0 告警；`cargo fmt --check` 干净
 - 行数：session.rs <800、gc.rs <800、catalog.rs <800，其余新改文件 ≤400
 
