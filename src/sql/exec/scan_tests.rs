@@ -254,10 +254,10 @@ fn seed_join_sides(shared: &Shared) {
     let r = schema(2, "r");
     seed_catalog(shared, &l);
     seed_catalog(shared, &r);
-    put_version(&shared, &l, 1, 1, Some(row_of(1, "a")));
-    put_version(&shared, &l, 2, 1, Some(row_of(2, "b")));
-    put_version(&shared, &r, 1, 1, Some(row_of(1, "x")));
-    put_version(&shared, &r, 3, 1, Some(row_of(3, "z")));
+    put_version(shared, &l, 1, 1, Some(row_of(1, "a")));
+    put_version(shared, &l, 2, 1, Some(row_of(2, "b")));
+    put_version(shared, &r, 1, 1, Some(row_of(1, "x")));
+    put_version(shared, &r, 3, 1, Some(row_of(3, "z")));
 }
 
 fn join_rows(kind: JoinKind, on: Option<Expr>, using: &[&str]) -> Vec<Vec<Value>> {
