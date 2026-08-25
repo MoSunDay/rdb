@@ -400,6 +400,17 @@ contract; module map lives in `agents/rust/sql.md`.
 - **Planner**: sargable `=`/`IN`/`BETWEEN` on an indexed column -> pk lookup (>1000 pks or
   no index -> SeqScan). In cluster mode the index path is disabled (v1) and EXPLAIN shows
   `Gather(bands=N)` over `SeqScan`.
+- **Query language**: `UNION [ALL]` over SELECTs (column arity checked, INT|DOUBLE columns
+  widen to DOUBLE, plain UNION dedups with NULLs equal, result names from the left operand),
+  non-recursive `WITH` CTEs (case-insensitive, later definitions shadow, optional column
+  alias list), derived tables (`FROM (SELECT ...) alias`), scalar subqueries and
+  `IN (SELECT ...)` (hoisted and materialized before execution), and FROM-less SELECT
+  (`SELECT 1`) are supported; every operand runs through the normal pipeline, so in a
+  ready cluster each operand gathers cluster-wide before the coordinator composes.
+  Trailing ORDER BY (ordinals allowed)/LIMIT/OFFSET apply to the whole compound. Loudly
+  rejected (MySQL 1235): INTERSECT/EXCEPT/MINUS, `BY NAME` set quantifiers,
+  `WITH RECURSIVE`, correlated subqueries, LATERAL derived tables, and derived tables
+  without an alias.
 - **2PC writes**: any node accepts DML; the coordinator groups the pre-encoded batch by
   slot-band owner, PREPAREs (0x02 headers + unique entries + durable participant marker,
   one atomic RocksDB batch per participant), durably records the decision, then DECIDEs

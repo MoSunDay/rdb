@@ -292,8 +292,15 @@ mod tests {
 
     #[test]
     fn unsupported_is_explicit() {
-        let e = parse_statement("SELECT * FROM t UNION SELECT * FROM t2").expect_err("u");
+        let e = parse_statement("SELECT * FROM t EXCEPT SELECT * FROM t2").expect_err("e");
         assert!(e.msg.contains("not supported"), "{e}");
-        assert!(parse_statement("SELECT 1").is_err()); // no FROM in v1
+        assert!(parse_statement("SELECT * FROM t INTERSECT SELECT * FROM t2").is_err());
+        assert!(parse_statement("WITH RECURSIVE r (n) AS (SELECT 1) SELECT n FROM r").is_err());
+        // FROM-less SELECT and UNION are supported since phase 1.
+        assert!(parse_statement("SELECT 1").is_ok());
+        assert!(matches!(
+            parse_statement("SELECT * FROM t UNION SELECT * FROM t2"),
+            Ok(Statement::SelectCompound(_))
+        ));
     }
 }

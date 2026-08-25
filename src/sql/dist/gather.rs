@@ -111,6 +111,10 @@ fn join_gathers(shared: &Shared, tref: &TableRef) -> bool {
         TableRef::Join { left, right, .. } => {
             join_gathers(shared, left) || join_gathers(shared, right)
         }
+        // Derived tables materialize on this node (their own FROM
+        // gathers if clustered); they are never gather targets.
+        TableRef::Derived { .. } => false,
+        TableRef::NoTable => false,
     }
 }
 
@@ -127,6 +131,7 @@ pub async fn materialize(
     read_ts: u64,
     txn: Option<&Txn>,
     filter: Option<&Expr>,
+    ctes: &crate::sql::exec::relation::CteScope,
 ) -> SqlResult<Source> {
     // JOIN trees: every side materializes gather-aware (row tables per
     // band, columnar to every member) and the shared nested loop runs
@@ -141,8 +146,8 @@ pub async fn materialize(
         using,
     } = tref
     {
-        let l = Box::pin(materialize(shared, left, read_ts, txn, None)).await?;
-        let r = Box::pin(materialize(shared, right, read_ts, txn, None)).await?;
+        let l = Box::pin(materialize(shared, left, read_ts, txn, None, ctes)).await?;
+        let r = Box::pin(materialize(shared, right, read_ts, txn, None, ctes)).await?;
         return scan::join_sources(l, r, *kind, on.as_ref(), using);
     }
     // Columnar tables: segments commit where the txn closed, so a
@@ -150,6 +155,10 @@ pub async fn materialize(
     // bands); single-node reads stay on the local segment scan. The
     // residual filter applies downstream, exactly like band gathers.
     if let TableRef::Table { name, alias } = tref {
+        if ctes.lookup(name).is_some() {
+            // CTEs are in-memory relations on this node: never gather.
+            return scan::materialize(shared, tref, read_ts, txn, filter, ctes).await;
+        }
         let schema = catalog::lookup(shared, name)
             .map_err(SqlError::from)?
             .ok_or_else(|| SqlError::no_such_table(name))?;
@@ -171,10 +180,10 @@ pub async fn materialize(
         }
     }
     let TableRef::Table { name, alias } = tref else {
-        return scan::materialize(shared, tref, read_ts, txn, filter);
+        return scan::materialize(shared, tref, read_ts, txn, filter, ctes).await;
     };
     let Some(bs) = gatherable(shared, tref) else {
-        return scan::materialize(shared, tref, read_ts, txn, filter);
+        return scan::materialize(shared, tref, read_ts, txn, filter, ctes).await;
     };
     let schema = catalog::lookup(shared, name)
         .map_err(SqlError::from)?

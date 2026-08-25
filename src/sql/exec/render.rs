@@ -4,7 +4,9 @@
 //! touches storage or evaluates anything.
 
 use crate::sql::exec::{ColMeta, ExecOutcome};
-use crate::sql::parse::ast::{BinOp, Expr, JoinKind, Query, SelectItem, Statement, TableRef};
+use crate::sql::parse::ast::{
+    BinOp, CompoundQuery, Expr, JoinKind, Query, QueryBody, SelectItem, Statement, TableRef,
+};
 use crate::sql::parse::error::SqlResult;
 use crate::sql::storage::schema::{SqlType, Value};
 
@@ -18,6 +20,14 @@ pub fn expr_display(e: &Expr) -> String {
         },
         Expr::Lit(v) => lit_display(v),
         Expr::Placeholder => "?".to_string(),
+        Expr::Subquery(_) => "(SELECT ...)".to_string(),
+        Expr::InSubquery { negated, .. } => {
+            if *negated {
+                "<expr> NOT IN (SELECT ...)".to_string()
+            } else {
+                "<expr> IN (SELECT ...)".to_string()
+            }
+        }
         Expr::BinaryOp { left, op, right } => {
             format!(
                 "{} {} {}",
@@ -137,6 +147,7 @@ fn agg_name(f: &crate::sql::parse::ast::AggFunc) -> &'static str {
 pub fn explain(stmt: &Statement, headline: Vec<String>) -> SqlResult<ExecOutcome> {
     let lines = match stmt {
         Statement::Select(q) => explain_select(q, headline),
+        Statement::SelectCompound(cq) => explain_compound(cq, headline),
         other => vec![format!("Direct execution ({})", other.metric_kind())],
     };
     Ok(ExecOutcome::Rows {
@@ -147,6 +158,55 @@ pub fn explain(stmt: &Statement, headline: Vec<String>) -> SqlResult<ExecOutcome
         }],
         rows: lines.into_iter().map(|l| vec![Value::Str(l)]).collect(),
     })
+}
+
+/// Compound plan: set-operation tree over operand plans. Each
+/// operand renders its own pipeline (CTEs first, like MySQL's EXPLAIN
+/// lists them as derived tables).
+fn explain_compound(cq: &CompoundQuery, headline: Vec<String>) -> Vec<String> {
+    let mut lines = headline;
+    for cte in &cq.ctes {
+        let mut plan = explain_compound(&cte.query, Vec::new());
+        for l in plan.drain(..) {
+            lines.push(format!("CTE {}: {}", cte.name, l));
+        }
+    }
+    lines.extend(explain_body(&cq.body));
+    if !cq.order_by.is_empty() {
+        let keys = cq
+            .order_by
+            .iter()
+            .map(|k| {
+                let dir = if k.asc { "" } else { " DESC" };
+                format!("{}{}", expr_display(&k.expr), dir)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("Sort: {keys}"));
+    }
+    if let Some(l) = cq.limit {
+        lines.push(format!("Limit: {l} offset {}", cq.offset));
+    } else if cq.offset > 0 {
+        lines.push(format!("Offset: {}", cq.offset));
+    }
+    lines
+}
+
+fn explain_body(b: &QueryBody) -> Vec<String> {
+    match b {
+        QueryBody::Select(q) => explain_select(q, Vec::new()),
+        QueryBody::Nested(inner) => explain_compound(inner, Vec::new()),
+        QueryBody::Union { left, right, all } => {
+            let mut lines = explain_body(left);
+            lines.push(if *all {
+                "Union-All".to_string()
+            } else {
+                "Union-Distinct".to_string()
+            });
+            lines.extend(explain_body(right));
+            lines
+        }
+    }
 }
 
 fn explain_select(q: &Query, headline: Vec<String>) -> Vec<String> {
@@ -227,6 +287,8 @@ pub(crate) fn from_display(t: &TableRef) -> String {
             Some(a) => format!("{name} AS {a}"),
             None => name.clone(),
         },
+        TableRef::NoTable => "(no table)".to_string(),
+        TableRef::Derived { alias, .. } => format!("(SELECT ...) AS {alias}"),
         TableRef::Join {
             left, right, kind, ..
         } => {
@@ -271,6 +333,7 @@ fn collect_aggs(e: &Expr, out: &mut Vec<String>) {
     match e {
         Expr::Agg { .. } => out.push(expr_display(e)),
         Expr::Lit(_) | Expr::Placeholder | Expr::Col { .. } => {}
+        Expr::Subquery(_) | Expr::InSubquery { .. } => {}
         Expr::BinaryOp { left, right, .. } => {
             collect_aggs(left, out);
             collect_aggs(right, out);

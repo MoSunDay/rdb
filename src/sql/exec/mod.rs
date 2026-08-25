@@ -8,11 +8,14 @@
 pub mod agg;
 pub mod ddl;
 pub mod expr;
+pub mod relation;
 pub mod render;
 pub mod scan;
 pub mod select;
 pub mod sequence;
+pub mod set_ops;
 pub mod show;
+pub mod subquery;
 pub mod write;
 
 use crate::sql::parse::ast::Statement;
@@ -127,6 +130,10 @@ async fn dispatch(
         Statement::Delete { .. } => write::delete(shared, sess, stmt).await,
         Statement::Select(q) => {
             let (columns, rows) = select::run(shared, sess, q).await?;
+            Ok(ExecOutcome::Rows { columns, rows })
+        }
+        Statement::SelectCompound(cq) => {
+            let (columns, rows) = set_ops::run_statement(shared, sess, &cq).await?;
             Ok(ExecOutcome::Rows { columns, rows })
         }
         Statement::Explain(inner) => select::explain(shared, &inner),

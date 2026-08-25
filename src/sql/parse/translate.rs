@@ -35,6 +35,7 @@ pub fn placeholder_count(stmt: &Statement) -> usize {
         match x {
             Expr::Placeholder => 1,
             Expr::Lit(_) | Expr::Col { .. } => 0,
+            Expr::Subquery(cq) | Expr::InSubquery { query: cq, .. } => count_compound(cq),
             Expr::BinaryOp { left, right, .. } => count_expr(left) + count_expr(right),
             Expr::Not(x) | Expr::Neg(x) => count_expr(x),
             Expr::IsNull { expr, .. } => count_expr(expr),
@@ -66,8 +67,34 @@ pub fn placeholder_count(stmt: &Statement) -> usize {
                 .map(|k| count_expr(&k.expr))
                 .sum::<usize>()
     }
+    fn count_compound(cq: &CompoundQuery) -> usize {
+        cq.ctes
+            .iter()
+            .map(|c| count_compound(&c.query))
+            .sum::<usize>()
+            + count_body(&cq.body)
+            + cq.order_by
+                .iter()
+                .map(|k| count_expr(&k.expr))
+                .sum::<usize>()
+    }
+    fn count_body(b: &QueryBody) -> usize {
+        match b {
+            QueryBody::Select(q) => count_query(q) + count_from(&q.from),
+            QueryBody::Nested(inner) => count_compound(inner),
+            QueryBody::Union { left, right, .. } => count_body(left) + count_body(right),
+        }
+    }
+    fn count_from(t: &TableRef) -> usize {
+        match t {
+            TableRef::Table { .. } | TableRef::NoTable => 0,
+            TableRef::Derived { query, .. } => count_compound(query),
+            TableRef::Join { left, right, .. } => count_from(left) + count_from(right),
+        }
+    }
     match stmt {
-        Statement::Select(q) => count_query(q),
+        Statement::Select(q) => count_query(q) + count_from(&q.from),
+        Statement::SelectCompound(cq) => count_compound(cq),
         Statement::Insert { rows, .. } => rows.iter().flat_map(|r| r.iter().map(count_expr)).sum(),
         Statement::Update {
             assignments,
@@ -102,6 +129,11 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
                 *next += 1;
             }
             Expr::Lit(_) | Expr::Col { .. } => {}
+            Expr::Subquery(cq) => bind_compound(cq, next, values),
+            Expr::InSubquery { expr, query, .. } => {
+                bind(expr, next, values);
+                bind_compound(query, next, values);
+            }
             Expr::BinaryOp { left, right, .. } => {
                 bind(left, next, values);
                 bind(right, next, values);
@@ -156,8 +188,44 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
             bind(&mut k.expr, next, values);
         }
     }
+    fn bind_compound(cq: &mut CompoundQuery, next: &mut usize, values: &[Value]) {
+        for cte in &mut cq.ctes {
+            bind_compound(&mut cte.query, next, values);
+        }
+        bind_body(&mut cq.body, next, values);
+        for k in &mut cq.order_by {
+            bind(&mut k.expr, next, values);
+        }
+    }
+    fn bind_body(b: &mut QueryBody, next: &mut usize, values: &[Value]) {
+        match b {
+            QueryBody::Select(q) => {
+                bind_query(q, next, values);
+                bind_from(&mut q.from, next, values);
+            }
+            QueryBody::Nested(inner) => bind_compound(inner, next, values),
+            QueryBody::Union { left, right, .. } => {
+                bind_body(left, next, values);
+                bind_body(right, next, values);
+            }
+        }
+    }
+    fn bind_from(t: &mut TableRef, next: &mut usize, values: &[Value]) {
+        match t {
+            TableRef::Table { .. } | TableRef::NoTable => {}
+            TableRef::Derived { query, .. } => bind_compound(query, next, values),
+            TableRef::Join { left, right, .. } => {
+                bind_from(left, next, values);
+                bind_from(right, next, values);
+            }
+        }
+    }
     match stmt {
-        Statement::Select(q) => bind_query(q, &mut next, values),
+        Statement::Select(q) => {
+            bind_query(q, &mut next, values);
+            bind_from(&mut q.from, &mut next, values);
+        }
+        Statement::SelectCompound(cq) => bind_compound(cq, &mut next, values),
         Statement::Insert { rows, .. } => {
             for row in rows {
                 for v in row {
@@ -207,9 +275,20 @@ pub(crate) fn object_name(name: &ObjectName) -> SqlResult<String> {
 
 fn translate(stmt: SqlStatement) -> SqlResult<Statement> {
     match stmt {
-        SqlStatement::Query(q) => Ok(Statement::Select(
-            crate::sql::parse::query::translate_query(&q)?,
-        )),
+        SqlStatement::Query(q) => {
+            // Plain lock-bearing SELECT keeps the fast path; CTE /
+            // UNION / parenthesized shapes go through the compound
+            // query expression.
+            if q.with.is_none() && matches!(q.body.as_ref(), sqlparser::ast::SetExpr::Select(_)) {
+                Ok(Statement::Select(
+                    crate::sql::parse::query::translate_query(&q)?,
+                ))
+            } else {
+                Ok(Statement::SelectCompound(Box::new(
+                    crate::sql::parse::query::translate_compound(&q)?,
+                )))
+            }
+        }
         SqlStatement::Insert(i) => translate_insert(i),
         SqlStatement::Update(u) => translate_update(u),
         SqlStatement::Delete(d) => translate_delete(d),

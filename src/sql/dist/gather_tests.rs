@@ -1,4 +1,5 @@
 use super::*;
+use crate::sql::exec::relation::CteScope;
 use crate::sql::storage::catalog::catalog_key;
 use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
 use crate::sql::tx;
@@ -177,7 +178,9 @@ async fn gather_merges_bands_disjointly() {
 
     // read_ts = 5: old values, the not-yet-deleted row (deleted at ts
     // 9) included with its live-at-5 value.
-    let src = materialize(&a, &tref("g"), 5, None, None).await.unwrap();
+    let src = materialize(&a, &tref("g"), 5, None, None, &CteScope::default())
+        .await
+        .unwrap();
     let mut expect: BTreeMap<Vec<u8>, Vec<Value>> = BTreeMap::new();
     for pk in 1..=40i64 {
         let key = row::pk_encode(&Value::Int(pk)).unwrap();
@@ -191,7 +194,9 @@ async fn gather_merges_bands_disjointly() {
     );
 
     // read_ts = 10: new values, deleted pk gone -- exactly once each.
-    let src = materialize(&a, &tref("g"), 10, None, None).await.unwrap();
+    let src = materialize(&a, &tref("g"), 10, None, None, &CteScope::default())
+        .await
+        .unwrap();
     expect.clear();
     for pk in 1..=40i64 {
         let key = row::pk_encode(&Value::Int(pk)).unwrap();
@@ -207,7 +212,7 @@ async fn gather_merges_bands_disjointly() {
     };
     tx::stage_upsert(&mut txn, &s, row_of(99, "staged")).unwrap();
     tx::stage_delete(&mut txn, &s, row::pk_encode(&Value::Int(1)).unwrap()).unwrap();
-    let src = materialize(&a, &tref("g"), 10, Some(&txn), None)
+    let src = materialize(&a, &tref("g"), 10, Some(&txn), None, &CteScope::default())
         .await
         .unwrap();
     let ids: Vec<i64> = src
@@ -245,7 +250,7 @@ async fn unreachable_node_fails_the_whole_read() {
     // Local rows exist: partial results would be silently wrong.
     put_version(&a, &s, 1, 3, Some(row_of(1, "local")));
 
-    let err = materialize(&a, &tref("g"), 10, None, None)
+    let err = materialize(&a, &tref("g"), 10, None, None, &CteScope::default())
         .await
         .expect_err("remote is down");
     assert_eq!(err.code, ErrorCode::NodeUnreachable);
@@ -290,7 +295,9 @@ async fn columnar_fanout_unions_every_node() {
     tokio::spawn(super::super::server::serve_on(listener, Arc::new(b)));
     register_node(&a, "127.0.0.1:33112", &sql_rpc);
 
-    let src = materialize(&a, &tref("cg"), 10, None, None).await.unwrap();
+    let src = materialize(&a, &tref("cg"), 10, None, None, &CteScope::default())
+        .await
+        .unwrap();
     assert_eq!(src.scope.sides.len(), 1);
     assert_eq!(src.scope.sides[0].qualifier, "cg");
     let mut got = src.rows.clone();
@@ -301,7 +308,9 @@ async fn columnar_fanout_unions_every_node() {
     assert_eq!(got, vec![row_of(1, "from-a"), row_of(2, "from-b")]);
 
     // read_ts cutoff applies on the remote side too (ts 6 > 5).
-    let src = materialize(&a, &tref("cg"), 5, None, None).await.unwrap();
+    let src = materialize(&a, &tref("cg"), 5, None, None, &CteScope::default())
+        .await
+        .unwrap();
     assert_eq!(src.rows, vec![row_of(1, "from-a")]);
 
     // The coordinator appends the open txn's staged appends last.
@@ -312,7 +321,7 @@ async fn columnar_fanout_unions_every_node() {
     };
     txn.appends
         .insert("cg".to_string(), vec![row_of(3, "staged")]);
-    let src = materialize(&a, &tref("cg"), 10, Some(&txn), None)
+    let src = materialize(&a, &tref("cg"), 10, Some(&txn), None, &CteScope::default())
         .await
         .unwrap();
     assert_eq!(src.rows.len(), 3);
@@ -341,7 +350,7 @@ async fn columnar_fanout_fails_whole_read_when_node_unreachable() {
     set_topology(&a, &["127.0.0.1:33113", peer]);
     register_node(&a, peer, &flaky);
 
-    let err = materialize(&a, &tref("cd"), 10, None, None)
+    let err = materialize(&a, &tref("cd"), 10, None, None, &CteScope::default())
         .await
         .expect_err("remote is down");
     assert_eq!(err.code, ErrorCode::NodeUnreachable);

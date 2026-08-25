@@ -10,8 +10,10 @@
 use crate::sql::dist::gather;
 use crate::sql::exec::agg::{eval_in_group, has_agg, Unit};
 use crate::sql::exec::expr::{cmp_values, eval, truthy};
+use crate::sql::exec::relation::CteScope;
 use crate::sql::exec::render;
 use crate::sql::exec::scan::{self, FromScope, Source};
+use crate::sql::exec::subquery::SubqCtx;
 use crate::sql::exec::{ColMeta, ExecOutcome, SqlSession};
 use crate::sql::parse::ast::{
     AggFunc, BinOp, Expr, OrderKey, Query, SelectItem, Statement, TableRef,
@@ -20,6 +22,7 @@ use crate::sql::parse::error::SqlResult;
 use crate::sql::plan;
 use crate::sql::storage::schema::{SqlType, Value};
 use crate::sql::tx::latch;
+use crate::sql::tx::Txn;
 use crate::state::Shared;
 
 /// Execute a SELECT as a snapshot read. Autocommit reads run at the
@@ -30,25 +33,50 @@ pub async fn run(
     sess: &SqlSession,
     q: Query,
 ) -> SqlResult<(Vec<ColMeta>, Vec<Vec<Value>>)> {
-    // Locking reads (FOR UPDATE / FOR SHARE) latch matched rows in
-    // this process only -- a cluster gather cannot hold latches on
-    // remote bands, so those topologies veto the statement loudly.
-    if q.lock.is_some() && gather::headline(shared, &q.from).is_some() {
-        return Err(latch::cluster_veto());
-    }
     let (read_ts, txn) = match sess.txn.as_ref() {
         Some(t) => (t.read_ts, Some(t)),
         None => (shared.sql_ts.now(), None),
     };
+    let ctes = CteScope::default();
+    run_at(shared, read_ts, txn, &q, &ctes).await
+}
+
+/// Scope-aware select core shared with the compound path: CTE names
+/// resolve before the catalog, and the snapshot is the caller's (a
+/// compound's operands all read at the same timestamp).
+pub async fn run_at(
+    shared: &Shared,
+    read_ts: u64,
+    txn: Option<&Txn>,
+    q: &Query,
+    ctes: &CteScope,
+) -> SqlResult<(Vec<ColMeta>, Vec<Vec<Value>>)> {
+    // Locking reads (FOR UPDATE / FOR SHARE) latch matched rows in
+    // this process only -- a cluster gather cannot hold latches on
+    // remote bands, so those topologies veto the statement loudly.
+    // CTE / derived sides are local relations, never gatherable.
+    if q.lock.is_some() && gather::headline(shared, &q.from).is_some() {
+        return Err(latch::cluster_veto());
+    }
+    // Hoist subqueries (scalar -> literal, IN (SELECT ...) -> IN list)
+    // before anything downstream sees the tree: the filter feeds the
+    // planner pushdown, projection/order eval, and the latch matcher.
+    let subq = SubqCtx {
+        shared,
+        read_ts,
+        txn,
+        ctes,
+    };
+    let q = &crate::sql::exec::subquery::rewrite_query(q, &subq).await?;
     // Multi-node clusters read scatter-gather (falls back to the local
     // scan path for joins / single-node topologies).
-    let src = gather::materialize(shared, &q.from, read_ts, txn, q.filter.as_ref()).await?;
+    let src = gather::materialize(shared, &q.from, read_ts, txn, q.filter.as_ref(), ctes).await?;
     // ---- locking-read hook (isolated block; nothing below changes) ----
     // Explicit txn: latches carry the txn's id and release at COMMIT /
     // ROLLBACK (or ROLLBACK TO, keeping pre-savepoint ones). Autocommit:
     // an ephemeral owner releases at statement end, so the statement is
     // a plain read that only fails fast on live conflicts.
-    let stmt_scope: Option<u64> = match (q.lock, sess.txn.as_ref()) {
+    let stmt_scope: Option<u64> = match (q.lock, txn) {
         (Some(lock), Some(t)) => {
             latch::lock_matched(shared, &src, q.filter.as_ref(), lock, t.id)?;
             None
@@ -60,7 +88,7 @@ pub async fn run(
         }
         (None, _) => None,
     };
-    let out = execute_query(&q, &src);
+    let out = execute_query(q, &src);
     if let Some(id) = stmt_scope {
         latch::release_owner(id);
     }
@@ -315,6 +343,8 @@ fn output_name(expr: &Expr, alias: &Option<String>, scope: &FromScope) -> (Strin
 fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
     match e {
         Expr::Lit(v) => v.sql_type().unwrap_or(SqlType::VarChar),
+        Expr::Subquery(_) | Expr::InSubquery { .. } => SqlType::VarChar, // rewritten pre-typing
+
         Expr::Col { table, name } => scope
             .resolve_checked(table.as_deref(), name)
             .ok()
