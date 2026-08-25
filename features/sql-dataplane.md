@@ -24,7 +24,8 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   写入整体失败，不留半行数据；重启后自动恢复在疑事务。
 - 分布式读：单表 SELECT 从各节点按 slot band 并发拉取后合并过滤；任一数据节点
   不可达则查询报错（不返回部分结果）。
-- 限制（v1）：集群模式下索引点查与 JOIN 暂走全表 gather；SQL 读路径不参与
+- 限制（v1）：集群模式下索引点查暂不可用（退化为全表 gather；JOIN 两侧均按
+  gather 物化后在协调者做嵌套循环，EXPLAIN 显示 `Gather(join)`）；SQL 读路径不参与
   RESP 侧 HA 故障切换。
 
 ## 配置

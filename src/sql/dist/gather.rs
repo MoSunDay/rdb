@@ -22,11 +22,15 @@
 //!   pipeline (filter, aggregates/GROUP BY, order, limit) run on the
 //!   coordinator over the MERGED rows -- single code path, single
 //!   node behavior when the cluster is not ready.
-//! - v1 scope: plain single-table FROMs only (JOINs keep the local
-//!   nested-loop materialization) and no index usage in cluster mode
-//!   (a node's secondary indexes only cover its band, so an
-//!   IndexLookup could silently miss remote rows -- the planner is
-//!   bypassed entirely on the gather path).
+//! - JOINs materialize each side with this same gather logic (row
+//!   tables per band, columnar tables to every member) and then run
+//!   the shared nested loop (`scan::join_sources`) on the coordinator
+//!   -- a join reading only the local node's slice of a side would be
+//!   silent partial data, so joins NEVER fall back to local scans in
+//!   a ready cluster. No index usage in cluster mode remains (a
+//!   node's secondary indexes only cover its band, so an IndexLookup
+//!   could silently miss remote rows -- the planner is bypassed
+//!   entirely on the gather path).
 //! - Columnar tables fan out to EVERY member instead of slot bands:
 //!   segments commit where the txn closed, so any node may hold some
 //!   of the table's segments. Each node answers one `ScanColumnar`
@@ -62,10 +66,12 @@ use crate::state::Shared;
 
 /// Scatter-gather applies to this FROM when the cluster is ready with
 /// more than one node and the FROM is one plain table; the answer is
-/// the per-owner band list (this node's band included).
+/// the per-owner band list (this node's band included). JOIN trees
+/// are answered per-side by `materialize` (see `join_gathers` for the
+/// EXPLAIN verdict), not by this function.
 pub fn gatherable(shared: &Shared, tref: &TableRef) -> Option<Vec<Band>> {
     let TableRef::Table { .. } = tref else {
-        return None; // joins stay local-scan v1
+        return None; // join trees gather per-side in `materialize`
     };
     let r = routing(shared)?;
     (r.addrs.len() > 1).then(|| bands(&r))
@@ -73,7 +79,8 @@ pub fn gatherable(shared: &Shared, tref: &TableRef) -> Option<Vec<Band>> {
 
 /// EXPLAIN headline of the distributed plan ("Gather(bands=N)", or
 /// "Gather(columnar, nodes=N)" when the FROM is a plain columnar
-/// table, which fans out to every member instead of slot bands).
+/// table, which fans out to every member instead of slot bands; a
+/// JOIN tree whose sides fan out reads "Gather(join)").
 pub fn headline(shared: &Shared, tref: &TableRef) -> Option<String> {
     if let TableRef::Table { name, .. } = tref {
         if let Ok(Some(schema)) = catalog::lookup(shared, name) {
@@ -84,14 +91,36 @@ pub fn headline(shared: &Shared, tref: &TableRef) -> Option<String> {
             }
         }
     }
+    if matches!(tref, TableRef::Join { .. }) && join_gathers(shared, tref) {
+        return Some("Gather(join)".to_string());
+    }
     gatherable(shared, tref).map(|bs| format!("Gather(bands={})", bs.len()))
 }
 
+/// Whether any leaf table of a JOIN tree fans out in the current
+/// topology (row tables per band, columnar tables to every member) --
+/// the EXPLAIN verdict mirroring what `materialize` will do per-side.
+fn join_gathers(shared: &Shared, tref: &TableRef) -> bool {
+    match tref {
+        TableRef::Table { name, .. } => match catalog::lookup(shared, name) {
+            Ok(Some(s)) if s.engine.is_columnar() => {
+                routing(shared).is_some_and(|r| r.addrs.len() > 1)
+            }
+            _ => gatherable(shared, tref).is_some(),
+        },
+        TableRef::Join { left, right, .. } => {
+            join_gathers(shared, left) || join_gathers(shared, right)
+        }
+    }
+}
+
 /// Gather-aware FROM materialization for SELECTs. Single plain table
-/// in a ready multi-node cluster -> band scatter-gather; everything
-/// else -> the exact single-node `scan::materialize` path (joins, or
-/// no cluster at all). The residual filter stays downstream in both
-/// paths; it is only forwarded to the local planner in the fallback.
+/// in a ready multi-node cluster -> band scatter-gather (columnar ->
+/// every-member fan-out); JOIN trees -> each side through this same
+/// logic, then the shared nested loop on the coordinator; everything
+/// else -> the exact single-node `scan::materialize` path (no cluster
+/// at all). The residual filter stays downstream in all paths; it is
+/// only forwarded to the local planner in the fallback.
 pub async fn materialize(
     shared: &Shared,
     tref: &TableRef,
@@ -99,6 +128,16 @@ pub async fn materialize(
     txn: Option<&Txn>,
     filter: Option<&Expr>,
 ) -> SqlResult<Source> {
+    // JOIN trees: every side materializes gather-aware (row tables per
+    // band, columnar to every member) and the shared nested loop runs
+    // on the coordinator. A local-only side would silently drop other
+    // nodes' rows, so joins never take the single-node fallback while
+    // the cluster is ready.
+    if let TableRef::Join { left, right, on } = tref {
+        let l = Box::pin(materialize(shared, left, read_ts, txn, None)).await?;
+        let r = Box::pin(materialize(shared, right, read_ts, txn, None)).await?;
+        return scan::join_sources(l, r, on.as_ref());
+    }
     // Columnar tables: segments commit where the txn closed, so a
     // ready multi-node cluster fans out to EVERY member (no slot
     // bands); single-node reads stay on the local segment scan. The
