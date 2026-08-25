@@ -27,6 +27,7 @@ fn schema(id: u32, name: &str) -> TableSchema {
         pk: "id".into(),
         engine: Engine::Row,
         indexes: vec![],
+        auto_increment: None,
     }
 }
 
