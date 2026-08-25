@@ -101,6 +101,17 @@ pub struct Query {
     pub limit: Option<u64>,
     pub offset: u64,
     pub distinct: bool,
+    /// Trailing locking clause (`FOR UPDATE` / `FOR SHARE`): metadata
+    /// only -- the result shape is unchanged; the executor takes row
+    /// latches on the matched pks (see `tx::latch`).
+    pub lock: Option<LockRead>,
+}
+
+/// Locking-read mode parsed off `FOR UPDATE` / `FOR SHARE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockRead {
+    ForUpdate,
+    ForShare,
 }
 
 #[derive(Debug, Clone, PartialEq)]

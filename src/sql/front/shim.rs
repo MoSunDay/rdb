@@ -228,7 +228,12 @@ async fn run_statement(
 ) -> SqlResult<ExecOutcome> {
     let trimmed = query.trim().trim_end_matches(';').trim();
     if let Some(names) = vars::parse_sysvar_query(trimmed) {
-        return vars::sysvar_outcome(&names, SERVER_VERSION);
+        // Session-aware answers: the connection's persisted isolation
+        // level overrides the static default (see `vars::SessionVars`).
+        let session_vars = vars::SessionVars {
+            isolation: sess.isolation.clone(),
+        };
+        return vars::sysvar_outcome(&names, SERVER_VERSION, &session_vars);
     }
     let stmt = parse_statement(trimmed)?;
     exec::execute(shared, sess, stmt).await
