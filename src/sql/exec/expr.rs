@@ -6,6 +6,7 @@
 use crate::sql::parse::ast::{BinOp, Expr};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::schema::{SqlType, Value};
+use crate::sql::temporal::{self, MICROS_PER_DAY};
 
 /// Resolve `table.name` -> column index; tables must be unambiguous.
 pub trait ColumnScope {
@@ -219,6 +220,16 @@ fn truthy_as_tristate(v: &Value) -> SqlResult<Option<bool>> {
 
 fn arith(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
     use BinOp::*;
+    // No date arithmetic in v1 (no interval type); say so explicitly
+    // instead of leaking the raw debug pairing below.
+    if matches!(l, Value::Date(_) | Value::DateTime(_))
+        || matches!(r, Value::Date(_) | Value::DateTime(_))
+    {
+        return Err(SqlError::new(
+            ErrorCode::NotSupported,
+            "DATE/DATETIME values do not support arithmetic".to_string(),
+        ));
+    }
     // Integer arithmetic stays integer unless an operand is a double.
     let double_mode = matches!(l, Value::Double(_)) || matches!(r, Value::Double(_));
     if double_mode {
@@ -295,6 +306,103 @@ pub fn cmp_values(l: &Value, r: &Value) -> SqlResult<std::cmp::Ordering> {
         (Bytes(a), Bytes(b)) => a.cmp(b),
         (Str(a), Bytes(b)) => a.as_bytes().cmp(b.as_slice()),
         (Bytes(a), Str(b)) => a.as_slice().cmp(b.as_bytes()),
+        // Same-domain temporals compare as their underlying integers.
+        (Date(a), Date(b)) => a.cmp(b),
+        (DateTime(a), DateTime(b)) => a.cmp(b),
+        // Cross-scale: lift days to microseconds once, compare either way.
+        (Date(_), DateTime(_)) | (DateTime(_), Date(_)) => {
+            let (days, us) = match (l, r) {
+                (Date(d), DateTime(t)) | (DateTime(t), Date(d)) => (*d, *t),
+                _ => unreachable!("guard pins the pair shape"),
+            };
+            days.checked_mul(MICROS_PER_DAY)
+                .map(|dm| dm.cmp(&us))
+                .ok_or_else(|| {
+                    SqlError::new(
+                        ErrorCode::NotSupported,
+                        format!("cannot compare {l:?} with {r:?}"),
+                    )
+                })?
+        }
+        // A string compares against a temporal in the temporal's domain:
+        // parse it canonically; anything else is an incorrect value.
+        (Str(s), Date(d)) => match temporal::parse_date(s) {
+            Some(p) => p.cmp(d),
+            None => {
+                return Err(SqlError::new(
+                    ErrorCode::NotSupported,
+                    format!("Incorrect DATE value: '{s}'"),
+                ))
+            }
+        },
+        (Date(d), Str(s)) => match temporal::parse_date(s) {
+            Some(p) => d.cmp(&p),
+            None => {
+                return Err(SqlError::new(
+                    ErrorCode::NotSupported,
+                    format!("Incorrect DATE value: '{s}'"),
+                ))
+            }
+        },
+        (Str(s), DateTime(t)) => match temporal::parse_datetime(s) {
+            Some(p) => p.cmp(t),
+            None => {
+                return Err(SqlError::new(
+                    ErrorCode::NotSupported,
+                    format!("Incorrect DATETIME value: '{s}'"),
+                ))
+            }
+        },
+        (DateTime(t), Str(s)) => match temporal::parse_datetime(s) {
+            Some(p) => t.cmp(&p),
+            None => {
+                return Err(SqlError::new(
+                    ErrorCode::NotSupported,
+                    format!("Incorrect DATETIME value: '{s}'"),
+                ))
+            }
+        },
+        // An integer compares as the temporal's compact YYYYMMDD[HMS] form.
+        (Int(_), Date(_)) | (Date(_), Int(_)) => {
+            let (i, d) = match (l, r) {
+                (Int(i), Date(d)) | (Date(d), Int(i)) => (*i, *d),
+                _ => unreachable!("guard pins the pair shape"),
+            };
+            temporal::compact_date(d)
+                .map(|c| {
+                    if matches!(l, Int(_)) {
+                        i.cmp(&c)
+                    } else {
+                        c.cmp(&i)
+                    }
+                })
+                .ok_or_else(|| {
+                    SqlError::new(
+                        ErrorCode::NotSupported,
+                        format!("cannot compare {l:?} with {r:?}"),
+                    )
+                })?
+        }
+        (Int(_), DateTime(_)) | (DateTime(_), Int(_)) => {
+            let (i, t) = match (l, r) {
+                (Int(i), DateTime(t)) | (DateTime(t), Int(i)) => (*i, *t),
+                _ => unreachable!("guard pins the pair shape"),
+            };
+            temporal::compact_datetime(t)
+                .map(|c| {
+                    if matches!(l, Int(_)) {
+                        i.cmp(&c)
+                    } else {
+                        c.cmp(&i)
+                    }
+                })
+                .ok_or_else(|| {
+                    SqlError::new(
+                        ErrorCode::NotSupported,
+                        format!("cannot compare {l:?} with {r:?}"),
+                    )
+                })?
+        }
         (a, b) => {
             return Err(SqlError::new(
                 ErrorCode::NotSupported,
@@ -376,6 +484,16 @@ fn eval_func(name: &str, args: &[Value]) -> SqlResult<Value> {
             )),
         },
         ("version", []) => Ok(Value::Str(env!("CARGO_PKG_VERSION").to_string())),
+        // Clock functions: UTC wall clock (no session timezone), always
+        // microsecond precision -- an fsp argument parses but is ignored.
+        ("now", [] | [_])
+        | ("current_timestamp", [] | [_])
+        | ("sysdate", [] | [_])
+        | ("localtime", [] | [_])
+        | ("localtimestamp", [] | [_]) => Ok(Value::DateTime(temporal::now_micros())),
+        ("curdate", [] | [_]) | ("current_date", [] | [_]) => {
+            Ok(Value::Date(temporal::today_days()))
+        }
         // AUTO_INCREMENT session function; see exec/sequence.rs.
         ("last_insert_id", args) => crate::sql::exec::sequence::last_insert_id_value(args),
         _ => Err(SqlError::new(
@@ -395,6 +513,39 @@ pub fn coerce(v: Value, ty: SqlType) -> SqlResult<Value> {
         (Value::Int(i), SqlType::Double) => Value::Double(i as f64),
         (Value::Int(i), SqlType::Bool) => Value::Bool(i != 0),
         (Value::Str(s), SqlType::Blob) => Value::Bytes(s.into_bytes()),
+        // Temporal coercion: strings via the canonical spellings, ints
+        // via the compact YYYYMMDD[HHMMSS] forms; anything unparsable is
+        // an incorrect value, not a silent NULL (MySQL 1292 style).
+        (Value::Str(s), SqlType::Date) => {
+            Value::Date(temporal::parse_date(&s).ok_or_else(|| incorrect_value("DATE", &s))?)
+        }
+        (Value::Str(s), SqlType::DateTime) => Value::DateTime(
+            temporal::parse_datetime(&s).ok_or_else(|| incorrect_value("DATETIME", &s))?,
+        ),
+        (Value::Int(i), SqlType::Date) => Value::Date(
+            temporal::parse_compact_date(i)
+                .ok_or_else(|| incorrect_value("DATE", &i.to_string()))?,
+        ),
+        (Value::Int(i), SqlType::DateTime) => Value::DateTime(
+            temporal::parse_compact_datetime(i)
+                .ok_or_else(|| incorrect_value("DATETIME", &i.to_string()))?,
+        ),
+        // Date -> DateTime is midnight of that day; the reverse truncates.
+        (Value::Date(d), SqlType::DateTime) => Value::DateTime(
+            d.checked_mul(MICROS_PER_DAY)
+                .ok_or_else(|| incorrect_value("DATETIME", &d.to_string()))?,
+        ),
+        (Value::DateTime(us), SqlType::Date) => Value::Date(us.div_euclid(MICROS_PER_DAY)),
+        // Text and compact-integer renderings of a temporal.
+        (Value::Date(d), SqlType::VarChar) => Value::Str(temporal::format_date(d)),
+        (Value::DateTime(us), SqlType::VarChar) => Value::Str(temporal::format_datetime(us)),
+        (Value::Date(d), SqlType::Int) => Value::Int(
+            temporal::compact_date(d).ok_or_else(|| incorrect_value("DATE", &d.to_string()))?,
+        ),
+        (Value::DateTime(us), SqlType::Int) => Value::Int(
+            temporal::compact_datetime(us)
+                .ok_or_else(|| incorrect_value("DATETIME", &us.to_string()))?,
+        ),
         (Value::Bytes(b), SqlType::VarChar) => Value::Str(String::from_utf8(b).map_err(|_| {
             SqlError::new(ErrorCode::BadNull, "blob is not valid utf8".to_string())
         })?),
@@ -406,6 +557,14 @@ pub fn coerce(v: Value, ty: SqlType) -> SqlResult<Value> {
             ))
         }
     })
+}
+
+/// Loud incorrect-value error of a temporal coercion (the parse failed).
+fn incorrect_value(domain: &str, s: &str) -> SqlError {
+    SqlError::new(
+        ErrorCode::WrongValue,
+        format!("Incorrect {domain} value: '{s}'"),
+    )
 }
 
 #[cfg(test)]
@@ -487,5 +646,145 @@ mod tests {
             Ok(Value::Int(1))
         ));
         assert!(coerce(Value::Str("x".into()), SqlType::Int).is_err());
+    }
+
+    #[test]
+    fn coerce_temporal_strings_and_ints() {
+        // 2024-02-29 is day 19782; canonical and compact spellings agree.
+        assert_eq!(
+            coerce(Value::Str("2024-02-29".into()), SqlType::Date),
+            Ok(Value::Date(19_782))
+        );
+        assert_eq!(
+            coerce(Value::Str("20240229".into()), SqlType::Date),
+            Ok(Value::Date(19_782))
+        );
+        assert_eq!(
+            coerce(Value::Int(20_240_229), SqlType::Date),
+            Ok(Value::Date(19_782))
+        );
+        assert_eq!(
+            coerce(Value::Str("2024-02-29 12:13:14".into()), SqlType::DateTime),
+            Ok(Value::DateTime(19_782 * MICROS_PER_DAY + 43_994_000_000))
+        );
+        assert_eq!(
+            coerce(Value::Int(20_240_229_121_314), SqlType::DateTime),
+            Ok(Value::DateTime(19_782 * MICROS_PER_DAY + 43_994_000_000))
+        );
+        // invalid values error loudly, MySQL 1292 style
+        let e = coerce(Value::Str("2024-02-30".into()), SqlType::Date).unwrap_err();
+        assert_eq!(e.msg, "Incorrect DATE value: '2024-02-30'");
+        assert!(coerce(Value::Str("junk".into()), SqlType::DateTime).is_err());
+        assert!(coerce(Value::Int(99_999_999), SqlType::Date).is_err());
+        // Doubles never reach a temporal column.
+        assert!(coerce(Value::Double(20_240_229.0), SqlType::Date).is_err());
+    }
+
+    #[test]
+    fn coerce_temporal_cross_domain() {
+        // Date -> DateTime is midnight; DateTime -> Date truncates.
+        assert_eq!(
+            coerce(Value::Date(19_782), SqlType::DateTime),
+            Ok(Value::DateTime(19_782 * MICROS_PER_DAY))
+        );
+        assert_eq!(
+            coerce(
+                Value::DateTime(19_782 * MICROS_PER_DAY + 43_994_000_000),
+                SqlType::Date
+            ),
+            Ok(Value::Date(19_782))
+        );
+        // Text and compact-integer renderings.
+        assert_eq!(
+            coerce(Value::Date(19_782), SqlType::VarChar),
+            Ok(Value::Str("2024-02-29".into()))
+        );
+        assert_eq!(
+            coerce(
+                Value::DateTime(19_782 * MICROS_PER_DAY + 500_000),
+                SqlType::VarChar
+            ),
+            Ok(Value::Str("2024-02-29 00:00:00.500000".into()))
+        );
+        assert_eq!(
+            coerce(Value::Date(19_782), SqlType::Int),
+            Ok(Value::Int(20_240_229))
+        );
+        assert_eq!(
+            coerce(
+                Value::DateTime(19_782 * MICROS_PER_DAY + 43_994_000_000),
+                SqlType::Int
+            ),
+            Ok(Value::Int(20_240_229_121_314))
+        );
+        // Blools and bytes never become temporal.
+        assert!(coerce(Value::Bool(true), SqlType::Date).is_err());
+        assert!(coerce(Value::Date(0), SqlType::Blob).is_err());
+    }
+
+    #[test]
+    fn cmp_temporal_domains() {
+        use std::cmp::Ordering::*;
+        let midnight = Value::DateTime(19_782 * MICROS_PER_DAY);
+        assert_eq!(cmp_values(&Value::Date(19_782), &midnight).unwrap(), Equal);
+        assert_eq!(cmp_values(&midnight, &Value::Date(19_782)).unwrap(), Equal);
+        assert_eq!(
+            cmp_values(&Value::Date(19_782), &Value::DateTime(0)).unwrap(),
+            Greater
+        );
+        // strings parse in the temporal's domain, both directions
+        assert_eq!(
+            cmp_values(&Value::Str("2024-03-01".into()), &Value::Date(19_782)).unwrap(),
+            Greater
+        );
+        assert_eq!(
+            cmp_values(&Value::Date(19_782), &Value::Str("2024-03-01".into())).unwrap(),
+            Less
+        );
+        // ints compare against the compact form
+        assert_eq!(
+            cmp_values(&Value::Int(20_240_229), &Value::Date(19_782)).unwrap(),
+            Equal
+        );
+        assert_eq!(
+            cmp_values(&Value::Date(19_782), &Value::Int(20_240_228)).unwrap(),
+            Greater
+        );
+        // unparsable strings and doubles stay loud
+        let e = cmp_values(&Value::Str("garbage".into()), &Value::Date(1)).unwrap_err();
+        assert_eq!(e.msg, "Incorrect DATE value: 'garbage'");
+        assert!(cmp_values(&Value::Double(1.0), &Value::Date(1)).is_err());
+    }
+
+    #[test]
+    fn temporal_arith_errors_loudly() {
+        let e = eval_str(&Expr::BinaryOp {
+            left: Box::new(Expr::Lit(Value::Date(1))),
+            op: BinOp::Add,
+            right: Box::new(Expr::Lit(Value::Int(1))),
+        })
+        .unwrap_err();
+        assert_eq!(e.msg, "DATE/DATETIME values do not support arithmetic");
+    }
+
+    #[test]
+    fn clock_functions_smoke() {
+        // Kind only -- the value moves with the wall clock. (Function
+        // names arrive lowercased from the translator.)
+        assert!(matches!(eval_func("now", &[]), Ok(Value::DateTime(_))));
+        assert!(matches!(
+            eval_func("current_timestamp", &[Value::Int(6)]),
+            Ok(Value::DateTime(_))
+        ));
+        assert!(matches!(
+            eval_func("localtimestamp", &[]),
+            Ok(Value::DateTime(_))
+        ));
+        assert!(matches!(eval_func("curdate", &[]), Ok(Value::Date(_))));
+        assert!(matches!(
+            eval_func("current_date", &[Value::Int(0)]),
+            Ok(Value::Date(_))
+        ));
+        assert!(eval_func("now", &[Value::Int(1), Value::Int(2)]).is_err());
     }
 }

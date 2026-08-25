@@ -627,9 +627,14 @@ fn translate_type(t: &DataType) -> SqlResult<SqlType> {
         Varbinary(_) | Binary(_) | Blob(_) | TinyBlob | MediumBlob | LongBlob | Bytea => {
             SqlType::Blob
         }
+        // DATE is days since the epoch, DATETIME microseconds (see
+        // `temporal`); TIMESTAMP parses as DATETIME. The optional fsp
+        // is ignored -- storage is always microsecond precision.
+        Date => SqlType::Date,
+        Datetime(_) | Timestamp(_, _) => SqlType::DateTime,
         other => {
             return Err(SqlError::unsupported(format!(
-                "column type {other} (v1: BOOL/INT/DOUBLE/VARCHAR/BLOB)"
+                "column type {other} (v1: BOOL/INT/DOUBLE/VARCHAR/BLOB/DATE/DATETIME/TIMESTAMP)"
             )))
         }
     })

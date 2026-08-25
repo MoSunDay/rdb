@@ -5,7 +5,9 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
 - 任意 rdb 节点开启 `mysql_bind` 后即是一个 MySQL 服务端：native-password 登录
   （`mysql_user`/`mysql_password` 配置），支持 CREATE/DROP TABLE、CREATE/DROP INDEX、
   INSERT/UPDATE/DELETE、SELECT（WHERE/ORDER BY/LIMIT/DISTINCT/JOIN/GROUP BY/
-  HAVING/聚合）、SHOW TABLES/COLUMNS/INDEX、EXPLAIN、`?` 预编译语句。
+  HAVING/聚合）、SHOW TABLES/COLUMNS/INDEX、EXPLAIN、`?` 预编译语句；列类型
+  BOOL/BIGINT/DOUBLE/VARCHAR/BLOB/DATE/DATETIME/TIMESTAMP（TIMESTAMP 为 DATETIME
+  别名，`NOW()`/`CURDATE()` 等时钟函数可用；TIME/DECIMAL 仍不支持）。
 - 表目录经 raft 复制：集群内任一节点建表，全集群可见；DDL 仅 leader 生效
   （follower 收到会得到 "not leader" 类错误，客户端重试即可）。
 - 事务：`BEGIN`/`COMMIT`/`ROLLBACK` 快照隔离——事务内重复读稳定（repeatable read）、

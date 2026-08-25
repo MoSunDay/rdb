@@ -2,8 +2,9 @@
 //!
 //! MySQL-protocol frontend (`front`), sqlparser-based IR (`parse`),
 //! raft-replicated catalog + row codec (`storage`), executor (`exec`),
-//! planner (`plan`), secondary indexes (`index`), transactions (`tx`) and
-//! the node-to-node scatter-gather/2PC layer (`dist`).
+//! planner (`plan`), secondary indexes (`index`), transactions (`tx`),
+//! civil DATE/DATETIME math (`temporal`) and the node-to-node
+//! scatter-gather/2PC layer (`dist`).
 
 pub mod columnar;
 pub mod dist;
@@ -13,4 +14,5 @@ pub mod index;
 pub mod parse;
 pub mod plan;
 pub mod storage;
+pub mod temporal;
 pub mod tx;

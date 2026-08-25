@@ -126,7 +126,14 @@ fn sum_values(vals: &[Value]) -> Value {
         });
         return Value::Int(sum);
     }
-    Value::Double(vals.iter().filter_map(as_num).sum())
+    // Mixed/non-numeric input (e.g. SUM over temporal or string cells)
+    // sums only the numeric members; with none, SUM is NULL like AVG
+    // (an empty f64 iterator sums to -0.0 in Rust, not 0.0 -- avoid
+    // rendering that as a bogus "-0" cell).
+    match vals.iter().filter_map(as_num).reduce(|a, b| a + b) {
+        Some(s) => Value::Double(s),
+        None => Value::Null,
+    }
 }
 
 fn avg_values(vals: &[Value]) -> Value {
