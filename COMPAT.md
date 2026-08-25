@@ -375,7 +375,10 @@ contract; module map lives in `agents/rust/sql.md`.
 - **Scatter-gather reads**: single-table scans fan out per slot band over the internal
   `sql_rpc_bind` TCP protocol (length-prefixed JSON), merged at the coordinator and then
   filtered/ordered/aggregated there. A dead band owner fails the query loudly (no partial
-  results). JOINs and index paths stay local-only (v1).
+  results). JOINs materialize every side gather-aware (row tables per band, columnar tables
+  to every member; `Gather(join)` in EXPLAIN) and run the shared nested loop on the
+  coordinator -- a join silently reading only the local node's slice was a correctness bug
+  and is fixed. Index paths stay local-only (v1).
 - **GC**: a 30s sweep deletes versions at or below the oracle watermark except each pk's
   newest (live) anchor; tombstone anchors take their whole prefix with them. Prepared
   (0x02) versions are never swept. DROPPED tables are reclaimed too: every node's sweep
