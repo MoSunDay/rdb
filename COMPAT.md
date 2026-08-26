@@ -492,6 +492,47 @@ immutable once published.
   are placed by current slot ownership, and a node owning no slot band rejects columnar
   INSERTs ("no eligible slot band").
 
+## StarRocks table-model DDL (Rust-only)
+
+StarRocks-compatible `CREATE TABLE` headers are accepted and mapped onto the two existing
+storage engines. No new engine: the mapping is syntax-level; placement stays the CRC16
+slot sharding (see deviations).
+
+- **Accepted headers**:
+  `PRIMARY KEY(col) [DISTRIBUTED BY HASH(col) [BUCKETS n]]` -> row store, INSERT-as-UPSERT.
+  `DUPLICATE KEY(cols...) [DISTRIBUTED BY HASH(col) [BUCKETS n]]` -> columnar, append-only.
+  Distribution is optional (`BUCKETS` defaults to StarRocks' 10). A MySQL-level pk may be
+  written inline (`col INT PRIMARY KEY`) or as a constraint; for DUPLICATE tables a MySQL
+  `PRIMARY KEY` is not required — the first DUPLICATE KEY column becomes schema-only pk
+  metadata, keeping its declared nullability.
+- **Pre-parser**: sqlparser has no StarRocks grammar, so the model clauses are lifted from
+  raw text BEFORE the MySQL parse (token scan over comments/quoted spans in
+  `sql::parse::starrocks`). Unrecognized clauses — `PARTITION BY`, `PROPERTIES`,
+  `ORDER BY`, `UNIQUE KEY(...)`, `DISTRIBUTED BY RANDOM`, `ENGINE=row`/`innodb` on a
+  model table, `PRIMARY KEY` + `ENGINE=columnar` — reject loudly with MySQL 1235 instead
+  of being dropped silently. Multi-column `PRIMARY KEY(...)` still rejects with the
+  single-pk message (composite pk is Phase 4).
+- **Schema metadata**: `TableSchema.key_model` (`MySql` | `PrimaryKey` | `Duplicate`) and
+  `TableSchema.distribution` (`{columns, buckets}`) persist in the raft catalog JSON,
+  both `#[serde(default)]`: old catalog JSON decodes as `MySql`/none. Because old nodes
+  cannot render the new fields, ROLLING upgrades are NOT safe once a StarRocks DDL exists:
+  co-upgrade nodes together (same gate as any catalog-shape change).
+- **PK-model writes**: autocommit INSERT recovers each pk's visible row BEFORE stamping
+  (statement read point) and feeds index maintenance a replace, so unique entries move
+  with the values; within explicit txns, staging already keyed rows by `(table, pk)`, so
+  last-write-wins collapse is inherent and COMMIT derives replaces from the snapshot.
+  UPDATE / DELETE behave as usual on the row store.
+- **Deviations from real StarRocks** (by design):
+  - DISTRIBUTED BY is recorded as schema metadata only: physical placement remains the
+    Redis-style crc16 slot sharding; no buckets/buckets rebalance exist. `BUCKETS n`
+    validates `n >= 1` and nothing else.
+  - Cluster mode: a PK-model upsert coordinated by a node that does not own all target
+    slots ships only the NEW versions through 2PC (old-side recovery is coordinator-local).
+    Row correctness holds everywhere (one version per pk wins by ts); whether the new value
+    shadows older seeds on every reader follows cluster-wide timestamp ordering — the same
+    M2-era caveat ordinary cross-node UPDATEs already carry, so secondaries/unique entries
+    plus cross-coordinator replace recency stay follow-up work alongside composite keys.
+
 ## Runtime verification (this tree)
 
 - Full RESP drill (gate text, cluster init/nodes, MOVED format+routing, hash-tag co-location,

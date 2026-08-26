@@ -13,6 +13,9 @@ pub enum Statement {
         columns: Vec<ColumnSpec>,
         pk: String,
         engine: crate::sql::storage::schema::Engine,
+        /// StarRocks table model lifted by the pre-parser (`None` for
+        /// plain MySQL DDL; see `parse::starrocks`).
+        starrocks: Option<crate::sql::parse::starrocks::StarRocksModel>,
     },
     DropTable {
         name: String,

@@ -19,12 +19,12 @@ use crate::sql::exec::select::{filter_rows, order_rows};
 use crate::sql::exec::sequence;
 use crate::sql::exec::{ExecOutcome, SqlSession};
 use crate::sql::index::maintain::{self, Transition};
-use crate::sql::index::RowSide;
+use crate::sql::index::{self, RowSide};
 use crate::sql::parse::ast::{Expr, OrderKey, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog;
 use crate::sql::storage::row;
-use crate::sql::storage::schema::{TableSchema, Value};
+use crate::sql::storage::schema::{KeyModel, TableSchema, Value};
 use crate::sql::tx;
 use crate::state::Shared;
 use crate::store::ops;
@@ -76,14 +76,36 @@ pub async fn insert(
         .iter()
         .map(|r| pk_key_of(&schema, r))
         .collect::<SqlResult<Vec<_>>>()?;
+    // StarRocks PRIMARY KEY model treats INSERT as UPSERT: recover each
+    // pk's visible row BEFORE the batch is stamped so index maintenance
+    // sees a replace (unique entries move with the new values) instead
+    // of a blind insert that would leave stale entries behind. Other
+    // models keep pure inserts (empty `old_rows`).
+    let old_rows: Vec<Option<Vec<Value>>> = if schema.key_model == KeyModel::PrimaryKey {
+        let now = shared.sql_ts.now();
+        let mut olds = Vec::with_capacity(pk_keys.len());
+        for pk in &pk_keys {
+            olds.push(
+                index::visible_row_at_pk(&shared.store, &schema, pk, now)
+                    .map_err(SqlError::from)?,
+            );
+        }
+        olds
+    } else {
+        Vec::new()
+    };
     let trans: Vec<Transition<'_>> = full_rows
         .iter()
-        .zip(pk_keys.iter())
-        .map(|(r, pk)| {
-            Transition::insert(RowSide {
-                pk_key: pk,
+        .enumerate()
+        .map(|(i, r)| Transition {
+            old: old_rows.get(i).and_then(|o| o.as_ref()).map(|o| RowSide {
+                pk_key: &pk_keys[i],
+                values: o,
+            }),
+            new: Some(RowSide {
+                pk_key: &pk_keys[i],
                 values: r,
-            })
+            }),
         })
         .collect();
     let idx = index_ops(shared, &schema, &trans)?;

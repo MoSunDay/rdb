@@ -241,7 +241,7 @@ pub fn dropped_ids(shared: &Shared) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
+    use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType};
     use crate::state::testutil;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -264,6 +264,8 @@ mod tests {
             auto_increment: None,
             engine: Engine::Row,
             indexes: Vec::new(),
+            key_model: KeyModel::MySql,
+            distribution: None,
         })
         .unwrap()
     }

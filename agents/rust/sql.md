@@ -17,9 +17,12 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
 - `parse/`：sqlparser 驱动的 AST→内部 IR（`translate.rs`），错误码→MySQL 错误号
   （`error.rs`：1213 写写冲突、1062 唯一冲突、1027 节点不可达等）；`query.rs`
   （复合查询翻译：UNION [ALL]/WITH CTE/派生表——INTERSECT/EXCEPT/BY NAME/
-  WITH RECURSIVE 1235 大声拒绝）。
+  WITH RECURSIVE 1235 大声拒绝）；`starrocks.rs`（StarRocks 表模型预解析：
+  PRIMARY KEY/DUPLICATE KEY/DISTRIBUTED BY 在 MySQL 解析前从原文 token 扫描摘出
+  并改写注入，未识别子句 1235 大声拒绝——见 COMPAT.md "StarRocks table-model DDL"）。
 - `exec/`：执行器——`mod.rs`（`execute` 入口 + `SqlSession`）、`write.rs`（DML 与
-  写集生成）、`select.rs`（`run_at` 单一咽喉：子查询改写 + 锁 veto）/`scan.rs`
+  写集生成；StarRocks PK 模型的自动提交 INSERT 先按可见快照回收旧行喂给索引维护，
+  即 upsert replace）、`select.rs`（`run_at` 单一咽喉：子查询改写 + 锁 veto）/`scan.rs`
   （FROM 物化 + 事务叠合，带 `CteScope`）、`set_ops.rs`（复合查询执行：CTE 物化、
   UNION 拼装/去重/拓宽）、`relation.rs`（`Relation` + CTE 作用域）、`subquery.rs`
   （标量/IN 子查询提升改写）、`agg.rs`、`expr.rs`、`show.rs`、`render.rs`（EXPLAIN，
@@ -72,4 +75,6 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   `sql_types_e2e.rs`（DATE/DATETIME：字面量往返、谓词、类型化元数据、预编译
   二进制 cell 与参数、唯一索引、UNION 宽化）、
   `columnar_e2e.rs`（列存单机 + 3 节点集群扇出读）、
+  `starrocks_model_e2e.rs`（表模型：单机 PK upsert/DUP 追加/拒绝矩阵，3 节点
+  跨 owner replace 的行级收敛）、
   `txn_semantics_e2e.rs`（SAVEPOINT 可见性 / @@transaction_isolation / 锁读冲突）。

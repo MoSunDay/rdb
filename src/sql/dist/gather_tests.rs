@@ -1,7 +1,7 @@
 use super::*;
 use crate::sql::exec::relation::CteScope;
 use crate::sql::storage::catalog::catalog_key;
-use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
+use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType};
 use crate::sql::tx;
 use crate::state::testutil;
 use std::sync::Arc;
@@ -26,6 +26,8 @@ fn schema(id: u32, name: &str) -> TableSchema {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 
