@@ -28,7 +28,7 @@ use crate::sql::parse::ast::{ColumnSpec, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog::{self, CatalogTxn};
 use crate::sql::storage::row;
-use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, SqlType, TableSchema};
+use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, KeyModel, SqlType, TableSchema};
 use crate::state::Shared;
 use crate::store::ops;
 
@@ -40,7 +40,19 @@ pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
             columns,
             pk,
             engine,
-        } => create_table(shared, &name, if_not_exists, &columns, &pk, engine).await,
+            starrocks,
+        } => {
+            create_table(
+                shared,
+                &name,
+                if_not_exists,
+                &columns,
+                &pk,
+                engine,
+                starrocks.as_ref(),
+            )
+            .await
+        }
         Statement::DropTable { name, if_exists } => drop_table(shared, &name, if_exists).await,
         Statement::CreateIndex {
             table,
@@ -93,8 +105,9 @@ async fn create_table(
     columns: &[ColumnSpec],
     pk: &str,
     engine: Engine,
+    starrocks: Option<&crate::sql::parse::starrocks::StarRocksModel>,
 ) -> SqlResult<ExecOutcome> {
-    let schema = build_schema(0, name, columns, pk, engine)?;
+    let schema = build_schema(0, name, columns, pk, engine, starrocks)?;
     if catalog::lookup(shared, name)
         .map_err(SqlError::from)?
         .is_some()
@@ -310,7 +323,41 @@ pub fn build_schema(
     columns: &[ColumnSpec],
     pk: &str,
     engine: Engine,
+    starrocks: Option<&crate::sql::parse::starrocks::StarRocksModel>,
 ) -> SqlResult<TableSchema> {
+    // StarRocks table models (Phase 3): DUPLICATE implies the
+    // append-only columnar engine; PRIMARY KEY is the row-store upsert
+    // model and cannot ride the columnar engine.
+    let key_model = starrocks.map(|m| m.kind).unwrap_or(KeyModel::MySql);
+    let engine = match (key_model, engine) {
+        (KeyModel::Duplicate, _) => Engine::Columnar,
+        (KeyModel::PrimaryKey, Engine::Columnar) => {
+            return Err(SqlError::new(
+                ErrorCode::NotSupported,
+                "StarRocks PRIMARY KEY tables are row-store upsert tables \
+                 (ENGINE=columnar is not supported)",
+            ))
+        }
+        (_, e) => e,
+    };
+    // DISTRIBUTED BY columns must exist; buckets must be positive.
+    // (Distribution is recorded metadata -- placement stays crc16.)
+    if let Some(d) = starrocks.and_then(|m| m.distribution.as_ref()) {
+        if d.buckets == 0 {
+            return Err(SqlError::new(
+                ErrorCode::Parse,
+                "BUCKETS must be at least 1",
+            ));
+        }
+        for c in &d.columns {
+            if !columns.iter().any(|col| col.name.eq_ignore_ascii_case(c)) {
+                return Err(SqlError::new(
+                    ErrorCode::BadField,
+                    format!("unknown column '{c}' in DISTRIBUTED BY"),
+                ));
+            }
+        }
+    }
     let pk_idx = columns
         .iter()
         .position(|c| c.name.eq_ignore_ascii_case(pk))
@@ -372,11 +419,14 @@ pub fn build_schema(
             ));
         }
         // A primary key is implicitly NOT NULL (MySQL semantics), even
-        // if the body said NULL.
+        // if the body said NULL. DUPLICATE-model tables keep the
+        // declared nullability: their "pk" is recorded metadata of the
+        // first dup-key column, not a dedup key.
+        let pk_not_null = i == pk_idx && key_model != KeyModel::Duplicate;
         defs.push(ColumnDef {
             name: c.name.clone(),
             sql_type: c.sql_type,
-            nullable: c.nullable && i != pk_idx,
+            nullable: c.nullable && !pk_not_null,
         });
     }
     Ok(TableSchema {
@@ -387,6 +437,8 @@ pub fn build_schema(
         auto_increment,
         engine,
         indexes: Vec::new(),
+        key_model,
+        distribution: starrocks.and_then(|m| m.distribution.clone()),
     })
 }
 
@@ -420,15 +472,15 @@ mod tests {
             spec("d", SqlType::Double, false),
         ];
         // missing pk column
-        let err = build_schema(0, "t", &cols, "nope", Engine::Row).unwrap_err();
+        let err = build_schema(0, "t", &cols, "nope", Engine::Row, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::Parse);
         assert!(err.msg.contains("primary key column 'nope'"));
         // duplicate column
         let dup = [int_spec("id"), int_spec("ID")];
-        let err = build_schema(0, "t", &dup, "id", Engine::Row).unwrap_err();
+        let err = build_schema(0, "t", &dup, "id", Engine::Row, None).unwrap_err();
         assert!(err.msg.contains("duplicate column"));
         // pk is implicitly NOT NULL even when declared NULL
-        let s = build_schema(7, "t", &cols, "id", Engine::Row).unwrap();
+        let s = build_schema(7, "t", &cols, "id", Engine::Row, None).unwrap();
         assert_eq!(s.id, 7);
         assert_eq!(s.pk, "id");
         assert!(!s.columns[0].nullable, "pk coerced NOT NULL");
@@ -453,7 +505,7 @@ mod tests {
             ai_spec("id", SqlType::Int),
             spec("v", SqlType::VarChar, true),
         ];
-        let s = build_schema(1, "t", &cols, "id", Engine::Row).unwrap();
+        let s = build_schema(1, "t", &cols, "id", Engine::Row, None).unwrap();
         assert_eq!(s.auto_increment.as_deref(), Some("id"));
         assert_eq!(s.auto_increment_index(), Some(0));
 
@@ -463,7 +515,7 @@ mod tests {
             ai_spec("seq", SqlType::Int),
             spec("v", SqlType::VarChar, true),
         ];
-        let err = build_schema(0, "t", &dup, "id", Engine::Row).unwrap_err();
+        let err = build_schema(0, "t", &dup, "id", Engine::Row, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::WrongAutoKey);
         assert!(err.msg.contains("only one auto column"));
 
@@ -472,7 +524,7 @@ mod tests {
             ai_spec("id", SqlType::VarChar),
             spec("v", SqlType::Int, true),
         ];
-        let err = build_schema(0, "t", &varchar, "id", Engine::Row).unwrap_err();
+        let err = build_schema(0, "t", &varchar, "id", Engine::Row, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::WrongAutoKey);
         assert!(err.msg.contains("Incorrect column specifier"));
 
@@ -481,7 +533,7 @@ mod tests {
             spec("id", SqlType::Int, false),
             ai_spec("seq", SqlType::Int),
         ];
-        let err = build_schema(0, "t", &not_pk, "id", Engine::Row).unwrap_err();
+        let err = build_schema(0, "t", &not_pk, "id", Engine::Row, None).unwrap_err();
         assert_eq!(err.code, ErrorCode::WrongAutoKey);
         assert!(err.msg.contains("must be defined as a key"));
     }
@@ -697,3 +749,7 @@ mod tests {
         assert_eq!(catalog::dropped_ids(&shared), vec![3]);
     }
 }
+
+#[cfg(test)]
+#[path = "ddl_starrocks_tests.rs"]
+mod starrocks_tests;

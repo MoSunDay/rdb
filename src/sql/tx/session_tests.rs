@@ -6,7 +6,7 @@ use crate::sql::parse::error::ErrorCode;
 use crate::state::testutil;
 
 fn schema(id: u32, name: &str) -> TableSchema {
-    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
+    use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType};
     TableSchema {
         id,
         name: name.to_string(),
@@ -26,6 +26,8 @@ fn schema(id: u32, name: &str) -> TableSchema {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 
@@ -307,7 +309,7 @@ async fn conflicting_commit_releases_snapshot_and_writes_nothing() {
 // ---------- M2: columnar append write path ----------
 
 fn columnar_schema(id: u32, name: &str) -> TableSchema {
-    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
+    use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType};
     TableSchema {
         id,
         name: name.to_string(),
@@ -327,6 +329,8 @@ fn columnar_schema(id: u32, name: &str) -> TableSchema {
         auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 

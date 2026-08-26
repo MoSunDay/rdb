@@ -8,7 +8,7 @@ use super::meta::{
 use super::writer;
 use super::{rebuild, registry_of, Registry};
 use crate::sql::storage::codec::KIND_SQL_SEGMENT;
-use crate::sql::storage::schema::{ColumnDef, Engine, SqlType, TableSchema, Value};
+use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType, TableSchema, Value};
 use crate::state::testutil;
 
 fn zone(name: &str, null_count: u64, min: Value, max: Value) -> SegmentColumnZone {
@@ -145,6 +145,8 @@ fn two_col_schema() -> TableSchema {
         auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 

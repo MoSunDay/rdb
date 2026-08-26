@@ -2,7 +2,7 @@
 
 use super::meta::SegmentState;
 use super::{encode, reader, registry_of, writer};
-use crate::sql::storage::schema::{ColumnDef, Engine, SqlType, TableSchema, Value};
+use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType, TableSchema, Value};
 use crate::state::testutil;
 
 fn col(name: &str, sql_type: SqlType, nullable: bool) -> ColumnDef {
@@ -25,6 +25,8 @@ fn columnar_schema(id: u32) -> TableSchema {
         auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 
@@ -74,6 +76,8 @@ fn decode_segment_rejects_width_mismatch() {
         auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     };
     let err = reader::decode_segment(&file, &three).unwrap_err();
     assert!(err.msg.contains("width mismatch"), "{}", err.msg);

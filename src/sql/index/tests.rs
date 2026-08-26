@@ -5,7 +5,7 @@
 use super::*;
 use crate::sql::parse::error::ErrorCode;
 use crate::sql::storage::row;
-use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef};
+use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, KeyModel};
 use crate::state::{testutil, Shared};
 use std::sync::Arc;
 
@@ -33,6 +33,8 @@ fn schema() -> TableSchema {
         pk: "id".into(),
         auto_increment: None,
         engine: Engine::Row,
+        key_model: KeyModel::MySql,
+        distribution: None,
         indexes: vec![
             IndexDef {
                 id: 1,

@@ -16,15 +16,19 @@ use crate::sql::parse::ast::*;
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 pub(crate) use crate::sql::parse::expr::translate_expr;
 
-use crate::sql::storage::schema::{Engine, SqlType, Value};
+use crate::sql::parse::starrocks::StarRocksModel;
+use crate::sql::storage::schema::{Engine, KeyModel, SqlType, Value};
 
 /// Parse one SQL string; exactly one statement expected (clients send one).
+/// StarRocks table-model clauses are lifted out first (see
+/// `parse::starrocks`); everything else reaches sqlparser untouched.
 pub fn parse_statement(sql: &str) -> SqlResult<Statement> {
+    let (text, model) = crate::sql::parse::starrocks::preparse(sql)?;
     let stmts =
-        Parser::parse_sql(&MySqlDialect {}, sql).map_err(|e| SqlError::parse(e.to_string()))?;
+        Parser::parse_sql(&MySqlDialect {}, &text).map_err(|e| SqlError::parse(e.to_string()))?;
     match stmts.len() {
         0 => Err(SqlError::parse("empty statement")),
-        1 => translate(stmts.into_iter().next().unwrap()),
+        1 => translate(stmts.into_iter().next().unwrap(), model.as_ref()),
         _ => Err(SqlError::unsupported("multi-statement queries")),
     }
 }
@@ -273,7 +277,7 @@ pub(crate) fn object_name(name: &ObjectName) -> SqlResult<String> {
     }
 }
 
-fn translate(stmt: SqlStatement) -> SqlResult<Statement> {
+fn translate(stmt: SqlStatement, sr: Option<&StarRocksModel>) -> SqlResult<Statement> {
     match stmt {
         SqlStatement::Query(q) => {
             // Plain lock-bearing SELECT keeps the fast path; CTE /
@@ -292,7 +296,7 @@ fn translate(stmt: SqlStatement) -> SqlResult<Statement> {
         SqlStatement::Insert(i) => translate_insert(i),
         SqlStatement::Update(u) => translate_update(u),
         SqlStatement::Delete(d) => translate_delete(d),
-        SqlStatement::CreateTable(c) => translate_create_table(c),
+        SqlStatement::CreateTable(c) => translate_create_table(c, sr),
         SqlStatement::Drop {
             object_type,
             if_exists,
@@ -322,7 +326,7 @@ fn translate(stmt: SqlStatement) -> SqlResult<Statement> {
             })
         }
         SqlStatement::Explain { statement, .. } => {
-            Ok(Statement::Explain(Box::new(translate(*statement)?)))
+            Ok(Statement::Explain(Box::new(translate(*statement, sr)?)))
         }
         SqlStatement::StartTransaction { .. } => Ok(Statement::Begin),
         SqlStatement::Commit { .. } => Ok(Statement::Commit),
@@ -490,7 +494,10 @@ fn translate_drop(
     }
 }
 
-fn translate_create_table(c: sqlparser::ast::CreateTable) -> SqlResult<Statement> {
+fn translate_create_table(
+    c: sqlparser::ast::CreateTable,
+    sr: Option<&StarRocksModel>,
+) -> SqlResult<Statement> {
     if c.query.is_some() {
         return Err(SqlError::unsupported("CREATE TABLE ... AS SELECT"));
     }
@@ -509,26 +516,24 @@ fn translate_create_table(c: sqlparser::ast::CreateTable) -> SqlResult<Statement
         match constraint {
             TableConstraint::PrimaryKey(cons) => {
                 if pk.is_some() || cons.columns.len() != 1 {
-                    return Err(SqlError::unsupported(
-                        "exactly one primary-key column is required",
-                    ));
+                    let why = "exactly one primary-key column is required";
+                    return Err(SqlError::unsupported(why));
                 }
                 pk = Some(match &cons.columns[0].column.expr {
                     SqlExpr::Identifier(id) => id.value.clone(),
                     other => return Err(SqlError::unsupported(format!("PRIMARY KEY {other}"))),
                 });
             }
-            _ => {
-                return Err(SqlError::unsupported(
-                    "table constraints other than PRIMARY KEY",
-                ))
-            }
+            _ => return Err(SqlError::unsupported("other table constraints")),
         }
     }
-    let Some(pk) = pk else {
-        return Err(SqlError::unsupported(
-            "tables need exactly one PRIMARY KEY column",
-        ));
+    // DUPLICATE model: StarRocks has no pk; the first dup-key column
+    // becomes the schema pk (metadata only -- the columnar engine
+    // never dedups on it, see ddl::build_schema).
+    let pk = match pk {
+        Some(pk) => pk,
+        None if sr.is_some_and(|m| m.kind == KeyModel::Duplicate) => sr.unwrap().keys[0].clone(),
+        _ => return Err(SqlError::unsupported("need exactly one PK column")),
     };
     if columns
         .iter()
@@ -546,6 +551,7 @@ fn translate_create_table(c: sqlparser::ast::CreateTable) -> SqlResult<Statement
         columns,
         pk,
         engine: table_engine(&c.table_options),
+        starrocks: sr.cloned(),
     })
 }
 
