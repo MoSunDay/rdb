@@ -423,3 +423,91 @@ async fn date_primary_key_round_trips_through_row_codec() {
     let (_, got) = rows(&shared, "SELECT d, n FROM day").await;
     assert_eq!(got, vec![vec![Value::Date(19_783), Value::Int(1)]]);
 }
+
+/// StarRocks PRIMARY KEY model: autocommit INSERT is an UPSERT. A
+/// re-inserted pk replaces its row (no duplicate error, one visible
+/// version), and index maintenance must see a REPLACE -- without the
+/// old-side recovery the second statement would (a) fail the unique
+/// check on 'red' and (b) leak a stale entry on any accepted write.
+#[tokio::test]
+async fn pk_model_insert_upserts_and_moves_unique_entries() {
+    let shared = setup().await;
+    ddl::run(
+        &shared,
+        parse_statement(
+            "CREATE TABLE up (k INT NOT NULL, v VARCHAR(8) NULL) \
+             PRIMARY KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 3",
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    ddl::run(
+        &shared,
+        parse_statement("CREATE UNIQUE INDEX uv ON up (v)").unwrap(),
+    )
+    .await
+    .unwrap();
+
+    exec(&shared, "INSERT INTO up (k, v) VALUES (1, 'red')").await;
+    exec(
+        &shared,
+        "INSERT INTO up (k, v) VALUES (1, 'blue'), (2, 'red')",
+    )
+    .await;
+
+    let (_, got) = rows(&shared, "SELECT k, v FROM up ORDER BY k").await;
+    assert_eq!(got.len(), 2, "one visible row per pk after upsert");
+    assert_eq!(got[0], vec![Value::Int(1), Value::Str("blue".into())]);
+
+    let schema = catalog::lookup(&shared, "up").unwrap().unwrap();
+    let uv = index::IndexRef::of(&schema.indexes[0]);
+    let owners = index::lookup_pks(&shared.store, &schema, &uv, &Value::Str("red".into())).unwrap();
+    assert_eq!(
+        owners,
+        vec![row::pk_encode(&Value::Int(2)).unwrap()],
+        "'red' moved to pk 2; no stale owner left behind"
+    );
+}
+
+/// Same upsert semantics through a transaction: two staged INSERTs of
+/// one pk collapse to the last value and COMMIT indexes only it.
+#[tokio::test]
+async fn pk_model_txn_stages_collapse_at_commit() {
+    let shared = setup().await;
+    ddl::run(
+        &shared,
+        parse_statement(
+            "CREATE TABLE upt (k INT NOT NULL, v VARCHAR(8) NULL) \
+             PRIMARY KEY(k) DISTRIBUTED BY HASH(k)",
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut sess = SqlSession {
+        txn: Some(crate::sql::tx::begin(&shared.sql_ts)),
+        ..Default::default()
+    };
+    write_in(
+        &shared,
+        &mut sess,
+        parse_statement("INSERT INTO upt (k, v) VALUES (1, 'a')").unwrap(),
+    )
+    .await
+    .unwrap();
+    write_in(
+        &shared,
+        &mut sess,
+        parse_statement("INSERT INTO upt (k, v) VALUES (1, 'b')").unwrap(),
+    )
+    .await
+    .unwrap();
+    crate::sql::tx::commit(&shared, sess.txn.take().unwrap())
+        .await
+        .unwrap();
+
+    let (_, got) = rows(&shared, "SELECT k, v FROM upt").await;
+    assert_eq!(got, vec![vec![Value::Int(1), Value::Str("b".into())]]);
+}

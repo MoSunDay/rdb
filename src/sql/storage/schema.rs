@@ -88,6 +88,33 @@ impl Engine {
     }
 }
 
+/// StarRocks table model of a table (Phase 3). `MySql` is the default
+/// of pre-Phase-3 catalog JSON (`#[serde(default)]`): plain row-store
+/// tables whose INSERT keeps the historical last-write-wins behavior.
+/// `PrimaryKey` = StarRocks PK model mapped onto the row engine with
+/// upsert INSERT (same pk -> whole-row replace, old index entries
+/// cleared). `Duplicate` = StarRocks duplicate model mapped onto the
+/// append-only columnar engine (no pk dedup; the first DUPLICATE KEY
+/// column is recorded as the schema pk for metadata only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyModel {
+    #[default]
+    MySql,
+    PrimaryKey,
+    Duplicate,
+}
+
+/// `DISTRIBUTED BY HASH(cols) BUCKETS n` recorded in the schema.
+/// Metadata only: rdb's physical distribution stays the engine's own
+/// crc16 slot hashing (documented deviation, COMPAT.md) -- no bucket
+/// scheduler and no partition pruning runs on these fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Distribution {
+    pub columns: Vec<String>,
+    pub buckets: u32,
+}
+
 /// A table schema, stored as JSON under `sql_catalog/<table>` (see
 /// `catalog.rs`). `id` is stable across renames (there are none in v1) and
 /// namespaces physical row keys, so a dropped+recreated table never reads
@@ -108,6 +135,13 @@ pub struct TableSchema {
     pub engine: Engine,
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
+    /// StarRocks table model (see [`KeyModel`]); old catalog JSON
+    /// without the field decodes as `MySql` (the pre-Phase-3 engine).
+    #[serde(default)]
+    pub key_model: KeyModel,
+    /// Parsed `DISTRIBUTED BY HASH(...) BUCKETS n`, metadata only.
+    #[serde(default)]
+    pub distribution: Option<Distribution>,
 }
 
 impl TableSchema {
@@ -191,6 +225,8 @@ mod tests {
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
+            key_model: KeyModel::MySql,
+            distribution: None,
         }
     }
 
@@ -219,6 +255,27 @@ mod tests {
         let back: TableSchema = serde_json::from_str(&old).expect("de old json");
         assert_eq!(back.auto_increment, None);
         assert_eq!(back, demo());
+    }
+
+    /// Pre-Phase-3 catalog JSON (no key_model/distribution fields)
+    /// must keep loading as the MySQL model -- persisted catalogs
+    /// exist on live clusters, and mixed-version rollout is gated on
+    /// exactly this decode (see COMPAT.md).
+    #[test]
+    fn old_catalog_json_without_key_model_loads_mysql() {
+        let mut s = demo();
+        s.key_model = KeyModel::Duplicate;
+        s.distribution = Some(Distribution {
+            columns: vec!["id".into()],
+            buckets: 8,
+        });
+        let js = serde_json::to_string(&s).expect("ser");
+        let old = js
+            .replace(",\"key_model\":\"duplicate\"", "")
+            .replace(",\"distribution\":{\"columns\":[\"id\"],\"buckets\":8}", "");
+        let back: TableSchema = serde_json::from_str(&old).expect("de old json");
+        assert_eq!(back.key_model, KeyModel::MySql);
+        assert_eq!(back.distribution, None);
     }
 
     #[test]

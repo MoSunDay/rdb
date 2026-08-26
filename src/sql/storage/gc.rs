@@ -222,7 +222,7 @@ mod tests {
     use crate::sql::storage::row::{
         encode_row, encode_tombstone, pk_encode, row_slot, version_key, visible_value,
     };
-    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType, TableSchema, Value};
+    use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType, TableSchema, Value};
     use crate::state::testutil;
 
     fn schema(id: u32) -> TableSchema {
@@ -245,6 +245,8 @@ mod tests {
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
+            key_model: KeyModel::MySql,
+            distribution: None,
         }
     }
 

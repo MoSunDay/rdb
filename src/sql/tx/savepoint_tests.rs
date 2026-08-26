@@ -8,7 +8,7 @@ use crate::sql::parse::error::ErrorCode;
 use crate::sql::storage::schema::Value;
 
 fn schema(id: u32, name: &str) -> TableSchema {
-    use crate::sql::storage::schema::{ColumnDef, Engine, SqlType};
+    use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType};
     TableSchema {
         id,
         name: name.to_string(),
@@ -27,6 +27,8 @@ fn schema(id: u32, name: &str) -> TableSchema {
         pk: "id".into(),
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
         auto_increment: None,
     }
 }

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::sql::exec::relation::CteScope;
-use crate::sql::storage::schema::{ColumnDef, Engine};
+use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel};
 use crate::state::testutil;
 
 fn schema(id: u32, name: &str) -> TableSchema {
@@ -26,6 +26,8 @@ fn schema(id: u32, name: &str) -> TableSchema {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 
@@ -161,6 +163,8 @@ async fn materialize_nested_loop_join_with_on() {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     };
     seed_catalog(&shared, &u);
     seed_catalog(&shared, &o);
@@ -214,6 +218,8 @@ fn resolve_reports_ambiguity() {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     };
     let scope = FromScope {
         sides: vec![table_side(&s, &None), {

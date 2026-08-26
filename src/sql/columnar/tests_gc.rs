@@ -10,7 +10,7 @@ use super::meta::{self, SegmentMeta, SegmentState};
 use super::{registry_of, writer};
 use crate::sql::dist::participant::{self, Vote};
 use crate::sql::storage::catalog;
-use crate::sql::storage::schema::{ColumnDef, Engine, SqlType, TableSchema, Value};
+use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType, TableSchema, Value};
 use crate::state::testutil;
 use crate::state::Shared;
 use crate::store::ops;
@@ -43,6 +43,8 @@ fn columnar_schema() -> TableSchema {
         auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 

@@ -3,7 +3,7 @@
 use crate::sql::columnar::decode;
 use crate::sql::columnar::encode::{build_segment, ColumnZone, ENC_DICT, ENC_PLAIN};
 use crate::sql::columnar::format::{self, crc32, MAGIC};
-use crate::sql::storage::schema::{ColumnDef, Engine, SqlType, TableSchema, Value};
+use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType, TableSchema, Value};
 
 fn col(name: &str, sql_type: SqlType, nullable: bool) -> ColumnDef {
     ColumnDef {
@@ -28,6 +28,8 @@ fn all_types_schema() -> TableSchema {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 
@@ -40,6 +42,8 @@ fn int_schema() -> TableSchema {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 
@@ -55,6 +59,8 @@ fn str_schema(nullable: bool) -> TableSchema {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     }
 }
 
@@ -170,6 +176,8 @@ fn temporal_columns_round_trip_plain_with_zonemap() {
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
+        key_model: KeyModel::MySql,
+        distribution: None,
     };
     let day = |s: &str| Value::Date(crate::sql::temporal::parse_date(s).unwrap());
     let at = |s: &str| Value::DateTime(crate::sql::temporal::parse_datetime(s).unwrap());

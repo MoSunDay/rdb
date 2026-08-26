@@ -318,6 +318,7 @@ fn split8<'a>(rest: &'a [u8], what: &str) -> Result<(&'a [u8], &'a [u8]), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::storage::schema::KeyModel;
     use crate::sql::storage::schema::{ColumnDef, Engine};
 
     fn schema() -> TableSchema {
@@ -355,6 +356,8 @@ mod tests {
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
+            key_model: KeyModel::MySql,
+            distribution: None,
         }
     }
 
@@ -400,6 +403,8 @@ mod tests {
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
+            key_model: KeyModel::MySql,
+            distribution: None,
         };
         let rows = vec![
             vec![Value::Int(1), Value::Date(-1), Value::DateTime(-1)],
