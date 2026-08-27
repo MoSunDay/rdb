@@ -108,10 +108,14 @@ fn union_relations(l: Relation, r: Relation, all: bool) -> SqlResult<Relation> {
         .zip(&r.columns)
         .map(|(a, b)| {
             let sql_type = widen(a.sql_type, b.sql_type)?;
+            // Either operand may produce NULL for this position, and a
+            // merged column is never a single table's key.
             Ok(crate::sql::exec::ColMeta {
                 table: a.table.clone(),
                 name: a.name.clone(),
                 sql_type,
+                nullable: a.nullable || b.nullable,
+                primary: false,
             })
         })
         .collect::<SqlResult<Vec<_>>>()?;
@@ -254,11 +258,7 @@ mod tests {
     use crate::sql::storage::schema::SqlType;
 
     fn col(name: &str, ty: SqlType) -> ColMeta {
-        ColMeta {
-            table: String::new(),
-            name: name.to_string(),
-            sql_type: ty,
-        }
+        ColMeta::computed("", name, ty)
     }
 
     fn rel(cols: Vec<ColMeta>, rows: Vec<Vec<Value>>) -> Relation {
