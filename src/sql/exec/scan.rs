@@ -18,7 +18,7 @@ use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::plan;
 use crate::sql::storage::catalog;
 use crate::sql::storage::row::{self, HEADER_LIVE};
-use crate::sql::storage::schema::{SqlType, TableSchema, Value};
+use crate::sql::storage::schema::{KeyModel, SqlType, TableSchema, Value};
 use crate::state::Shared;
 use crate::store::ops;
 use crate::store::Store;
@@ -33,6 +33,12 @@ pub struct ScopeSide {
     pub table: String,
     pub columns: Vec<String>,
     pub types: Vec<SqlType>,
+    /// Per-column nullability, parallel to `columns` (from the schema).
+    pub nullable: Vec<bool>,
+    /// Position of the pk column when this side is a real table whose
+    /// key is a real row-store key; `None` for derived relations and the
+    /// DUPLICATE model (its "pk" is recorded metadata, not a key).
+    pub key_pos: Option<usize>,
     /// Offset of this side's first column in the joined row.
     pub offset: usize,
 }
@@ -379,8 +385,24 @@ pub fn join_sources(
     // Offsets address the COMBINED row (left cells, then right cells).
     let using_pairs = resolve_using(using, &l.scope, &r.scope, left_width)?;
     let mut scope = l.scope;
+    // An OUTER join null-extends the unmatched side, so that side's
+    // declared nullability no longer holds for the result set -- and the
+    // wire encoder rejects a NULL cell for a NOT NULL column. A
+    // null-extended "pk" is likewise no key.
+    let left_outer = matches!(kind, JoinKind::Right | JoinKind::Full);
+    let right_outer = matches!(kind, JoinKind::Left | JoinKind::Full);
+    if left_outer {
+        for side in &mut scope.sides {
+            side.nullable = vec![true; side.columns.len()];
+            side.key_pos = None;
+        }
+    }
     for mut side in r.scope.sides {
         side.offset += left_width;
+        if right_outer {
+            side.nullable = vec![true; side.columns.len()];
+            side.key_pos = None;
+        }
         scope.sides.push(side);
     }
     if let Some(cond) = on {
@@ -507,11 +529,20 @@ fn resolve_using(
 
 /// The FROM-scope side of one plain table reference.
 pub fn table_side(schema: &TableSchema, alias: &Option<String>) -> ScopeSide {
+    // The DUP model's "pk" is recorded metadata, not a dedup key (see
+    // the build_schema comment in ddl.rs), so it is no wire PRI_KEY.
+    let key_pos = if schema.key_model == KeyModel::Duplicate {
+        None
+    } else {
+        schema.column_index(&schema.pk)
+    };
     ScopeSide {
         qualifier: alias.clone().unwrap_or_else(|| schema.name.clone()),
         table: schema.name.clone(),
         columns: schema.columns.iter().map(|c| c.name.clone()).collect(),
         types: schema.columns.iter().map(|c| c.sql_type).collect(),
+        nullable: schema.columns.iter().map(|c| c.nullable).collect(),
+        key_pos,
         offset: 0,
     }
 }

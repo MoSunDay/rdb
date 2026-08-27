@@ -294,6 +294,8 @@ fn expand_items(items: &[SelectItem], scope: &FromScope) -> SqlResult<Vec<(Expr,
                                 table: side.qualifier.clone(),
                                 name: col.clone(),
                                 sql_type: side.types[i],
+                                nullable: side.nullable[i],
+                                primary: side.key_pos == Some(i),
                             },
                         ));
                     }
@@ -301,18 +303,41 @@ fn expand_items(items: &[SelectItem], scope: &FromScope) -> SqlResult<Vec<(Expr,
             }
             SelectItem::Expr { expr, alias } => {
                 let (table, name) = output_name(expr, alias, scope);
+                let (nullable, primary) = col_flags(expr, scope);
                 out.push((
                     expr.clone(),
                     ColMeta {
                         table,
                         name,
                         sql_type: result_type(expr, scope),
+                        nullable,
+                        primary,
                     },
                 ));
             }
         }
     }
     Ok(out)
+}
+
+/// Wire flags of a select-list item: a bare column reference inherits
+/// its owning side's declared nullability / PRI_KEY; anything computed
+/// is nullable and unkeyed. Resolution is already validated before this
+/// runs, so misses fall back to the safe (nullable, unkeyed) default.
+fn col_flags(e: &Expr, scope: &FromScope) -> (bool, bool) {
+    let Expr::Col { table, name } = e else {
+        return (true, false);
+    };
+    let Ok(idx) = scope.resolve_checked(table.as_deref(), name) else {
+        return (true, false);
+    };
+    for side in &scope.sides {
+        if idx >= side.offset && idx < side.offset + side.columns.len() {
+            let i = idx - side.offset;
+            return (side.nullable[i], side.key_pos == Some(i));
+        }
+    }
+    (true, false)
 }
 
 /// Output column naming: alias, else the column name (plain Col), else

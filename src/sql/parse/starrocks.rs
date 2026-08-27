@@ -12,9 +12,9 @@
 //! * statements without any StarRocks clause pass through
 //!   byte-identical -- zero behavior change for MySQL DDL;
 //! * other StarRocks clauses (`PARTITION BY`, `PROPERTIES`,
-//!   `ORDER BY`, `UNIQUE KEY`, `DISTRIBUTED BY RANDOM`) are rejected
-//!   loudly (MySQL 1235) with a clause-naming message instead of a
-//!   generic syntax error.
+//!   `ORDER BY`, `UNIQUE KEY`, `AGGREGATE KEY`,
+//!   `DISTRIBUTED BY RANDOM`) are rejected loudly (MySQL 1235) with a
+//!   clause-naming message instead of a generic syntax error.
 //!
 //! Pure functions over token slices -- no regex.
 
@@ -161,6 +161,10 @@ pub fn preparse(sql: &str) -> SqlResult<(String, Option<StarRocksModel>)> {
         } else if is_kw(&toks[i], "UNIQUE") {
             return Err(unsupported(
                 "UNIQUE KEY model (use DUPLICATE KEY or PRIMARY KEY)",
+            ));
+        } else if is_kw(&toks[i], "AGGREGATE") {
+            return Err(unsupported(
+                "AGGREGATE KEY model (use DUPLICATE KEY or PRIMARY KEY)",
             ));
         } else if is_kw(&toks[i], "DISTRIBUTED") {
             let (dist, next) = distributed_clause(&toks, i)?;

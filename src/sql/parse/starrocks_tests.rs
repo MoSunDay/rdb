@@ -124,6 +124,7 @@ fn unsupported_starrocks_clauses_reject_loudly() {
             "ORDER BY",
         ),
         ("CREATE TABLE t (k INT) UNIQUE KEY(k) DISTRIBUTED BY HASH(k)", "UNIQUE KEY"),
+        ("CREATE TABLE t (k INT) AGGREGATE KEY(k)", "AGGREGATE KEY"),
         (
             "CREATE TABLE t (k INT) DUPLICATE KEY(k) DISTRIBUTED BY RANDOM BUCKETS 4",
             "RANDOM",

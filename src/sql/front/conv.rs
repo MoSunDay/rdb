@@ -148,21 +148,42 @@ pub fn sql_type_to_mysql(t: SqlType) -> ColumnType {
     }
 }
 
-/// One resultset column descriptor: engine type -> wire type, no flags
-/// (nullability is dynamic in the engine, so NOT_NULL stays unset).
+/// One resultset column descriptor: engine type -> wire type, no flags.
+/// Used where nothing is known about nullability (placeholders) and by
+/// the tests; real result columns go through [`colmetas_to_columns`],
+/// which mirrors the schema's declared flags.
 pub fn sql_type_column(name: &str, table: &str, t: SqlType) -> Column {
+    column_with(name, table, t, ColumnFlags::empty())
+}
+
+/// One resultset column descriptor with explicit wire flags. Flags must
+/// never overclaim: opensrv's binary encoder rejects a NULL cell for a
+/// NOT_NULL-flagged column, so only plain table columns with known
+/// schema flags may set them.
+fn column_with(name: &str, table: &str, t: SqlType, colflags: ColumnFlags) -> Column {
     Column {
         table: table.to_string(),
         column: name.to_string(),
         coltype: sql_type_to_mysql(t),
-        colflags: ColumnFlags::empty(),
+        colflags,
     }
 }
 
-/// Resultset descriptors for an executor `ColMeta` list.
+/// Resultset descriptors for an executor `ColMeta` list. The wire flags
+/// mirror the metadata exactly: a non-nullable column is NOT_NULL, a
+/// primary-key column is PRI_KEY (which a pk always is, being NOT NULL).
 pub fn colmetas_to_columns(cols: &[ColMeta]) -> Vec<Column> {
     cols.iter()
-        .map(|c| sql_type_column(&c.name, &c.table, c.sql_type))
+        .map(|c| {
+            let mut flags = ColumnFlags::empty();
+            if !c.nullable {
+                flags |= ColumnFlags::NOT_NULL_FLAG;
+            }
+            if c.primary {
+                flags |= ColumnFlags::PRI_KEY_FLAG;
+            }
+            column_with(&c.name, &c.table, c.sql_type, flags)
+        })
         .collect()
 }
 
@@ -455,8 +476,53 @@ mod tests {
             assert_eq!(c.coltype, want);
             assert_eq!(c.column, "n");
             assert_eq!(c.table, "t");
+            // Untyped descriptors (placeholders) stay flag-free.
             assert_eq!(c.colflags, ColumnFlags::empty());
         }
+    }
+
+    #[test]
+    fn colmetas_carry_schema_flags() {
+        // A plain NOT NULL pk column: NOT_NULL | PRI_KEY.
+        let metas = vec![
+            ColMeta {
+                table: "t".into(),
+                name: "id".into(),
+                sql_type: SqlType::Int,
+                nullable: false,
+                primary: true,
+            },
+            // Nullable unkeyed column: no flags overclaimed.
+            ColMeta::computed("t", "v", SqlType::VarChar),
+        ];
+        let cols = colmetas_to_columns(&metas);
+        assert_eq!(
+            cols[0].colflags,
+            ColumnFlags::NOT_NULL_FLAG | ColumnFlags::PRI_KEY_FLAG
+        );
+        assert_eq!(cols[1].colflags, ColumnFlags::empty());
+
+        // NOT NULL without a key, and a nullable primary (the DUPLICATE
+        // model records a "pk" that is not a key) -- each flag maps alone.
+        let metas = vec![
+            ColMeta {
+                table: "t".into(),
+                name: "n".into(),
+                sql_type: SqlType::Int,
+                nullable: false,
+                primary: false,
+            },
+            ColMeta {
+                table: "t".into(),
+                name: "k".into(),
+                sql_type: SqlType::VarChar,
+                nullable: true,
+                primary: true,
+            },
+        ];
+        let cols = colmetas_to_columns(&metas);
+        assert_eq!(cols[0].colflags, ColumnFlags::NOT_NULL_FLAG);
+        assert_eq!(cols[1].colflags, ColumnFlags::PRI_KEY_FLAG);
     }
 
     #[test]
@@ -466,12 +532,10 @@ mod tests {
                 table: "users".into(),
                 name: "id".into(),
                 sql_type: SqlType::Int,
+                nullable: false,
+                primary: true,
             },
-            ColMeta {
-                table: "".into(),
-                name: "count(*)".into(),
-                sql_type: SqlType::Double,
-            },
+            ColMeta::computed("", "count(*)", SqlType::Double),
         ];
         let cols = colmetas_to_columns(&metas);
         assert_eq!(cols.len(), 2);
