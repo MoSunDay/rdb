@@ -123,11 +123,17 @@ where
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        let out = {
+        let (out, insert_id) = {
             let mut sess = self.sess.lock().await;
-            run_statement(&self.shared, &mut sess, query).await
+            let (out, is_insert) = run_statement(&self.shared, &mut sess, query).await;
+            // Only an INSERT reports its generated id on the wire: a
+            // stale id from an earlier INSERT must never ride, say, an
+            // UPDATE's OK packet. The session value itself persists
+            // (SELECT LAST_INSERT_ID() depends on it).
+            let insert_id = if is_insert { wire_insert_id(&sess) } else { 0 };
+            (out, insert_id)
         };
-        write_outcome(results, out).await
+        write_outcome(results, out, insert_id).await
     }
 
     async fn on_prepare<'a>(
@@ -189,11 +195,14 @@ where
             results.error(e.kind(), e.msg.as_bytes()).await?;
             return Ok(());
         }
-        let out = {
+        let (out, insert_id) = {
             let mut sess = self.sess.lock().await;
-            exec::execute(&self.shared, &mut sess, stmt).await
+            let is_insert = matches!(stmt, Statement::Insert { .. });
+            let out = exec::execute(&self.shared, &mut sess, stmt).await;
+            let insert_id = if is_insert { wire_insert_id(&sess) } else { 0 };
+            (out, insert_id)
         };
-        write_outcome(results, out).await
+        write_outcome(results, out, insert_id).await
     }
 
     async fn on_close(&mut self, stmt: u32) {
@@ -219,13 +228,15 @@ impl<W> SqlShim<W> {
 }
 
 /// Parse + execute one query text (shared by on_query's direct path).
-/// `SELECT @@...` system-variable probes are answered by the frontend's
-/// compatibility table before the engine sees them (see `vars.rs`).
+/// Returns the outcome plus whether the statement was an INSERT (the
+/// caller gates the OK packet's `last_insert_id` on it). `SELECT @@...`
+/// system-variable probes are answered by the frontend's compatibility
+/// table before the engine sees them (see `vars.rs`).
 async fn run_statement(
     shared: &Shared,
     sess: &mut SqlSession,
     query: &str,
-) -> SqlResult<ExecOutcome> {
+) -> (SqlResult<ExecOutcome>, bool) {
     let trimmed = query.trim().trim_end_matches(';').trim();
     if let Some(names) = vars::parse_sysvar_query(trimmed) {
         // Session-aware answers: the connection's persisted isolation
@@ -233,27 +244,52 @@ async fn run_statement(
         let session_vars = vars::SessionVars {
             isolation: sess.isolation.clone(),
         };
-        return vars::sysvar_outcome(&names, SERVER_VERSION, &session_vars);
+        return (
+            vars::sysvar_outcome(&names, SERVER_VERSION, &session_vars),
+            false,
+        );
     }
-    let stmt = parse_statement(trimmed)?;
-    exec::execute(shared, sess, stmt).await
+    match parse_statement(trimmed) {
+        Ok(stmt) => {
+            let is_insert = matches!(stmt, Statement::Insert { .. });
+            (exec::execute(shared, sess, stmt).await, is_insert)
+        }
+        Err(e) => (Err(e), false),
+    }
+}
+
+/// OK-packet insert id: the id this connection's most recent INSERT
+/// generated (u64 on the wire; 0 when the session value is out of the
+/// wire field's range).
+fn wire_insert_id(sess: &SqlSession) -> u64 {
+    u64::try_from(sess.last_insert_id).unwrap_or(0)
 }
 
 /// Encode one executor outcome (or error) as a MySQL response. Shared by
-/// the text and binary (prepared) paths.
+/// the text and binary (prepared) paths. `insert_id` rides the OK
+/// packet's `last_insert_id` field (0 for non-INSERT statements).
 async fn write_outcome<W>(
     results: QueryResultWriter<'_, W>,
     out: SqlResult<ExecOutcome>,
+    insert_id: u64,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
 {
     match out {
-        Ok(ExecOutcome::Ok) => results.completed(OkResponse::default()).await,
+        Ok(ExecOutcome::Ok) => {
+            results
+                .completed(OkResponse {
+                    last_insert_id: insert_id,
+                    ..Default::default()
+                })
+                .await
+        }
         Ok(ExecOutcome::Affected(n)) => {
             results
                 .completed(OkResponse {
                     affected_rows: n,
+                    last_insert_id: insert_id,
                     ..Default::default()
                 })
                 .await

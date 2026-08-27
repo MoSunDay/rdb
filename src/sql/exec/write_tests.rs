@@ -511,3 +511,51 @@ async fn pk_model_txn_stages_collapse_at_commit() {
     let (_, got) = rows(&shared, "SELECT k, v FROM upt").await;
     assert_eq!(got, vec![vec![Value::Int(1), Value::Str("b".into())]]);
 }
+
+/// CREATE UNIQUE INDEX must actually backfill: rows that predate the
+/// index get entries, so a later duplicate INSERT is rejected and a
+/// distinct one lands. Guards the catalog_txn refactor, where the
+/// backfill was skipped because an applied plan's drained `mutations`
+/// looked exactly like an IF NOT EXISTS no-op.
+#[tokio::test]
+async fn create_unique_index_backfills_and_enforces_on_insert() {
+    let shared = setup().await;
+    assert!(matches!(
+        exec(&shared, "INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b')").await,
+        ExecOutcome::Affected(2)
+    ));
+    ddl::run(
+        &shared,
+        parse_statement("CREATE UNIQUE INDEX uv ON t (v)").unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // The pre-existing rows are reachable through the new index.
+    let schema = catalog::lookup(&shared, "t").unwrap().unwrap();
+    let uv = index::IndexRef::of(&schema.indexes[0]);
+    let owners = index::lookup_pks(&shared.store, &schema, &uv, &Value::Str("a".into())).unwrap();
+    assert_eq!(
+        owners,
+        vec![row::pk_encode(&Value::Int(1)).unwrap()],
+        "backfilled entry for the pre-index row"
+    );
+
+    // ... so a duplicate of 'a' is rejected, not silently accepted.
+    let err = write(
+        &shared,
+        parse_statement("INSERT INTO t (id, v) VALUES (9, 'a')").unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::DupEntry);
+    assert!(err.msg.contains("Duplicate entry"), "{}", err.msg);
+
+    // A distinct value is accepted and owned by its row.
+    assert!(matches!(
+        exec(&shared, "INSERT INTO t (id, v) VALUES (9, 'c')").await,
+        ExecOutcome::Affected(1)
+    ));
+    let owners = index::lookup_pks(&shared.store, &schema, &uv, &Value::Str("c".into())).unwrap();
+    assert_eq!(owners, vec![row::pk_encode(&Value::Int(9)).unwrap()]);
+}

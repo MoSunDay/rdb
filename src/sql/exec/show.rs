@@ -26,11 +26,11 @@ fn show_tables(shared: &Shared, sess: &SqlSession) -> SqlResult<ExecOutcome> {
         sess.db.as_str()
     };
     Ok(ExecOutcome::Rows {
-        columns: vec![ColMeta {
-            table: String::new(),
-            name: format!("Tables_in_{db}"),
-            sql_type: SqlType::VarChar,
-        }],
+        columns: vec![ColMeta::computed(
+            "",
+            &format!("Tables_in_{db}"),
+            SqlType::VarChar,
+        )],
         rows: catalog::list_tables(shared)
             .into_iter()
             .map(|s| vec![Value::Str(s.name)])
@@ -42,11 +42,7 @@ fn show_columns(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
     let schema = catalog::lookup(shared, table)
         .map_err(SqlError::from)?
         .ok_or_else(|| SqlError::no_such_table(table))?;
-    let str_col = |name: &str| ColMeta {
-        table: String::new(),
-        name: name.to_string(),
-        sql_type: SqlType::VarChar,
-    };
+    let str_col = |name: &str| ColMeta::computed("", name, SqlType::VarChar);
     Ok(ExecOutcome::Rows {
         columns: vec![
             str_col("Field"),
@@ -97,16 +93,8 @@ fn show_indexes(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
     let schema = catalog::lookup(shared, table)
         .map_err(SqlError::from)?
         .ok_or_else(|| SqlError::no_such_table(table))?;
-    let str_col = |name: &str| ColMeta {
-        table: String::new(),
-        name: name.to_string(),
-        sql_type: SqlType::VarChar,
-    };
-    let int_col = |name: &str| ColMeta {
-        table: String::new(),
-        name: name.to_string(),
-        sql_type: SqlType::Int,
-    };
+    let str_col = |name: &str| ColMeta::computed("", name, SqlType::VarChar);
+    let int_col = |name: &str| ColMeta::computed("", name, SqlType::Int);
     let mut rows = vec![vec![
         Value::Str(schema.name.clone()),
         Value::Int(0),

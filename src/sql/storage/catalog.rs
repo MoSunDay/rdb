@@ -61,8 +61,16 @@ pub struct CatalogTxn<'a> {
 }
 
 impl CatalogTxn<'_> {
-    /// Persist a schema (upsert) through raft; awaits commit.
-    pub async fn put(self, schema: &TableSchema) -> Result<(), String> {
+    /// The FSM view behind the held write guard: DDL decisions
+    /// (lookups, id allocation) read through it so they see exactly the
+    /// state their mutations land on.
+    pub fn state(&self) -> &RaftState {
+        self.raft
+    }
+
+    /// Persist a schema (upsert) through raft; awaits commit. A txn may
+    /// apply several mutations before its guard is released.
+    pub async fn put(&mut self, schema: &TableSchema) -> Result<(), String> {
         let value = serde_json::to_string(schema).map_err(|e| e.to_string())?;
         let entry = RaftLogEntryData {
             key: catalog_key(&schema.name),
@@ -76,7 +84,7 @@ impl CatalogTxn<'_> {
     /// table's id (a bare decimal, never valid TableSchema JSON), so id
     /// allocation stays monotone across drop+recreate cycles even after
     /// restarts; readers treat unparseable values as absent.
-    pub async fn drop(self, table: &str, id: u32) -> Result<(), String> {
+    pub async fn drop(&mut self, table: &str, id: u32) -> Result<(), String> {
         let entry = RaftLogEntryData {
             key: catalog_key(table),
             value: id.to_string(),
@@ -87,7 +95,7 @@ impl CatalogTxn<'_> {
 
     /// One raw FSM entry through the same replicated path (used for the
     /// AUTO_INCREMENT next-value counter under `sql_sequence/`).
-    pub async fn put_kv(self, key: &str, value: &str) -> Result<(), String> {
+    pub async fn put_kv(&mut self, key: &str, value: &str) -> Result<(), String> {
         let entry = RaftLogEntryData {
             key: key.to_string(),
             value: value.to_string(),
@@ -123,7 +131,13 @@ pub fn lookup_raft(
     raft: &std::sync::RwLock<RaftState>,
     table: &str,
 ) -> Result<Option<TableSchema>, String> {
-    let raw = state::raft_get(&raft.read().unwrap(), &catalog_key(table));
+    lookup_state(&raft.read().unwrap(), table)
+}
+
+/// [`lookup_raft`] over an already-borrowed state (a DDL critical
+/// section reads through its held write guard).
+pub fn lookup_state(raft: &RaftState, table: &str) -> Result<Option<TableSchema>, String> {
+    let raw = state::raft_get(raft, &catalog_key(table));
     if raw.is_empty() {
         return Ok(None); // pre-upgrade `""` tombstone: absent
     }
@@ -149,7 +163,12 @@ pub fn list_tables(shared: &Shared) -> Vec<TableSchema> {
 /// Raft-handle shaped schema listing for call sites that run with no
 /// `Shared` (the columnar GC sweep parks on the blocking pool).
 pub fn list_tables_raft(raft: &std::sync::RwLock<RaftState>) -> Vec<TableSchema> {
-    let raft = raft.read().unwrap();
+    list_tables_state(&raft.read().unwrap())
+}
+
+/// [`list_tables_raft`] over an already-borrowed state (a DDL critical
+/// section reads through its held write guard).
+pub fn list_tables_state(raft: &RaftState) -> Vec<TableSchema> {
     let mut out = Vec::new();
     // live_kv is the FSM view on a real node; the leader-local `kv` map
     // is the stub/apply-time source and stands in when there is no FSM
@@ -203,7 +222,12 @@ pub fn next_index_id(schema: &TableSchema) -> u32 {
 /// decimal id). Together with the live set they keep id allocation
 /// monotone: an id is either live, tombstoned, or never issued.
 pub fn dropped_ids_raft(raft: &std::sync::RwLock<RaftState>) -> Vec<u32> {
-    let raft = raft.read().unwrap();
+    dropped_ids_state(&raft.read().unwrap())
+}
+
+/// [`dropped_ids_raft`] over an already-borrowed state (a DDL critical
+/// section reads through its held write guard).
+pub fn dropped_ids_state(raft: &RaftState) -> Vec<u32> {
     let mut out = Vec::new();
     let entries: Vec<(String, String)> = match &raft.live_kv {
         Some(kv) => {

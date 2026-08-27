@@ -34,6 +34,9 @@ impl Relation {
                 table: qualifier.to_string(),
                 columns: self.columns.iter().map(|c| c.name.clone()).collect(),
                 types: self.columns.iter().map(|c| c.sql_type).collect(),
+                // A derived relation has no declared nullability or key.
+                nullable: vec![true; self.columns.len()],
+                key_pos: None,
                 offset: 0,
             }],
         }

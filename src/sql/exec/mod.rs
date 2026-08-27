@@ -31,6 +31,27 @@ pub struct ColMeta {
     pub table: String,
     pub name: String,
     pub sql_type: SqlType,
+    /// Whether the column may hold NULL. Computed expressions are
+    /// always nullable; only plain table columns mirror their
+    /// `ColumnDef.nullable` (the wire encoder rejects NULL cells for
+    /// NOT_NULL-flagged columns, so this must never overclaim).
+    pub nullable: bool,
+    /// The column is the table's primary key.
+    pub primary: bool,
+}
+
+impl ColMeta {
+    /// A nullable, unkeyed result column (computed expressions and the
+    /// SHOW / EXPLAIN / @@sysvar outputs).
+    pub fn computed(table: &str, name: &str, sql_type: SqlType) -> ColMeta {
+        ColMeta {
+            table: table.to_string(),
+            name: name.to_string(),
+            sql_type,
+            nullable: true,
+            primary: false,
+        }
+    }
 }
 
 /// Statement outcome: a rowset (SELECT/SHOW/EXPLAIN), an affected-rows

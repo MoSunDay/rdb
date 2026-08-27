@@ -117,11 +117,7 @@ pub fn sysvar_outcome(
             _ => SqlType::VarChar,
         };
         row.push(value);
-        columns.push(ColMeta {
-            table: String::new(),
-            name: name.clone(),
-            sql_type,
-        });
+        columns.push(ColMeta::computed("", name, sql_type));
     }
     Ok(ExecOutcome::Rows {
         columns,

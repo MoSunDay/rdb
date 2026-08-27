@@ -104,7 +104,7 @@ pub async fn allocate(
         let walk = assign(&mut rows, ai, floor);
         let target = persist_target(floor, &walk);
         if target > floor {
-            let txn =
+            let mut txn =
                 catalog::begin(&mut guard, "AUTO_INCREMENT allocation").map_err(SqlError::from)?;
             handle
                 .block_on(txn.put_kv(&catalog::sequence_key(&table), &target.to_string()))

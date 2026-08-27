@@ -154,11 +154,7 @@ pub fn explain(stmt: &Statement, headline: Vec<String>) -> SqlResult<ExecOutcome
         other => vec![format!("Direct execution ({})", other.metric_kind())],
     };
     Ok(ExecOutcome::Rows {
-        columns: vec![ColMeta {
-            table: String::new(),
-            name: "plan".to_string(),
-            sql_type: SqlType::VarChar,
-        }],
+        columns: vec![ColMeta::computed("", "plan", SqlType::VarChar)],
         rows: lines.into_iter().map(|l| vec![Value::Str(l)]).collect(),
     })
 }

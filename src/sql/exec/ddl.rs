@@ -1,13 +1,15 @@
 //! CREATE/DROP TABLE and CREATE/DROP INDEX.
 //!
-//! DDL is linearizable through the raft control plane. Schema reads
-//! (lookup / id allocation) run first WITHOUT the write lock; then the
-//! mutation holds `shared.raft.write()` across `catalog::begin` + the
-//! txn method -- that guard is the DDL mutex serializing concurrent
-//! CREATEs (which could otherwise both observe the same max table id).
-//! Because `CatalogTxn` borrows the guard across its await, the whole
-//! lock window runs on the blocking pool (`catalog_apply` below): the
-//! executor's futures stay `Send`, which the MySQL shim requires.
+//! DDL is linearizable through the raft control plane: each statement
+//! runs its whole critical section -- schema reads (lookup, table-id
+//! allocation, index pre-checks) AND the catalog write -- inside ONE
+//! `shared.raft.write()` guard window on the blocking pool
+//! (`catalog_txn` below). That guard is the DDL mutex: two concurrent
+//! CREATEs can never both observe the same max table id, and two CREATE
+//! INDEX statements can never both pass the same existence check.
+//! Because the `CatalogTxn` borrows the guard across its awaits, the
+//! window must stay off the async executors (the futures the MySQL shim
+//! polls must stay `Send`), hence `spawn_blocking`.
 //!
 //! Physical rows of a dropped row-engine table are intentionally left
 //! orphaned: the catalog tombstone makes them unreachable, and a
@@ -16,6 +18,11 @@
 //! forever, so DROP also purges the 0x23 metas, the registry entries
 //! and the files (`columnar::commit::drop_table_segments`) once the
 //! catalog drop has landed.
+//!
+//! Follow-up work (AUTO_INCREMENT counter lifecycle, index entry
+//! backfill/sweep, columnar segment purge) runs AFTER the window: it
+//! needs the async executors and its correctness does not depend on
+//! serializing against other DDL.
 
 use std::sync::Arc;
 
@@ -29,7 +36,7 @@ use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog::{self, CatalogTxn};
 use crate::sql::storage::row;
 use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, KeyModel, SqlType, TableSchema};
-use crate::state::Shared;
+use crate::state::{RaftState, Shared};
 use crate::store::ops;
 
 pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
@@ -79,20 +86,78 @@ enum CatalogMutation {
     Kv { key: String, value: String },
 }
 
+/// The decision one DDL critical section arrived at: mutations to apply
+/// under the held raft write guard, plus the schema the caller's
+/// follow-up work continues from (echoed because the lookup ran INSIDE
+/// the guard). `changed` distinguishes "the window decided nothing"
+/// (IF NOT/EXISTS no-ops) from a real decision: `catalog_txn` drains
+/// `mutations` as it applies them, so an applied plan comes back with
+/// an empty `mutations` and that emptiness must not be read as a no-op.
+struct DdlPlan {
+    mutations: Vec<CatalogMutation>,
+    schema: Option<TableSchema>,
+    changed: bool,
+}
+
+impl DdlPlan {
+    fn noop() -> DdlPlan {
+        DdlPlan {
+            mutations: Vec::new(),
+            schema: None,
+            changed: false,
+        }
+    }
+}
+
 /// Run `begin` + the txn method while holding the raft write guard, on
 /// the blocking pool (`CatalogTxn`'s guard borrow spans its await).
+/// Kept for single-mutation follow-ups that need no decision (the
+/// AUTO_INCREMENT counter lifecycle).
 async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<()> {
     let raft = Arc::clone(&shared.raft);
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();
-        let txn: CatalogTxn<'_> = catalog::begin(&mut guard, "DDL").map_err(SqlError::from)?;
+        let mut txn: CatalogTxn<'_> = catalog::begin(&mut guard, "DDL").map_err(SqlError::from)?;
         match mutation {
             CatalogMutation::Put(schema) => handle.block_on(txn.put(&schema)),
             CatalogMutation::Drop(schema) => handle.block_on(txn.drop(&schema.name, schema.id)),
             CatalogMutation::Kv { key, value } => handle.block_on(txn.put_kv(&key, &value)),
         }
         .map_err(SqlError::from)
+    })
+    .await
+    .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))?
+}
+
+/// Run `decide` + its mutations inside ONE raft write-guard window on
+/// the blocking pool: schema reads (lookup / id allocation / index
+/// pre-checks) and the catalog write are atomic, so two concurrent
+/// CREATEs can never observe the same max table id and two CREATE INDEX
+/// statements can never both pass the same existence check. `decide`
+/// sees the FSM view through the held guard and must only do cheap
+/// reads (plus local store reads for the unique-index pre-check).
+async fn catalog_txn<F>(shared: &Shared, decide: F) -> SqlResult<DdlPlan>
+where
+    F: FnOnce(&RaftState) -> SqlResult<DdlPlan> + Send + 'static,
+{
+    let raft = Arc::clone(&shared.raft);
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = raft.write().unwrap();
+        // begin() keeps the leadership check FIRST (a follower must get
+        // the "requires the raft leader" error, not a decision error).
+        let mut txn: CatalogTxn<'_> = catalog::begin(&mut guard, "DDL").map_err(SqlError::from)?;
+        let mut plan = decide(txn.state())?;
+        for mutation in std::mem::take(&mut plan.mutations) {
+            match mutation {
+                CatalogMutation::Put(schema) => handle.block_on(txn.put(&schema)),
+                CatalogMutation::Drop(schema) => handle.block_on(txn.drop(&schema.name, schema.id)),
+                CatalogMutation::Kv { key, value } => handle.block_on(txn.put_kv(&key, &value)),
+            }
+            .map_err(SqlError::from)?;
+        }
+        Ok(plan)
     })
     .await
     .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))?
@@ -108,23 +173,30 @@ async fn create_table(
     starrocks: Option<&crate::sql::parse::starrocks::StarRocksModel>,
 ) -> SqlResult<ExecOutcome> {
     let schema = build_schema(0, name, columns, pk, engine, starrocks)?;
-    if catalog::lookup(shared, name)
-        .map_err(SqlError::from)?
-        .is_some()
-    {
-        if if_not_exists {
-            return Ok(ExecOutcome::Ok);
+    let table = name.to_string();
+    let plan = catalog_txn(shared, move |raft| {
+        if catalog::lookup_state(raft, &table)?.is_some() {
+            if if_not_exists {
+                return Ok(DdlPlan::noop());
+            }
+            return Err(SqlError::new(
+                ErrorCode::TableExists,
+                format!("table '{table}' already exists"),
+            ));
         }
-        return Err(SqlError::new(
-            ErrorCode::TableExists,
-            format!("table '{name}' already exists"),
-        ));
-    }
-    let schema = TableSchema {
-        id: alloc_table_id(shared),
-        ..schema
+        let mut schema = schema;
+        schema.id = alloc_table_id(raft);
+        Ok(DdlPlan {
+            mutations: vec![CatalogMutation::Put(schema.clone())],
+            schema: Some(schema),
+            changed: true,
+        })
+    })
+    .await?;
+    // IF NOT EXISTS on an existing table: the window decided nothing.
+    let Some(schema) = plan.schema else {
+        return Ok(ExecOutcome::Ok);
     };
-    catalog_apply(shared, CatalogMutation::Put(schema.clone())).await?;
     // Counter lifecycle rides the same replicated path: CREATE seeds
     // `sql_sequence/<table>` = 1 alongside the schema (lazy default 1
     // also covers it, but an explicit entry makes cluster state visible
@@ -143,16 +215,25 @@ async fn create_table(
 }
 
 async fn drop_table(shared: &Shared, name: &str, if_exists: bool) -> SqlResult<ExecOutcome> {
-    let schema = match catalog::lookup(shared, name).map_err(SqlError::from)? {
-        Some(s) => s,
-        None => {
+    let table = name.to_string();
+    let plan = catalog_txn(shared, move |raft| {
+        let Some(schema) = catalog::lookup_state(raft, &table)? else {
             if if_exists {
-                return Ok(ExecOutcome::Ok);
+                return Ok(DdlPlan::noop());
             }
-            return Err(SqlError::no_such_table(name));
-        }
+            return Err(SqlError::no_such_table(&table));
+        };
+        Ok(DdlPlan {
+            mutations: vec![CatalogMutation::Drop(schema.clone())],
+            schema: Some(schema),
+            changed: true,
+        })
+    })
+    .await?;
+    // IF EXISTS on a missing table: the window decided nothing.
+    let Some(schema) = plan.schema else {
+        return Ok(ExecOutcome::Ok);
     };
-    catalog_apply(shared, CatalogMutation::Drop(schema.clone())).await?;
     // Clear the AUTO_INCREMENT counter so a recreated table starts at 1
     // again ("" is the house tombstone: reads fall back to the default).
     if schema.auto_increment.is_some() {
@@ -179,57 +260,77 @@ async fn create_index(
     unique: bool,
     if_not_exists: bool,
 ) -> SqlResult<ExecOutcome> {
-    let mut schema = lookup_table(shared, table)?;
-    if schema.engine.is_columnar() {
-        return Err(SqlError::new(
-            ErrorCode::NotSupported,
-            format!("indexes are not supported on columnar table '{table}'"),
-        ));
-    }
-    if schema.index(name).is_some() {
-        if if_not_exists {
-            return Ok(ExecOutcome::Ok);
-        }
-        return Err(SqlError::new(
-            ErrorCode::DupEntry,
-            format!("index '{name}' already exists"),
-        ));
-    }
-    if schema.column_index(column).is_none() {
-        return Err(SqlError::new(
-            ErrorCode::BadField,
-            format!("unknown column '{column}' in '{table}'"),
-        ));
-    }
-    // Multi-column indexes never reach here (translate rejects them),
-    // but keep the guard local: M2 indexes exactly one column.
-    // UNIQUE pre-check runs BEFORE the catalog entry exists, so a clean
-    // rejection leaves nothing behind. Rows are read at the CURRENT
-    // committed snapshot.
+    // Store handle + snapshot ts are captured BEFORE the window: the
+    // unique-index pre-check reads local rows inside it.
+    let store = Arc::clone(&shared.store);
+    let now = shared.sql_ts.now();
+    let (table, name, column) = (table.to_string(), name.to_string(), column.to_string());
     let index = IndexRef {
-        name: name.to_string(),
-        column: column.to_string(),
+        name: name.clone(),
+        column: column.clone(),
         unique,
     };
-    if unique {
-        let rows = scan::visible_rows(&shared.store, &schema, shared.sql_ts.now())?;
-        index::maintain::assert_no_duplicates(&schema, &index, &rows)?;
+    let probe = index.clone();
+    let target = table.clone();
+    let plan = catalog_txn(shared, move |raft| {
+        let index = probe;
+        let mut schema =
+            catalog::lookup_state(raft, &table)?.ok_or_else(|| SqlError::no_such_table(&table))?;
+        if schema.engine.is_columnar() {
+            return Err(SqlError::new(
+                ErrorCode::NotSupported,
+                format!("indexes are not supported on columnar table '{table}'"),
+            ));
+        }
+        if schema.index(&name).is_some() {
+            if if_not_exists {
+                return Ok(DdlPlan::noop());
+            }
+            return Err(SqlError::new(
+                ErrorCode::DupEntry,
+                format!("index '{name}' already exists"),
+            ));
+        }
+        if schema.column_index(&column).is_none() {
+            return Err(SqlError::new(
+                ErrorCode::BadField,
+                format!("unknown column '{column}' in '{table}'"),
+            ));
+        }
+        // Multi-column indexes never reach here (translate rejects them),
+        // but keep the guard local: M2 indexes exactly one column.
+        // UNIQUE pre-check runs BEFORE the catalog entry exists, so a clean
+        // rejection leaves nothing behind. Rows are read at the CURRENT
+        // committed snapshot.
+        if unique {
+            let rows = scan::visible_rows(&store, &schema, now)?;
+            index::maintain::assert_no_duplicates(&schema, &index, &rows)?;
+        }
+        let id = catalog::next_index_id(&schema);
+        schema.indexes.push(IndexDef {
+            id,
+            name,
+            column,
+            unique,
+        });
+        Ok(DdlPlan {
+            mutations: vec![CatalogMutation::Put(schema)],
+            schema: None,
+            changed: true,
+        })
+    })
+    .await?;
+    // IF NOT EXISTS on an existing index: the window decided nothing.
+    if !plan.changed {
+        return Ok(ExecOutcome::Ok);
     }
-    let id = catalog::next_index_id(&schema);
-    schema.indexes.push(IndexDef {
-        id,
-        name: name.to_string(),
-        column: column.to_string(),
-        unique,
-    });
-    catalog_apply(shared, CatalogMutation::Put(schema)).await?;
     // Backfill: rescan AFTER the catalog entry is committed, so every
     // row visible at this point is covered (any writer that started
     // earlier and lands later may miss its entry -- the accepted M2
     // race window; the residual WHERE filter hides stale entries, and
     // missing entries only cost the planner an index that finds fewer
     // pks than exist, which the fallback heuristic bounds).
-    let schema = lookup_table(shared, table)?;
+    let schema = lookup_table(shared, &target)?;
     backfill_index(shared, &schema, &index).await?;
     Ok(ExecOutcome::Ok)
 }
@@ -260,38 +361,68 @@ async fn drop_index(
     name: &str,
     if_exists: bool,
 ) -> SqlResult<ExecOutcome> {
-    let mut schema = lookup_table(shared, table)?;
-    let Some(pos) = schema
+    let (table, needle) = (table.to_string(), name.to_string());
+    let plan = catalog_txn(shared, move |raft| {
+        let name = needle;
+        let mut schema =
+            catalog::lookup_state(raft, &table)?.ok_or_else(|| SqlError::no_such_table(&table))?;
+        let Some(pos) = schema
+            .indexes
+            .iter()
+            .position(|i| i.name.eq_ignore_ascii_case(&name))
+        else {
+            if if_exists {
+                return Ok(DdlPlan::noop());
+            }
+            return Err(SqlError::new(
+                ErrorCode::Unknown,
+                format!("index '{name}' doesn't exist"),
+            ));
+        };
+        // Capture the column before the definition leaves the schema: the
+        // on-disk keys are identified by (table_id, col_pos) alone. The
+        // check runs inside the window so a clean rejection leaves the
+        // catalog untouched.
+        let col = schema.indexes[pos].column.clone();
+        if schema.column_index(&col).is_none() {
+            return Err(SqlError::new(
+                ErrorCode::BadField,
+                format!("unknown column '{col}'"),
+            ));
+        }
+        // Removal by position keeps the remaining index ids stable. The
+        // catalog entry goes first: if the entry sweep then fails, the
+        // orphaned keys are unreachable (no index def) and harmless, while
+        // the reverse order could leave a DECLARED index with no entries.
+        // The echoed schema is the PRE-removal snapshot: the follow-up
+        // sweep still needs the dropped column's position.
+        let echo = schema.clone();
+        schema.indexes.remove(pos);
+        Ok(DdlPlan {
+            mutations: vec![CatalogMutation::Put(schema)],
+            schema: Some(echo),
+            changed: true,
+        })
+    })
+    .await?;
+    // IF EXISTS on a missing index: the window decided nothing.
+    if !plan.changed {
+        return Ok(ExecOutcome::Ok);
+    }
+    let Some(snapshot) = plan.schema else {
+        return Ok(ExecOutcome::Ok);
+    };
+    // Recover (table_id, col_pos) from the echoed pre-removal schema;
+    // both lookups were validated inside the window.
+    let pos = snapshot
         .indexes
         .iter()
         .position(|i| i.name.eq_ignore_ascii_case(name))
-    else {
-        if if_exists {
-            return Ok(ExecOutcome::Ok);
-        }
-        return Err(SqlError::new(
-            ErrorCode::Unknown,
-            format!("index '{name}' doesn't exist"),
-        ));
-    };
-    // Capture the column before the definition leaves the schema: the
-    // on-disk keys are identified by (table_id, col_pos) alone.
-    let col_pos = schema
-        .column_index(&schema.indexes[pos].column)
-        .ok_or_else(|| {
-            SqlError::new(
-                ErrorCode::BadField,
-                format!("unknown column '{}'", schema.indexes[pos].column),
-            )
-        })?;
-    // Removal by position keeps the remaining index ids stable. The
-    // catalog entry goes first: if the entry sweep then fails, the
-    // orphaned keys are unreachable (no index def) and harmless, while
-    // the reverse order could leave a DECLARED index with no entries.
-    let table_id = schema.id;
-    schema.indexes.remove(pos);
-    catalog_apply(shared, CatalogMutation::Put(schema)).await?;
-    index::drop_entries(Arc::clone(&shared.store), table_id, col_pos as u32)
+        .expect("dropped index present in the pre-removal snapshot");
+    let col_pos = snapshot
+        .column_index(&snapshot.indexes[pos].column)
+        .expect("dropped index column present in the pre-removal snapshot");
+    index::drop_entries(Arc::clone(&shared.store), snapshot.id, col_pos as u32)
         .await
         .map_err(SqlError::from)?;
     Ok(ExecOutcome::Ok)
@@ -303,15 +434,20 @@ fn lookup_table(shared: &Shared, table: &str) -> SqlResult<TableSchema> {
         .ok_or_else(|| SqlError::no_such_table(table))
 }
 
-/// catalog::next_table_id takes `&Arc<Shared>`; the executor works with
-/// a plain `&Shared`, so mirror its one-line max+1 here.
-fn alloc_table_id(shared: &Shared) -> u32 {
-    let live_max = catalog::list_tables(shared)
+/// Next free table id: max of the live and tombstoned ids plus one, so
+/// ids stay monotone across drop+recreate cycles even after restarts.
+/// Runs inside the DDL guard window (`catalog_txn`), which is what
+/// keeps two concurrent CREATEs from observing the same max.
+fn alloc_table_id(raft: &RaftState) -> u32 {
+    let live_max = catalog::list_tables_state(raft)
         .iter()
         .map(|s| s.id)
         .max()
         .unwrap_or(0);
-    let dropped_max = catalog::dropped_ids(shared).into_iter().max().unwrap_or(0);
+    let dropped_max = catalog::dropped_ids_state(raft)
+        .into_iter()
+        .max()
+        .unwrap_or(0);
     live_max.max(dropped_max) + 1
 }
 
@@ -443,312 +579,8 @@ pub fn build_schema(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sql::parse::error::ErrorCode;
-    use crate::sql::parse::parse_statement;
-    use crate::sql::storage::catalog;
-    use crate::state::testutil;
-
-    fn spec(name: &str, ty: crate::sql::storage::schema::SqlType, nullable: bool) -> ColumnSpec {
-        ColumnSpec {
-            name: name.to_string(),
-            sql_type: ty,
-            nullable,
-            auto_increment: false,
-        }
-    }
-
-    fn int_spec(name: &str) -> ColumnSpec {
-        spec(name, crate::sql::storage::schema::SqlType::Int, true)
-    }
-
-    #[test]
-    fn build_schema_validates_body() {
-        use crate::sql::storage::schema::SqlType;
-        let cols = [
-            int_spec("id"),
-            spec("v", SqlType::VarChar, true),
-            spec("d", SqlType::Double, false),
-        ];
-        // missing pk column
-        let err = build_schema(0, "t", &cols, "nope", Engine::Row, None).unwrap_err();
-        assert_eq!(err.code, ErrorCode::Parse);
-        assert!(err.msg.contains("primary key column 'nope'"));
-        // duplicate column
-        let dup = [int_spec("id"), int_spec("ID")];
-        let err = build_schema(0, "t", &dup, "id", Engine::Row, None).unwrap_err();
-        assert!(err.msg.contains("duplicate column"));
-        // pk is implicitly NOT NULL even when declared NULL
-        let s = build_schema(7, "t", &cols, "id", Engine::Row, None).unwrap();
-        assert_eq!(s.id, 7);
-        assert_eq!(s.pk, "id");
-        assert!(!s.columns[0].nullable, "pk coerced NOT NULL");
-        assert!(s.columns[1].nullable);
-        assert!(!s.columns[2].nullable, "declared NOT NULL stays");
-    }
-
-    fn ai_spec(name: &str, ty: crate::sql::storage::schema::SqlType) -> ColumnSpec {
-        ColumnSpec {
-            auto_increment: true,
-            ..spec(name, ty, true)
-        }
-    }
-
-    /// MySQL 1075/1063 rules: at most one AUTO_INCREMENT column, integer
-    /// type, and it must be the (single-column) primary key.
-    #[test]
-    fn build_schema_validates_auto_increment() {
-        use crate::sql::storage::schema::SqlType;
-        // legal: one integer AI column that is the pk
-        let cols = [
-            ai_spec("id", SqlType::Int),
-            spec("v", SqlType::VarChar, true),
-        ];
-        let s = build_schema(1, "t", &cols, "id", Engine::Row, None).unwrap();
-        assert_eq!(s.auto_increment.as_deref(), Some("id"));
-        assert_eq!(s.auto_increment_index(), Some(0));
-
-        // two AI columns -> 1075
-        let dup = [
-            ai_spec("id", SqlType::Int),
-            ai_spec("seq", SqlType::Int),
-            spec("v", SqlType::VarChar, true),
-        ];
-        let err = build_schema(0, "t", &dup, "id", Engine::Row, None).unwrap_err();
-        assert_eq!(err.code, ErrorCode::WrongAutoKey);
-        assert!(err.msg.contains("only one auto column"));
-
-        // non-integer AI column -> incorrect column specifier
-        let varchar = [
-            ai_spec("id", SqlType::VarChar),
-            spec("v", SqlType::Int, true),
-        ];
-        let err = build_schema(0, "t", &varchar, "id", Engine::Row, None).unwrap_err();
-        assert_eq!(err.code, ErrorCode::WrongAutoKey);
-        assert!(err.msg.contains("Incorrect column specifier"));
-
-        // AI column not part of the (only supported) key -> 1075
-        let not_pk = [
-            spec("id", SqlType::Int, false),
-            ai_spec("seq", SqlType::Int),
-        ];
-        let err = build_schema(0, "t", &not_pk, "id", Engine::Row, None).unwrap_err();
-        assert_eq!(err.code, ErrorCode::WrongAutoKey);
-        assert!(err.msg.contains("must be defined as a key"));
-    }
-
-    /// CREATE TABLE persists the schema flag AND the initial next-value
-    /// counter (raft FSM entry `sql_sequence/<table>` = "1"); DROP clears
-    /// it so a recreated table starts from 1 again.
-    #[tokio::test]
-    async fn create_auto_increment_table_persists_counter() {
-        let shared = testutil::shared_with(testutil::test_config());
-        run(
-            &shared,
-            parse_statement(
-                "CREATE TABLE ai (id BIGINT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64) NULL)",
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        let s = catalog::lookup(&shared, "ai").unwrap().expect("created");
-        assert_eq!(s.auto_increment.as_deref(), Some("id"));
-        let raw = crate::state::raft_get(
-            &shared.raft.read().unwrap(),
-            &catalog::sequence_key(&s.name),
-        );
-        assert_eq!(raw, "1", "counter persisted alongside the schema");
-
-        run(&shared, parse_statement("DROP TABLE ai").unwrap())
-            .await
-            .unwrap();
-        let raw =
-            crate::state::raft_get(&shared.raft.read().unwrap(), &catalog::sequence_key("ai"));
-        assert_eq!(raw, "", "drop clears the counter (recreate starts at 1)");
-    }
-
-    #[tokio::test]
-    async fn create_lookup_drop_round_trip() {
-        let shared = testutil::shared_with(testutil::test_config());
-        let stmt =
-            parse_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)").unwrap();
-        run(&shared, stmt).await.unwrap();
-        let s = catalog::lookup(&shared, "t").unwrap().expect("created");
-        assert_eq!(s.pk, "id");
-        assert_eq!(s.id, 1, "first table id");
-
-        // second table allocates a fresh id (max+1 over the stub kv)
-        let stmt = parse_statement("CREATE TABLE u (id BIGINT PRIMARY KEY)").unwrap();
-        run(&shared, stmt).await.unwrap();
-        assert_eq!(catalog::lookup(&shared, "u").unwrap().unwrap().id, 2);
-
-        // plain re-create fails; IF NOT EXISTS is a no-op
-        let dup =
-            parse_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)").unwrap();
-        let err = run(&shared, dup).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::TableExists);
-        let ine = parse_statement(
-            "CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)",
-        )
-        .unwrap();
-        assert!(matches!(run(&shared, ine).await.unwrap(), ExecOutcome::Ok));
-
-        // DROP + tombstone: lookup misses, a repeat fails, IF EXISTS is fine
-        let drop = parse_statement("DROP TABLE t").unwrap();
-        assert!(matches!(run(&shared, drop).await.unwrap(), ExecOutcome::Ok));
-        assert!(catalog::lookup(&shared, "t").unwrap().is_none());
-        let again = parse_statement("DROP TABLE t").unwrap();
-        let err = run(&shared, again).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::NoSuchTable);
-        let ine = parse_statement("DROP TABLE IF EXISTS t").unwrap();
-        assert!(matches!(run(&shared, ine).await.unwrap(), ExecOutcome::Ok));
-    }
-
-    #[tokio::test]
-    async fn drop_columnar_table_purges_segments() {
-        let shared = testutil::shared_with(testutil::test_config());
-        run(
-            &shared,
-            parse_statement(
-                "CREATE TABLE cd (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL) ENGINE=columnar",
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        let schema = catalog::lookup(&shared, "cd").unwrap().unwrap();
-        assert!(schema.engine.is_columnar());
-        // Commit one segment the way the write path does.
-        let rows = vec![vec![
-            crate::sql::storage::schema::Value::Int(1),
-            crate::sql::storage::schema::Value::Null,
-        ]];
-        let meta = crate::sql::columnar::writer::commit_segment(&shared, &schema, 7, 10, &rows)
-            .await
-            .unwrap();
-        let dir = crate::sql::columnar::writer::columnar_dir(&shared.conf);
-        assert!(dir.join(&meta.file).exists());
-        assert_eq!(
-            crate::sql::columnar::registry_of(&shared)
-                .segments(schema.id)
-                .len(),
-            1
-        );
-
-        run(&shared, parse_statement("DROP TABLE cd").unwrap())
-            .await
-            .unwrap();
-        assert!(catalog::lookup(&shared, "cd").unwrap().is_none());
-        assert!(crate::sql::columnar::registry_of(&shared)
-            .segments(schema.id)
-            .is_empty());
-        assert!(!dir.join(&meta.file).exists(), "segment file must be gone");
-    }
-
-    #[tokio::test]
-    async fn create_and_drop_index_keeps_ids_stable() {
-        let shared = testutil::shared_with(testutil::test_config());
-        run(
-            &shared,
-            parse_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)").unwrap(),
-        )
-        .await
-        .unwrap();
-        run(
-            &shared,
-            parse_statement("CREATE INDEX i1 ON t (v)").unwrap(),
-        )
-        .await
-        .unwrap();
-        run(
-            &shared,
-            parse_statement("CREATE UNIQUE INDEX i2 ON t (v)").unwrap(),
-        )
-        .await
-        .unwrap();
-        let s = catalog::lookup(&shared, "t").unwrap().unwrap();
-        let ids: Vec<u32> = s.indexes.iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec![1, 2]);
-        assert!(s.indexes[1].unique);
-
-        // dropping i1 leaves i2's id untouched
-        run(&shared, parse_statement("DROP INDEX i1 ON t").unwrap())
-            .await
-            .unwrap();
-        let s = catalog::lookup(&shared, "t").unwrap().unwrap();
-        assert_eq!(s.indexes.len(), 1);
-        assert_eq!(s.indexes[0].id, 2);
-        assert_eq!(s.indexes[0].name, "i2");
-
-        // unknown index errors without IF EXISTS
-        let err = run(&shared, parse_statement("DROP INDEX nope ON t").unwrap())
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Unknown);
-        assert!(matches!(
-            run(
-                &shared,
-                parse_statement("DROP INDEX IF EXISTS nope ON t").unwrap()
-            )
-            .await
-            .unwrap(),
-            ExecOutcome::Ok
-        ));
-    }
-
-    /// Monotone table ids (audit fix): DROP writes the dropped id as
-    /// the tombstone value, so a re-created table -- same name or any
-    /// other -- never reuses an issued id and can never alias the old
-    /// table's orphaned row bytes. Runs the real CREATE/DROP path.
-    #[tokio::test]
-    async fn table_ids_stay_monotone_across_drop_recreate() {
-        let shared = testutil::shared_with(testutil::test_config());
-        let create_t = "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)";
-        run(&shared, parse_statement(create_t).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(catalog::lookup(&shared, "t").unwrap().unwrap().id, 1);
-
-        // same name, fresh id: the orphan-alias guard itself
-        run(&shared, parse_statement("DROP TABLE t").unwrap())
-            .await
-            .unwrap();
-        run(&shared, parse_statement(create_t).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            catalog::lookup(&shared, "t").unwrap().unwrap().id,
-            2,
-            "re-created table must not reuse the dropped id"
-        );
-
-        // ids keep counting past live AND tombstoned ids
-        run(
-            &shared,
-            parse_statement("CREATE TABLE u (id BIGINT PRIMARY KEY)").unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(catalog::lookup(&shared, "u").unwrap().unwrap().id, 3);
-        run(&shared, parse_statement("DROP TABLE u").unwrap())
-            .await
-            .unwrap();
-        run(
-            &shared,
-            parse_statement("CREATE TABLE v (id BIGINT PRIMARY KEY)").unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(catalog::lookup(&shared, "v").unwrap().unwrap().id, 4);
-
-        // Tombstones live under the table-name key, so re-creating "t"
-        // replaced id 1's tombstone with the live id-2 schema -- safe,
-        // because 2 now bounds allocation. Only u's tombstone survives.
-        assert_eq!(catalog::dropped_ids(&shared), vec![3]);
-    }
-}
+#[path = "ddl_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 #[path = "ddl_starrocks_tests.rs"]

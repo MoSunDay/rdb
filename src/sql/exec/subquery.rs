@@ -36,7 +36,10 @@ async fn run_subquery(
     Box::pin(run_compound(ctx.shared, ctx.read_ts, ctx.txn, cq, ctx.ctes))
         .await
         .map_err(|e| {
-            if e.msg.contains("unknown column") {
+            // Only the executor's own resolution failure marks a correlation:
+            // a nested subquery's already-rewritten verdict (NotSupported) must
+            // not be re-wrapped, and ambiguous-name errors are not outer refs.
+            if e.code == ErrorCode::BadField && e.msg.starts_with("unknown column") {
                 SqlError::new(
                     ErrorCode::NotSupported,
                     format!(

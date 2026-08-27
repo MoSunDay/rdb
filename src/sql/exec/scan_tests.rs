@@ -307,6 +307,36 @@ async fn left_join_null_extends_unmatched_left_rows() {
     );
 }
 
+/// An OUTER join null-extends the unmatched side, so that side's
+/// declared nullability must widen (and its PRI_KEY must go): the wire
+/// encoder rejects a NULL cell for a NOT NULL column.
+#[tokio::test]
+async fn outer_join_widens_nullability_of_the_extended_side() {
+    let shared = shared();
+    seed_join_sides(&shared);
+    let on = Some(parse_filter("l.id = r.id"));
+    let scope = materialize(
+        &shared,
+        &join_ref(JoinKind::Left, on, &[]),
+        2,
+        None,
+        None,
+        &CteScope::default(),
+    )
+    .await
+    .unwrap()
+    .scope;
+    let [l, r] = scope.sides.as_slice() else {
+        panic!("two sides");
+    };
+    // Left side keeps its declared flags (id is the NOT NULL pk).
+    assert_eq!(l.nullable, vec![false, true]);
+    assert_eq!(l.key_pos, Some(0));
+    // Null-extended right side: everything may be NULL, no key.
+    assert_eq!(r.nullable, vec![true, true]);
+    assert_eq!(r.key_pos, None);
+}
+
 #[tokio::test]
 async fn right_join_null_extends_unmatched_right_rows() {
     // on l.id = r.id: (1,a,1,x) and (NULL,NULL,3,z).
