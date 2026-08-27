@@ -1,4 +1,4 @@
-Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
+Commit: d481b1d708c248f86be394189d01ca7305fc8528
 # SQL 数据面（MySQL 协议 + 分布式事务）
 
 ## 能力
@@ -12,6 +12,8 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
   （follower 收到会得到 "not leader" 类错误，客户端重试即可）。
 - 事务：`BEGIN`/`COMMIT`/`ROLLBACK` 快照隔离——事务内重复读稳定（repeatable read）、
   自写可见、断连自动回滚；两个并发事务改同一主键，后提交者得到 1213 冲突错误。
+- StarRocks 模型头：`PRIMARY KEY(...)`（行存 upsert）与 `DUPLICATE KEY(...)`
+  （列存追加）可直接写在建表语句里；未识别子句与 `AGGREGATE KEY` 以 1235 大声拒绝。
 - 索引：单列二级索引与唯一索引（唯一冲突报 1062）；带索引的等值/IN/BETWEEN 查询
   走索引点查（EXPLAIN 可见 IndexScan）。
 - 列存表：`CREATE TABLE ... ENGINE=columnar`——追加式（仅 INSERT，UPDATE/DELETE/
@@ -38,7 +40,14 @@ Commit: c0cce389e75f34cf39c06ac4b56f22cde7efd1f3
 
 ## 用户可见规则
 - 错误语义对齐 MySQL 常用号段：1062 唯一冲突、1213 写写冲突（可重试）、
-  1027 节点不可达、DDL 进事务被拒。
+  1027 节点不可达、DDL 进事务被拒；并发 `CREATE TABLE` 由同一 raft 写守卫窗口
+  内的单一目录决策仲裁（table-id 分配 + 变更同窗口生效），败者收到 1050（表已存在）。
+- 表达式遵循 SQL 三值逻辑：与 NULL 比较为 NULL，`NOT NULL -> NULL`；`IN` 先短路
+  相等命中，否则见过 NULL 即返回 NULL（`NOT IN` 同理）。`length()` 按字节计数，
+  `char_length()` 按字符计数。
+- 列元数据带可空/主键标志：SHOW COLUMNS 与线协议列定义置 `NOT_NULL_FLAG` /
+  `PRI_KEY_FLAG`；自动分配主键的 INSERT 的 OK 包携带 `last_insert_id`
+  （非 INSERT 语句为 0）。
 - NULL 不进索引（唯一列多个 NULL 合法）；墓碑行由后台 GC 按最老活跃快照水位清理。
 
 ## 相关

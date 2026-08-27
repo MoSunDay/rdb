@@ -366,6 +366,13 @@ contract; module map lives in `agents/rust/sql.md`.
   One transaction writes ONE engine: staging a row-store write after a columnar append
   (or vice versa) is rejected at the statement (MySQL 1235, "a transaction cannot mix
   row-store and columnar writes"); mixed reads across engines remain legal.
+- **DDL atomicity**: a DDL statement's table-id allocation and its catalog mutations
+  (table/index entries, schema, CREATE INDEX backfill) are decided inside ONE raft
+  write-guard window (`catalog_txn`/`DdlPlan`) and applied together, so concurrent
+  `CREATE TABLE`s across sessions can never collide on table ids — the loser observes
+  the winner's committed name and fails with 1050 (table exists), not a duplicate id.
+  A plan that drained no mutations is a no-op (`changed` flag), which keeps backfill
+  from being skipped on re-parse paths.
 - **Locking reads**: `SELECT ... FOR UPDATE / FOR SHARE [OF tbl]` latches the matched
   (post-filter) rows in a node-local registry keyed `(table_id, pk)`. FOR UPDATE is
   exclusive, FOR SHARE composes; re-acquiring with the same owner — including a FOR
@@ -396,7 +403,10 @@ contract; module map lives in `agents/rust/sql.md`.
   connection auto-generated and `LAST_INSERT_ID(n)` sets-and-returns n; because
   expression evaluation cannot see the session, the value additionally lives in a
   process-wide atomic mirror — connections in ONE process share it (a deliberate v1
-  deviation). `LAST_INSERT_ID()` result metadata is BIGINT, like MySQL.
+  deviation). `LAST_INSERT_ID()` result metadata is BIGINT, like MySQL. The OK packet of a
+  statement that ran an INSERT carries the session's last-insert-id in its
+  `last_insert_id` field; every non-INSERT statement's OK packet carries 0 (resultset
+  terminators do too — do not read the value after a SELECT).
 - **Temporal types**: `DATE` = days since epoch (i64), `DATETIME`/`TIMESTAMP` =
   microseconds (i64); TIMESTAMP is a plain DATETIME alias (no time-zone semantics) and
   `(fsp)` is parsed and ignored (full microsecond precision; the fraction renders only
@@ -426,7 +436,14 @@ contract; module map lives in `agents/rust/sql.md`.
   Trailing ORDER BY (ordinals allowed)/LIMIT/OFFSET apply to the whole compound. Loudly
   rejected (MySQL 1235): INTERSECT/EXCEPT/MINUS, `BY NAME` set quantifiers,
   `WITH RECURSIVE`, correlated subqueries, LATERAL derived tables, and derived tables
-  without an alias.
+  without an alias. Expressions follow SQL three-valued logic:
+  comparisons with NULL yield NULL, `NOT NULL` is NULL, and `IN`/`NOT IN` short-circuit
+  on the first equality hit, otherwise return NULL once any NULL operand was seen
+  (`2 IN (NULL, 1)` is NULL, not FALSE — as in MySQL). Scalar `length()` counts BYTES
+  while `char_length()` counts characters.
+- **Column metadata**: column definitions (SHOW COLUMNS and the wire protocol) carry
+  NOT_NULL_FLAG / PRI_KEY_FLAG from `ColMeta.nullable`/`ColMeta.primary`; a
+  DUPLICATE-model schema-only pk gets no key flag.
 - **2PC writes**: any node accepts DML; the coordinator groups the pre-encoded batch by
   slot-band owner, PREPAREs (0x02 headers + unique entries + durable participant marker,
   one atomic RocksDB batch per participant), durably records the decision, then DECIDEs
@@ -509,8 +526,8 @@ slot sharding (see deviations).
   raw text BEFORE the MySQL parse (token scan over comments/quoted spans in
   `sql::parse::starrocks`). Unrecognized clauses — `PARTITION BY`, `PROPERTIES`,
   `ORDER BY`, `UNIQUE KEY(...)`, `DISTRIBUTED BY RANDOM`, `ENGINE=row`/`innodb` on a
-  model table, `PRIMARY KEY` + `ENGINE=columnar` — reject loudly with MySQL 1235 instead
-  of being dropped silently. Multi-column `PRIMARY KEY(...)` still rejects with the
+  model table, `PRIMARY KEY` + `ENGINE=columnar`, and `AGGREGATE KEY` — reject loudly
+  with MySQL 1235 instead of being dropped silently. Multi-column `PRIMARY KEY(...)` still rejects with the
   single-pk message (composite pk is Phase 4).
 - **Schema metadata**: `TableSchema.key_model` (`MySql` | `PrimaryKey` | `Duplicate`) and
   `TableSchema.distribution` (`{columns, buckets}`) persist in the raft catalog JSON,
@@ -541,4 +558,4 @@ slot sharding (see deviations).
 - HA: leader kill -9 → new leader in ~6s → writes commit → node restart rejoins as follower
   and catches up (verified both pre- and post-failover keys).
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test
-  --workspace` green (862 tests).
+  --workspace` green (995 tests).
