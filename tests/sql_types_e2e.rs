@@ -395,3 +395,38 @@ async fn prepared_binary_cells_params_unique_index_union() {
     );
     node.kill_now();
 }
+
+/// Unsupported column types reject loudly at translate time (MySQL
+/// 1235, the type named in the message), and the zero-date literal is
+/// an incorrect value (MySQL 1292) instead of a silent epoch/NULL.
+#[tokio::test]
+async fn unsupported_and_zero_temporal_values_loud() {
+    let dir = std::env::temp_dir().join(format!("rdb-sql-types-loud-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut node = spawn_node_mysql(&dir, 0, true, None);
+    wait_resp_ready(&mut node, 15).await;
+    wait_mysql_ready(&node, 15).await;
+    let mut c = mysql_root_conn(&node, PASS).await;
+
+    // v1 keeps DATE/DATETIME/TIMESTAMP and drops the rest of the
+    // temporal/numeric zoo by name (see translate.rs).
+    for (sql, ty) in [
+        ("CREATE TABLE t (d TIME)", "TIME"),
+        ("CREATE TABLE t (d DECIMAL(10,2))", "DECIMAL(10,2)"),
+    ] {
+        let e = mysql_server_error(&mut c, sql).await;
+        assert_eq!(e.code, 1235, "{sql}: {}", e.message);
+        assert!(e.message.contains(ty), "{sql}: {}", e.message);
+    }
+
+    // '0000-00-00' is outside the DATE domain (year 0001..=9999, real
+    // month/day): MySQL 1292, nothing stored.
+    ddl(&mut c, "CREATE TABLE ok (id BIGINT PRIMARY KEY, d DATE)").await;
+    let e = mysql_server_error(&mut c, "INSERT INTO ok (id, d) VALUES (1, '0000-00-00')").await;
+    assert_eq!(e.code, 1292, "{}", e.message);
+    assert!(e.message.contains("Incorrect DATE value"), "{}", e.message);
+    let got = rows(&mut c, "SELECT COUNT(*) FROM ok").await;
+    assert_eq!(got, vec![vec![s("0")]], "nothing stored");
+    node.kill_now();
+}

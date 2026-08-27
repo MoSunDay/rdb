@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{spawn_node_mysql, wait_mysql_ready, wait_resp_ready};
+use common::{mysql_root_conn, spawn_node_mysql, wait_mysql_ready, wait_resp_ready};
 use mysql_async::prelude::*;
 use mysql_async::{OptsBuilder, Value as MVal};
 
@@ -307,5 +307,99 @@ async fn native_password_auth_enforced() {
             "access denied error for {user}, got: {msg}"
         );
     }
+    node.child.kill().ok();
+}
+
+/// Concurrent DDL stays isolated: four connections interleave CREATEs
+/// of their OWN tables (table ids allocated atomically, so no two
+/// tables can ever share one), two connections racing on the SAME name
+/// produce exactly one winner (MySQL 1050 for the loser), and no table
+/// ever shows another writer's row.
+#[tokio::test]
+async fn concurrent_create_tables_stay_isolated() {
+    let dir = std::env::temp_dir().join(format!("rdb-sql-ddl-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut node = spawn_node_mysql(&dir, 0, true, None);
+    wait_resp_ready(&mut node, 15).await;
+    wait_mysql_ready(&node, 15).await;
+
+    let mut conns: Vec<mysql_async::Conn> = Vec::new();
+    for _ in 0..4 {
+        conns.push(mysql_root_conn(&node, PASS).await);
+    }
+
+    // 4 conns x 3 tables of their own, all in flight together: 12
+    // CREATE + INSERT pairs racing through one catalog.
+    futures::future::join_all(conns.iter_mut().enumerate().map(|(i, c)| async move {
+        for j in 0..3 {
+            ddl(
+                c,
+                &format!("CREATE TABLE c{i}_t{j} (id BIGINT PRIMARY KEY, tag VARCHAR(16))"),
+            )
+            .await;
+            c.query_drop(format!(
+                "INSERT INTO c{i}_t{j} (id, tag) VALUES (1, 'c{i}')"
+            ))
+            .await
+            .expect("own insert");
+        }
+    }))
+    .await;
+
+    // two conns race on the SAME name: exactly one wins
+    let mut ra = mysql_root_conn(&node, PASS).await;
+    let mut rb = mysql_root_conn(&node, PASS).await;
+    let create = "CREATE TABLE shared_raced (id BIGINT PRIMARY KEY, tag VARCHAR(16))";
+    let raced = futures::future::join_all([ra.query_drop(create), rb.query_drop(create)]).await;
+    let mut winners = 0;
+    let mut losers: Vec<mysql_async::ServerError> = Vec::new();
+    for r in raced {
+        match r {
+            Ok(()) => winners += 1,
+            Err(mysql_async::Error::Server(e)) => losers.push(e),
+            Err(other) => panic!("unexpected race error: {other}"),
+        }
+    }
+    assert_eq!(winners, 1, "exactly one CREATE TABLE wins");
+    assert_eq!(losers.len(), 1, "the loser reports exactly one error");
+    // 1050 = ER_TABLE_EXISTS_ERROR ("table 'x' already exists")
+    assert_eq!(losers[0].code, 1050, "loser: {}", losers[0].message);
+
+    // one row lands in the surviving table (whichever conn won)
+    ra.query_drop("INSERT INTO shared_raced (id, tag) VALUES (1, 'raced')")
+        .await
+        .expect("insert into the surviving table");
+
+    // SHOW TABLES lists all 13 (12 own + the raced one)
+    let mut names: Vec<String> = rows(&mut conns[0], "SHOW TABLES")
+        .await
+        .into_iter()
+        .map(|r| match &r[0] {
+            MVal::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            v => panic!("non-bytes table cell {v:?}"),
+        })
+        .collect();
+    names.sort();
+    let mut want: Vec<String> = (0..4)
+        .flat_map(|i| (0..3).map(move |j| format!("c{i}_t{j}")))
+        .collect();
+    want.push("shared_raced".to_string());
+    want.sort();
+    assert_eq!(names, want, "SHOW TABLES after the concurrent DDL");
+
+    // no crosstalk: every table holds exactly its writer's own row
+    for (i, c) in conns.iter_mut().enumerate() {
+        for j in 0..3 {
+            let got = rows(c, &format!("SELECT id, tag FROM c{i}_t{j}")).await;
+            assert_eq!(
+                got,
+                vec![vec![int(1), s(&format!("c{i}"))]],
+                "c{i}_t{j} must hold only its own row"
+            );
+        }
+    }
+    let got = rows(&mut ra, "SELECT id, tag FROM shared_raced").await;
+    assert_eq!(got, vec![vec![int(1), s("raced")]], "exactly one row");
     node.child.kill().ok();
 }
