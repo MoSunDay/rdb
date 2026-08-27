@@ -601,3 +601,43 @@ pub async fn start_cluster(dir: &Path, n: usize) -> (Vec<ProcNode>, usize) {
     wait_cluster_nodes_list_all(&nodes, &binds, 90).await;
     (nodes, leader)
 }
+
+/// 3-node SQL cluster bring-up: bootstrap + 2 joiners with the MySQL and
+/// sql_rpc planes enabled, CLUSTER INIT, and a converged `sql_nodes`
+/// registry (self-registration is a 3s ticker: leaders self-write,
+/// followers forward through /sql/nodes, so poll the raft-replicated
+/// registry until every node shows a live sql_rpc bind). Returns the
+/// nodes in spawn order; node0 is the bootstrap leader.
+pub async fn start_sql_cluster(dir: &Path, n: usize) -> Vec<ProcNode> {
+    let mut nodes = Vec::new();
+    let mut first = spawn_node_sql(dir, 0, true, None);
+    wait_resp_ready(&mut first, 30).await;
+    wait_mysql_ready(&first, 15).await;
+    nodes.push(first);
+    assert_eq!(wait_leader(&nodes, 60).await, 0, "node0 must lead first");
+    let join = nodes[0].http.clone();
+    for id in 1..n {
+        let mut node = spawn_node_sql(dir, id, false, Some(&join));
+        wait_resp_ready(&mut node, 30).await;
+        wait_mysql_ready(&node, 15).await;
+        nodes.push(node);
+    }
+    let leader = wait_leader(&nodes, 60).await;
+    let binds: Vec<String> = nodes.iter().map(|x| x.resp.clone()).collect();
+    cluster_init(&nodes[leader], &binds).await;
+    wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let reg = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"get", b"sql_nodes"]).await;
+        let ready = binds.iter().all(|b| contains_bytes(&reg, b.as_bytes()))
+            && !contains_bytes(&reg, b"\"sql_rpc\":\"\"");
+        if ready {
+            return nodes;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry never converged: {reg:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}

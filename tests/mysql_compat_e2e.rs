@@ -2,7 +2,8 @@
 //! UNION [ALL], non-recursive CTEs (WITH), derived tables, and
 //! uncorrelated subqueries (scalar + IN), plus the loud rejections
 //! (INTERSECT/EXCEPT, WITH RECURSIVE, correlated refs, arity
-//! mismatch, multi-row scalars) and compound EXPLAIN.
+//! mismatch, multi-row scalars), the three-valued logic of
+//! IN / NOT IN / NOT, and compound EXPLAIN.
 
 mod common;
 
@@ -296,5 +297,34 @@ async fn ctes_derived_and_subqueries() {
     )
     .await;
     assert_eq!(got, vec![vec![int(2)]], "subquery inside CTE");
+    node.kill_now();
+}
+
+/// Three-valued logic: NULL is UNKNOWN, not FALSE. `x IN (NULL, ...)`
+/// stays NULL unless an exact match, `NOT IN` over a NULL element is
+/// NULL for every non-member, and `NOT` flips known booleans only
+/// (MySQL's truth tables, asserted through SELECT cells).
+#[tokio::test]
+async fn not_and_in_are_three_valued() {
+    let dir = std::env::temp_dir().join(format!("rdb-compat-3vl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut node = spawn_node_mysql(&dir, 0, true, None);
+    wait_resp_ready(&mut node, 15).await;
+    wait_mysql_ready(&node, 15).await;
+    let mut c = connect(&node).await;
+
+    for (sql, want) in [
+        ("SELECT 1 IN (NULL, 1)", int(1)),
+        ("SELECT 2 IN (NULL, 1)", MVal::NULL),
+        ("SELECT 2 IN (NULL, 3)", MVal::NULL),
+        ("SELECT 1 NOT IN (NULL, 2)", MVal::NULL),
+        ("SELECT 3 NOT IN (NULL, 2)", MVal::NULL),
+        ("SELECT NOT NULL", MVal::NULL),
+        ("SELECT NOT 0", int(1)),
+        ("SELECT NOT 5", int(0)),
+    ] {
+        assert_eq!(rows(&mut c, sql).await, vec![vec![want]], "{sql}");
+    }
     node.kill_now();
 }

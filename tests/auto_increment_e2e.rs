@@ -198,6 +198,72 @@ async fn counter_survives_restart() {
     );
 }
 
+/// The OK packet's `last_insert_id` field rides every statement reply:
+/// the generated id after an INSERT (the FIRST id of a multi-row
+/// batch), 0 after any other statement -- so mysql_async's
+/// `Conn::last_insert_id` is Some right after INSERTs and None once an
+/// UPDATE replaces the last OK packet. The session function keeps its
+/// own value, and tables without an auto column never set one.
+/// (Allocations reserve RESERVE_BATCH = 64 ids per raft round-trip, so
+/// the batch after a single insert starts at 1 + 64.)
+#[tokio::test]
+async fn ok_packet_carries_last_insert_id() {
+    let (mut node, mut c) = world("ok-packet").await;
+
+    // single-row INSERT: Some(generated id); it also burns the rest of
+    // the 64-wide reservation (see sequence::RESERVE_BATCH)
+    c.query_drop("INSERT INTO ai (v) VALUES ('one')")
+        .await
+        .expect("single insert");
+    assert_eq!(c.last_insert_id(), Some(1), "id of the single-row INSERT");
+
+    // multi-row INSERT: Some(first id of the batch) -- 65, not 2,
+    // because the single insert above reserved a 64-wide chunk
+    c.query_drop("INSERT INTO ai (v) VALUES ('a'), ('b'), ('c')")
+        .await
+        .expect("batch insert");
+    assert_eq!(c.last_insert_id(), Some(65), "first id of the batch");
+
+    // a non-INSERT OK packet carries 0 -> None (read right after the
+    // UPDATE: resultset replies muddy the field, so never probe it
+    // after a SELECT).
+    c.query_drop("UPDATE ai SET v = 'z' WHERE v = 'one'")
+        .await
+        .expect("update");
+    assert_eq!(c.last_insert_id(), None, "UPDATE OK packet carries 0");
+
+    // the session function still holds the last generated id
+    assert_eq!(
+        rows(&mut c, "SELECT LAST_INSERT_ID() FROM ai LIMIT 1").await,
+        vec![vec![int(65)]],
+        "LAST_INSERT_ID() survives non-INSERT statements"
+    );
+
+    // a table without AUTO_INCREMENT: no NEW id is generated, but an
+    // INSERT still echoes the session's stored id in the OK packet
+    // (shim gates the field on `is_insert`, not on id generation --
+    // matching the session value LAST_INSERT_ID() keeps); only
+    // non-INSERT statements carry 0.
+    run(
+        &mut c,
+        "CREATE TABLE plain (id BIGINT PRIMARY KEY, v VARCHAR(8))",
+    )
+    .await;
+    c.query_drop("INSERT INTO plain (id, v) VALUES (1, 'p')")
+        .await
+        .expect("plain insert");
+    assert_eq!(
+        c.last_insert_id(),
+        Some(65),
+        "plain INSERT echoes the session id, generates none"
+    );
+    c.query_drop("DELETE FROM plain WHERE id = 1")
+        .await
+        .expect("delete");
+    assert_eq!(c.last_insert_id(), None, "DELETE OK packet carries 0");
+    node.kill_now();
+}
+
 /// 3-process cluster: the counter is raft-replicated catalog state, so
 /// ids allocated on the leader are visible and UNIQUE everywhere (each
 /// node's scatter-gather SELECT returns the same full set), statements
@@ -206,49 +272,13 @@ async fn counter_survives_restart() {
 /// leader-only rule DDL already follows).
 #[tokio::test]
 async fn cluster_allocates_unique_ids_through_raft() {
-    use common::{
-        cluster_init, cmd_one_shot, spawn_node_sql, wait_cluster_nodes_list_all, wait_leader,
-        ProcNode, TOKEN,
-    };
-
     let dir = std::env::temp_dir().join(format!("rdb-sql-ai-cluster-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut nodes: Vec<ProcNode> = Vec::new();
-    let mut first = spawn_node_sql(&dir, 0, true, None);
-    wait_resp_ready(&mut first, 30).await;
-    wait_mysql_ready(&first, 15).await;
-    nodes.push(first);
-    assert_eq!(wait_leader(&nodes, 60).await, 0, "node0 must lead first");
-    let join = nodes[0].http.clone();
-    for id in 1..3 {
-        let mut node = spawn_node_sql(&dir, id, false, Some(&join));
-        wait_resp_ready(&mut node, 30).await;
-        wait_mysql_ready(&node, 15).await;
-        nodes.push(node);
-    }
-    let leader = wait_leader(&nodes, 60).await;
-    let binds: Vec<String> = nodes.iter().map(|n| n.resp.clone()).collect();
-    cluster_init(&nodes[leader], &binds).await;
-    wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let reg = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"get", b"sql_nodes"]).await;
-        let ready = binds
-            .iter()
-            .all(|b| common::contains_bytes(&reg, b.as_bytes()))
-            && !common::contains_bytes(&reg, b"\"sql_rpc\":\"\"");
-        if ready {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "registry never converged: {reg:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
-
+    let nodes = common::start_sql_cluster(&dir, 3).await;
+    // The helper asserts node0 leads first (and it keeps the leadership).
+    let leader = 0;
     let mut lc = connect(&nodes[leader]).await;
     run(
         &mut lc,
