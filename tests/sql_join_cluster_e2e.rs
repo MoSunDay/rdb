@@ -11,13 +11,9 @@
 
 mod common;
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{
-    cluster_init, cmd_one_shot, spawn_node_sql, wait_cluster_nodes_list_all, wait_leader,
-    wait_mysql_ready, wait_resp_ready, ProcNode, TOKEN,
-};
+use common::{start_sql_cluster, wait_leader, ProcNode};
 use mysql_async::prelude::*;
 use mysql_async::{OptsBuilder, Value as MVal};
 
@@ -102,48 +98,12 @@ async fn col(conn: &mut mysql_async::Conn, sql: &str) -> Vec<String> {
         .collect()
 }
 
-async fn start_sql_cluster(dir: &Path) -> Vec<ProcNode> {
-    let mut nodes = Vec::new();
-    let mut first = spawn_node_sql(dir, 0, true, None);
-    wait_resp_ready(&mut first, 30).await;
-    wait_mysql_ready(&first, 15).await;
-    nodes.push(first);
-    assert_eq!(wait_leader(&nodes, 60).await, 0, "node0 must lead first");
-    let join = nodes[0].http.clone();
-    for id in 1..3 {
-        let mut node = spawn_node_sql(dir, id, false, Some(&join));
-        wait_resp_ready(&mut node, 30).await;
-        wait_mysql_ready(&node, 15).await;
-        nodes.push(node);
-    }
-    let leader = wait_leader(&nodes, 60).await;
-    let binds: Vec<String> = nodes.iter().map(|n| n.resp.clone()).collect();
-    cluster_init(&nodes[leader], &binds).await;
-    wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let reg = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"get", b"sql_nodes"]).await;
-        let ready = binds
-            .iter()
-            .all(|b| common::contains_bytes(&reg, b.as_bytes()))
-            && !common::contains_bytes(&reg, b"\"sql_rpc\":\"\"");
-        if ready {
-            return nodes;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "registry never converged: {reg:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-}
-
 #[tokio::test]
 async fn cluster_joins_gather_both_sides() {
     let dir = std::env::temp_dir().join(format!("rdb-join-cluster-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let nodes = start_sql_cluster(&dir).await;
+    let nodes = start_sql_cluster(&dir, 3).await;
     let leader = wait_leader(&nodes, 60).await;
     let mut conns = Vec::new();
     for n in &nodes {

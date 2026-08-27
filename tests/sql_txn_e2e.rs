@@ -1,7 +1,8 @@
 //! Explicit BEGIN/COMMIT/ROLLBACK snapshot transactions over a real rdb
 //! process: snapshot isolation between connections, repeatable reads,
-//! own-write visibility, write-write conflicts (first committer wins)
-//! and DDL rejection inside a transaction.
+//! own-write visibility, write-write conflicts (first committer wins),
+//! DDL rejection inside a transaction, and connection loss rolling the
+//! open txn back.
 
 mod common;
 
@@ -299,5 +300,56 @@ async fn ddl_rejected_inside_txn() {
     assert_eq!(one_int(&rows(&mut a, "SELECT COUNT(*) FROM base").await), 0);
     a.query_drop("ROLLBACK").await.expect("rollback");
     ddl(&mut a, "CREATE TABLE fine (id BIGINT PRIMARY KEY)").await;
+    node.kill_now();
+}
+
+/// A connection that vanishes with an open txn leaves nothing behind:
+/// the staged insert never becomes visible and the server-side
+/// rollback (connection end) releases the snapshot, so the engine
+/// stays healthy for fresh connections.
+#[tokio::test]
+async fn disconnect_rolls_back_open_txn() {
+    let (mut node, mut a) = world(
+        "drop",
+        "CREATE TABLE gone (id BIGINT PRIMARY KEY, v VARCHAR(16) NULL)",
+    )
+    .await;
+
+    a.query_drop("BEGIN").await.expect("begin");
+    a.query_drop("INSERT INTO gone (id, v) VALUES (1, 'staged')")
+        .await
+        .expect("staged insert");
+    // only the writer's own snapshot sees it
+    assert_eq!(one_int(&rows(&mut a, "SELECT COUNT(*) FROM gone").await), 1);
+
+    // hard-drop the connection while the txn is open
+    a.disconnect().await.expect("disconnect conn A");
+
+    // conn B polls until the staged row is definitively gone
+    let mut b = connect(&node).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let count = one_int(&rows(&mut b, "SELECT COUNT(*) FROM gone").await);
+        if count == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "staged row survived the disconnect: {count}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // sanity: a fresh explicit txn still commits normally
+    b.query_drop("BEGIN").await.expect("begin");
+    b.query_drop("INSERT INTO gone (id, v) VALUES (2, 'kept')")
+        .await
+        .expect("insert");
+    b.query_drop("COMMIT").await.expect("commit");
+    assert_eq!(
+        one_int(&rows(&mut b, "SELECT COUNT(*) FROM gone").await),
+        1,
+        "explicit COMMIT still works after the abandoned txn"
+    );
     node.kill_now();
 }

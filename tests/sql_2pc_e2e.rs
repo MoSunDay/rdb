@@ -17,13 +17,9 @@
 
 mod common;
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{
-    cluster_init, cmd_one_shot, spawn_node_sql, wait_cluster_nodes_list_all, wait_leader,
-    wait_mysql_ready, wait_resp_ready, ProcNode, TOKEN,
-};
+use common::{cmd_one_shot, start_sql_cluster, wait_mysql_ready, wait_resp_ready, ProcNode, TOKEN};
 use mysql_async::prelude::*;
 use mysql_async::{OptsBuilder, Value as MVal};
 
@@ -138,48 +134,6 @@ async fn wait_table(conn: &mut mysql_async::Conn, table: &str, node: &ProcNode) 
     }
 }
 
-/// 3-node SQL cluster: bootstrap -> joiners -> leader -> CLUSTER INIT ->
-/// topology convergence -> the `sql_nodes` registry carries every bind
-/// with a non-empty sql_rpc port (the precondition for 2PC routing).
-async fn start_sql_cluster(dir: &Path) -> Vec<ProcNode> {
-    let mut nodes = Vec::new();
-    let mut first = spawn_node_sql(dir, 0, true, None);
-    wait_resp_ready(&mut first, 30).await;
-    wait_mysql_ready(&first, 15).await;
-    nodes.push(first);
-    assert_eq!(wait_leader(&nodes, 60).await, 0, "node0 must lead first");
-    let join = nodes[0].http.clone();
-    for id in 1..3 {
-        let mut node = spawn_node_sql(dir, id, false, Some(&join));
-        wait_resp_ready(&mut node, 30).await;
-        wait_mysql_ready(&node, 15).await;
-        nodes.push(node);
-    }
-    let leader = wait_leader(&nodes, 60).await;
-    let binds: Vec<String> = nodes.iter().map(|n| n.resp.clone()).collect();
-    cluster_init(&nodes[leader], &binds).await;
-    wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
-    // Registration is a 3s ticker (leaders self-write, followers forward
-    // through /sql/nodes): poll the raft-replicated registry until all
-    // three nodes are present with a live sql_rpc bind.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let reg = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"get", b"sql_nodes"]).await;
-        let ready = binds
-            .iter()
-            .all(|b| common::contains_bytes(&reg, b.as_bytes()))
-            && !common::contains_bytes(&reg, b"\"sql_rpc\":\"\"");
-        if ready {
-            return nodes;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "registry never converged: {reg:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-}
-
 /// M3 SELECTs scatter-gather: EVERY node must read back the WHOLE
 /// table, exactly the expected id set from each node alike (bands are
 /// disjoint and pk -> slot is pure, so nothing is missed or doubled).
@@ -221,7 +175,7 @@ async fn cross_slot_commit_locality_veto_and_status_route() {
     let dir = std::env::temp_dir().join(format!("rdb-sql-2pc-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let nodes = start_sql_cluster(&dir).await;
+    let nodes = start_sql_cluster(&dir, 3).await;
     let mut c0 = connect(&nodes[0]).await;
     let mut c1 = connect(&nodes[1]).await;
     let mut c2 = connect(&nodes[2]).await;
@@ -324,7 +278,7 @@ async fn dead_participant_aborts_and_restart_recovers() {
     let dir = std::env::temp_dir().join(format!("rdb-sql-2pc-crash-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut nodes = start_sql_cluster(&dir).await;
+    let mut nodes = start_sql_cluster(&dir, 3).await;
     let mut c0 = connect(&nodes[0]).await;
     let mut c1 = connect(&nodes[1]).await;
     let mut c2 = connect(&nodes[2]).await;

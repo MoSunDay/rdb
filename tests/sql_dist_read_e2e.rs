@@ -11,17 +11,16 @@
 //!   node keeps its pinned snapshot even after another node commits a
 //!   spanning INSERT (every participant's oracle advanced), and sees
 //!   the rows after COMMIT;
-//! - EXPLAIN announces the distributed plan ("Gather(bands=3)").
+//! - EXPLAIN announces the distributed plan ("Gather(bands=3)");
+//! - locking reads (FOR UPDATE) veto in cluster mode, and EXPLAIN
+//!   degrades an indexed table to gather + SeqScan (no IndexScan: a
+//!   band-local index could silently miss remote rows).
 
 mod common;
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{
-    cluster_init, cmd_one_shot, spawn_node_sql, wait_cluster_nodes_list_all, wait_leader,
-    wait_mysql_ready, wait_resp_ready, ProcNode, TOKEN,
-};
+use common::{mysql_server_error, start_sql_cluster, ProcNode};
 use mysql_async::prelude::*;
 use mysql_async::{OptsBuilder, Value as MVal};
 
@@ -102,45 +101,6 @@ async fn wait_table(conn: &mut mysql_async::Conn, table: &str, node: &ProcNode) 
     }
 }
 
-/// 3-node SQL cluster with a converged topology and `sql_nodes`
-/// registry (sql_rpc ports resolvable: the precondition for both the
-/// 2PC write path and the ScanBand read path).
-async fn start_sql_cluster(dir: &Path) -> Vec<ProcNode> {
-    let mut nodes = Vec::new();
-    let mut first = spawn_node_sql(dir, 0, true, None);
-    wait_resp_ready(&mut first, 30).await;
-    wait_mysql_ready(&first, 15).await;
-    nodes.push(first);
-    assert_eq!(wait_leader(&nodes, 60).await, 0, "node0 must lead first");
-    let join = nodes[0].http.clone();
-    for id in 1..3 {
-        let mut node = spawn_node_sql(dir, id, false, Some(&join));
-        wait_resp_ready(&mut node, 30).await;
-        wait_mysql_ready(&node, 15).await;
-        nodes.push(node);
-    }
-    let leader = wait_leader(&nodes, 60).await;
-    let binds: Vec<String> = nodes.iter().map(|n| n.resp.clone()).collect();
-    cluster_init(&nodes[leader], &binds).await;
-    wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let reg = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"get", b"sql_nodes"]).await;
-        let ready = binds
-            .iter()
-            .all(|b| common::contains_bytes(&reg, b.as_bytes()))
-            && !common::contains_bytes(&reg, b"\"sql_rpc\":\"\"");
-        if ready {
-            return nodes;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "registry never converged: {reg:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-}
-
 /// All cells of a resultset as strings (NULL as "NULL"): ids come back
 /// as MySQL bytes, ints as ints -- normalize both.
 async fn grid(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<String>> {
@@ -193,7 +153,7 @@ async fn distributed_reads_gather_filter_aggregate_and_snapshot() {
     let dir = std::env::temp_dir().join(format!("rdb-sql-dist-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let nodes = start_sql_cluster(&dir).await;
+    let nodes = start_sql_cluster(&dir, 3).await;
     let mut c0 = connect(&nodes[0]).await;
     let mut c1 = connect(&nodes[1]).await;
     let mut c2 = connect(&nodes[2]).await;
@@ -276,5 +236,53 @@ async fn distributed_reads_gather_filter_aggregate_and_snapshot() {
         col(&mut c1, "SELECT COUNT(*) FROM items").await,
         vec!["80"],
         "post-commit read gathers the new rows"
+    );
+}
+
+/// The two cluster-mode regressions of a secondary index: a locking
+/// read cannot hold band-local latches across a gather (MySQL 1235
+/// veto), and the planner is bypassed entirely on the gather path --
+/// even with a usable index on the predicate the plan stays
+/// `Gather(bands=3)` over `SeqScan` (an IndexLookup would silently
+/// miss the remote bands).
+#[tokio::test]
+async fn for_update_vetoed_and_explain_degrades_on_indexed_table() {
+    let dir = std::env::temp_dir().join(format!("rdb-sql-dist-idx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nodes = start_sql_cluster(&dir, 3).await;
+    let mut c0 = connect(&nodes[0]).await;
+
+    ddl(
+        &mut c0,
+        "CREATE TABLE ix (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, tag VARCHAR(8) NOT NULL)",
+    )
+    .await;
+    ddl(&mut c0, "CREATE INDEX ix_k ON ix (k)").await;
+    c0.query_drop("INSERT INTO ix (id, k, tag) VALUES (1, 1, 'a')")
+        .await
+        .expect("seed");
+
+    // (i) locking read inside an explicit txn: loud veto, nothing
+    // locked, txn still alive for ROLLBACK.
+    c0.query_drop("BEGIN").await.expect("begin");
+    let e = mysql_server_error(&mut c0, "SELECT id FROM ix WHERE k = 1 FOR UPDATE").await;
+    assert_eq!(e.code, 1235, "FOR UPDATE must veto: {}", e.message);
+    assert!(
+        e.message.contains("cluster") && e.message.contains("gather"),
+        "veto must name the cluster/gather limitation: {}",
+        e.message
+    );
+    c0.query_drop("ROLLBACK").await.expect("rollback");
+
+    // (ii) the same predicate plans as gather + SeqScan, never an
+    // index access path.
+    let plan = col(&mut c0, "EXPLAIN SELECT id FROM ix WHERE k = 1").await;
+    assert!(plan[0].starts_with("Gather(bands=3)"), "plan: {plan:?}");
+    assert_eq!(plan[1], "SeqScan ix", "plan: {plan:?}");
+    assert!(
+        plan.iter()
+            .all(|l| !l.contains("IndexScan") && !l.contains("IndexLookup")),
+        "index must not be used in cluster mode: {plan:?}"
     );
 }

@@ -12,7 +12,7 @@ mod common;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{spawn_node_mysql, wait_mysql_ready, wait_resp_ready, ProcNode};
+use common::{mysql_server_error, spawn_node_mysql, wait_mysql_ready, wait_resp_ready, ProcNode};
 use mysql_async::prelude::*;
 use mysql_async::{OptsBuilder, Value as MVal};
 
@@ -111,6 +111,24 @@ async fn spawn(dir: &Path) -> ProcNode {
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
     node
+}
+
+/// One cross-band txn per node (`tick` keys spread over every slot
+/// band, so all three members join the 2PC and apply the decided ts --
+/// `advance_to` raises each node's read point past commits closed on
+/// other coordinators). Failures are ignored: the caller only polls
+/// for convergence afterwards.
+async fn advance_read_points(nodes: &[ProcNode]) {
+    for node in nodes {
+        let mut c = connect(node).await;
+        let vals: Vec<String> = (0..30).map(|k| format!("({k}, 't')")).collect();
+        let _ = c
+            .query_drop(format!(
+                "INSERT INTO tick (k, v) VALUES {}",
+                vals.join(", ")
+            ))
+            .await;
+    }
 }
 
 #[tokio::test]
@@ -221,6 +239,15 @@ async fn starrocks_models_single_node() {
         ER_PARSE_ERROR,
     )
     .await;
+
+    // the AGGREGATE KEY model names itself in the loud rejection
+    let e = mysql_server_error(&mut c, "CREATE TABLE bad (k INT NOT NULL) AGGREGATE KEY(k)").await;
+    assert_eq!(e.code, ER_NOT_SUPPORTED_YET, "{}", e.message);
+    assert!(
+        e.message.contains("AGGREGATE KEY"),
+        "rejection must name the model: {}",
+        e.message
+    );
 }
 
 /// Cluster: a StarRocks PRIMARY KEY table over 3 nodes. Each node seeds
@@ -230,47 +257,13 @@ async fn starrocks_models_single_node() {
 /// via the 2PC commit path.
 #[tokio::test]
 async fn starrocks_pk_upsert_three_node_cluster() {
-    use common::{
-        cluster_init, cmd_one_shot, spawn_node_sql, wait_cluster_nodes_list_all, wait_leader, TOKEN,
-    };
-
     let dir = std::env::temp_dir().join(format!("rdb-sr-cluster-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut nodes: Vec<ProcNode> = Vec::new();
-    let mut first = spawn_node_sql(&dir, 0, true, None);
-    wait_resp_ready(&mut first, 30).await;
-    wait_mysql_ready(&first, 15).await;
-    nodes.push(first);
-    assert_eq!(wait_leader(&nodes, 60).await, 0);
-    let join = nodes[0].http.clone();
-    for id in 1..3 {
-        let mut node = spawn_node_sql(&dir, id, false, Some(&join));
-        wait_resp_ready(&mut node, 30).await;
-        wait_mysql_ready(&node, 15).await;
-        nodes.push(node);
-    }
-    let leader = wait_leader(&nodes, 60).await;
-    let binds: Vec<String> = nodes.iter().map(|n| n.resp.clone()).collect();
-    cluster_init(&nodes[leader], &binds).await;
-    wait_cluster_nodes_list_all(&nodes, &binds, 30).await;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let reg = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"get", b"sql_nodes"]).await;
-        let ready = binds
-            .iter()
-            .all(|b| common::contains_bytes(&reg, b.as_bytes()))
-            && !common::contains_bytes(&reg, b"\"sql_rpc\":\"\"");
-        if ready {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "registry never converged: {reg:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+    let nodes = common::start_sql_cluster(&dir, 3).await;
+    // The helper asserts node0 leads first (and it keeps the leadership).
+    let leader = 0;
 
     let mut lc = connect(&nodes[leader]).await;
     ddl(
@@ -347,4 +340,134 @@ async fn starrocks_pk_upsert_three_node_cluster() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Cluster: a StarRocks DUPLICATE KEY table over 3 nodes (columnar
+/// segments fan out to every member, reads gather with no dedup, a
+/// segment lives on exactly one node). Each node appends its own block
+/// of 10 rows; every node must read back 30 rows with the key set
+/// 0..30 EXACTLY ONCE. A repeated key appends (count grows, no pk
+/// dedup) and UPDATE vetoes as an append-only violation.
+#[tokio::test]
+async fn starrocks_duplicate_model_three_node_cluster() {
+    let dir = std::env::temp_dir().join(format!("rdb-sr-dup-cluster-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let nodes = common::start_sql_cluster(&dir, 3).await;
+    let mut lc = connect(&nodes[0]).await;
+    ddl(
+        &mut lc,
+        "CREATE TABLE dup_c (k BIGINT NOT NULL, k2 BIGINT NOT NULL, v VARCHAR(16) NULL) \
+         DUPLICATE KEY(k2) DISTRIBUTED BY HASH(k2) BUCKETS 3",
+    )
+    .await;
+
+    // each node appends its own block of 10 rows (distinct key range,
+    // distinct v tag per writer)
+    for (i, node) in nodes.iter().enumerate() {
+        let mut c = connect(node).await;
+        let vals: Vec<String> = (0..10)
+            .map(|j| format!("({}, {}, 'n{i}')", i * 10 + j, i * 10 + j))
+            .collect();
+        c.query_drop(format!(
+            "INSERT INTO dup_c (k, k2, v) VALUES {}",
+            vals.join(", ")
+        ))
+        .await
+        .expect("seed insert");
+    }
+
+    // gather exactly-once: every node sees 30 rows and the key set
+    // 0..30 with no missing and no doubled key. Followers' read points
+    // only advance through their own ts grants or 2PC applies
+    // (oracle::advance_to), so each poll round runs one cross-band
+    // txn through every node first -- the documented convergence path
+    // for "a node that never allocated timestamps itself would hand
+    // out snapshots below the commit ts and never see the rows".
+    ddl(
+        &mut lc,
+        "CREATE TABLE tick (k BIGINT PRIMARY KEY, v VARCHAR(8) NULL)",
+    )
+    .await;
+    let want_keys: Vec<i64> = (0..30).collect();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        advance_read_points(&nodes).await;
+        let mut done = true;
+        for (i, node) in nodes.iter().enumerate() {
+            let mut c = connect(node).await;
+            let count = grid(&mut c, "SELECT COUNT(*) FROM dup_c")
+                .await
+                .pop()
+                .and_then(|mut r| r.pop());
+            if count.as_deref() != Some("30") {
+                eprintln!("NODE {i}: count {count:?} (want 30)");
+                done = false;
+                continue;
+            }
+            let mut ks: Vec<i64> = col(&mut c, "SELECT k FROM dup_c")
+                .await
+                .into_iter()
+                .map(|k| k.parse().expect("int key"))
+                .collect();
+            ks.sort();
+            if ks != want_keys {
+                eprintln!("NODE {i} key set mismatch: got {ks:?}");
+                done = false;
+            }
+        }
+        if done {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cluster never converged on the appended key set"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // DUPLICATE model appends: the same key twice stays twice
+    {
+        let mut c = connect(&nodes[1]).await;
+        c.query_drop("INSERT INTO dup_c (k, k2, v) VALUES (0, 0, 'appended')")
+            .await
+            .expect("append an existing key");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        advance_read_points(&nodes).await;
+        let mut done = true;
+        for (i, node) in nodes.iter().enumerate() {
+            let mut c = connect(node).await;
+            let got = grid(&mut c, "SELECT COUNT(*) FROM dup_c").await;
+            if got != vec![vec!["31"]] {
+                eprintln!("NODE {i} count after append: {got:?}");
+                done = false;
+            }
+        }
+        if done {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cluster never converged on the appended duplicate row"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let mut fc = connect(&nodes[1]).await;
+    assert_eq!(
+        col(&mut fc, "SELECT v FROM dup_c WHERE k = 0 ORDER BY v").await,
+        vec!["appended", "n0"],
+        "both versions of key 0 read back"
+    );
+
+    // append-only: UPDATE is a loud rejection (MySQL 1235)
+    let e = mysql_server_error(&mut lc, "UPDATE dup_c SET v = 'x' WHERE k = 0").await;
+    assert_eq!(e.code, ER_NOT_SUPPORTED_YET, "{}", e.message);
+    assert!(
+        e.message.contains("append-only"),
+        "rejection must name the append-only model: {}",
+        e.message
+    );
 }
