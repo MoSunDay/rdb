@@ -19,12 +19,14 @@ use crate::store::Store;
 /// the callback returns `false` to stop early (unused by the hasher,
 /// which always drains the range).
 ///
-/// User-data kind range: KIND_STRING_TTL (0x01) ..= KIND_VECTORSET_ELEM
-/// (0x12). The raw-string layout (0x00) is hashed separately below; the
-/// expire index (0xFD) is derived state (its contents follow the data
-/// records) and is covered transitively.
+/// User-data kind range: KIND_STRING_TTL (0x01) ..= KIND_ANN_POSTING
+/// (0x18), i.e. every family including the SEARCH kinds (0x13..=0x18;
+/// next registered kind is the expire index at 0xFD). The raw-string
+/// layout (0x00) is hashed separately below; the expire index is
+/// derived state (its contents follow the data records) and is covered
+/// transitively.
 const USER_KINDS: std::ops::RangeInclusive<u8> =
-    codec::KIND_STRING_TTL..=codec::KIND_VECTORSET_ELEM;
+    codec::KIND_STRING_TTL..=codec::KIND_ANN_POSTING;
 
 /// Hash every physical byte stored for `key` under `prefix`.
 ///
@@ -130,6 +132,32 @@ mod tests {
         sh.store
             .db
             .delete(codec::elem_key(p, KIND_HASH_FLD, k, b"f"))
+            .unwrap();
+        assert_eq!(h0, value_hash(&sh.store, p, k));
+    }
+
+    #[test]
+    fn hash_tracks_search_family() {
+        let sh = shared();
+        let p = b"42/" as &[u8];
+        let k = b"fkey" as &[u8];
+        let h0 = value_hash(&sh.store, p, k);
+
+        // SEARCH family records (FT.* data) are user data too: an ANN
+        // posting element under the key -- the top boundary kind, 0x18 --
+        // must move the fingerprint, or FT.* writes cannot dirty a
+        // MULTI/EXEC transaction.
+        sh.store
+            .db
+            .put(codec::elem_key(p, codec::KIND_ANN_POSTING, k, b"d1"), b"q")
+            .unwrap();
+        let h1 = value_hash(&sh.store, p, k);
+        assert_ne!(h0, h1);
+
+        // deleting the record restores the absent-state hash
+        sh.store
+            .db
+            .delete(codec::elem_key(p, codec::KIND_ANN_POSTING, k, b"d1"))
             .unwrap();
         assert_eq!(h0, value_hash(&sh.store, p, k));
     }

@@ -77,8 +77,7 @@ impl Oracle {
 
     /// Reserve `n` consecutive timestamps at once (one write batch stamps
     /// many versions); the range is `[start, start+n)`.
-    pub fn alloc_n(&self, n: u64) -> std::ops::Range<u64> {
-        match self.cluster.get() {
+    pub fn alloc_n(&self, n: u64) -> std::ops::Range<u64> {        match self.cluster.get() {
             Some(core) if core.active() => {
                 let r = core.alloc_n(n);
                 // Keep the local counter above every cluster grant so a
@@ -97,6 +96,51 @@ impl Oracle {
                 let start = self.next.fetch_add(n, Ordering::SeqCst);
                 start..start + n
             }
+        }
+    }
+
+    /// Like [`Self::alloc_n`] but the range is guaranteed to sit strictly
+    /// above `floor` (the statement's read point). Snapshot isolation:
+    /// a write must stamp versions NEWER than everything it read, even
+    /// when the locally reserved block was granted before commits this
+    /// node observed since the snapshot (2PC participant `advance_to`).
+    pub fn alloc_n_above(&self, n: u64, floor: u64) -> std::ops::Range<u64> {
+        match self.cluster.get() {
+            Some(core) if core.active() => {
+                let r = core.alloc_above(n, floor);
+                self.next.fetch_max(r.end, Ordering::SeqCst);
+                r
+            }
+            Some(core) => {
+                self.next.fetch_max(floor + 1, Ordering::SeqCst);
+                let start = self.next.fetch_add(n, Ordering::SeqCst);
+                core.observe_floor(start + n.max(1) - 1);
+                start..start + n
+            }
+            None => {
+                self.next.fetch_max(floor + 1, Ordering::SeqCst);
+                let start = self.next.fetch_add(n, Ordering::SeqCst);
+                start..start + n
+            }
+        }
+    }
+
+    /// Best-effort pre-commit hook (cluster mode): make the locally
+    /// reserved block serve timestamps above `floor` by folding in the
+    /// raft-replicated cursor and re-leasing past a stale tail. See
+    /// [`ClusterTs::reserve_write_frontier`]. No-op in local mode.
+    pub async fn reserve_write_frontier(&self, floor: u64, want: u64) {
+        if let Some(core) = self.cluster_core() {
+            core.reserve_write_frontier(floor, want).await;
+        }
+    }
+
+    /// Fold the raft-replicated cursor into this node's read-point
+    /// horizon (see [`ClusterTs::sync_cursor_frontier`]). No-op in
+    /// local mode.
+    pub fn sync_cursor_frontier(&self) {
+        if let Some(core) = self.cluster_core() {
+            core.sync_cursor_frontier();
         }
     }
 

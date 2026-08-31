@@ -28,12 +28,14 @@ use std::sync::Arc;
 
 use rocksdb::WriteBatch;
 
+use crate::sql::dist;
 use crate::sql::exec::scan;
 use crate::sql::exec::ExecOutcome;
 use crate::sql::index::{self, IndexOps, IndexRef};
 use crate::sql::parse::ast::{ColumnSpec, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog::{self, CatalogTxn};
+use crate::sql::storage::replicate;
 use crate::sql::storage::row;
 use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, KeyModel, SqlType, TableSchema};
 use crate::state::{RaftState, Shared};
@@ -116,7 +118,7 @@ impl DdlPlan {
 async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<()> {
     let raft = Arc::clone(&shared.raft);
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
+    let applied = tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();
         let mut txn: CatalogTxn<'_> = catalog::begin(&mut guard, "DDL").map_err(SqlError::from)?;
         match mutation {
@@ -124,10 +126,15 @@ async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<
             CatalogMutation::Drop(schema) => handle.block_on(txn.drop(&schema.name, schema.id)),
             CatalogMutation::Kv { key, value } => handle.block_on(txn.put_kv(&key, &value)),
         }
-        .map_err(SqlError::from)
+        .map_err(SqlError::from)?;
+        Ok::<_, SqlError>(txn.applied().to_vec())
     })
     .await
-    .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))?
+    .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))??;
+    // The ack implies follower visibility: hold the response until the
+    // peers' FSMs serve the mutation (best-effort, see `replicate`).
+    replicate::wait_peers_serve(shared, &applied).await;
+    Ok(())
 }
 
 /// Run `decide` + its mutations inside ONE raft write-guard window on
@@ -143,7 +150,7 @@ where
 {
     let raft = Arc::clone(&shared.raft);
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
+    let (plan, applied) = tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();
         // begin() keeps the leadership check FIRST (a follower must get
         // the "requires the raft leader" error, not a decision error).
@@ -157,10 +164,14 @@ where
             }
             .map_err(SqlError::from)?;
         }
-        Ok(plan)
+        Ok::<_, SqlError>((plan, txn.applied().to_vec()))
     })
     .await
-    .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))?
+    .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))??;
+    // The ack implies follower visibility: hold the response until the
+    // peers' FSMs serve the mutation (best-effort, see `replicate`).
+    replicate::wait_peers_serve(shared, &applied).await;
+    Ok(plan)
 }
 
 async fn create_table(
@@ -337,9 +348,19 @@ async fn create_index(
 
 /// Write index entries for every live row (leader-side, after the
 /// catalog entry committed). One synced batch per whole backfill.
+/// Backfill one new index's entries for every LIVE row of the table.
+/// The row set is gathered across slot owners (rows live on every
+/// node), and the produced entries are routed to the OWNER of each
+/// key's slot: a local batch would leave unique-key entries on the
+/// leader for slots other nodes own, and the owning participants would
+/// then never see them -- the unique veto would miss exactly the
+/// pre-existing values. All-local key sets keep the single-batch path.
 async fn backfill_index(shared: &Shared, schema: &TableSchema, index: &IndexRef) -> SqlResult<()> {
     let read_ts = shared.sql_ts.now();
-    let rows = scan::visible_rows(&shared.store, schema, read_ts)?;
+    let rows = match dist::gather::gatherable_by_name(shared) {
+        Some(bs) => dist::gather::gather_rows(shared, &bs, schema, read_ts).await?,
+        None => scan::visible_rows(&shared.store, schema, read_ts)?,
+    };
     let mut ops: IndexOps = Vec::with_capacity(rows.len());
     for r in &rows {
         let pk_key = row::pk_encode(&r[schema.pk_index()]).map_err(SqlError::from)?;
@@ -347,6 +368,35 @@ async fn backfill_index(shared: &Shared, schema: &TableSchema, index: &IndexRef)
     }
     if ops.is_empty() {
         return Ok(());
+    }
+    // A unique index over already-duplicated values is unbuildable:
+    // two pks claiming one key can never both win, and routing them to
+    // different owners would silently weaken the constraint. Reject the
+    // CREATE like a duplicate insert instead (before any key lands).
+    let mut owners: std::collections::BTreeMap<&[u8], &[u8]> = std::collections::BTreeMap::new();
+    for (key, val) in &ops {
+        let Some(pk) = val.as_deref() else { continue };
+        if let Some(prev) = owners.get(key.as_slice()) {
+            if *prev != pk {
+                return Err(SqlError::new(
+                    ErrorCode::DupEntry,
+                    format!(
+                        "Duplicate entry '{}' for key '{}': the column already holds duplicates",
+                        String::from_utf8_lossy(pk),
+                        index.name
+                    ),
+                ));
+            }
+        }
+        owners.insert(key.as_slice(), pk);
+    }
+    drop(owners);
+    // Route entries to each key's slot owner: 2PC when any owner is
+    // another node, one local batch otherwise (single-node world or
+    // every key on this node).
+    let no_writes: dist::plan::SimpleWrites = Vec::new();
+    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, schema, &no_writes, &ops)? {
+        return dist::twopc::run(shared, &plan).await;
     }
     let mut batch = WriteBatch::default();
     index::maintain::apply_ops(&mut batch, ops);

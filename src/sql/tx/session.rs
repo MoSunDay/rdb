@@ -355,6 +355,12 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
     // Single-node deployments never enter this branch: the exact M2
     // batch sequence below stays untouched. Segments travel inside the
     // plan attached to the coordinator's own slice.
+    // The write frontier is reserved BEFORE planning so the plan's ts
+    // range can never stamp versions below the txn's read point; the
+    // plan (or the local batch below) allocates one ts per staged
+    // write plus one per appended segment.
+    let want = txn.writes.len() as u64 + txn.appends.len() as u64;
+    shared.sql_ts.reserve_write_frontier(txn.read_ts, want).await;
     if let Some(plan) = crate::sql::dist::plan::try_plan_txn(shared, txn)? {
         return crate::sql::dist::twopc::run(shared, &plan).await;
     }
@@ -369,7 +375,7 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
     // atomic batch: rows take the head, one ts per columnar table's
     // segment takes the tail (BTreeMap order = deterministic).
     let total = txn.writes.len() as u64 + txn.appends.len() as u64;
-    let ts = shared.sql_ts.alloc_n(total);
+    let ts = shared.sql_ts.alloc_n_above(total, txn.read_ts);
     let row_ts = ts.start..ts.start + txn.writes.len() as u64;
     let mut batch = build_commit_batch(&txn.writes, &schemas, row_ts)?;
     crate::sql::index::maintain::apply_ops(&mut batch, idx);

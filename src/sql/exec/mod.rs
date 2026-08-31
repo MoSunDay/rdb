@@ -128,6 +128,9 @@ async fn dispatch(
             if let Some(txn) = sess.txn.take() {
                 tx::commit(shared, txn).await?;
             }
+            // Pin the snapshot to the cluster's latest applied ts (a
+            // follower's own block lease can lag the raft cursor).
+            shared.sql_ts.sync_cursor_frontier();
             sess.txn = Some(tx::begin(&shared.sql_ts));
             Ok(ExecOutcome::Ok)
         }
@@ -176,6 +179,7 @@ async fn dispatch(
         // MySQL starts an implicit transaction for a bare SAVEPOINT.
         Statement::Savepoint(name) => {
             if sess.txn.is_none() {
+                shared.sql_ts.sync_cursor_frontier();
                 sess.txn = Some(tx::begin(&shared.sql_ts));
             }
             tx::savepoint(sess.txn.as_mut().expect("txn begun above"), &name);

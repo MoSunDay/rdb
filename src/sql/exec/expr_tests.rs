@@ -301,3 +301,40 @@ fn length_counts_bytes_char_length_counts_chars() {
         Ok(Value::Null)
     ));
 }
+
+/// Integer div/mod wrap like Add/Sub/Mul: MIN / -1 must not panic
+/// (divide-by-zero still evaluates to NULL).
+#[test]
+fn eval_int_div_mod_wrap_extremes() {
+    use crate::sql::parse::ast::BinOp::*;
+    let bin = |op: BinOp, l: Expr, r: Expr| Expr::BinaryOp {
+        left: Box::new(l),
+        op,
+        right: Box::new(r),
+    };
+    let lit = |i: i64| Expr::Lit(Value::Int(i));
+    let min = i64::MIN;
+    assert_eq!(
+        eval_str(&bin(Div, lit(min), lit(-1))),
+        Ok(Value::Int(min))
+    );
+    assert_eq!(eval_str(&bin(Mod, lit(min), lit(-1))), Ok(Value::Int(0)));
+    // divide / modulo by zero stays NULL
+    assert!(matches!(
+        eval_str(&bin(Div, lit(7), lit(0))),
+        Ok(Value::Null)
+    ));
+    assert!(matches!(
+        eval_str(&bin(Mod, lit(7), lit(0))),
+        Ok(Value::Null)
+    ));
+    // ordinary division and modulo are unchanged
+    assert!(matches!(
+        eval_str(&bin(Div, lit(7), lit(2))),
+        Ok(Value::Int(3))
+    ));
+    assert!(matches!(
+        eval_str(&bin(Mod, lit(7), lit(2))),
+        Ok(Value::Int(1))
+    ));
+}

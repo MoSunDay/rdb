@@ -7,28 +7,57 @@ name = "rdb"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+# The process entry needs the full stack (raft/SQL/monitor); under a
+# store-only build (`--no-default-features --features store`) the bin is
+# skipped entirely so the embedder never compiles it.
+name = "rdb"
+path = "src/main.rs"
+required-features = ["full"]
+
+[features]
+# `full` = the rdb server stack (default); `store` = embedder-only slice
+# exposing just the RocksDB KV layer. `store` is deliberately independent
+# of `full` (`default-features = false, features = ["store"]`).
+default = ["full"]
+full = [
+    "dep:async-trait",
+    "dep:futures",
+    "dep:jieba-rs",
+    "dep:openraft",
+    "dep:opensrv-mysql",
+    "dep:prometheus",
+    "dep:serde_yaml",
+    "dep:sha1",
+    "dep:socket2",
+    "dep:sqlparser",
+    "dep:tracing-subscriber",
+]
+store = []
+
 [dependencies]
 rocksdb = "0.24"
 tokio = { version = "1", features = ["full", "test-util"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
 serde_json = { version = "1", features = ["preserve_order"] }
 md-5 = "0.10"
 hex = "0.4"
-prometheus = "0.13"
-openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
-futures = "0.3"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Heavy, non-store dependencies below are optional and pulled in by `full`.
+prometheus = { version = "0.13", optional = true }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2"], optional = true }
+futures = { version = "0.3", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 # Only used for TCP keepalive on raft sockets; already in the tree via tokio.
 # The "all" feature unlocks `TcpKeepalive::with_retries` (TCP_KEEPCNT).
-socket2 = { version = "0.6", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"], optional = true }
 # MySQL-protocol frontend (M1): shim + SQL parsing + native-password auth.
-opensrv-mysql = { version = "=0.7.0", default-features = false }
-sqlparser = "=0.62.0"
-sha1 = "0.10"
-async-trait = "0.1"
+opensrv-mysql = { version = "=0.7.0", default-features = false, optional = true }
+sqlparser = { version = "=0.62.0", optional = true }
+sha1 = { version = "0.10", optional = true }
+async-trait = { version = "0.1", optional = true }
 # Chinese word segmentation for the FT.* search tokenizer (embedded dict).
-jieba-rs = "0.10"
+jieba-rs = { version = "0.10", optional = true }
+serde_yaml = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

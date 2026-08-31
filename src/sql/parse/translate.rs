@@ -384,32 +384,32 @@ fn translate_set(set: sqlparser::ast::Set) -> SqlResult<Statement> {
     use sqlparser::ast::Set as SqlSet;
     match set {
         SqlSet::SetTransaction { modes, .. } => translate_set_transaction(&modes),
-        SqlSet::SetNames { .. }
-        | SqlSet::SetNamesDefault {}
-        | SqlSet::SetTimeZone { .. }
+        // `SET NAMES x [COLLATE y]` / `SET NAMES DEFAULT`: pure charset
+        // declaration. Real clients (mycli/pymysql/JDBC) send it on every
+        // connect; the engine is utf-8 end-to-end, so honor it as a no-op
+        // instead of breaking the handshake.
+        SqlSet::SetNames { .. } | SqlSet::SetNamesDefault {} => Ok(Statement::SetIgnored),
+        SqlSet::SetTimeZone { .. }
         | SqlSet::SetRole { .. }
         | SqlSet::SetSessionAuthorization(_)
         | SqlSet::SetSessionParam(_)
         | SqlSet::ParenthesizedAssignments { .. } => Err(SqlError::unsupported(format!(
             "{set} (session/transaction settings)"
         ))),
-        SqlSet::SingleAssignment { ref variable, .. } => reject_session_var(variable, &set),
+        SqlSet::SingleAssignment { ref variable, ref values, .. } => {
+            super::session::reject_session_var(variable, values, &set)
+        }
         SqlSet::MultipleAssignments {
             ref assignments, ..
         } => {
             for a in assignments {
-                reject_session_var(&a.name, &set)?;
+                super::session::reject_session_var(&a.name, std::slice::from_ref(&a.value), &set)?;
             }
             Ok(Statement::SetIgnored)
         }
     }
 }
 
-/// Reject assignments to variables that change session/transaction
-/// semantics; anything else is cosmetic and ignored.
-/// `SET [SESSION|GLOBAL] TRANSACTION ...`: only ISOLATION LEVEL is
-/// accepted (the engine's snapshot isolation already IS repeatable
-/// read, MySQL's default); access modes and snapshots are rejected.
 fn translate_set_transaction(modes: &[sqlparser::ast::TransactionMode]) -> SqlResult<Statement> {
     use sqlparser::ast::{TransactionAccessMode, TransactionIsolationLevel, TransactionMode};
     let mut level: Option<String> = None;
@@ -437,30 +437,6 @@ fn translate_set_transaction(modes: &[sqlparser::ast::TransactionMode]) -> SqlRe
         // A no-isolation `SET TRANSACTION READ WRITE` is harmless.
         None => Ok(Statement::SetIgnored),
         Some(level) => Ok(Statement::SetIsolation { level }),
-    }
-}
-
-fn reject_session_var(
-    variable: &sqlparser::ast::ObjectName,
-    set: &sqlparser::ast::Set,
-) -> SqlResult<Statement> {
-    let name = variable.to_string().to_ascii_lowercase();
-    let sensitive = [
-        "autocommit",
-        "isolation",
-        "session",
-        "time_zone",
-        "names",
-        "charset",
-    ]
-    .iter()
-    .any(|k| name.contains(k));
-    if sensitive {
-        Err(SqlError::unsupported(format!(
-            "{set} (session/transaction settings)"
-        )))
-    } else {
-        Ok(Statement::SetIgnored)
     }
 }
 

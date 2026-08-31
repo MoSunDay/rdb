@@ -59,6 +59,65 @@ fn carve_math_is_dense_and_exhaustion_aware() {
 }
 
 #[test]
+fn carve_never_serves_below_observed_commits() {
+    // A participant applied a commit at ts 42 (`advance_to` -> global_hi),
+    // while its own block was granted before that commit.
+    let mut st = TsState {
+        block_lo: 10,
+        block_hi: 30,
+        global_hi: 42,
+        observed_floor: 42,
+        ..TsState::default()
+    };
+    // Serving 10.. would stamp versions below the commit at 42; a later
+    // snapshot (read_ts >= 42) would shadow them -> silently lost write.
+    assert_eq!(carve(&mut st, 5), None, "poisoned tail must not serve");
+    assert_eq!(
+        remaining(&st),
+        0,
+        "stale remainder discarded so the refiller re-anchors"
+    );
+    assert_eq!(
+        carve(&mut st, 5),
+        None,
+        "discarded block stays exhausted (fallback handles allocation)"
+    );
+    // A fresh block strictly above the observed floor keeps serving, and
+    // `global_hi` covering the reserved tail is NOT staleness (install
+    // folds block_hi-1 into it by design: the reserved tail is servable).
+    let mut fresh = TsState {
+        block_lo: 43,
+        block_hi: 50,
+        global_hi: 49,
+        observed_floor: 42,
+        ..TsState::default()
+    };
+    assert_eq!(carve(&mut fresh, 2), Some(43..45));
+    assert_eq!(fresh.block_lo, 45);
+    assert_eq!(fresh.global_hi, 49);
+}
+
+#[test]
+fn alloc_n_reallocates_above_read_point_after_observed_commit() {
+    // End-to-end shape of the regression: block granted [10,30), then the
+    // node observes a commit at 50; the next allocation must not hand out
+    // 10.. (below the read point) but a range above 50.
+    let (raft, topo) = stub_leader();
+    let ts = ClusterTs::new(deps_of(&raft, &topo));
+    assert!(install_block(&mut ts.state.lock().unwrap(), 10, 30));
+    ts.observe_floor(50);
+    assert_eq!(ts.now(), 50);
+    let r = ts.alloc_n(4);
+    assert!(r.start > 50, "alloc {r:?} must sit above the read point");
+    assert_eq!(ts.now(), r.end - 1);
+    assert!(ts.degraded());
+    // And the refiller's next fetch floor covers the observed commit, so
+    // the fresh block re-anchors above it instead of reusing stale grants.
+    assert!(install_block(&mut ts.state.lock().unwrap(), r.end + 1, r.end + 9));
+    assert_eq!(ts.alloc_n(2), r.end + 1..r.end + 3);
+}
+
+#[test]
 fn carve_above_floor_rejects_blocks_below_requester_grants() {
     let mut st = TsState {
         block_lo: 10,
@@ -302,4 +361,138 @@ async fn route_sql_ts_auth_and_leader_gate() {
         format!("{} {}", 1 + TS_BLOCK, 1 + 2 * TS_BLOCK),
         "continues at the persisted cursor"
     );
+}
+
+// ---- regression: frozen read point / stale write tail ----
+// A node that leased an early ts block and then went idle used to keep
+// `now()` at its block tail forever (an idle block is never below the
+// refill low-water, so nothing re-anchored it), while the rest of the
+// cluster granted on: reads filtered out newer versions, UPDATEs
+// matched 0 rows, and commits stamped versions UNDER the cluster's
+// newest -- newest-ts-wins buried them silently.
+
+#[test]
+fn now_rides_the_raft_cursor_frontier() {
+    let (raft, topo) = stub_leader();
+    let ts = ClusterTs::new(deps_of(&raft, &topo));
+    // This node's block: [1, 4097). Its global_hi freezes at 4096.
+    install_block(&mut ts.state.lock().unwrap(), 1, 1 + TS_BLOCK);
+    // The cluster meanwhile granted through 5 blocks (raft cursor).
+    let frontier = 5 * TS_BLOCK;
+    raft.write()
+        .unwrap()
+        .kv
+        .insert(TS_CURSOR_KEY.to_string(), frontier.to_string());
+    assert_eq!(ts.now(), TS_BLOCK, "pre-sync: frozen at the block tail");
+    ts.sync_cursor_frontier();
+    assert_eq!(
+        ts.now(),
+        frontier - 1,
+        "read point rides cursor - 1, not the stale block tail"
+    );
+    ts.note_cursor(frontier - TS_BLOCK);
+    assert_eq!(ts.now(), frontier - 1, "cursor fold never walks back");
+}
+
+#[tokio::test]
+async fn reserve_write_frontier_rebases_a_stale_tail_above_the_frontier() {
+    // The defect-B write tail: this node carved [1, 4097) before the
+    // cursor moved on. Committing at those timestamps buries the
+    // versions under the cluster's newest, and the conflict veto cannot
+    // catch it (the row's newest ts compares below the read point).
+    // reserve_write_frontier must discard the stale tail and lease
+    // above the frontier BEFORE the plan allocates.
+    let (raft, topo) = stub_leader();
+    let ts = ClusterTs::new(deps_of(&raft, &topo));
+    install_block(&mut ts.state.lock().unwrap(), 1, 1 + TS_BLOCK);
+    let frontier = 5 * TS_BLOCK;
+    raft.write()
+        .unwrap()
+        .kv
+        .insert(TS_CURSOR_KEY.to_string(), frontier.to_string());
+
+    ts.reserve_write_frontier(frontier - 1, 4).await;
+
+    assert!(!ts.degraded(), "a successful re-lease clears degradation");
+    let r = ts.alloc_n(4);
+    assert_eq!(
+        r,
+        frontier..frontier + 4,
+        "the plan's ts range must clear the frontier, not reuse [1, 4097)"
+    );
+    assert_eq!(
+        raft.read().unwrap().kv.get(TS_CURSOR_KEY).cloned(),
+        Some((frontier + TS_BLOCK).to_string()),
+        "the re-lease persisted its cursor before serving"
+    );
+    assert_eq!(ts.now(), frontier + TS_BLOCK - 1, "read point follows");
+}
+
+#[tokio::test]
+async fn reserve_write_frontier_keeps_a_tail_already_above_the_frontier() {
+    // A fresh tail is untouched: no discard, no raft write, no fetch.
+    let (raft, topo) = stub_leader();
+    let ts = ClusterTs::new(deps_of(&raft, &topo));
+    let lo = 5 * TS_BLOCK;
+    install_block(&mut ts.state.lock().unwrap(), lo, lo + TS_BLOCK);
+    raft.write()
+        .unwrap()
+        .kv
+        .insert(TS_CURSOR_KEY.to_string(), lo.to_string());
+
+    ts.reserve_write_frontier(3 * TS_BLOCK, 4).await;
+
+    assert_eq!(ts.alloc_n(4), lo..lo + 4, "fresh tail still serves");
+    assert_eq!(
+        raft.read().unwrap().kv.get(TS_CURSOR_KEY).cloned(),
+        Some(lo.to_string()),
+        "no extra lease was taken"
+    );
+}
+
+#[tokio::test]
+async fn reserve_write_frontier_refetches_a_short_tail_above_the_floor() {
+    // The write-tail defect, size variant: the lease sits ABOVE the
+    // read frontier but is shorter than the imminent plan's alloc (a
+    // refiller tick drained it mid-burst). The alloc never fetches, so
+    // it would degrade to the GAP fallback -- stamps no cursor ride can
+    // ever cover, invisible to every later reader. The reserve must
+    // treat a short tail exactly like a stale one: discard and lease
+    // enough above the frontier.
+    let (raft, topo) = stub_leader();
+    let ts = ClusterTs::new(deps_of(&raft, &topo));
+    let lo = 5 * TS_BLOCK;
+    // Above any floor, but only 8 stamps left for a 4000-ts plan. The
+    // cursor sits at the lease end (the leader authorized exactly this
+    // block), so the re-lease must start there.
+    install_block(&mut ts.state.lock().unwrap(), lo + TS_BLOCK - 8, lo + TS_BLOCK);
+    raft.write()
+        .unwrap()
+        .kv
+        .insert(TS_CURSOR_KEY.to_string(), (lo + TS_BLOCK).to_string());
+
+    ts.reserve_write_frontier(lo, 4000).await;
+
+    let r = ts.alloc_n(4000);
+    assert_eq!(
+        r,
+        (lo + TS_BLOCK)..(lo + TS_BLOCK + 4000),
+        "a short tail must be re-leased, never served from the GAP fallback"
+    );
+    assert!(!ts.degraded(), "the re-lease cleared degradation");
+}
+
+#[tokio::test]
+async fn alloc_above_degrades_only_when_the_leader_is_unreachable() {
+    // The fallback is the last resort, not a service path: with a live
+    // leader, reserve_write_frontier must hand the alloc a real block.
+    let (raft, topo) = stub_leader();
+    let ts = ClusterTs::new(deps_of(&raft, &topo));
+    ts.reserve_write_frontier(0, 2 * TS_BLOCK).await;
+    assert_eq!(
+        ts.alloc_n(2 * TS_BLOCK),
+        1..1 + 2 * TS_BLOCK,
+        "a fresh node leases a real block, not the GAP fallback"
+    );
+    assert!(!ts.degraded());
 }

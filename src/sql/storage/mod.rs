@@ -4,5 +4,6 @@
 pub mod catalog;
 pub mod codec;
 pub mod gc;
+pub mod replicate;
 pub mod row;
 pub mod schema;

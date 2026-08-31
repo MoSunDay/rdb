@@ -40,10 +40,12 @@ pub struct Marker {
     pub keys: Vec<Vec<u8>>,
 }
 
-/// Outcome payload. The coordinator's copy carries the per-participant
-/// index ops (so recovery answers can finish a lost Decide); a
-/// participant's copy only records the decision it applied and its
-/// own ops (to answer TxnStatus).
+/// Outcome payload. Both roles map index ops per node: the
+/// coordinator's copy carries every participant's slice (so recovery
+/// answers can finish a lost Decide); a participant's copy carries its
+/// own slice under its bind (so status answers serve per-node ops
+/// without ever leaking another node's slice). `own_ops` is
+/// local-replay-only state: this node's slice on a participant.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct OutcomeRecord {
     pub commit: bool,
@@ -93,6 +95,22 @@ pub enum Vote {
     No(String),
 }
 
+/// Extract the conflicting commit's ts from a `conflict:` veto reason
+/// (the format written by `vote`: "... committed at ts N after read ts
+/// R"). A veto proves the coordinator's read point lags a decided
+/// commit; the coordinator folds N into its timestamp oracle so the
+/// client's retry pins a snapshot above the row that vetoed it instead
+/// of re-pinning the same lagging view and vetoing forever.
+pub fn conflict_ts(reason: &str) -> Option<u64> {
+    const TAG: &str = "committed at ts ";
+    let rest = reason.split_once(TAG)?.1;
+    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// PREPARE: validate every entry, then stage one atomic batch.
 ///
 /// Veto reasons are prefixed strings the coordinator maps to client
@@ -127,7 +145,8 @@ pub fn vote(
                 let Some((_slot, table_id, pk, ts)) = row::parse_version_key(&e.key) else {
                     return Err("conflict: unparsable row key".into());
                 };
-                if let Some(n) = crate::sql::tx::session::newest_version_ts(store, table_id, &pk)? {
+                let pn = crate::sql::tx::session::newest_version_ts(store, table_id, &pk)?;
+                if let Some(n) = pn {
                     // `n == commit_ts` with a prepared value = our own
                     // retried prepare (the ts range is globally unique,
                     // nobody else can own that ts).
@@ -240,6 +259,7 @@ pub fn decide(
     dir: &std::path::Path,
     registry: &crate::sql::columnar::Registry,
     txn_id: &str,
+    bind: &str,
     commit: bool,
     index_ops: &[WireOp],
 ) -> Result<u64, String> {
@@ -307,7 +327,17 @@ pub fn decide(
         commit,
         commit_ts: marker.as_ref().map(|m| m.commit_ts).unwrap_or(0),
         written_at: now_secs(),
-        index_ops: BTreeMap::new(),
+        // The slice is mapped under THIS node's bind so every status
+        // answer serves ops per requesting node; `own_ops` stays
+        // local-replay-only and never crosses the wire. (Binaries
+        // before this format wrote an empty map here; those records
+        // answer "no mapped ops" to everyone -- degraded replay, but
+        // no foreign slice can ever be applied.)
+        index_ops: if commit {
+            BTreeMap::from([(bind.to_string(), index_ops.to_vec())])
+        } else {
+            BTreeMap::new()
+        },
         own_ops: index_ops.to_vec(),
     };
     batch.put(
@@ -320,10 +350,14 @@ pub fn decide(
 /// TxnStatus answer from THIS node's records: a local outcome wins,
 /// an in-doubt marker means Unknown, neither means the node never
 /// heard of the txn (Unknown -- safe, the asker's lease timer runs).
-pub fn status(store: &Store, txn_id: &str, _node: &str) -> Outcome {
+/// A committed answer carries only the slice mapped for `node`.
+pub fn status(store: &Store, txn_id: &str, node: &str) -> Outcome {
     match read_outcome(store, txn_id) {
         Some(rec) if rec.commit => Outcome::Committed {
-            index_ops: rec.own_ops,
+            // Coordinator records map every participant, participant
+            // records map their own bind; `own_ops` never crosses the
+            // wire (this surface cannot verify the requester owns it).
+            index_ops: rec.index_ops.get(node).cloned().unwrap_or_default(),
         },
         Some(_) => Outcome::Aborted,
         None => Outcome::Unknown,
@@ -381,4 +415,29 @@ pub fn outcomes(store: &Store) -> Vec<(String, OutcomeRecord)> {
             serde_json::from_slice(&v).ok().map(|m| (id, m))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::conflict_ts;
+
+    #[test]
+    fn conflict_ts_extracts_committed_ts_from_veto_reason() {
+        let reason = "conflict: write-write conflict on row committed at ts 4202538 \
+                      after read ts 4202537";
+        assert_eq!(conflict_ts(reason), Some(4202538));
+        // Trailing digits (no "after read ts" tail) still parse.
+        assert_eq!(
+            conflict_ts("conflict: write-write conflict on row committed at ts 7"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn conflict_ts_rejects_non_conflict_reasons() {
+        assert_eq!(conflict_ts("dup: duplicate entry for key"), None);
+        assert_eq!(conflict_ts("conflict: unparsable row key"), None);
+        assert_eq!(conflict_ts("conflict: write-write conflict on row committed at ts "), None);
+        assert_eq!(conflict_ts(""), None);
+    }
 }

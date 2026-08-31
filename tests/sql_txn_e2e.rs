@@ -353,3 +353,57 @@ async fn disconnect_rolls_back_open_txn() {
     );
     node.kill_now();
 }
+
+#[tokio::test]
+async fn multi_statement_txn_applies_every_update() {
+    // Regression (defect A): a coordinator whose ts view lagged the
+    // cluster frontier read rows below a frozen read point, matched 0
+    // rows, and COMMIT early-returned Ok -- every UPDATE after the
+    // first vanished with an OK on the wire. Every statement here must
+    // land: later ones read earlier ones' staged writes (an INSERT
+    // matched by value, an UPDATE matched by its own predecessor).
+    let (mut node, mut a) = world(
+        "mu",
+        "CREATE TABLE mu (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)",
+    )
+    .await;
+    let mut b = connect(&node).await;
+
+    a.query_drop("INSERT INTO mu (id, v) VALUES (1, 'a'), (2, 'b')")
+        .await
+        .expect("seed");
+
+    for sql in [
+        "BEGIN",
+        "INSERT INTO mu (id, v) VALUES (3, 'c')",
+        "UPDATE mu SET v = 'a2' WHERE id = 1",
+        "UPDATE mu SET v = 'c2' WHERE v = 'c'", // matches the staged INSERT only
+        "UPDATE mu SET v = 'a3' WHERE v = 'a2'", // matches this txn's own staged UPDATE
+        "UPDATE mu SET v = 'b2' WHERE id = 2", // third target row, same txn
+        "COMMIT",
+    ] {
+        a.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        if sql.starts_with("UPDATE") {
+            assert_eq!(a.affected_rows(), 1, "{sql} must match its row");
+        }
+    }
+
+    assert_eq!(
+        rows(&mut b, "SELECT v FROM mu WHERE id = 1").await,
+        vec![vec![s("a3")]],
+        "first UPDATE applied"
+    );
+    assert_eq!(
+        rows(&mut b, "SELECT v FROM mu WHERE id = 2").await,
+        vec![vec![s("b2")]],
+        "a later UPDATE of the same txn applied"
+    );
+    assert_eq!(
+        rows(&mut b, "SELECT v FROM mu WHERE id = 3").await,
+        vec![vec![s("c2")]],
+        "UPDATE matching the staged INSERT applied"
+    );
+    node.kill_now();
+}

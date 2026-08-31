@@ -51,7 +51,17 @@ pub async fn sweep_once(shared: &Shared) -> Result<(), String> {
             // replaying the decision is idempotent, so just do it.
             Some(rec) => {
                 let ops = if rec.commit {
-                    rec.own_ops.clone()
+                    if rec.index_ops.is_empty() {
+                        // Participant-format record (ours): our slice.
+                        rec.own_ops.clone()
+                    } else {
+                        // Coordinator-format record: our slice is
+                        // mapped under our bind (own_ops is empty).
+                        rec.index_ops
+                            .get(&shared.conf.bind)
+                            .cloned()
+                            .unwrap_or_default()
+                    }
                 } else {
                     Vec::new()
                 };
@@ -142,9 +152,10 @@ async fn decide_blocking(
     let dir = crate::sql::columnar::writer::columnar_dir(&shared.conf);
     let registry = crate::sql::columnar::registry_of(shared);
     let txn_id = txn_id.to_string();
+    let bind = shared.conf.bind.clone();
     let ops = ops.to_vec();
     let applied = tokio::task::spawn_blocking(move || {
-        participant::decide(&store, &dir, &registry, &txn_id, commit, &ops)
+        participant::decide(&store, &dir, &registry, &txn_id, &bind, commit, &ops)
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -196,17 +207,15 @@ pub fn route_status(
 
 /// Outcome rendering for [`route_status`]: body text as parsed by
 /// [`parse_status_body`], `unknown` when this node never recorded the
-/// txn. The `node` param selects that participant's index ops from a
-/// coordinator's record; a participant answers with its own ops.
+/// txn. The `node` param selects that participant's index ops from the
+/// record's per-node map; a node absent from the map gets an empty
+/// slice (`own_ops` is local-replay state -- this surface cannot
+/// verify a requester owns it, so it never crosses the wire).
 pub fn status_body(store: &crate::store::Store, txn_id: &str, node: &str) -> String {
     match participant::read_outcome(store, txn_id) {
         Some(rec) if !rec.commit => "aborted\n".to_string(),
         Some(rec) => {
-            let ops = if rec.index_ops.is_empty() {
-                rec.own_ops.clone()
-            } else {
-                rec.index_ops.get(node).cloned().unwrap_or_default()
-            };
+            let ops = rec.index_ops.get(node).cloned().unwrap_or_default();
             format!(
                 "committed {}\n",
                 serde_json::to_string(&ops).unwrap_or_else(|_| "[]".to_string())
@@ -219,6 +228,76 @@ pub fn status_body(store: &crate::store::Store, txn_id: &str, node: &str) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    fn open_test_store() -> (tempfile::TempDir, crate::store::Store) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::store::rocksdb::open(dir.path().to_str().unwrap()).expect("store");
+        (dir, store)
+    }
+
+    fn put_outcome(store: &crate::store::Store, id: &str, rec: &participant::OutcomeRecord) {
+        let mut batch = WriteBatch::default();
+        batch.put(participant::outcome_key(id), serde_json::to_vec(rec).unwrap());
+        ops::batch_write(store, batch).unwrap();
+    }
+
+    #[test]
+    fn status_body_serves_only_mapped_ops() {
+        let (_dir, store) = open_test_store();
+        let mut map = BTreeMap::new();
+        map.insert("A".to_string(), vec![(vec![1u8], Some(vec![2u8]))]);
+        map.insert("B".to_string(), vec![(vec![3u8], None)]);
+        put_outcome(&store, "t1", &participant::coordinator_outcome(true, 7, map));
+        assert_eq!(status_body(&store, "t1", "A"), "committed [[[1],[2]]]\n");
+        assert_eq!(status_body(&store, "t1", "B"), "committed [[[3],null]]\n");
+        // A node absent from the map gets an empty slice, never
+        // another participant's slice.
+        assert_eq!(status_body(&store, "t1", "C"), "committed []\n");
+    }
+
+    #[test]
+    fn status_body_never_serves_own_ops() {
+        let (_dir, store) = open_test_store();
+        // Participant-format record written by binaries before the
+        // per-node map: empty index_ops, populated own_ops.
+        let rec = participant::OutcomeRecord {
+            commit: true,
+            commit_ts: 7,
+            written_at: 0,
+            index_ops: BTreeMap::new(),
+            own_ops: vec![(vec![9u8], Some(vec![8u8]))],
+        };
+        put_outcome(&store, "t2", &rec);
+        assert_eq!(status_body(&store, "t2", "P1"), "committed []\n");
+        assert_eq!(status_body(&store, "t2", ""), "committed []\n");
+    }
+
+    #[test]
+    fn status_serves_mapped_ops_per_node() {
+        let (_dir, store) = open_test_store();
+        let mut map = BTreeMap::new();
+        map.insert("A".to_string(), vec![(vec![1u8], Some(vec![2u8]))]);
+        put_outcome(&store, "t3", &participant::coordinator_outcome(true, 7, map));
+        assert_eq!(
+            participant::status(&store, "t3", "A"),
+            super::super::proto::Outcome::Committed {
+                index_ops: vec![(vec![1u8], Some(vec![2u8]))]
+            }
+        );
+        assert_eq!(
+            participant::status(&store, "t3", "C"),
+            super::super::proto::Outcome::Committed { index_ops: Vec::new() }
+        );
+        put_outcome(
+            &store,
+            "t4",
+            &participant::coordinator_outcome(false, 7, BTreeMap::new()),
+        );
+        assert_eq!(participant::status(&store, "t4", "A"), super::super::proto::Outcome::Aborted);
+        assert_eq!(status_body(&store, "t4", "A"), "aborted\n");
+        assert_eq!(status_body(&store, "t5", "A"), "unknown\n");
+    }
 
     #[test]
     fn status_body_roundtrips_through_parser() {

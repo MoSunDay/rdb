@@ -37,25 +37,52 @@ const ACK_RETRY_SECS: u64 = 60;
 pub async fn run(shared: &Shared, plan: &CommitPlan) -> SqlResult<()> {
     let mut voted: Vec<String> = Vec::new();
     let mut veto: Option<SqlError> = None;
+    let mut veto_ts: Option<u64> = None;
     for (addr, pp) in &plan.participants {
         match prepare_one(shared, plan, addr, pp).await {
             Ok(()) => voted.push(addr.clone()),
             Err(e) => {
-                veto = Some(e);
-                break;
+                // A veto must not short-circuit the prepare round: a
+                // sibling participant may hold ANOTHER unobserved commit
+                // with a higher ts. Aborting early folds only the first
+                // vetoed row's ts, so the client's retry pins a snapshot
+                // that still predates the sibling commits and silently
+                // computes from stale versions.
+                veto_ts = fold_ts(veto_ts, &e);
+                if veto.is_none() {
+                    veto = Some(e);
+                }
             }
         }
     }
     match veto {
         Some(e) => {
+            // A `conflict:` veto proves a commit this coordinator had not
+            // observed (its read point chose every slice's `read_ts`).
+            // Fold the highest reported ts into the read point so the
+            // client's retry pins a snapshot above EVERY row committed
+            // since its BEGIN instead of re-pinning the same lagging view
+            // and vetoing forever.
+            if let Some(n) = veto_ts {
+                shared.sql_ts.advance_to(n);
+            }
             // Decide abort on everyone that already staged, self first.
-            decide_all(shared, plan, false, &voted).await;
+            // A failed abort broadcast is covered by the participants'
+            // lease expiry; the veto error is what the client sees.
+            decide_all(shared, plan, false, &voted).await.ok();
             Err(e)
         }
-        None => {
-            decide_all(shared, plan, true, &voted).await;
-            Ok(())
-        }
+        None => decide_all(shared, plan, true, &voted).await,
+    }
+}
+
+/// Running max over every vetoed participant's reported commit ts
+/// (`None` stays `None` when no veto carried a parseable ts).
+fn fold_ts(acc: Option<u64>, e: &SqlError) -> Option<u64> {
+    match (acc, participant::conflict_ts(&e.msg)) {
+        (Some(a), Some(n)) => Some(a.max(n)),
+        (None, Some(n)) => Some(n),
+        (a, None) => a,
     }
 }
 
@@ -114,24 +141,61 @@ async fn prepare_one(
 /// Phase 2: durable outcome first, then Decide to every participant
 /// (`voted` = phase-1 survivors; on abort a participant that never
 /// voted simply has no marker and no-ops). Unacked remote Decides get
-/// a bounded background retry.
-async fn decide_all(shared: &Shared, plan: &CommitPlan, commit: bool, voted: &[String]) {
+/// a bounded background retry. A commit outcome that cannot be
+/// persisted FAILS the commit (WriteConflict, nothing decided
+/// anywhere, best-effort abort broadcast): no Decide ever leaves a
+/// node that cannot remember its decision.
+async fn decide_all(
+    shared: &Shared,
+    plan: &CommitPlan,
+    commit: bool,
+    voted: &[String],
+) -> SqlResult<()> {
     let index_ops: BTreeMap<String, Vec<_>> = plan
         .participants
         .iter()
         .map(|(addr, pp)| (addr.clone(), pp.index_ops.clone()))
         .collect();
     let record = participant::coordinator_outcome(commit, plan.commit_ts, index_ops);
+    let payload = serde_json::to_vec(&record).map_err(|e| {
+        SqlError::new(
+            ErrorCode::WriteConflict,
+            format!("sql2pc: encode outcome {}: {e}", plan.txn_id),
+        )
+    })?;
     let mut batch = WriteBatch::default();
-    batch.put(
-        participant::outcome_key(&plan.txn_id),
-        serde_json::to_vec(&record).unwrap_or_default(),
-    );
+    batch.put(participant::outcome_key(&plan.txn_id), payload);
     // fsync BEFORE any Decide leaves this node: once a participant can
     // see a commit decision, every future status query must too.
     if let Err(e) = ops::batch_write_async(Arc::clone(&shared.store), batch).await {
-        eprintln!("sql2pc: outcome write failed for {}: {e}", plan.txn_id);
+        if commit {
+            // Nothing has left this node yet, so abort is always safe;
+            // broadcasting it also spares the participants the 60s
+            // lease wait. The client may retry the whole txn.
+            eprintln!(
+                "sql2pc: outcome write failed for {}: {e}; aborting, no Decide sent",
+                plan.txn_id
+            );
+            broadcast_decides(shared, plan, false, voted).await;
+            return Err(SqlError::new(
+                ErrorCode::WriteConflict,
+                format!("sql2pc: outcome persist failed: {e}"),
+            ));
+        }
+        // An abort is also the lease-expiry default, so a failed abort
+        // outcome record only slows convergence; never a safety gate.
+        eprintln!("sql2pc: abort outcome write failed for {}: {e}", plan.txn_id);
     }
+    broadcast_decides(shared, plan, commit, voted).await;
+    Ok(())
+}
+
+/// Decide fan-out only (no outcome persistence): the local slice
+/// first, then every remote participant; unacked remote Decides get a
+/// bounded background retry. Split from [`decide_all`] so the
+/// persist-failure fallback can broadcast an abort without re-entering
+/// the persist gate.
+async fn broadcast_decides(shared: &Shared, plan: &CommitPlan, commit: bool, voted: &[String]) {
     for addr in voted {
         let ops_for_addr = plan
             .participants
@@ -143,8 +207,9 @@ async fn decide_all(shared: &Shared, plan: &CommitPlan, commit: bool, voted: &[S
             let dir = crate::sql::columnar::writer::columnar_dir(&shared.conf);
             let registry = crate::sql::columnar::registry_of(shared);
             let txn_id = plan.txn_id.clone();
+            let bind = shared.conf.bind.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                participant::decide(&store, &dir, &registry, &txn_id, commit, &ops_for_addr)
+                participant::decide(&store, &dir, &registry, &txn_id, &bind, commit, &ops_for_addr)
             })
             .await;
             // Self slice: the coordinator allocated the ts range, so its
@@ -163,7 +228,9 @@ async fn decide_all(shared: &Shared, plan: &CommitPlan, commit: bool, voted: &[S
         };
         match client::request(&sql_rpc, &req).await {
             Ok(Resp::Ack) | Ok(Resp::Vote { .. }) => {}
-            Ok(other) => retry_decide(sql_rpc, req, format!("unexpected reply {other:?}")),
+            Ok(other) => {
+                retry_decide(sql_rpc, req, format!("unexpected reply {other:?}"))
+            }
             Err(e) => retry_decide(sql_rpc, req, e),
         }
     }
@@ -207,4 +274,40 @@ fn spill(stage: &str, why: String) -> SqlError {
         ErrorCode::WriteConflict,
         format!("2pc {stage} failed: {why}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conflict(at: u64, after: u64) -> SqlError {
+        SqlError::new(
+            ErrorCode::WriteConflict,
+            format!("conflict: write-write conflict on row committed at ts {at} after read ts {after}"),
+        )
+    }
+
+    #[test]
+    fn fold_ts_keeps_the_highest_reported_commit_ts() {
+        // The first veto surfaced ts 8396843 but a sibling participant
+        // held 8396844: the retry's snapshot must clear BOTH, so the
+        // fold is a running max over every veto in the prepare round.
+        let acc = fold_ts(None, &conflict(8396843, 4202537));
+        let acc = fold_ts(acc, &conflict(8396844, 4202537));
+        assert_eq!(acc, Some(8396844));
+        // Order independent.
+        let acc = fold_ts(None, &conflict(8396844, 4202537));
+        let acc = fold_ts(acc, &conflict(8396843, 4202537));
+        assert_eq!(acc, Some(8396844));
+    }
+
+    #[test]
+    fn fold_ts_ignores_non_conflict_vetoes_and_preserves_acc() {
+        let other = SqlError::new(ErrorCode::Unknown, "no such table: items".to_string());
+        assert_eq!(fold_ts(None, &other), None);
+        // A non-conflict veto in the middle must not drop the ts the
+        // earlier conflict veto already reported.
+        let acc = fold_ts(None, &conflict(8396843, 4202537));
+        assert_eq!(fold_ts(acc, &other), Some(8396843));
+    }
 }

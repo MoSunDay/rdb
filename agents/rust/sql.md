@@ -65,11 +65,18 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
 - 版本键 ts 后缀取反（`!ts`）：同 pk 新版本在前；`visible_value` 取 `ts ≤ read_ts`
   的首个非 0x02 版本。
 - 时间戳：集群未就绪=本地原子；就绪后所有 alloc 经 leader 块授权，游标先 raft 持久；
-  任一节点 `now()` 为本地已知 global_hi（允许读旧快照，禁止回退）。
-- 2PC：提交决议先落本地库再广播；参与者 PREPARE 批含 0x02 行 + 唯一索引项 + 标记；
-  COMMIT 翻转 0x02→0x01 并补 0x21 项；读路径永不显露 0x02。
-- 集群模式（>1 稳定实例）下：读走 Gather（band 并发拉取，任一 owner 不可达即整查
-  报错）；索引路径与 JOIN 物化保持本地（v1 限制）。
+  `now()` 骑集群游标前沿（`sync_cursor_frontier`，允许读旧快照，禁止回退）；写路径
+  先按读点预留写前沿（`reserve_write_frontier`/`alloc_n_above`，过期或过短的本地
+  块尾作废重租），保证本节点写入的 ts 高于它已读到的版本。
+- 2PC：提交决议先落本地库再广播（outcome 落库失败 = 提交失败：不发出任何 Decide，
+  尽力广播 abort，客户端收到可重试 WriteConflict）；status 应答（HTTP 与 TxnStatus）
+  只含请求节点名下的索引切片（outcome 记录按节点映射：协调者含全部参与者、参与者
+  在自身 bind 下；`own_ops` 仅本地重放，永不过线）；参与者 PREPARE 批含 0x02 行 +
+  唯一索引项 + 标记；COMMIT 翻转 0x02→0x01 并补 0x21 项；读路径永不显露 0x02。
+- 集群模式（>1 稳定实例）下：读与 UPDATE/DELETE 行匹配走 Gather（band 并发拉取，
+  任一 owner 不可达即整查报错，写匹配绝不只看本地切片）；DDL ack 前等各可达 peer
+  的 FSM 服务该目录写（`storage/replicate.rs` 复制屏障，best-effort 有界延迟）；
+  索引路径与 JOIN 物化保持本地（v1 限制）。
 - 列存：段只落提交节点，读向所有节点扇出（`ScanColumnar`）；可见性=段级
   `commit_ts ≤ read_ts`，prepared 段不入注册表即不可见；段元数据与行写同批原子发布。
 

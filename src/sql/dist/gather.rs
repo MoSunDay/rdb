@@ -69,12 +69,25 @@ use crate::state::Shared;
 /// the per-owner band list (this node's band included). JOIN trees
 /// are answered per-side by `materialize` (see `join_gathers` for the
 /// EXPLAIN verdict), not by this function.
-pub fn gatherable(shared: &Shared, tref: &TableRef) -> Option<Vec<Band>> {
-    let TableRef::Table { .. } = tref else {
-        return None; // join trees gather per-side in `materialize`
-    };
+/// Whether UPDATE/DELETE row matching must fan out: in a ready
+/// multi-node cluster the answer is the per-owner band list, because
+/// a local scan would see only this node's slice and silently match 0
+/// (or a fraction of the) rows living on other slot owners. The table
+/// name only documents intent: routing is table-agnostic (every slot
+/// maps to exactly one owner). JOIN trees are answered per-side by
+/// `materialize`; columnar tables never reach here (they are
+/// append-only for writes and reject UPDATE/DELETE).
+pub fn gatherable_by_name(shared: &Shared) -> Option<Vec<Band>> {
     let r = routing(shared)?;
     (r.addrs.len() > 1).then(|| bands(&r))
+}
+
+/// [`gatherable_by_name`] keyed by a FROM reference (SELECT path).
+pub fn gatherable(shared: &Shared, tref: &TableRef) -> Option<Vec<Band>> {
+    if !matches!(tref, TableRef::Table { .. }) {
+        return None; // join trees gather per-side in `materialize`
+    }
+    gatherable_by_name(shared)
 }
 
 /// EXPLAIN headline of the distributed plan ("Gather(bands=N)", or
@@ -201,8 +214,11 @@ pub async fn materialize(
 /// Union of every band's rows visible at `read_ts`, ordered by pk_key
 /// bytes (the same deterministic order a local scan produces). The
 /// self band scans this store; every remote owner answers one
-/// concurrent `ScanBand`. First failure aborts the whole read.
-async fn gather_rows(
+/// concurrent `ScanBand`. First failure aborts the whole read. Also
+/// the row source for distributed UPDATE/DELETE matching
+/// (`exec::write::matched_rows`), so write matching never sees a
+/// silent slice of the table.
+pub(crate) async fn gather_rows(
     shared: &Shared,
     bs: &[Band],
     schema: &TableSchema,

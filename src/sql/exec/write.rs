@@ -119,14 +119,22 @@ pub async fn insert(
         .zip(pk_keys.iter())
         .map(|(r, pk)| (pk.clone(), Some(r)))
         .collect();
+    let read_ts = shared.sql_ts.now();
+    // Write frontier before planning: the plan's ts range (2PC) or the
+    // local alloc below must stamp above the txn's read point; both
+    // allocate one ts per row.
+    shared
+        .sql_ts
+        .reserve_write_frontier(read_ts, n)
+        .await;
     if let Some(plan) =
-        dist::plan::try_plan_simple(shared, shared.sql_ts.now(), &schema, &writes, &idx)?
+        dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)?
     {
         return dist::twopc::run(shared, &plan)
             .await
             .map(|_| ExecOutcome::Affected(n));
     }
-    let ts = shared.sql_ts.alloc_n(n);
+    let ts = shared.sql_ts.alloc_n_above(n, read_ts);
     let mut batch = WriteBatch::default();
     for (i, values) in full_rows.iter().enumerate() {
         // Duplicate PKs inside one batch are legal: each row gets its
@@ -252,7 +260,8 @@ pub async fn update(
         &order_by,
         limit,
         sess.txn.as_ref(),
-    )?;
+    )
+    .await?;
 
     // Decide writes purely, then either stage them (txn) or stamp one
     // ts range over all versions (autocommit).
@@ -349,14 +358,21 @@ pub async fn update(
         }
         dist_writes.push((pk_key_of(&schema, &p.values)?, Some(&p.values)));
     }
+    let read_ts = shared.sql_ts.now();
+    // Write frontier before planning (same rationale as INSERT); the
+    // plan allocates one ts per write (pk moves add a tombstone).
+    shared
+        .sql_ts
+        .reserve_write_frontier(read_ts, dist_writes.len() as u64)
+        .await;
     if let Some(plan) =
-        dist::plan::try_plan_simple(shared, shared.sql_ts.now(), &schema, &dist_writes, &idx)?
+        dist::plan::try_plan_simple(shared, read_ts, &schema, &dist_writes, &idx)?
     {
         return dist::twopc::run(shared, &plan)
             .await
             .map(|_| ExecOutcome::Affected(plans.len() as u64));
     }
-    let ts = shared.sql_ts.alloc_n(versions);
+    let ts = shared.sql_ts.alloc_n_above(versions, read_ts);
     let mut batch = WriteBatch::default();
     let mut next = ts.start;
     for p in &plans {
@@ -413,7 +429,8 @@ pub async fn delete(
         &order_by,
         limit,
         sess.txn.as_ref(),
-    )?;
+    )
+    .await?;
     let n = matched.len() as u64;
     if n == 0 {
         return Ok(ExecOutcome::Affected(0));
@@ -443,14 +460,19 @@ pub async fn delete(
     let idx = index_ops(shared, &schema, &trans)?;
     // M3 2PC hook (see the INSERT path note).
     let writes: dist::plan::SimpleWrites = pk_keys.iter().map(|pk| (pk.clone(), None)).collect();
-    if let Some(plan) =
-        dist::plan::try_plan_simple(shared, shared.sql_ts.now(), &schema, &writes, &idx)?
-    {
+    let read_ts = shared.sql_ts.now();
+    // Write frontier before planning (same rationale as INSERT); the
+    // plan allocates one ts per write.
+    shared
+        .sql_ts
+        .reserve_write_frontier(read_ts, writes.len() as u64)
+        .await;
+    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await
             .map(|_| ExecOutcome::Affected(n));
     }
-    let ts = shared.sql_ts.alloc_n(n);
+    let ts = shared.sql_ts.alloc_n_above(n, read_ts);
     let mut batch = WriteBatch::default();
     for (i, r) in matched.iter().enumerate() {
         let key = pk_key_of(&schema, r)?;
@@ -480,10 +502,13 @@ fn bad_field(col: &str) -> SqlError {
     )
 }
 
-/// WHERE + ORDER BY + LIMIT shared by UPDATE and DELETE. Inside a txn
-/// the read runs at its pinned `read_ts` MERGED with its staged writes,
-/// so UPDATE-twice/DELETE-then-UPDATE chains see own writes.
-fn matched_rows(
+/// WHERE + ORDER BY + LIMIT shared by UPDATE and DELETE. In a ready
+/// multi-node cluster the candidate rows are gathered from every slot
+/// owner exactly like a SELECT (a local scan would see only this
+/// node's band and silently miss remote rows). Inside a txn the read
+/// runs at its pinned `read_ts` MERGED with its staged writes, so
+/// UPDATE-twice/DELETE-then-UPDATE chains see own writes.
+async fn matched_rows(
     shared: &Shared,
     schema: &TableSchema,
     scope: &FromScope,
@@ -492,10 +517,24 @@ fn matched_rows(
     limit: Option<u64>,
     txn: Option<&crate::sql::tx::Txn>,
 ) -> SqlResult<Vec<Vec<Value>>> {
+    // Autocommit matching takes its read point fresh: fold the raft
+    // cursor frontier first so `now()` rides the cluster's latest
+    // applied ts (a follower coordinating an UPDATE would otherwise
+    // match at its stale ts-block tail and silently miss rows stamped
+    // above it). Txn mode keeps the snapshot pinned at BEGIN.
     let read_ts = txn
         .map(|t| t.read_ts)
-        .unwrap_or_else(|| shared.sql_ts.now());
-    let mut rows = scan::visible_rows(&shared.store, schema, read_ts)?;
+        .unwrap_or_else(|| {
+            shared.sql_ts.sync_cursor_frontier();
+            shared.sql_ts.now()
+        });
+    // Same fan-out verdict as a SELECT: per-owner bands when the
+    // cluster is ready (UPDATE/DELETE reject columnar tables before
+    // this point, so the band gather is the only distributed shape).
+    let mut rows = match dist::gather::gatherable_by_name(shared) {
+        Some(bs) => dist::gather::gather_rows(shared, &bs, schema, read_ts).await?,
+        None => scan::visible_rows(&shared.store, schema, read_ts)?,
+    };
     if let Some(t) = txn {
         rows = crate::sql::tx::merge_rows(schema, rows, t)?;
     }

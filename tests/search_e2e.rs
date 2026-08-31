@@ -168,7 +168,7 @@ fn ft_text_lifecycle_and_ranking() {
 
 #[test]
 fn ft_knn_bruteforce_build_and_prefilter() {
-    let (shared, _dir) = shared_at("45002");
+    let (shared, _dir) = shared_at("45007");
     ok(
         &call(
             &shared,
@@ -359,4 +359,50 @@ fn ft_ttl_expires_whole_family() {
         contains_bytes(&r, b":0\r\n"),
         "stale postings after TTL: {r:?}"
     );
+}
+
+/// FT.SEARCH must answer with ONE flat array (`*N` header, integer
+/// total, then per-hit docid/[score]/[content]). Regression: the
+/// header was missing, so every element left the server as a
+/// standalone RESP value and clients only ever rendered the total.
+#[test]
+fn ft_search_reply_is_a_flat_array() {
+    let (shared, _dir) = shared_at("45009");
+    ok(
+        &call(
+            &shared,
+            "ft.create",
+            &[b"idx", b"SCHEMA", b"body", b"TEXT", b"vec", b"VECTOR", b"DIM", b"2"],
+        ),
+        "create",
+    );
+    assert_eq!(
+        call(
+            &shared,
+            "ft.add",
+            &[b"idx", b"d1", br#"{"body":"hello","vec":[1,0]}"#]
+        ),
+        b":1\r\n".to_vec(),
+        "add d1"
+    );
+    assert_eq!(
+        call(
+            &shared,
+            "ft.add",
+            &[b"idx", b"d2", br#"{"body":"world","vec":[0,1]}"#]
+        ),
+        b":1\r\n".to_vec(),
+        "add d2"
+    );
+    // Text search: *3 = total + (docid + content) per hit.
+    let r = call(&shared, "ft.search", &[b"idx", b"@body:hello"]);
+    assert_eq!(r.first(), Some(&b'*'), "array header: {r:?}");
+    assert!(r.starts_with(b"*3\r\n:1\r\n"), "text shape: {r:?}");
+    // WITHSCORES + NOCONTENT: *3 = total + docid + score per hit.
+    let r = call(
+        &shared,
+        "ft.search",
+        &[b"idx", b"*", b"WITHSCORES", b"NOCONTENT"],
+    );
+    assert!(r.starts_with(b"*5\r\n:2\r\n"), "knn/score shape: {r:?}");
 }

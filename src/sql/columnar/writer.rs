@@ -131,18 +131,21 @@ pub fn build_meta(
     }
 }
 
-/// First candidate `base, base+1, ...` whose placement slot satisfies
-/// `allow` (bounded scan; segment ids never need global coordination).
+/// First candidate `base, base+1, ...` that is `free` (no segment meta
+/// exists yet) and whose placement slot satisfies `allow`. The scan
+/// alone is NOT injective -- two bases can share the next eligible
+/// slot band -- so `free` is what keeps segment ids unique.
 pub fn choose_segment_id(
     table_id: u32,
     base: u64,
     allow: &dyn Fn(u16) -> bool,
+    free: &dyn Fn(u64) -> bool,
 ) -> Result<u64, String> {
     for i in 0..MAX_SEGMENT_ID_CANDIDATES {
         let Some(id) = base.checked_add(i) else {
             break;
         };
-        if allow(meta::segment_slot(table_id, id)) {
+        if free(id) && allow(meta::segment_slot(table_id, id)) {
             return Ok(id);
         }
     }
@@ -151,13 +154,28 @@ pub fn choose_segment_id(
 
 /// Segment id for a local flush: in a ready cluster the segment must
 /// land in a slot band this node owns; single-node accepts anything.
+/// An id whose meta key already exists is never reused: the forward
+/// scan from `base` is not injective, so a later flush whose base fell
+/// just below an already-used id would pick that id again and its
+/// meta/file/registry upsert would silently replace the old segment
+/// (the store stays the source of truth, also across restarts).
 pub fn local_segment_id(shared: &Shared, table_id: u32, base: u64) -> Result<u64, String> {
-    let Some(r) = crate::sql::dist::routing(shared) else {
-        return choose_segment_id(table_id, base, &|_| true);
+    // Treat store errors as taken: never overwrite on a failed read.
+    let free = |id: u64| {
+        matches!(
+            ops::get_physical(&shared.store, &meta::meta_key(table_id, id)),
+            Ok(None)
+        )
     };
-    choose_segment_id(table_id, base, &|slot| {
-        crate::sql::dist::owner(&r, slot) == r.host
-    })
+    let Some(r) = crate::sql::dist::routing(shared) else {
+        return choose_segment_id(table_id, base, &|_| true, &free);
+    };
+    choose_segment_id(
+        table_id,
+        base,
+        &|slot| crate::sql::dist::owner(&r, slot) == r.host,
+        &free,
+    )
 }
 
 /// Autocommit fast path: one segment + one meta key, published in ONE

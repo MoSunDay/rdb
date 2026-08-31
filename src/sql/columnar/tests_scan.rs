@@ -164,3 +164,92 @@ async fn table_rows_resolves_schema_by_id() {
     );
     assert!(reader::table_rows(&shared, 9, 9).is_err(), "not columnar");
 }
+
+/// Regression (cluster INSERT data loss): three consecutive autocommit
+/// columnar INSERTs served by ONE node of a ready cluster. Segment ids
+/// are scanned forward from each statement's commit ts to the next
+/// slot band this node owns -- a mapping that is NOT injective: when
+/// the base's own slot is foreign, the next statement (base+1) scans
+/// to the very same id, and its meta key / segment file / registry
+/// upsert silently replace the first batch's segment. The real three
+/// node cluster showed COUNT(*) 3 -> 4 -> 7 with batch 1's rows gone;
+/// every batch must keep its own segment (3 -> 7 -> 10 here).
+#[tokio::test]
+async fn three_autocommit_inserts_keep_every_batch_visible() {
+    use crate::sql::columnar::meta;
+    use crate::sql::exec::{ddl, write, SqlSession};
+    use crate::sql::parse::parse_statement;
+    use crate::topology;
+
+    let shared = testutil::shared_with(testutil::test_config());
+    let foreign = "127.0.0.1:32712".to_string();
+    let third = "127.0.0.1:32713".to_string();
+    // Ready three member cluster; THIS node is addrs[0] (band owner of
+    // the low slots), exactly like the raft leader in the repro.
+    *shared.topology.write().unwrap() = topology::refresh(&format!(
+        "{},{},{}",
+        shared.conf.bind, foreign, third
+    ));
+    ddl::run(
+        &shared,
+        parse_statement("CREATE TABLE cl (k BIGINT PRIMARY KEY) ENGINE=columnar").unwrap(),
+    )
+    .await
+    .unwrap();
+    let schema = crate::sql::storage::catalog::lookup(&shared, "cl")
+        .unwrap()
+        .expect("table exists");
+    assert!(schema.engine.is_columnar());
+    // The next statement's commit ts is the id scan's base: make its
+    // slot FOREIGN (the old chooser jumped forward) and the following
+    // candidates' slots LOCAL (the jump was short, base+1 in the real
+    // cluster), so batch 2's base scans onto batch 1's chosen id.
+    let base = shared.sql_ts.now() + 1;
+    {
+        let mut topo = shared.topology.write().unwrap();
+        for c in base..base + 32 {
+            let slot = meta::segment_slot(schema.id, c);
+            let owner = if c == base {
+                foreign.clone()
+            } else {
+                shared.conf.bind.clone()
+            };
+            topo.owner_map.insert(slot, owner);
+        }
+    }
+    let mut sess = SqlSession::default();
+    let batches = [
+        ("INSERT INTO cl (k) VALUES (1), (2), (3)", 3_i64),
+        ("INSERT INTO cl (k) VALUES (4), (5), (6), (7)", 7),
+        ("INSERT INTO cl (k) VALUES (8), (9), (10)", 10),
+    ];
+    for (sql, expected) in batches {
+        write::insert(&shared, &mut sess, parse_statement(sql).unwrap())
+            .await
+            .unwrap();
+        let rows = reader::table_rows(&shared, schema.id, shared.sql_ts.now()).unwrap();
+        let mut ks: Vec<i64> = rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                Value::Int(k) => *k,
+                other => panic!("unexpected key {other:?}"),
+            })
+            .collect();
+        ks.sort();
+        assert_eq!(
+            ks.len(),
+            expected as usize,
+            "COUNT(*) after '{sql}': earlier batches must stay visible"
+        );
+        assert_eq!(
+            *ks.last().unwrap(), expected,
+            "batch '{sql}' appended its own rows"
+        );
+    }
+    // One segment per batch, all distinct ids, all rows present.
+    let segs = registry_of(&shared).segments(schema.id);
+    let mut ids: Vec<u64> = segs.iter().map(|m| m.segment_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "three batches, three distinct segments");
+}
