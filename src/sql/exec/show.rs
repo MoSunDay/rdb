@@ -106,7 +106,9 @@ fn show_indexes(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
     for i in &schema.indexes {
         rows.push(vec![
             Value::Str(schema.name.clone()),
-            Value::Int(u8::from(i.unique) as i64),
+            // MySQL semantics: Non_unique is 0 for a UNIQUE index and
+            // 1 for a plain secondary index.
+            Value::Int(!i.unique as i64),
             Value::Str(i.name.clone()),
             Value::Int(1),
             Value::Str(i.column.clone()),
@@ -275,8 +277,8 @@ mod tests {
             other => panic!("shape {other:?}"),
         };
         assert_eq!(entry(0), (0, "PRIMARY".to_string(), "id".to_string()));
-        assert_eq!(entry(1), (0, "idx_v".to_string(), "v".to_string()));
-        assert_eq!(entry(2), (1, "uq_n".to_string(), "n".to_string()));
+        assert_eq!(entry(1), (1, "idx_v".to_string(), "v".to_string()));
+        assert_eq!(entry(2), (0, "uq_n".to_string(), "n".to_string()));
 
         // SHOW COLUMNS Key flags follow the index kinds
         let Ok(ExecOutcome::Rows { rows, .. }) = run(

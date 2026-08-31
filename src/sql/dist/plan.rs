@@ -139,9 +139,12 @@ fn build(
 ) -> SqlResult<Option<CommitPlan>> {
     // Rows take the head of the ts range, one segment commit ts per
     // appended table takes the tail (BTreeMap order = deterministic).
+    // An index-only plan (catalog backfill routed through 2PC) still
+    // consumes one ts: the range start is the txn id and must never be
+    // handed to a later commit.
     let ts = shared
         .sql_ts
-        .alloc_n(writes.len() as u64 + appends.len() as u64);
+        .alloc_n_above((writes.len() as u64 + appends.len() as u64).max(1), read_ts);
     let mut participants: BTreeMap<String, ParticipantPlan> = BTreeMap::new();
     for (i, (table_id, pk, values)) in writes.iter().enumerate() {
         let schema = schemas.get(table_id).ok_or_else(|| {

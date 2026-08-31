@@ -119,6 +119,7 @@ async fn dispatch(req: &Req, shared: &Shared, mux: &tokio::sync::Mutex<()>) -> R
                 &crate::sql::columnar::writer::columnar_dir(&shared.conf),
                 &crate::sql::columnar::registry_of(shared),
                 txn_id,
+                &shared.conf.bind,
                 *commit,
                 index_ops,
             ) {

@@ -81,10 +81,20 @@ pub struct TsState {
     pub block_lo: u64,
     pub block_hi: u64,
     /// Highest timestamp this node knows has been granted (carved,
-    /// fetched or observed); returned by `now()`.
+    /// fetched or observed); `now()` returns this (or the frontier
+    /// below, when the cursor moved further).
     pub global_hi: u64,
+    /// Highest timestamp this node knows was COMMITTED elsewhere
+    /// (`advance_to` on 2PC decide, local-counter mirrors). Unlike
+    /// `global_hi` this never includes this node's own reserved-but-
+    /// unused block tail, so it is the exact floor a new grant must
+    /// clear to stay above versions the node already read.
+    pub observed_floor: u64,
     /// Last raft cursor observed (exclusive end of every block
-    /// authorized so far); the fallback jumps above `cursor + GAP`.
+    /// authorized so far); the fallback jumps above `cursor + GAP`,
+    /// and `now()` rides `cursor - 1` so the read point tracks the
+    /// cluster's assigned-time frontier even when this node's own
+    /// block lease lags it.
     pub last_cursor: u64,
     /// True while allocations come from the locally-bumped fallback.
     pub degraded: bool,
@@ -105,10 +115,22 @@ pub fn remaining(st: &TsState) -> u64 {
 }
 
 /// Carve `n` consecutive timestamps from the local block; `None` when
-/// the block is exhausted or smaller than `n`.
+/// the block is exhausted, or when the remainder went STALE.
 pub fn carve(st: &mut TsState, n: u64) -> Option<Range<u64>> {
     if n == 0 {
         return Some(st.block_lo..st.block_lo);
+    }
+    // Stale-tail guard: when this node OBSERVED commits at or above its
+    // reserved tail (2PC participant applying a commit decided elsewhere,
+    // via `observe_floor`), the tail's grants sit below commits the node
+    // itself already read. Stamping them would bury the write under the
+    // versions it replaces (newest-ts-wins) and silently lose it.
+    // Discard the poisoned remainder; `alloc_n` falls back above
+    // `global_hi` (>= observed floor) once, and the refiller re-anchors
+    // the cursor with `floor = global_hi + 1`.
+    if st.block_lo <= st.observed_floor {
+        st.block_lo = st.block_hi;
+        return None;
     }
     if remaining(st) < n {
         return None;
@@ -205,17 +227,52 @@ impl ClusterTs {
         }
     }
 
-    /// Local knowledge of the newest granted timestamp (`global_hi`).
-    pub fn now(&self) -> u64 {
-        self.state.lock().unwrap().global_hi
+    /// Allocate `n` timestamps for a statement whose read point is
+    /// `floor`. The reserved tail serves while it is fresh (carve's
+    /// observed-commit guard); when it is poisoned or exhausted the
+    /// range is carved from the locally-bumped fallback, which always
+    /// lands above both the observed commits and `floor` (a
+    /// snapshot-isolated write must stamp versions newer than everything
+    /// it read). The next fetch re-anchors the cursor above the bump.
+    pub fn alloc_above(&self, n: u64, floor: u64) -> Range<u64> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(r) = carve(&mut st, n) {
+            return r;
+        }
+        st.block_lo = st.block_hi;
+        st.global_hi = st.global_hi.max(floor);
+        fallback_range(&mut st, n)
     }
 
-    /// Fold an externally granted high-water mark into `global_hi`
-    /// (local-atomic allocations made while the cluster core is
-    /// installed but not yet active).
+    /// Local knowledge of the newest granted timestamp (`global_hi`).
+    pub fn now(&self) -> u64 {
+        let st = self.state.lock().unwrap();
+        st.global_hi.max(st.last_cursor.saturating_sub(1))
+    }
+
+    /// Fold the raft-replicated `sql_ts_cursor` into the local view. The
+    /// cursor is the exclusive end of every block the cluster has
+    /// authorized, so `cursor - 1` is a strict lower bound on all
+    /// assigned timestamps: raising `last_cursor` lifts the `now()`
+    /// read point to the cluster frontier even while this node's own
+    /// block lease (and hence `global_hi`) lags behind it.
+    pub fn note_cursor(&self, cursor: u64) {
+        if cursor == 0 {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        st.last_cursor = st.last_cursor.max(cursor);
+    }
+
+    /// Fold an externally granted high-water mark into `global_hi` and
+    /// past the local reserve (`observed_floor`): a commit decided
+    /// elsewhere (or a pre-cluster local grant) must both lift the read
+    /// point AND poison any reserved tail sitting below it, so later
+    /// allocations can never stamp versions under what this node read.
     pub fn observe_floor(&self, hi: u64) {
         let mut st = self.state.lock().unwrap();
         st.global_hi = st.global_hi.max(hi);
+        st.observed_floor = st.observed_floor.max(hi);
     }
 
     /// True once a fetched block has room (tests + refill polls).
@@ -227,11 +284,37 @@ impl ClusterTs {
         self.state.lock().unwrap().degraded
     }
 
+    /// Fold the raft-replicated `sql_ts_cursor` (exclusive end of every
+    /// block the cluster authorized) into `last_cursor`: `cursor - 1`
+    /// bounds all assigned timestamps, so `now()` can ride the cluster
+    /// frontier even while this node's own block lease (and thus
+    /// `global_hi`) lags behind it. Cheap: one FSM-mirror read, no RPC.
+    pub fn sync_cursor_frontier(&self) {
+        if !self.active() {
+            return;
+        }
+        // try_read, never blocking: this runs on runtime workers (per
+        // write statement and every refill tick), and blocking here on
+        // a DDL's raft write-guard window could freeze the tokio
+        // driver. The fold is best-effort; the next tick or statement
+        // retries.
+        let Ok(r) = self.deps.raft.try_read() else {
+            return;
+        };
+        let cursor = state::raft_get(&r, TS_CURSOR_KEY).parse::<u64>().unwrap_or(0);
+        drop(r);
+        if cursor > 0 {
+            let mut st = self.state.lock().unwrap();
+            st.last_cursor = st.last_cursor.max(cursor);
+        }
+    }
+
     /// One refill round: fetch a fresh block when the local one is low.
     pub async fn refill_once(&self) -> Result<(), String> {
         if !self.active() {
             return Ok(());
         }
+        self.sync_cursor_frontier();
         let (need, floor) = {
             let st = self.state.lock().unwrap();
             (remaining(&st) < REFILL_LOW_WATER, st.global_hi + 1)
@@ -258,10 +341,57 @@ impl ClusterTs {
         Ok(())
     }
 
+    /// Make the locally reserved tail serve the caller's imminent alloc
+    /// of `want` timestamps above `floor` (the write's read frontier). A
+    /// tail granted BEFORE the cluster cursor moved past it would stamp
+    /// versions older than commits the txn just read -- newest-ts-wins
+    /// buries such a write silently, and the conflict veto cannot catch
+    /// it (the row's newest ts compares below the read point). A tail
+    /// SHORTER than `want` is just as fatal: the alloc cannot be served
+    /// mid-refill-tick (allocs never fetch) and would degrade to the
+    /// GAP fallback, whose stamps no cursor ride can ever cover. So:
+    /// fold in the live cursor, drop a stale or short tail, lease
+    /// `want.max(TS_BLOCK)` above the frontier. Best-effort: when the
+    /// leader is unreachable the caller's alloc falls back above
+    /// `last_cursor` (frozen degraded semantics), which this sync
+    /// already anchored.
+    pub async fn reserve_write_frontier(&self, floor: u64, want: u64) {
+        if !self.active() {
+            return;
+        }
+        self.sync_cursor_frontier();
+        let floor = floor.max(self.state.lock().unwrap().observed_floor + 1);
+        let serves = |st: &TsState| st.block_lo >= floor && remaining(st) >= want;
+        {
+            let st = self.state.lock().unwrap();
+            if serves(&st) {
+                return;
+            }
+        }
+        {
+            // Discard the stale or short tail (block_lo == block_hi
+            // empties it).
+            let mut st = self.state.lock().unwrap();
+            if !serves(&st) {
+                st.block_lo = st.block_hi;
+            }
+        }
+        let Ok((lo, hi)) = self.fetch_serialized(want.max(TS_BLOCK), floor).await else {
+            return;
+        };
+        let mut st = self.state.lock().unwrap();
+        if install_block(&mut st, lo, hi) {
+            st.degraded = false;
+        }
+    }
+
     /// Lease `n` timestamps for a REMOTE follower (`/sql/ts`): carve
     /// from the local block when it fits above `floor`, else fetch
     /// (raft cursor write) first. Same carve logic everywhere.
     pub async fn carve_remote(&self, n: u64, floor: u64) -> Result<Range<u64>, String> {
+        // Never serve or fetch below commits THIS leader already observed:
+        // the requester's floor only covers its own (possibly older) view.
+        let floor = floor.max(self.state.lock().unwrap().observed_floor + 1);
         let fits = {
             let mut st = self.state.lock().unwrap(); // dropped at block end
             carve_above_floor(&mut st, n, floor)

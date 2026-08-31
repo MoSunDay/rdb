@@ -275,13 +275,14 @@ fn arith(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
             if *b == 0 {
                 return Ok(Value::Null);
             }
-            Value::Int(a / b)
+            // wrapping, like Add/Sub/Mul above: MIN / -1 must not panic.
+            Value::Int(a.wrapping_div(*b))
         }
         Mod => {
             if *b == 0 {
                 return Ok(Value::Null);
             }
-            Value::Int(a % b)
+            Value::Int(a.wrapping_rem(*b))
         }
         _ => unreachable!(),
     })

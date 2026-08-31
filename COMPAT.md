@@ -447,9 +447,13 @@ contract; module map lives in `agents/rust/sql.md`.
 - **2PC writes**: any node accepts DML; the coordinator groups the pre-encoded batch by
   slot-band owner, PREPAREs (0x02 headers + unique entries + durable participant marker,
   one atomic RocksDB batch per participant), durably records the decision, then DECIDEs
-  (commit flips 0x02->0x01 + applies secondary index entries; abort deletes). In-doubt
-  markers resolve via `/sql2pc/status?id=` on the coordinator, presumed-abort after a
-  60s lease. Readers never see 0x02 rows.
+  (commit flips 0x02->0x01 + applies secondary index entries; abort deletes). A commit
+  whose outcome cannot be persisted fails CLOSED: no Decide leaves the coordinator
+  (best-effort abort broadcast instead) and the client gets a retryable WriteConflict.
+  In-doubt markers resolve via `/sql2pc/status?id=` on the coordinator, presumed-abort
+  after a 60s lease; the answer carries ONLY the requesting node's mapped index ops
+  (outcome records map ops per node -- a participant under its own bind; `own_ops` is
+  local-replay state and never crosses the wire). Readers never see 0x02 rows.
 - **Scatter-gather reads**: single-table scans fan out per slot band over the internal
   `sql_rpc_bind` TCP protocol (length-prefixed JSON), merged at the coordinator and then
   filtered/ordered/aggregated there. A dead band owner fails the query loudly (no partial

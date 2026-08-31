@@ -58,6 +58,10 @@ pub fn sequence_next(shared: &Shared, table: &str) -> i64 {
 /// both observe max_id and pick the same new id).
 pub struct CatalogTxn<'a> {
     raft: &'a mut RaftState,
+    /// Every replicated entry this txn landed, in order: the
+    /// replication barrier replays these to the peers so a DDL ack
+    /// implies follower visibility (see [`super::replicate`]).
+    applied: Vec<(String, String)>,
 }
 
 impl CatalogTxn<'_> {
@@ -66,6 +70,11 @@ impl CatalogTxn<'_> {
     /// state their mutations land on.
     pub fn state(&self) -> &RaftState {
         self.raft
+    }
+
+    /// Entries applied so far (key -> value as written through raft).
+    pub fn applied(&self) -> &[(String, String)] {
+        &self.applied
     }
 
     /// Persist a schema (upsert) through raft; awaits commit. A txn may
@@ -77,7 +86,10 @@ impl CatalogTxn<'_> {
             value,
         };
         let ticket = state::raft_apply_start(self.raft, &entry)?;
-        state::raft_apply_await(ticket).await
+        state::raft_apply_await(ticket).await?;
+        self.applied
+            .push((catalog_key(&schema.name), entry.value));
+        Ok(())
     }
 
     /// Remove a table's schema. The tombstone value carries the dropped
@@ -90,7 +102,9 @@ impl CatalogTxn<'_> {
             value: id.to_string(),
         };
         let ticket = state::raft_apply_start(self.raft, &entry)?;
-        state::raft_apply_await(ticket).await
+        state::raft_apply_await(ticket).await?;
+        self.applied.push((catalog_key(table), id.to_string()));
+        Ok(())
     }
 
     /// One raw FSM entry through the same replicated path (used for the
@@ -101,7 +115,9 @@ impl CatalogTxn<'_> {
             value: value.to_string(),
         };
         let ticket = state::raft_apply_start(self.raft, &entry)?;
-        state::raft_apply_await(ticket).await
+        state::raft_apply_await(ticket).await?;
+        self.applied.push((key.to_string(), value.to_string()));
+        Ok(())
     }
 }
 
@@ -117,7 +133,10 @@ pub fn begin<'a>(raft: &'a mut RaftState, what: &str) -> Result<CatalogTxn<'a>, 
         };
         return Err(format!("{what} requires the raft leader{hint}"));
     }
-    Ok(CatalogTxn { raft })
+    Ok(CatalogTxn {
+        raft,
+        applied: Vec::new(),
+    })
 }
 
 /// Read one table's schema from the FSM view (leader and followers alike).

@@ -351,3 +351,319 @@ async fn dead_participant_aborts_and_restart_recovers() {
         n.kill_now();
     }
 }
+
+/// Regression (follower-coordinated writes must land on slot owners):
+/// an UPDATE/DELETE issued on a NON-owner node used to match rows with
+/// a LOCAL scan only, so it silently matched 0 (or a band-sized slice
+/// of) rows living on other slot owners and answered OK while nothing
+/// (or not everything) changed. Matching now fans out exactly like a
+/// SELECT, so the statement's write set covers the whole table and the
+/// 2PC commit reaches every slot owner.
+///
+/// - autocommit UPDATE of every row, coordinated by node1;
+/// - explicit-txn transfer pair (UPDATE -40 / UPDATE +40) coordinated
+///   by every node in turn (whoever coordinates, both rows must move);
+/// - autocommit DELETE of every row, coordinated by node2.
+#[tokio::test]
+async fn follower_coordinated_update_delete_reaches_all_slot_owners() {
+    let dir = std::env::temp_dir().join(format!(
+        "rdb-sql-follower-write-e2e-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nodes = start_sql_cluster(&dir, 3).await;
+    let mut c0 = connect(&nodes[0]).await;
+    let mut c1 = connect(&nodes[1]).await;
+    let mut c2 = connect(&nodes[2]).await;
+
+    ddl(
+        &mut c0,
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, amt BIGINT NOT NULL)",
+    )
+    .await;
+    wait_table(&mut c1, "items", &nodes[1]).await;
+    wait_table(&mut c2, "items", &nodes[2]).await;
+
+    // Seed 40 rows from the leader: ids spread over all three slot
+    // bands (the chance they all land on one node is ~(1/3)^39).
+    let seed: Vec<String> = (1..=40).map(|i| format!("({}, 1000)", i)).collect();
+    c0.query_drop(format!("INSERT INTO items (id, amt) VALUES {}", seed.join(", ")))
+        .await
+        .expect("seed insert");
+    let got = placement(&mut [Some(&mut c0), Some(&mut c1), Some(&mut c2)]).await;
+    check_gathered(&got, &(1..=40).collect::<Vec<_>>(), "seeded");
+
+    // ---- autocommit UPDATE coordinated by a follower node ----
+    // Pre-fix this matched only node1's local band (~1/3 of the rows)
+    // and still answered OK; post-fix every row must move to 2000.
+    c1.query_drop("UPDATE items SET amt = 2000 WHERE id >= 1")
+        .await
+        .expect("follower-coordinated full update");
+    let n = c1.affected_rows() as usize;
+    assert_eq!(n, 40, "UPDATE must affect every row, not just a band");
+    for (i, c) in [&mut c0, &mut c1, &mut c2].iter_mut().enumerate() {
+        let rs: Vec<mysql_async::Row> =
+            c.query("SELECT DISTINCT amt FROM items").await.unwrap();
+        let mut v: Vec<i64> = rs
+            .into_iter()
+            .map(|r| match r.get::<MVal, _>(0) {
+                Some(MVal::Bytes(b)) => String::from_utf8(b).unwrap().parse().unwrap(),
+                Some(MVal::Int(i)) => i,
+                v => panic!("non-int amt cell {v:?}"),
+            })
+            .collect();
+        v.sort_unstable();
+        assert_eq!(v, vec![2000], "post-UPDATE node {i}");
+    }
+
+    // ---- explicit-txn transfer pair, coordinated by EVERY node ----
+    // Whoever coordinates, both rows must actually move: the staged
+    // writes fan out through 2PC at COMMIT.
+
+
+    transfer_via(&mut c0, None, "node0", 1960, 2040).await;
+    transfer_via(&mut c1, Some(&mut c0), "node1", 1920, 2080).await;
+    transfer_via(&mut c2, Some(&mut c0), "node2", 1880, 2120).await;
+
+    // ---- autocommit DELETE coordinated by another follower node ----
+    c2.query_drop("DELETE FROM items WHERE id >= 1")
+        .await
+        .expect("follower-coordinated full delete");
+    let n = c2.affected_rows() as usize;
+    assert_eq!(n, 40, "DELETE must remove every row, not just a band");
+    let got = placement(&mut [Some(&mut c0), Some(&mut c1), Some(&mut c2)]).await;
+    check_gathered(&got, &[], "post-DELETE gather");
+
+    for mut n in nodes {
+        n.kill_now();
+    }
+}
+
+/// One txn-mode transfer pair coordinated by `coord`'s node, then a
+/// read-back from the leader: id 1 must move -40 and id 2 +40 for
+/// every coordinator (a staged write set must reach its slot owner
+/// through 2PC no matter which node staged it).
+async fn transfer_via(
+    coord: &mut mysql_async::Conn,
+    leader: Option<&mut mysql_async::Conn>,
+    label: &str,
+    amt1: i64,
+    amt2: i64,
+) {
+    // A lagging coordinator snapshot can meet a row committed by another
+    // node's pair in between: the 2PC prepare vetoes with `conflict:`
+    // (1213, retryable). Back off briefly so the ts refiller re-anchors
+    // this node's read point, then retry the whole pair.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut failure: Option<String> = None;
+        for sql in [
+            "BEGIN",
+            "UPDATE items SET amt = amt - 40 WHERE id = 1",
+            "UPDATE items SET amt = amt + 40 WHERE id = 2",
+            "COMMIT",
+        ] {
+            if let Err(e) = coord.query_drop(sql).await {
+                failure = Some(format!("{sql}: {e}"));
+                break;
+            }
+        }
+        match failure {
+            None => break,
+            Some(m) => {
+                assert!(
+                    attempt < 4 && (m.contains("1213") || m.contains("conflict:")),
+                    "{label}: transfer failed (attempt {attempt}): {m}"
+                );
+                eprintln!("sql_2pc_e2e: {label} vetoed, retry {attempt}: {m}");
+                let _ = coord.query_drop("ROLLBACK").await;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    }
+    // `None` = the coordinator IS the leader; read back through it.
+    let reader: &mut mysql_async::Conn = match leader {
+        Some(l) => l,
+        None => coord,
+    };
+    let rs: Vec<mysql_async::Row> =
+        reader.query("SELECT id, amt FROM items WHERE id IN (1, 2)").await.unwrap();
+    let mut got: Vec<(i64, i64)> = rs
+        .into_iter()
+        .map(|r| {
+            let num = |i: usize| match r.get::<MVal, _>(i) {
+                Some(MVal::Bytes(b)) => String::from_utf8(b).unwrap().parse().unwrap(),
+                Some(MVal::Int(i)) => i,
+                v => panic!("non-int cell {v:?}"),
+            };
+            (num(0), num(1))
+        })
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![(1, amt1), (2, amt2)], "transfer via {label}");
+}
+
+// ---- defect-B regression: a follower whose ts lease predates the ----
+// ---- cluster frontier must still read and write AT the frontier ----
+
+/// crc16/xmodem, the same algorithm as the RESP plane's `hash::crc16`
+/// (check value 0x31C3): a SQL row's slot is
+/// `crc16(table_id_be ++ pk_key_bytes) % 16384`, its pk key bytes for a
+/// BIGINT pk are `0x02 ++ (i ^ i64::MIN).to_be_bytes()` (order-preserving
+/// `codec::key_int`), and slot s is owned by the first node i with
+/// `s <= (i+1) * per` (`per` = 16384/nodes, addrs[i] = node i).
+/// Replicated here so the test can aim rows at (or away from) one
+/// node's band without a handle on crate internals.
+fn crc16(key: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in key {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+#[tokio::test]
+async fn stale_block_follower_reads_and_writes_at_the_cluster_frontier() {
+    assert_eq!(crc16(b"123456789"), 0x31C3, "crc16 must match hash::crc16");
+    let per = 16384usize / 3;
+    let band = |slot: u16| (0..3).find(|i| slot as usize <= (i + 1) * per).unwrap();
+    let slot_of = |id: i64| -> u16 {
+        // table id 1: the first CREATE TABLE of this fresh cluster.
+        let mut k = 1u32.to_be_bytes().to_vec();
+        k.push(0x02);
+        k.extend_from_slice(&(id ^ (1i64 << 63)).to_be_bytes());
+        crc16(&k) % 16384
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "rdb-sql-stale-ts-e2e-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nodes = start_sql_cluster(&dir, 3).await;
+    let mut c0 = connect(&nodes[0]).await;
+    let mut c1 = connect(&nodes[1]).await;
+    let mut c2 = connect(&nodes[2]).await;
+
+    ddl(
+        &mut c0,
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, amt BIGINT NOT NULL)",
+    )
+    .await;
+    wait_table(&mut c1, "items", &nodes[1]).await;
+    wait_table(&mut c2, "items", &nodes[2]).await;
+
+    // node1 (a FOLLOWER) allocates this test's first timestamp, for a
+    // row in its OWN band (local path: node1 joins no 2PC). Its block
+    // lease then sits still -- an idle block is never below the refill
+    // low-water -- so node1's ts horizon is frozen at that early grant.
+    let seed_id = (1..).find(|i| band(slot_of(*i)) == 1).unwrap();
+    c1.query_drop(format!(
+        "INSERT INTO items (id, amt) VALUES ({seed_id}, 5)"
+    ))
+    .await
+    .expect("follower seed");
+
+    // The leader pushes the raft cursor a couple of blocks past every
+    // possible early grant (~3 x 4096 ts are handed out before the
+    // first statement runs): 14k rows in 256-row statements -- small
+    // enough that the leader's own block always refills in time (it
+    // must never degrade to the GAP fallback, whose stamps no cursor
+    // ride can cover) -- and all on ids OUTSIDE node1's band, so node1
+    // participates in none of those commits: nothing but the raft
+    // cursor can lift its horizon.
+    let mut want: Vec<i64> = vec![seed_id];
+    let mut chunk: Vec<String> = Vec::new();
+    let mut id = seed_id;
+    while want.len() < 14_001 {
+        id += 1;
+        if band(slot_of(id)) == 1 {
+            continue;
+        }
+        want.push(id);
+        chunk.push(format!("({}, 1000)", id));
+        if chunk.len() == 256 {
+            let sql = format!("INSERT INTO items (id, amt) VALUES {}", chunk.join(", "));
+            c0.query_drop(sql).await.expect("frontier push");
+            chunk.clear();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+    }
+    // Flush the final partial chunk: `want` counts every row, so the
+    // push must land all of them.
+    if !chunk.is_empty() {
+        let sql = format!("INSERT INTO items (id, amt) VALUES {}", chunk.join(", "));
+        c0.query_drop(sql).await.expect("frontier push (tail)");
+    }
+
+    // The raft cursor is folded into node1's read point inside the
+    // UPDATE statement itself (the autocommit match syncs the cursor
+    // before `now()`). Pre-fix there was nothing to fold: the horizon
+    // stayed at the early block tail, the UPDATE matched only the rows
+    // stamped under it, and its own versions were carved from the
+    // stale lease -- stamped UNDER the leader's newest rows and
+    // silently buried.
+    //
+    // A follower's knowledge is bounded by raft replication: rows whose
+    // cursor entry has not applied on node1 yet are not visible there
+    // (a SELECT would not see them either), so the first pass may miss
+    // the newest chunk. The invariant under test is CONVERGENCE: every
+    // pass matches everything visible at the pass's frontier, no
+    // matched row is ever lost, and once the frontier catches up the
+    // remaining rows match. Pre-fix the horizon never rose and the
+    // passes kept missing rows (while burying the ones they did
+    // match), so the loop never converges.
+    let mut matched: u64 = 0;
+    for attempt in 0..10 {
+        c1.query_drop("UPDATE items SET amt = amt + 1")
+            .await
+            .expect("stale-block follower UPDATE");
+        let this = c1.affected_rows();
+        matched += this;
+        if matched == want.len() as u64 {
+            break;
+        }
+        assert!(attempt < 9, "follower UPDATE never converged");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        matched, want.len() as u64,
+        "every row must match across passes, not just the pre-frontier ones"
+    );
+
+    // The moved versions must be the newest everywhere: on every node
+    // the whole table reads back (gather) and every amt moved exactly
+    // once (5 -> 6 for the seed, 1000 -> 1001 for the pushed rows).
+    for (i, c) in [&mut c0, &mut c1, &mut c2].iter_mut().enumerate() {
+        let rs: Vec<mysql_async::Row> =
+            c.query("SELECT DISTINCT amt FROM items").await.unwrap();
+        let mut amts: Vec<i64> = rs
+            .into_iter()
+            .map(|r| match r.get::<MVal, _>(0) {
+                Some(MVal::Bytes(b)) => String::from_utf8(b).unwrap().parse().unwrap(),
+                v => panic!("non-bytes amt cell {v:?}"),
+            })
+            .collect();
+        amts.sort_unstable();
+        assert_eq!(amts, vec![6, 1001], "node {i}: every version moved");
+    }
+    check_gathered(
+        &placement(&mut [Some(&mut c0), Some(&mut c1), Some(&mut c2)]).await,
+        &want,
+        "post-UPDATE gather",
+    );
+
+    for mut n in nodes {
+        n.kill_now();
+    }
+}
