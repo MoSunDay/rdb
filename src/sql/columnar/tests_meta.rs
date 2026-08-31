@@ -115,14 +115,20 @@ fn registry_insert_upserts_and_keeps_sorted() {
 #[test]
 fn choose_segment_id_finds_band_and_errors_when_none() {
     let table_id = 5u32;
-    let id = writer::choose_segment_id(table_id, 1000, &|slot| slot <= 8191).unwrap();
+    let id = writer::choose_segment_id(table_id, 1000, &|slot| slot <= 8191, &|_| true).unwrap();
     assert!(id >= 1000);
     assert!(
         meta::segment_slot(table_id, id) <= 8191,
         "picked id must hash into the allowed band"
     );
-    let err = writer::choose_segment_id(table_id, 0, &|_| false).unwrap_err();
+    let err = writer::choose_segment_id(table_id, 0, &|_| false, &|_| true).unwrap_err();
     assert!(err.contains("no eligible slot band"), "{err}");
+    // Taken ids are skipped even when their slot band is eligible: the
+    // forward scan alone is not injective (two bases can share the
+    // next eligible band), and reuse would overwrite a live segment.
+    let first = writer::choose_segment_id(table_id, 1000, &|_| true, &|_| true).unwrap();
+    let second = writer::choose_segment_id(table_id, first, &|_| true, &|id| id != first).unwrap();
+    assert!(second > first, "taken ids must be skipped, got {second}");
 }
 
 fn two_col_schema() -> TableSchema {

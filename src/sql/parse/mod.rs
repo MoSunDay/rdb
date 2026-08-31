@@ -8,6 +8,7 @@ pub mod error;
 pub(crate) mod expr;
 pub(crate) mod query;
 pub mod starrocks;
+pub(crate) mod session;
 pub(crate) mod table;
 pub(crate) mod translate;
 
@@ -208,8 +209,13 @@ mod tests {
             stmt("SHOW COLUMNS FROM t"),
             Statement::ShowColumns(_)
         ));
-        assert!(parse_statement("SET autocommit = 1").is_err());
-        assert!(parse_statement("SET NAMES utf8mb4").is_err());
+        // Real-client handshake: restating the engine's only mode is OK...
+        assert!(parse_statement("SET autocommit = 1").is_ok());
+        // ...while requesting a mode we do not implement still fails loud.
+        assert!(parse_statement("SET autocommit = 0").is_err());
+        // Real-client handshake: charset declaration is accepted (no-op).
+        assert!(parse_statement("SET NAMES utf8mb4").is_ok());
+        assert!(parse_statement("SET NAMES utf8mb4 COLLATE utf8mb4_bin").is_ok());
         // Isolation declarations are accepted and mapped onto the
         // engine's snapshot isolation (REPEATABLE READ semantics).
         assert!(matches!(

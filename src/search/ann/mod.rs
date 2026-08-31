@@ -171,7 +171,10 @@ pub fn knn(
         .enumerate()
         .map(|(i, c)| (vecmath::l2(c, query), i))
         .collect();
-    order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    // Distances come from user vectors / centroid means and can be NaN;
+    // total_cmp gives NaN a deterministic order (last) instead of the
+    // partial_cmp unwrap panicking mid-sort.
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
     // SQ8 shortlist from the probed partitions, then exact rerank of
     // the finalists from the doc records' raw vectors.
     let shortlist = k.saturating_mul(4).max(k + 16);
@@ -218,4 +221,75 @@ fn brute_force(
         .into_iter()
         .map(|h| (h.docid, -h.score))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::state::testutil;
+
+    /// A NaN centroid (or NaN query component) must not panic the KNN
+    /// partition probe: the NaN centroid sorts last (total_cmp), the
+    /// finite partition is probed and reranked normally, and an all-NaN
+    /// ordering yields no hits instead of an unwrap panic.
+    #[test]
+    fn knn_sorts_nan_distances_without_panicking() {
+        let sh = testutil::shared_with(crate::conf::Config::default());
+        let store: &Store = &sh.store;
+        let prefix = &b"42/"[..];
+        let index = &b"idx"[..];
+        let field = &b"v"[..];
+        let dim = 2u64;
+        let cal = quant::Calibration {
+            min: vec![0.0, 0.0],
+            scale: vec![1.0, 1.0],
+        };
+
+        // Partition 0 hosts a doc at the query point; centroid 1 is NaN.
+        let table = CentroidTable {
+            dim,
+            centroids: vec![vec![0.0, 0.0], vec![f32::NAN, 0.0]],
+            min: cal.min.clone(),
+            scale: cal.scale.clone(),
+            members: vec![1, 0],
+        };
+        sh.store
+            .db
+            .put(centroid_key(prefix, index, field), encode_centroids(&table))
+            .unwrap();
+        let entry = SqEntry {
+            docid: b"d1".to_vec(),
+            q: quant::encode(&cal, &[0.0, 0.0]),
+        };
+        sh.store
+            .db
+            .put(
+                ann_posting_key(prefix, index, field, 0),
+                encode_partition(dim, &[entry]),
+            )
+            .unwrap();
+        let rec = crate::search::index_codec::DocRecord {
+            doclen: 1,
+            terms: Vec::new(),
+            centroid: 0,
+            vector: vec![0.0, 0.0],
+            doc: Vec::new(),
+        };
+        sh.store
+            .db
+            .put(
+                doc_key(prefix, index, b"d1"),
+                crate::search::index_codec::encode_doc(&rec),
+            )
+            .unwrap();
+
+        let hits = knn(store, prefix, index, field, dim, &[0.0, 0.0], 1, 1).unwrap();
+        assert_eq!(hits, vec![(b"d1".to_vec(), 0.0)]);
+
+        // every distance NaN: deterministic total order, no panic, and
+        // the non-finite shortlist scores are dropped.
+        let hits = knn(store, prefix, index, field, dim, &[f64::NAN, 0.0], 1, 1).unwrap();
+        assert!(hits.is_empty());
+    }
 }

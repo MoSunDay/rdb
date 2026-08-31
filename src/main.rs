@@ -120,7 +120,15 @@ fn spawn_metrics_sync(
         let mut rx = raft.metrics();
         loop {
             let m = rx.borrow_and_update().clone();
-            state::sync_from_metrics(&mut raft_state.write().unwrap(), &m, &self_addr);
+            // try_write, never blocking: this task runs ON a runtime
+            // worker, and a blocking lock here can freeze the tokio
+            // driver (no timers, no socket reads) whenever a DDL holds
+            // the raft write-guard window (catalog_txn applies through
+            // the held guard). The mirror is a 500ms-periodic refresh;
+            // a skipped tick catches up on the next one.
+            if let Ok(mut guard) = raft_state.try_write() {
+                state::sync_from_metrics(&mut guard, &m, &self_addr);
+            }
             // Debug-only dump (RDB_DEBUG_REPL=1): per-peer replication progress.
             if debug_repl {
                 eprintln!(
