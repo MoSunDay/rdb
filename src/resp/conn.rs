@@ -329,14 +329,15 @@ fn queue_command(
     // Arity + slot routing, mirroring dispatch: a queue-time MOVED also
     // aborts the transaction (the keys live on another node).
     if !router::is_whitelisted(first) {
-        if argv.len() < 2 {
+        let key_idx = router::routing_key_index(first);
+        if argv.len() < key_idx + 1 {
             arity_error(out, first);
             conn.mark_dirty();
             return;
         }
-        let tag = hash::hash_tag(&argv[1]);
+        let tag = hash::hash_tag(&argv[key_idx]);
         let (slot, _) = hash::slot_with_prefix(tag);
-        if let Some(line) = command::redirect_line(shared, slot, &argv[1], conn.asking) {
+        if let Some(line) = command::redirect_line(shared, slot, &argv[key_idx], conn.asking) {
             codec::append_error(out, &line);
             conn.mark_dirty();
             return;

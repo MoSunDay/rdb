@@ -85,7 +85,12 @@ async fn create(ctx: &mut Ctx<'_>) {
     };
     let group = ctx.args[2].clone();
     let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
-    let read = model::read_meta(&ctx.shared.store, &prefix, &stream);
+    let read = model::read_meta(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        Some(ctx.shared.lite.as_ref()),
+    );
     let meta = match &read {
         Ok(MetaRead::Live(m)) => Some(m.clone()),
         Ok(MetaRead::Purged) | Ok(MetaRead::Missing) => None,
@@ -307,10 +312,15 @@ async fn setid(ctx: &mut Ctx<'_>) {
     let Some(mut payload) = model::decode_group(&raw) else {
         return resp::append_error(ctx.out, "ERR: corrupt group record");
     };
-    let last = model::read_meta(&ctx.shared.store, &prefix, &stream)
-        .ok()
-        .and_then(|r| r.live())
-        .map(|m| m.last_id());
+    let last = model::read_meta(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        Some(ctx.shared.lite.as_ref()),
+    )
+    .ok()
+    .and_then(|r| r.live())
+    .map(|m| m.last_id());
     let Ok(id) = group_start(last, &ctx.args[3]) else {
         return resp::append_error(
             ctx.out,

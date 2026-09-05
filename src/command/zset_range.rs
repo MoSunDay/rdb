@@ -1,6 +1,7 @@
 //! Sorted-set range commands: ZRANGE (rank/BYSCORE/BYLEX modes with
-//! REV/LIMIT/WITHSCORES) plus the classic twins ZRANGEBYSCORE/
-//! ZREVRANGEBYSCORE, ZRANGEBYLEX/ZREVRANGEBYLEX and ZLEXCOUNT. Score
+//! REV/LIMIT/WITHSCORES) plus the classic twins ZREVRANGE,
+//! ZRANGEBYSCORE/ZREVRANGEBYSCORE, ZRANGEBYLEX/ZREVRANGEBYLEX and
+//! ZLEXCOUNT. Score
 //! windows walk `zset_ds::for_each_scored` from the min bound's
 //! sortable prefix (stopping past the max bound); lex windows scan the
 //! whole index and filter member bytes; REV variants collect forward,
@@ -9,8 +10,8 @@
 use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
 use crate::command::list_cmd::clamp_range;
 use crate::command::zset_util::{
-    append_score, collect_scored, lex_within, parse_lex_bound, parse_score_bound, score_below_min,
-    score_past_max, seek_from_sortable, zset_state, LexBound, ZSetState,
+    append_score, collect_scored, eq_ignore_case, lex_within, parse_lex_bound, parse_score_bound,
+    score_below_min, score_past_max, seek_from_sortable, zset_state, LexBound, ZSetState,
 };
 use crate::command::Ctx;
 use crate::ds::{expire, zset_ds};
@@ -238,6 +239,36 @@ pub async fn zrange(ctx: &mut Ctx<'_>) {
         return;
     };
     rank_window_reply(ctx, &key, start, stop, &opts, "zrange");
+}
+
+/// ZREVRANGE key start stop [WITHSCORES] -> the rank window emitted
+/// descending: the classic twin of `ZRANGE ... REV`, so the indexes are
+/// read against the reversed order (0 = highest score) and the shared
+/// rank core simply gets `rev = true`. WITHSCORES is the ONLY option --
+/// LIMIT/BYSCORE/BYLEX are rejected as syntax errors, like Redis.
+pub async fn zrevrange(ctx: &mut Ctx<'_>) {
+    if ctx.args.len() < 3 {
+        arity(ctx.out, "zrevrange");
+        return;
+    }
+    let mut opts = RangeOpts {
+        rev: true,
+        ..RangeOpts::default()
+    };
+    for arg in &ctx.args[3..] {
+        if eq_ignore_case(arg, b"WITHSCORES") {
+            opts.withscores = true;
+        } else {
+            append_error(ctx.out, "ERR syntax error");
+            return;
+        }
+    }
+    let (Some(start), Some(stop)) = (parse_i64(&ctx.args[1]), parse_i64(&ctx.args[2])) else {
+        append_error(ctx.out, "ERR value is not an integer or out of range");
+        return;
+    };
+    let key = ctx.args[0].clone();
+    rank_window_reply(ctx, &key, start, stop, &opts, "zrevrange");
 }
 
 /// Rank mode: `[start..=stop]` with Redis clamping (negatives from the

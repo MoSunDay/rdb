@@ -1,5 +1,6 @@
 //! Multi-key set algebra: SUNION/SINTER/SDIFF (read) and their *STORE
-//! twins. Cluster rule: every key (destination included) must hash to the
+//! twins, plus SINTERCARD (capped intersection cardinality). Cluster
+//! rule: every key (destination included) must hash to the
 //! same slot -- the RESP layer derives one prefix from the FIRST key only
 //! -- else `-ERR CROSSSLOT ...` (Redis cluster wording; the Go rdb has no
 //! multi-key sets, so Redis's text is the contract).
@@ -14,11 +15,12 @@ use std::collections::HashSet;
 
 use rocksdb::WriteBatch;
 
-use crate::command::hash_cmd::{arity, WRONGTYPE};
+use crate::command::hash_cmd::{arity, parse_i64, WRONGTYPE};
 use crate::command::set_cmd::set_state;
 use crate::command::{keys_core, Ctx};
 use crate::ds::{expire, latch, setops};
 use crate::resp::codec::{append_array, append_bulk, append_error, append_int};
+use setops::require_same_slot;
 
 /// Which algebra the shared bodies compute.
 #[derive(Clone, Copy, PartialEq)]
@@ -167,4 +169,73 @@ pub async fn sinterstore(ctx: &mut Ctx<'_>) {
 
 pub async fn sdiffstore(ctx: &mut Ctx<'_>) {
     store_variant(ctx, "sdiffstore", Op::Diff).await;
+}
+
+/// SINTERCARD numkeys key [key ...] [LIMIT limit] -> cardinality of the
+/// intersection (missing keys = empty sets). A pure read: no latch.
+/// `numkeys` must be a positive integer that matches the number of key
+/// arguments that follow; LIMIT caps the computation early -- once the
+/// running count reaches it the answer is `limit` (LIMIT 0 = unlimited).
+pub async fn sintercard(ctx: &mut Ctx<'_>) {
+    if ctx.args.len() < 2 {
+        arity(ctx.out, "sintercard");
+        return;
+    }
+    let numkeys = match parse_i64(&ctx.args[0]) {
+        Some(n) if n > 0 => n,
+        _ => {
+            append_error(ctx.out, "ERR numkeys should be greater than 0");
+            return;
+        }
+    };
+    if numkeys as usize > ctx.args.len() - 1 {
+        append_error(
+            ctx.out,
+            "ERR Number of keys can't be greater than number of args",
+        );
+        return;
+    }
+    let keys = ctx.args[1..1 + numkeys as usize].to_vec();
+    if !require_same_slot(ctx.out, &keys) {
+        return;
+    }
+    let mut limit: i64 = -1; // -1 / 0 both mean unlimited
+    let mut i = 1 + numkeys as usize;
+    while i < ctx.args.len() {
+        if ctx.args[i].eq_ignore_ascii_case(b"LIMIT") && i + 1 < ctx.args.len() {
+            match parse_i64(&ctx.args[i + 1]) {
+                Some(n) if n >= 0 => limit = n,
+                _ => {
+                    append_error(ctx.out, "ERR value is not an integer or out of range");
+                    return;
+                }
+            }
+            i += 2;
+        } else {
+            // Any other token, or a dangling LIMIT, is a syntax error.
+            append_error(ctx.out, "ERR syntax error");
+            return;
+        }
+    }
+    let now = expire::now_ms();
+    let Ok(sets) = operand_sets(ctx, &keys, now) else {
+        return;
+    };
+    // Count over the smallest operand (the intersection can never be
+    // bigger), stopping as soon as LIMIT is provably reached.
+    let Some(seed) = sets.iter().min_by_key(|s| s.len()) else {
+        append_int(ctx.out, 0);
+        return;
+    };
+    let cap = usize::try_from(limit).unwrap_or(0);
+    let mut card = 0usize;
+    for m in seed {
+        if sets.iter().all(|s| s.contains(m)) {
+            card += 1;
+            if limit > 0 && card >= cap {
+                break;
+            }
+        }
+    }
+    append_int(ctx.out, card as i64);
 }

@@ -4,8 +4,11 @@
 //! as RESP frames via `crate::resp::codec` helpers. Handlers never touch the
 //! socket directly; `quit` asks for connection close via `close_conn`.
 
+pub mod bitops;
 pub mod cluster;
 pub mod cluster_slot;
+pub mod cmd_meta;
+pub mod flushdb;
 pub mod hash_cmd;
 pub mod hash_incr;
 pub mod hash_scan;
@@ -17,18 +20,23 @@ pub mod json_str;
 pub mod keys;
 pub mod keys_core;
 pub mod keys_scan;
+pub mod keyspace_role;
 pub mod list_block;
 pub mod list_cmd;
 pub mod list_move;
+pub mod list_mpop;
 pub mod list_ops;
 pub mod list_rewrite;
 pub mod migrate;
 pub mod raft_cmd;
+pub mod server_cmd;
 pub mod set_cmd;
 pub mod set_scan;
 pub mod setops_cmd;
 pub mod string;
+pub mod string_incr;
 pub mod string_opts;
+pub mod string_rw;
 pub mod tx_cmd;
 pub mod vectorset_attr;
 pub mod vectorset_cmd;
@@ -102,6 +110,31 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "restore" => Some(|ctx| Box::pin(migrate::restore(ctx))),
         "get" => Some(|ctx| Box::pin(string::get(ctx))),
         "set" => Some(|ctx| Box::pin(string::set(ctx))),
+        "incr" => Some(|ctx| Box::pin(string_incr::incr(ctx))),
+        "decr" => Some(|ctx| Box::pin(string_incr::decr(ctx))),
+        "incrby" => Some(|ctx| Box::pin(string_incr::incrby(ctx))),
+        "decrby" => Some(|ctx| Box::pin(string_incr::decrby(ctx))),
+        "incrbyfloat" => Some(|ctx| Box::pin(string_incr::incrbyfloat(ctx))),
+        "append" => Some(|ctx| Box::pin(string_rw::append(ctx))),
+        "strlen" => Some(|ctx| Box::pin(string_rw::strlen(ctx))),
+        "getset" => Some(|ctx| Box::pin(string_rw::getset(ctx))),
+        "setnx" => Some(|ctx| Box::pin(string_rw::setnx(ctx))),
+        "setex" => Some(|ctx| Box::pin(string_rw::setex(ctx))),
+        "psetex" => Some(|ctx| Box::pin(string_rw::psetex(ctx))),
+        "getdel" => Some(|ctx| Box::pin(string_rw::getdel(ctx))),
+        "setrange" => Some(|ctx| Box::pin(string_rw::setrange(ctx))),
+        "getrange" => Some(|ctx| Box::pin(string_rw::getrange(ctx))),
+        "setbit" => Some(|ctx| Box::pin(bitops::setbit(ctx))),
+        "getbit" => Some(|ctx| Box::pin(bitops::getbit(ctx))),
+        "bitcount" => Some(|ctx| Box::pin(bitops::bitcount(ctx))),
+        "bitpos" => Some(|ctx| Box::pin(bitops::bitpos(ctx))),
+        "bitop" => Some(|ctx| Box::pin(bitops::bitop(ctx))),
+        "command" => Some(|ctx| Box::pin(server_cmd::command(ctx))),
+        "info" => Some(|ctx| Box::pin(server_cmd::info(ctx))),
+        "dbsize" => Some(|ctx| Box::pin(server_cmd::dbsize(ctx))),
+        "echo" => Some(|ctx| Box::pin(server_cmd::echo(ctx))),
+        "select" => Some(|ctx| Box::pin(server_cmd::select(ctx))),
+        "flushdb" => Some(|ctx| Box::pin(flushdb::flushdb(ctx))),
         "del" => Some(|ctx| Box::pin(keys::del(ctx))),
         "unlink" => Some(|ctx| Box::pin(keys::del(ctx))),
         "exists" => Some(|ctx| Box::pin(keys::exists(ctx))),
@@ -119,6 +152,7 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "rename" => Some(|ctx| Box::pin(keys::rename(ctx))),
         "renamenx" => Some(|ctx| Box::pin(keys::renamenx(ctx))),
         "hset" => Some(|ctx| Box::pin(hash_cmd::hset(ctx))),
+        "hmset" => Some(|ctx| Box::pin(hash_cmd::hmset(ctx))),
         "hsetnx" => Some(|ctx| Box::pin(hash_cmd::hsetnx(ctx))),
         "hget" => Some(|ctx| Box::pin(hash_cmd::hget(ctx))),
         "hmget" => Some(|ctx| Box::pin(hash_cmd::hmget(ctx))),
@@ -148,6 +182,7 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "sinter" => Some(|ctx| Box::pin(setops_cmd::sinter(ctx))),
         "sinterstore" => Some(|ctx| Box::pin(setops_cmd::sinterstore(ctx))),
         "sunion" => Some(|ctx| Box::pin(setops_cmd::sunion(ctx))),
+        "sintercard" => Some(|ctx| Box::pin(setops_cmd::sintercard(ctx))),
         "sunionstore" => Some(|ctx| Box::pin(setops_cmd::sunionstore(ctx))),
         "mget" => Some(|ctx| Box::pin(string::mget(ctx))),
         "mset" => Some(|ctx| Box::pin(string::mset(ctx))),
@@ -158,6 +193,7 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "xadd" => Some(|ctx| Box::pin(crate::lite::append::xadd(ctx))),
         "xlen" => Some(|ctx| Box::pin(crate::lite::read::xlen(ctx))),
         "xrange" => Some(|ctx| Box::pin(crate::lite::append::xrange(ctx))),
+        "xrevrange" => Some(|ctx| Box::pin(crate::lite::range_rev::xrevrange(ctx))),
         "xtrim" => Some(|ctx| Box::pin(crate::lite::append::xtrim(ctx))),
         "xdel" => Some(|ctx| Box::pin(crate::lite::append::xdel(ctx))),
         "xidle" => Some(|ctx| Box::pin(crate::lite::append::xidle(ctx))),
@@ -183,6 +219,7 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "lmove" => Some(|ctx| Box::pin(list_move::lmove(ctx))),
         "lpop" => Some(|ctx| Box::pin(list_ops::lpop(ctx))),
         "lpos" => Some(|ctx| Box::pin(list_move::lpos(ctx))),
+        "lmpop" => Some(|ctx| Box::pin(list_mpop::lmpop(ctx))),
         "lpush" => Some(|ctx| Box::pin(list_cmd::lpush(ctx))),
         "lpushx" => Some(|ctx| Box::pin(list_cmd::lpushx(ctx))),
         "lrange" => Some(|ctx| Box::pin(list_cmd::lrange(ctx))),
@@ -209,6 +246,7 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "zpopmin" => Some(|ctx| Box::pin(zset_pop::zpopmin(ctx))),
         "zpopmax" => Some(|ctx| Box::pin(zset_pop::zpopmax(ctx))),
         "zrange" => Some(|ctx| Box::pin(zset_range::zrange(ctx))),
+        "zrevrange" => Some(|ctx| Box::pin(zset_range::zrevrange(ctx))),
         "zrangebyscore" => Some(|ctx| Box::pin(zset_range::zrangebyscore(ctx))),
         "zrevrangebyscore" => Some(|ctx| Box::pin(zset_range::zrevrangebyscore(ctx))),
         "zrangebylex" => Some(|ctx| Box::pin(zset_range::zrangebylex(ctx))),
@@ -377,16 +415,19 @@ pub(crate) async fn dispatch(
         // lone command name surfaced as a fabricated runtime-panic reply;
         // use the Redis-standard arity error instead. No latency sample on
         // this error path (Go observes only after the handler returns).
-        if argv.len() < 2 {
+        // The routing key sits at argv[1] except for token-led commands
+        // (LMPOP/SINTERCARD count, BITOP operation): router owns the index.
+        let key_idx = router::routing_key_index(&first);
+        if argv.len() < key_idx + 1 {
             arity_error(out, &first);
             return false;
         }
-        let tag = hash::hash_tag(&argv[1]);
+        let tag = hash::hash_tag(&argv[key_idx]);
         let (slot, prefix) = hash::slot_with_prefix(tag);
         prefix_key = prefix;
         let asking = conn.asking;
         conn.asking = false; // single-shot: consumed by this routed command
-        if let Some(line) = redirect_line(shared, slot, &argv[1], asking) {
+        if let Some(line) = redirect_line(shared, slot, &argv[key_idx], asking) {
             codec::append_error(out, &line);
             observe(shared, &first, true, start);
             return false;

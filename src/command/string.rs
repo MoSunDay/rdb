@@ -18,7 +18,7 @@ use crate::resp::codec::{
 };
 use crate::store::{self};
 
-fn arity(out: &mut Vec<u8>, cmd: &str) {
+pub(crate) fn arity(out: &mut Vec<u8>, cmd: &str) {
     append_error(
         out,
         &format!("ERR wrong number of arguments for '{}' command", cmd),
@@ -26,7 +26,7 @@ fn arity(out: &mut Vec<u8>, cmd: &str) {
 }
 
 /// What one key holds from a string reader's point of view.
-enum OldValue {
+pub(crate) enum OldValue {
     Missing,
     Str(Vec<u8>),
     /// Present, but not a string (hash/list/set/...): WRONGTYPE.
@@ -35,7 +35,7 @@ enum OldValue {
 
 /// Read a resolved key as a string: raw records and STRING_TTL envelopes
 /// carry one; other kinds do not.
-fn old_string_value(state: &KeyState) -> OldValue {
+pub(crate) fn old_string_value(state: &KeyState) -> OldValue {
     match state {
         KeyState::Missing => OldValue::Missing,
         KeyState::RawString { value } => OldValue::Str(value.clone()),
@@ -47,7 +47,7 @@ fn old_string_value(state: &KeyState) -> OldValue {
 }
 
 /// GET-option reply shape: old value as a bulk, absence as a null bulk.
-fn reply_old_or_null(out: &mut Vec<u8>, old: OldValue) {
+pub(crate) fn reply_old_or_null(out: &mut Vec<u8>, old: OldValue) {
     match old {
         OldValue::Str(v) => append_bulk(out, &v),
         OldValue::Missing => append_null(out),
@@ -82,7 +82,7 @@ pub(crate) fn clear_key_family(
 /// Write the new string: a STRING_TTL envelope when `deadline` > 0
 /// (expire index entry included), else the bare legacy record -- the same
 /// shapes `keys_core::apply_ttl` writes.
-fn write_string_record(
+pub(crate) fn write_string_record(
     batch: &mut WriteBatch,
     prefix: &[u8],
     key: &[u8],
@@ -98,9 +98,17 @@ fn write_string_record(
     }
 }
 
-/// `PING` -> `+PONG`.
+/// `PING [message]` -> `+PONG`, or the message itself when given (Redis
+/// semantics; health-check payloads round-trip).
 pub async fn ping(ctx: &mut Ctx<'_>) {
-    append_string(ctx.out, "PONG");
+    if ctx.args.len() > 1 {
+        arity(ctx.out, "ping");
+        return;
+    }
+    match ctx.args.first() {
+        Some(msg) => append_bulk(ctx.out, msg),
+        None => append_string(ctx.out, "PONG"),
+    }
 }
 
 /// `QUIT`: reply a single `+OK` and ask for the connection to close

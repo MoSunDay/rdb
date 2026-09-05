@@ -28,7 +28,13 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `conn.rs`：连接状态机——AUTH 门（仅 `raft_token` 可通过）、白名单跳过路由、slot 路由与 MOVED、`catch_unwind` 兜底、延迟埋点；
   - `mod.rs`：bind/accept，一连接一 task。
 - `command/`：命令注册表 `lookup` 与处理器。
-  - `string.rs`：GET/SET/DEL/MGET/MSET/PING/QUIT/CONFIG；
+  - `string.rs`：GET/SET/DEL/MGET/MSET/PING/QUIT/CONFIG（PING 带参回显）+ 共享助手（`old_string_value`/`write_string_record` 等）；
+  - `string_incr.rs`：INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT（共享核、TTL 保持、i64 溢出、f64 最短回程格式）；
+  - `string_rw.rs`：APPEND/STRLEN/GETSET/SETNX/SETEX/PSETEX/GETDEL/SETRANGE/GETRANGE（GETSET 清 TTL、SETRANGE 空结果删键、SETNX 的 NX 否决先于类型检查如 Redis）；
+  - `bitops.rs` + `bitops/bits.rs`：SETBIT/GETBIT/BITCOUNT/BITPOS/BITOP（MSB-first 位编号，与 Redis 7.2.5 实测对齐）；单测在 `bitops/tests/`（按命令族拆两文件）；
+  - `cmd_meta/`（表 `table.rs`/查找 `mod.rs`/测试 `tests.rs` 三文件）：`COMMANDS` 静态表（188 条 arity/first/last/step），注册表双向同步测试 + 路由键↔队列键（`routing_key_index` vs `keyspec::keys_of`）交叉校验锁定；
+  - `server_cmd.rs`：COMMAND（COUNT/INFO/DOCS/GETKEYS）/INFO（Server/Cluster/Keyspace）/DBSIZE/ECHO/SELECT；`flushdb.rs`：FLUSHDB（分块删、保控制面记录、与 Lite offset 刷盘轮次互斥 + 双重 clear 防孤儿消费组记录复活）；`keyspace_role.rs`：全键空间物理记录分类（Root/Member/Foreign，DBSIZE 计数与 FLUSHDB 擦除共用）；
+  - `list_mpop.rs`：LMPOP（numkeys 多键首非空）；`lite/range_rev.rs`：XREVRANGE（倒序迭代器 `for_each_down_from`）；另有 HMSET/ZREVRANGE/SINTERCARD 补齐；
   - `cluster.rs`：CLUSTER（init/nodes/test 等，拓扑读 `state::Shared.topology`）；
   - `raft_cmd.rs`：RAFT（help/stats/leader/nodes/set/get）；
   - `migrate.rs`：MIGRATE 数据面（host/port/key/db/timeout + KEYS 批量 dump→ASKING→RESTORE）
@@ -89,7 +95,9 @@ Commit: d481b1d708c248f86be394189d01ca7305fc8528
   - `ha_failover.rs`：`backup_target_map` 故障切换与恢复；
   - `ds_e2e.rs` / `expire_e2e.rs` / `hash_set_e2e.rs`：数据结构 e2e——信封 roundtrip、主动过期采样、EXPIRE 族/TTL 持久化、Hash/Set 全命令生命周期与 CROSSSLOT；`list_e2e.rs` / `zset_e2e.rs`：List/ZSet 全命令生命周期、LREM compaction、TTL 惰性清理、ZSCAN 游标、BLPOP/BZPOPMIN 跨连接唤醒与超时（含丢失唤醒回归用例）；`json_e2e.rs`：JSON 全命令生命周期（SET/GET 字节稳定、嵌套导航、ARR/OBJ 族、TTL 保持与惰性清理、MGET+CROSSSLOT）；`vectorset_e2e.rs`：VectorSet 全命令生命周期（VADD 两种向量形态、VSIM 召回排序与 score 格式、属性增改查、VREM 清空、TTL 交互）；`search_e2e.rs`：FT.* 全链路——文本 BM25 排序/中文命中/替换/删除/DROP、KNN 暴力→SPANN 构建→预过滤、索引键 TTL 整族清理；
   - `process_cluster_e2e.rs` / `process_failover_e2e.rs` / `process_metrics_e2e.rs` / `process_sigterm_e2e.rs`：进程级 e2e——`CARGO_BIN_EXE_rdb` 拉起真实二进制 + 临时 yaml 组 3 节点集群，断言协议应答原文（`-ERR: NOAUTH`、`-MOVED <slot> <addr>`、kill -9 后新 leader 选主、RocksDB 重启回读）、HTTP /depart 活节点 + 重 join 与 MIGRATE task/list 正/错路径、七数据家族 kill -9 存活、真实进程 scrape `/metrics`（`rdb_command_latency`/`raft_stats`）、SIGTERM/SIGINT 优雅停机（退出码 0 + Lite offset 水位已刷）；公共工具在 `tests/common/mod.rs`；
-  - `string_e2e.rs`：SET 全选项矩阵（NX/XX/EX/PX/EXAT/PXAT/KEEPTTL/GET 与语法错）+ MSET/MGET + CROSSSLOT。
+  - `string_e2e.rs`：SET 全选项矩阵（NX/XX/EX/PX/EXAT/PXAT/KEEPTTL/GET 与语法错）+ MSET/MGET + CROSSSLOT；
+  - `string_more_e2e.rs`：新 string 族（算术/溢出/值错误/TTL 语义/WRONGTYPE 矩阵/SETRANGE-GETRANGE 边界/32×25 并发 INCR latch 原子性）；`bits_e2e.rs`：位族 wire 级（MSB-first 编号表、跨字节稀疏、BITPOS 四规则、BITOP 混合长度/TTL/CROSSSLOT、MULTI EXECABORT、50 连发 pipeline）；
+  - `server_surface_e2e.rs`：COMMAND/INFO/DBSIZE/FLUSHDB（2100 键跨分块页）/SELECT/ECHO wire 帧；`routing_newcmds_e2e.rs`：新命令 MOVED 回归（LMPOP/SINTERCARD/BITOP 以 argv[2] 为路由键的陷阱用例）；`gaps_e2e.rs`：HMSET/ZREVRANGE/SINTERCARD/LMPOP/XREVRANGE 全错路径矩阵；`kv_newcmds_proc_e2e.rs`：真实二进制热身矩阵 + kill -9 respawn 持久化（计数/位/流/TTL 绝对期限）+ wire FLUSHDB；`flushdb_lite_e2e.rs`：FLUSHDB×Lite 流专项（offset 刷盘轮不复活孤儿消费组、旧组 NOGROUP、流重建 id 不回退）。
 - 集成测试统一用 `tempfile` 临时目录与临时端口（端口 0），无固定端口依赖。
 - 压测工具 `bench`（bin `rdb-bench`，见 `bench/src/`）：RESP 负载发生器，`--workload ping|set|get|mixed` × `--clients` × `--pipeline`，延迟按每批 RTT 采样（pipeline>1 时为批 RTT 非单命令 RTT）；自带单元测试。示例：`rdb-bench --addr 127.0.0.1:6379 --token <t> --workload mixed --clients 16 --pipeline 16`。
 

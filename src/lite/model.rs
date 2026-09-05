@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ds::codec::{
-    self, KIND_STREAM_ENTRY, KIND_STREAM_GROUP, KIND_STREAM_META, STREAM_FAMILY,
+    self, KIND_STREAM_ENTRY, KIND_STREAM_GROUP, KIND_STREAM_META, KIND_STREAM_PEND, STREAM_FAMILY,
 };
 use crate::ds::expire;
 use crate::hash;
@@ -135,6 +135,18 @@ pub fn entry_key(prefix: &[u8], stream: &[u8], id: EntryId) -> Vec<u8> {
 
 pub fn group_key(prefix: &[u8], stream: &[u8], group: &[u8]) -> Vec<u8> {
     codec::elem_key(prefix, KIND_STREAM_GROUP, stream, group)
+}
+
+/// Range bounds covering EVERY group record (the kind-0x0E window) of
+/// `stream`: `[first possible group key, first kind-0x0F key)` -- the
+/// next kind's window makes the upper bound exclusive-safe without
+/// depending on the group-name alphabet. Used by the deferred orphan
+/// sweep after a non-command path deleted the stream family.
+pub fn group_window(prefix: &[u8], stream: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (
+        codec::data_key(prefix, KIND_STREAM_GROUP, stream),
+        codec::data_key(prefix, KIND_STREAM_PEND, stream),
+    )
 }
 
 // ---- payloads -------------------------------------------------------------
@@ -267,7 +279,19 @@ impl MetaRead {
 }
 
 /// Read a stream's meta record; lazily purges an idle-expired stream.
-pub fn read_meta(store: &Store, prefix: &[u8], stream: &[u8]) -> Result<MetaRead, String> {
+///
+/// `lite` (pass it whenever the caller holds the shared runtime):
+/// a lazy purge must ALSO drop the stream's cached group offsets and
+/// queue the latched orphan sweep -- a dirty cached group surviving the
+/// purge is written back by the next 200ms flush round onto the deleted
+/// family, and the same-name `XGROUP CREATE` is then permanently
+/// BUSYGROUP (XINFO cannot even see the orphan: it needs live meta).
+pub fn read_meta(
+    store: &Store,
+    prefix: &[u8],
+    stream: &[u8],
+    lite: Option<&super::Runtime>,
+) -> Result<MetaRead, String> {
     let raw = match crate::store::ops::get_physical(store, &meta_key(prefix, stream))? {
         None => return Ok(MetaRead::Missing),
         Some(v) => v,
@@ -275,6 +299,9 @@ pub fn read_meta(store: &Store, prefix: &[u8], stream: &[u8]) -> Result<MetaRead
     let (expire_ms, body) = codec::decode_envelope(&raw);
     if expire::is_expired(expire_ms, expire::now_ms()) {
         expire::purge_if_expired(store, prefix, STREAM_FAMILY, stream, expire::now_ms());
+        if let Some(rt) = lite {
+            rt.stream_reaped(prefix, stream);
+        }
         return Ok(MetaRead::Purged);
     }
     Ok(serde_json::from_slice(body)
@@ -289,7 +316,10 @@ pub fn read_group(
     stream: &[u8],
     group: &[u8],
 ) -> Result<Option<GroupPayload>, String> {
-    if read_meta(store, prefix, stream)?.live().is_none() {
+    // No runtime handle by design: this runs on an offset-cache MISS
+    // only (loads check the cache first), so no dirty state can exist
+    // for the stream and the lazy purge here has nothing to invalidate.
+    if read_meta(store, prefix, stream, None)?.live().is_none() {
         return Ok(None);
     }
     let raw = crate::store::ops::get_physical(store, &group_key(prefix, stream, group))?;

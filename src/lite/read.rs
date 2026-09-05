@@ -145,7 +145,12 @@ fn append_streams_reply(out: &mut Vec<u8>, results: &[StreamEntries]) {
 /// `None` = malformed id argument.
 fn parse_read_id(ctx: &Ctx<'_>, id_arg: &[u8], prefix: &[u8], stream: &[u8]) -> Option<EntryId> {
     if id_arg == b"$" {
-        match model::read_meta(&ctx.shared.store, prefix, stream) {
+        match model::read_meta(
+            &ctx.shared.store,
+            prefix,
+            stream,
+            Some(ctx.shared.lite.as_ref()),
+        ) {
             Ok(MetaRead::Live(m)) => Some(m.last_id()),
             _ => Some(model::MIN_ID),
         }
@@ -255,7 +260,12 @@ pub async fn xlen(ctx: &mut Ctx<'_>) {
     let Some((stream, prefix)) = entries::stream_of(ctx, 0) else {
         return;
     };
-    let len = match model::read_meta(&ctx.shared.store, &prefix, &stream) {
+    let len = match model::read_meta(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        Some(ctx.shared.lite.as_ref()),
+    ) {
         Ok(MetaRead::Live(m)) => m.len,
         Ok(MetaRead::Purged) => {
             entries::count_reap(ctx);

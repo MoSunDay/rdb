@@ -443,3 +443,114 @@ fn spop_corrupt_empty_members_fails() {
     assert!(call(&s, "spop", &[b"k"]).starts_with(b"-ERR: spop failed"));
     assert!(call(&s, "spop", &[b"k", b"1"]).starts_with(b"-ERR: spop failed"));
 }
+
+/// SINTERCARD is not yet in the registry; drive the handler directly.
+fn call_sintercard(shared: &Shared, args: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let argv: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
+    let mut ctx = test_ctx(shared, PREFIX.to_vec(), argv, &mut out);
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime")
+        .block_on(crate::command::setops_cmd::sintercard(&mut ctx));
+    out
+}
+
+/// SINTERCARD: cardinality of the intersection; missing keys read as
+/// empty sets (card 0); LIMIT caps the computation early and LIMIT 0
+/// means unlimited.
+#[test]
+fn sintercard_card_limit_and_missing_keys() {
+    let (_g, s) = shared_for("127.0.0.1:40841");
+    call(&s, "sadd", &[b"{g}a", b"x", b"y", b"z"]);
+    call(&s, "sadd", &[b"{g}b", b"y", b"z", b"w"]);
+    assert_eq!(int_of(&call_sintercard(&s, &[b"2", b"{g}a", b"{g}b"])), 2);
+    // A single key degenerates to its own cardinality.
+    assert_eq!(int_of(&call_sintercard(&s, &[b"1", b"{g}a"])), 3);
+    // Missing operand = empty set -> 0.
+    assert_eq!(
+        int_of(&call_sintercard(&s, &[b"2", b"{g}a", b"{g}none"])),
+        0
+    );
+    // LIMIT smaller than the cardinality caps the reply; LIMIT 0 (or a
+    // LIMIT above the card) keeps the full count.
+    assert_eq!(
+        int_of(&call_sintercard(
+            &s,
+            &[b"2", b"{g}a", b"{g}b", b"LIMIT", b"1"]
+        )),
+        1
+    );
+    assert_eq!(
+        int_of(&call_sintercard(
+            &s,
+            &[b"2", b"{g}a", b"{g}b", b"LIMIT", b"0"]
+        )),
+        2
+    );
+    assert_eq!(
+        int_of(&call_sintercard(
+            &s,
+            &[b"2", b"{g}a", b"{g}b", b"LIMIT", b"99"]
+        )),
+        2
+    );
+    // case-insensitive option token.
+    assert_eq!(
+        int_of(&call_sintercard(
+            &s,
+            &[b"2", b"{g}a", b"{g}b", b"limit", b"1"]
+        )),
+        1
+    );
+    // A non-set operand is WRONGTYPE.
+    call(&s, "set", &[b"{g}str", b"v"]);
+    assert_eq!(
+        call_sintercard(&s, &[b"2", b"{g}a", b"{g}str"]),
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
+    );
+}
+
+/// SINTERCARD argument validation: numkeys, mismatch, LIMIT parsing,
+/// unknown option tokens and the multi-key slot rule.
+#[test]
+fn sintercard_errors() {
+    let (_g, s) = shared_for("127.0.0.1:40842");
+    call(&s, "sadd", &[b"{g}a", b"x"]);
+    for bad in [&b"0"[..], &b"-1"[..], &b"x"[..]] {
+        assert_eq!(
+            call_sintercard(&s, &[bad, b"{g}a"]),
+            b"-ERR numkeys should be greater than 0\r\n".to_vec(),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        call_sintercard(&s, &[b"3", b"{g}a", b"{g}b"]),
+        b"-ERR Number of keys can't be greater than number of args\r\n".to_vec()
+    );
+    assert_eq!(
+        call_sintercard(&s, &[b"2", b"{g}a", b"{g}b", b"LIMIT"]),
+        b"-ERR syntax error\r\n".to_vec()
+    );
+    assert_eq!(
+        call_sintercard(&s, &[b"2", b"{g}a", b"{g}b", b"LIMIT", b"x"]),
+        b"-ERR value is not an integer or out of range\r\n".to_vec()
+    );
+    assert_eq!(
+        call_sintercard(&s, &[b"2", b"{g}a", b"{g}b", b"LIMIT", b"-1"]),
+        b"-ERR value is not an integer or out of range\r\n".to_vec()
+    );
+    assert_eq!(
+        call_sintercard(&s, &[b"1", b"{g}a", b"JUNK"]),
+        b"-ERR syntax error\r\n".to_vec()
+    );
+    assert_eq!(
+        call_sintercard(&s, &[b"1"]),
+        b"-ERR wrong number of arguments for 'sintercard' command\r\n".to_vec()
+    );
+    // Cross-slot operands.
+    assert_eq!(
+        call_sintercard(&s, &[b"2", b"{g}a", b"{u}b"]),
+        b"-ERR CROSSSLOT Keys in request don't hash to the same slot\r\n".to_vec()
+    );
+}

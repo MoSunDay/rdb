@@ -24,6 +24,7 @@ pub mod offset;
 pub mod park_wait;
 pub mod pel;
 pub mod pending;
+pub mod range_rev;
 pub mod read;
 pub mod select;
 
@@ -32,6 +33,9 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rocksdb::WriteBatch;
+
+use crate::ds::{codec, expire, latch};
 use crate::hash;
 use crate::monitor;
 use crate::state;
@@ -99,7 +103,35 @@ pub struct Runtime {
     /// consumer) raw bytes: delivery skips the registry-key rewrite once
     /// the name is known (the key survives on disk).
     pub consumers: Mutex<HashSet<pel::ConsumerId>>,
+    /// Deferred orphan sweeps: streams whose family records were deleted
+    /// by a NON-command path (XIDLE active-expire reap, lazy idle purge,
+    /// DEL/EXPIRE of a stream key) and still need the latched sweep of
+    /// [`reap_stream`]. Pairs of (slot prefix, stream name).
+    reaps: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
     pub stats: Stats,
+}
+
+impl Runtime {
+    /// `stream`'s family records were just deleted by a non-command
+    /// path: drop its cached group states NOW -- any flush round that
+    /// validates after this drops the entry in `drop_superseded` -- and
+    /// queue the latched sweep that removes orphans a round already
+    /// past validation may still write (see [`reap_stream`]).
+    pub fn stream_reaped(&self, prefix: &[u8], stream: &[u8]) {
+        offset::remove_stream(&self.offsets, stream);
+        self.reaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((prefix.to_vec(), stream.to_vec()));
+    }
+
+    /// Sweeps queued and awaiting the next [`drain_reaps`] (tests).
+    pub fn pending_reaps(&self) -> usize {
+        self.reaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
 }
 
 impl Runtime {
@@ -138,6 +170,7 @@ pub fn new_runtime() -> Runtime {
         offsets: offset::new_cache(),
         picks: Mutex::new(HashMap::new()),
         consumers: Mutex::new(HashSet::new()),
+        reaps: Mutex::new(Vec::new()),
         stats: Stats::default(),
     }
 }
@@ -157,21 +190,92 @@ pub fn new_runtime() -> Runtime {
 /// commit out of order and regress the on-disk watermark, and a round
 /// that passed `drop_superseded` could still land after XGROUP DESTROY's
 /// commit and resurrect the destroyed group record.
-pub async fn flush_offsets_once(shared: &Arc<state::Shared>) -> Result<(), String> {
-    // Distinct latch keys of the dirty streams, byte-sorted (deadlock
-    // avoidance when two rounds overlap on several streams).
-    let mut latch_keys: Vec<Vec<u8>> = offset::dirty_keys(&shared.lite.offsets)
+/// Latch key of one stream's flush window: the meta key under the
+/// PARENT-derived slot prefix (bytes before the first `/`, or the whole
+/// name). One derivation shared by flush rounds, FLUSHDB's wipe and the
+/// deferred orphan sweep, so all three serialize on the same lock.
+pub fn stream_latch_key(stream: &[u8]) -> Vec<u8> {
+    let parent = match stream.iter().position(|&b| b == b'/') {
+        Some(i) => &stream[..i],
+        None => stream,
+    };
+    model::meta_key(&hash::slot_with_prefix(parent).1, stream)
+}
+
+/// Byte-sorted, deduplicated latch keys of every currently-dirty stream
+/// (deadlock avoidance when two latch-taking operations overlap).
+pub fn dirty_latch_keys(shared: &state::Shared) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = offset::dirty_keys(&shared.lite.offsets)
         .into_iter()
-        .map(|(stream, _)| {
-            let parent = match stream.iter().position(|&b| b == b'/') {
-                Some(i) => &stream[..i],
-                None => &stream[..],
-            };
-            model::meta_key(&hash::slot_with_prefix(parent).1, &stream)
-        })
+        .map(|(stream, _)| stream_latch_key(&stream))
         .collect();
-    latch_keys.sort();
-    latch_keys.dedup();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Deferred half of [`Runtime::stream_reaped`]: under the stream's flush
+/// latch, drop the cached state again (idempotent) and range-delete the
+/// stream's whole group-record window. The sweep closes the last race:
+/// a flush round that already passed `drop_superseded` when the family
+/// delete landed can still commit its group records AFTER that delete,
+/// and only deleting under the same latch (rounds hold it across their
+/// write) is ordered after every in-flight round.
+///
+/// Guard: the sweep only fires while the stream is still gone (or still
+/// idle-expired). A client that recreated the stream (XADD + XGROUP
+/// CREATE) between the family delete and this sweep owns the window now
+/// and must not lose its records.
+pub async fn reap_stream(shared: &state::Shared, prefix: &[u8], stream: &[u8]) {
+    let _guard = latch::lock(&shared.latch, &stream_latch_key(stream)).await;
+    offset::remove_stream(&shared.lite.offsets, stream);
+    let meta = model::meta_key(prefix, stream);
+    let stale = match ops::get_physical(&shared.store, &meta) {
+        // Still gone: any group record in the window is an orphan.
+        Ok(None) => true,
+        // Revived with the idle deadline still due: stale revival.
+        Ok(Some(raw)) => {
+            let (expire_ms, _) = codec::decode_envelope(&raw);
+            expire::is_expired(expire_ms, expire::now_ms())
+        }
+        // Cannot prove staleness: never delete blind.
+        Err(_) => false,
+    };
+    if stale {
+        let mut batch = WriteBatch::default();
+        let (lower, upper) = model::group_window(prefix, stream);
+        batch.delete_range(lower, upper);
+        if let Err(e) = ops::batch_write_async(Arc::clone(&shared.store), batch).await {
+            eprintln!(
+                "[lite] orphan sweep failed for {}: {e}",
+                String::from_utf8_lossy(stream)
+            );
+        }
+    }
+}
+
+/// Drain the deferred reap queue. The background offset loop calls this
+/// on every 200ms tick and the active-expire loop after every sampler
+/// round; concurrent drains are safe -- the queue is swapped under its
+/// lock, reaping is idempotent and duplicates collapse.
+pub async fn drain_reaps(shared: &state::Shared) {
+    let queued = std::mem::take(
+        &mut *shared
+            .lite
+            .reaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let mut seen = HashSet::new();
+    for (prefix, stream) in queued {
+        if seen.insert(stream.clone()) {
+            reap_stream(shared, &prefix, &stream).await;
+        }
+    }
+}
+
+pub async fn flush_offsets_once(shared: &Arc<state::Shared>) -> Result<(), String> {
+    let latch_keys = dirty_latch_keys(shared);
     let mut guards = Vec::with_capacity(latch_keys.len());
     for key in &latch_keys {
         guards.push(crate::ds::latch::lock(&shared.latch, key).await);
@@ -210,6 +314,9 @@ pub fn spawn_background(shared: Arc<state::Shared>) {
                 &shared.monitor,
                 offset::total_pending(&shared.lite.offsets) as f64,
             );
+            // Deferred orphan sweeps queued by non-command delete paths
+            // (XIDLE reaps, lazy idle purges) since the last tick.
+            drain_reaps(&shared).await;
         }
     });
 }

@@ -100,18 +100,23 @@ pub fn pick_hash(children: &[Vec<u8>], shard: &[u8]) -> Option<Vec<u8>> {
 
 /// Smallest retained length wins; ties break by name. Missing metas are
 /// skipped (never picked) so dead queues lose.
+/// `lite`: pass the shared runtime when available, so a lazily purged
+/// (idle-expired) queue also drops its cached group offsets and queues
+/// the orphan sweep (see [`model::read_meta`]); pure-function tests
+/// pass `None`.
 pub fn pick_least_backlog(
     store: &Store,
     prefix: &[u8],
     parent: &[u8],
     children: &[Vec<u8>],
+    lite: Option<&super::Runtime>,
 ) -> Vec<u8> {
     let mut best: Option<(u64, Vec<u8>)> = None;
     for child in children {
         let mut stream = parent.to_vec();
         stream.push(b'/');
         stream.extend_from_slice(child);
-        let len = model::read_meta(store, prefix, &stream)
+        let len = model::read_meta(store, prefix, &stream, lite)
             .ok()
             .and_then(|r| r.live())
             .map(|m| m.len)

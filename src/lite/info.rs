@@ -23,7 +23,12 @@ fn append_id_field(out: &mut Vec<u8>, id: model::EntryId) {
 
 /// `XINFO STREAM <stream>`.
 fn stream_info(ctx: &mut Ctx<'_>, stream: &[u8], prefix: &[u8]) {
-    let meta = match model::read_meta(&ctx.shared.store, prefix, stream) {
+    let meta = match model::read_meta(
+        &ctx.shared.store,
+        prefix,
+        stream,
+        Some(ctx.shared.lite.as_ref()),
+    ) {
         Ok(MetaRead::Live(m)) => m,
         Ok(_) => return resp::append_error(ctx.out, "ERR no such key"),
         Err(e) => return resp::append_error(ctx.out, &format!("ERR: xinfo failed: {e}")),
@@ -88,7 +93,12 @@ fn topics_info(ctx: &mut Ctx<'_>, parent: &[u8]) {
         let mut stream = parent.to_vec();
         stream.push(b'/');
         stream.extend_from_slice(&child);
-        let len = match model::read_meta(&ctx.shared.store, &prefix, &stream) {
+        let len = match model::read_meta(
+            &ctx.shared.store,
+            &prefix,
+            &stream,
+            Some(ctx.shared.lite.as_ref()),
+        ) {
             Ok(MetaRead::Live(m)) => m.len as i64,
             _ => 0,
         };
@@ -287,9 +297,13 @@ pub async fn xpick(ctx: &mut Ctx<'_>) {
         select::Strategy::Hash => select::pick_hash(&children, &ctx.args[2]).unwrap_or_else(|| {
             select::pick_round_robin(&ctx.shared.lite.picks, &parent, &children)
         }),
-        select::Strategy::LeastBacklog => {
-            select::pick_least_backlog(&ctx.shared.store, &prefix, &parent, &children)
-        }
+        select::Strategy::LeastBacklog => select::pick_least_backlog(
+            &ctx.shared.store,
+            &prefix,
+            &parent,
+            &children,
+            Some(ctx.shared.lite.as_ref()),
+        ),
     };
     let mut stream = parent;
     stream.push(b'/');

@@ -210,6 +210,17 @@ pub fn flush_dirty(cache: &OffsetCache) -> DirtySnapshot {
         .collect()
 }
 
+/// Drop the whole cache, dirty set included (FLUSHDB: every stream is
+/// being wiped, so every cached group state is stale; leaving entries
+/// dirty would let the next flush round resurrect orphan group records
+/// onto a wiped keyspace). Safe at any time: loads are read-through, so
+/// the cache repopulates from disk on demand.
+pub fn clear_all(cache: &OffsetCache) {
+    let mut write = cache.inner.write().unwrap();
+    write.map.clear();
+    write.dirty.clear();
+}
+
 pub fn dirty_len(cache: &OffsetCache) -> usize {
     cache.inner.read().unwrap().dirty.len()
 }

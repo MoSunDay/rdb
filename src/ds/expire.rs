@@ -212,7 +212,13 @@ pub fn slot_prefix_len(k: &[u8]) -> Option<usize> {
 /// The unprocessed stop key deliberately stays BEYOND the cursor: the
 /// resume is strictly-after, so a cursor ON it would skip it entirely
 /// next round.
-pub fn sample_once(store: &Store, now: u64, budget: usize, from: &[u8]) -> (usize, Vec<u8>) {
+pub fn sample_once(
+    store: &Store,
+    now: u64,
+    budget: usize,
+    from: &[u8],
+    lite: Option<&crate::lite::Runtime>,
+) -> (usize, Vec<u8>) {
     let mut purged = 0usize;
     let mut scanned = 0usize;
     let mut cursor = from.to_vec();
@@ -225,7 +231,7 @@ pub fn sample_once(store: &Store, now: u64, budget: usize, from: &[u8]) -> (usiz
             // key that WAS so the next round re-examines it.
             return false;
         }
-        process_scan_key(store, k, now, &mut purged);
+        process_scan_key(store, k, now, &mut purged, lite);
         cursor = k.to_vec();
         true
     });
@@ -239,7 +245,13 @@ pub fn sample_once(store: &Store, now: u64, budget: usize, from: &[u8]) -> (usiz
 /// Handle one examined scan key for [`sample_once`]: a due index entry
 /// is confirm-and-purged (and counted); data records, non-index kinds,
 /// undecodable entries and not-yet-due deadlines are merely passed over.
-fn process_scan_key(store: &Store, k: &[u8], now: u64, purged: &mut usize) {
+fn process_scan_key(
+    store: &Store,
+    k: &[u8],
+    now: u64,
+    purged: &mut usize,
+    lite: Option<&crate::lite::Runtime>,
+) {
     let Some(plen) = slot_prefix_len(k) else {
         return;
     };
@@ -252,7 +264,7 @@ fn process_scan_key(store: &Store, k: &[u8], now: u64, purged: &mut usize) {
     if !is_expired(expire, now) {
         return; // not due; another slot may still hold due entries
     }
-    if purge_indexed(store, &k[..plen], &body, expire, now) {
+    if purge_indexed(store, &k[..plen], &body, expire, now, lite) {
         *purged += 1;
     }
 }
@@ -262,7 +274,14 @@ fn process_scan_key(store: &Store, k: &[u8], now: u64, purged: &mut usize) {
 /// vanished or changed its TTL. Stays sync: it only ever runs inside
 /// [`sample_once`], which the active-expire loop executes on tokio's
 /// blocking pool, so the synced `batch_write` never lands on a worker.
-fn purge_indexed(store: &Store, prefix: &[u8], body: &[u8], expire: u64, now: u64) -> bool {
+fn purge_indexed(
+    store: &Store,
+    prefix: &[u8],
+    body: &[u8],
+    expire: u64,
+    now: u64,
+    lite: Option<&crate::lite::Runtime>,
+) -> bool {
     let index_key = {
         let mut k = prefix.to_vec();
         k.push(codec::KIND_EXPIRE_INDEX);
@@ -294,6 +313,15 @@ fn purge_indexed(store: &Store, prefix: &[u8], body: &[u8], expire: u64, now: u6
                     return false;
                 };
                 family_delete_entries(&mut batch, prefix, family, &key, expire);
+                // A reaped Lite stream family must also drop its cached
+                // group offsets and queue the latched orphan sweep, or
+                // the 200ms offset flusher writes orphan group records
+                // onto the deleted family (lite::Runtime::stream_reaped).
+                if family == codec::STREAM_FAMILY {
+                    if let Some(rt) = lite {
+                        rt.stream_reaped(prefix, &key);
+                    }
+                }
             } else {
                 batch.delete(index_key); // TTL moved or cleared: stale entry
             }
@@ -322,9 +350,10 @@ pub fn spawn_active_expire(shared: Arc<state::Shared>) {
                 // A round is sync RocksDB iteration plus synced writes:
                 // park it on the blocking pool, never a tokio worker.
                 let store = Arc::clone(&shared.store);
+                let lite = Arc::clone(&shared.lite);
                 let from = cursor.clone();
                 let Ok((purged, next)) = tokio::task::spawn_blocking(move || {
-                    sample_once(&store, now_ms(), BUDGET, &from)
+                    sample_once(&store, now_ms(), BUDGET, &from, Some(&lite))
                 })
                 .await
                 else {
@@ -335,6 +364,10 @@ pub fn spawn_active_expire(shared: Arc<state::Shared>) {
                     break;
                 }
             }
+            // Reaped Lite streams queued their offset-cache invalidation
+            // from the blocking round; run the latched orphan sweeps now
+            // (the lite background loop drains again every 200ms).
+            crate::lite::drain_reaps(&shared).await;
         }
     });
 }
@@ -405,7 +438,7 @@ mod tests {
         batch.put(&elem, b"x");
         ops::batch_write(&store, batch).unwrap();
 
-        assert_eq!(sample_once(&store, 200, 10, b"").0, 2);
+        assert_eq!(sample_once(&store, 200, 10, b"", None).0, 2);
         assert_eq!(read_enveloped(&store, P, b"due").unwrap(), None);
         // element went with the meta
         assert_eq!(ops::get_physical(&store, &elem).unwrap(), None);
@@ -413,7 +446,7 @@ mod tests {
         let (expire, payload) = read_enveloped(&store, P, b"later").unwrap().unwrap();
         assert_eq!((expire, payload), (9_000_000_000_000, b"v".to_vec()));
         // index entries for the purged keys are gone; a resample is idle
-        assert_eq!(sample_once(&store, 200, 10, b"").0, 0);
+        assert_eq!(sample_once(&store, 200, 10, b"", None).0, 0);
     }
 
     #[test]
@@ -426,7 +459,7 @@ mod tests {
         batch.put(&root, codec::encode_envelope(0, b"v"));
         set_ttl_entries(&mut batch, P, root, 111, 0);
         ops::batch_write(&store, batch).unwrap();
-        assert_eq!(sample_once(&store, 500, 10, b"").0, 0);
+        assert_eq!(sample_once(&store, 500, 10, b"", None).0, 0);
         let (expire, payload) = read_enveloped(&store, P, b"k").unwrap().unwrap();
         assert_eq!((expire, payload), (0, b"v".to_vec()));
     }
@@ -437,7 +470,7 @@ mod tests {
         write_enveloped(&store, KIND_STRING_TTL, b"k", 5, b"v");
         assert!(purge_if_expired(&store, P, STRING_FAMILY, b"k", 10));
         assert!(!purge_if_expired(&store, P, STRING_FAMILY, b"k", 10));
-        assert_eq!(sample_once(&store, 10, 10, b"").0, 0);
+        assert_eq!(sample_once(&store, 10, 10, b"", None).0, 0);
         // an index entry whose record vanished is still swept
         let mut batch = WriteBatch::default();
         batch.put(
@@ -445,7 +478,7 @@ mod tests {
             b"",
         );
         ops::batch_write(&store, batch).unwrap();
-        assert_eq!(sample_once(&store, 10, 10, b"").0, 1);
+        assert_eq!(sample_once(&store, 10, 10, b"", None).0, 1);
     }
 
     /// Bounded sleep-poll helper: returns once `gone(store, keys)` holds
@@ -480,7 +513,7 @@ mod tests {
         wait_until_gone(&store, &[root, idx]);
         assert!(!purge_if_expired_arc(&store, P, STRING_FAMILY, b"k", 10));
         // nothing left for the sampler to sweep
-        assert_eq!(sample_once(&store, 10, 10, b"").0, 0);
+        assert_eq!(sample_once(&store, 10, 10, b"", None).0, 0);
     }
 
     /// read_enveloped's inline purge rides the same detached path.
@@ -546,7 +579,7 @@ mod tests {
         // next key it touches -- the 99/ data record, which stays
         // UNPROCESSED: the cursor must sit on the last key the round
         // actually processed (the 10/ index entry), never the stop key.
-        let (purged, cursor) = sample_once(&store, 200, 1, b"");
+        let (purged, cursor) = sample_once(&store, 200, 1, b"", None);
         assert_eq!(purged, 1);
         assert_eq!(
             cursor,
@@ -554,7 +587,7 @@ mod tests {
             "cursor sits on the last key the round PROCESSED"
         );
         // resuming after that cursor clears the 99/ victim in slot order
-        let (purged2, cursor2) = sample_once(&store, 200, 1, &cursor);
+        let (purged2, cursor2) = sample_once(&store, 200, 1, &cursor, None);
         assert_eq!(purged2, 1);
         assert!(cursor2.is_empty(), "scan reached the tail and wrapped");
         assert_eq!(read_enveloped(&store, b"10/", b"k").unwrap(), None);
@@ -570,15 +603,15 @@ mod tests {
         let store = Arc::new(store);
         write_enveloped(&store, KIND_STRING_TTL, b"k1", 100, b"v");
         write_enveloped(&store, KIND_STRING_TTL, b"k2", 100, b"v");
-        let (purged1, cursor1) = sample_once(&store, 200, 1, b"");
+        let (purged1, cursor1) = sample_once(&store, 200, 1, b"", None);
         assert_eq!(purged1, 1);
         assert!(!cursor1.is_empty(), "budget cut the round: cursor returned");
         // round 2 must land on k2's index entry -- the key round 1
         // stopped on -- instead of resuming strictly after it
-        let (purged2, cursor2) = sample_once(&store, 200, 1, &cursor1);
+        let (purged2, cursor2) = sample_once(&store, 200, 1, &cursor1, None);
         assert_eq!(purged2, 1, "the stop key was re-examined, not skipped");
         assert!(cursor2.is_empty(), "both victims gone: scan hit the tail");
-        let (purged3, _) = sample_once(&store, 200, 1, &cursor2);
+        let (purged3, _) = sample_once(&store, 200, 1, &cursor2, None);
         assert_eq!(purged3, 0);
         for key in [b"k1".as_slice(), b"k2".as_slice()] {
             assert_eq!(
@@ -593,7 +626,7 @@ mod tests {
         let (_dir, store) = open_tmp("wrap");
         let store = Arc::new(store);
         write_enveloped_at(&store, b"99/", KIND_STRING_TTL, b"tail", 100, b"v");
-        let (purged, cursor) = sample_once(&store, 200, 10, b"");
+        let (purged, cursor) = sample_once(&store, 200, 10, b"", None);
         assert_eq!(purged, 1);
         assert!(
             cursor.is_empty(),
@@ -602,7 +635,7 @@ mod tests {
         // a NEW victim sorting before everything the sweep just saw: only
         // a wrapped (head restart) round can reach it
         write_enveloped_at(&store, b"10/", KIND_STRING_TTL, b"head", 100, b"v");
-        let (purged2, cursor2) = sample_once(&store, 200, 10, &cursor);
+        let (purged2, cursor2) = sample_once(&store, 200, 10, &cursor, None);
         assert_eq!(purged2, 1, "wrapped round restarts from the head");
         assert!(cursor2.is_empty());
         assert_eq!(read_enveloped(&store, b"10/", b"head").unwrap(), None);
@@ -634,7 +667,7 @@ mod tests {
         while ops::get_physical(&store, &due).unwrap().is_some() {
             rounds += 1;
             assert!(rounds < 16, "cursor rotation never reached the high slot");
-            let (_, next) = sample_once(&store, 200, 20, &cursor);
+            let (_, next) = sample_once(&store, 200, 20, &cursor, None);
             cursor = next;
         }
         assert!(rounds > 1, "the scan limit forced multiple rounds");
@@ -646,6 +679,109 @@ mod tests {
                 .0,
             far
         );
+    }
+
+    #[test]
+    fn sampler_reap_of_stream_invalidates_offset_cache() {
+        let (_dir, store) = open_tmp("streamreap");
+        let store = Arc::new(store);
+        let rt = crate::lite::new_runtime();
+
+        // One lite stream `p/c` stored under the PARENT-derived slot
+        // prefix: a meta record whose idle deadline is long past (+ its
+        // expire-index entry), one group record, and a DIRTY cached
+        // group offset for it (one XACK's worth -- the resurrection
+        // trigger the fix must defuse).
+        let prefix = crate::hash::slot_with_prefix(b"p").1;
+        let stream = b"p/c".to_vec();
+        let mkey = crate::lite::model::meta_key(&prefix, &stream);
+        let gkey = crate::lite::model::group_key(&prefix, &stream, b"g");
+        let mut batch = WriteBatch::default();
+        batch.put(
+            &mkey,
+            crate::lite::model::encode_meta_at(
+                &crate::lite::model::MetaPayload {
+                    created_ms: 1,
+                    last_ms: 1,
+                    last_seq: 0,
+                    len: 1,
+                    idle_ms: 60_000,
+                },
+                1, // deadline at epoch+1ms: due since forever
+            ),
+        );
+        batch.put(codec::expire_index_key(&prefix, 1, &mkey), b"");
+        batch.put(
+            &gkey,
+            crate::lite::model::encode_group(&crate::lite::model::GroupPayload {
+                created_ms: 1,
+                delivered_ms: 1,
+                delivered_seq: 0,
+                committed_ms: 1,
+                committed_seq: 0,
+            }),
+        );
+        ops::batch_write(&store, batch).unwrap();
+
+        crate::lite::offset::insert_new(
+            &rt.offsets,
+            &stream,
+            b"g",
+            crate::lite::offset::GroupState {
+                created_ms: 1,
+                delivered: crate::lite::model::EntryId { ms: 1, seq: 0 },
+                committed: crate::lite::model::EntryId { ms: 1, seq: 0 },
+                pending: 0,
+            },
+        );
+        crate::lite::offset::ack(
+            &rt.offsets,
+            &stream,
+            b"g",
+            &[crate::lite::model::EntryId { ms: 2, seq: 0 }],
+        )
+        .unwrap();
+        assert_eq!(crate::lite::offset::dirty_len(&rt.offsets), 1);
+
+        // The sampler purges the due family AND reports the stream for
+        // offset-cache invalidation + the deferred orphan sweep.
+        let (purged, _) = sample_once(&store, now_ms(), 10, b"", Some(&rt));
+        assert_eq!(purged, 1, "the due stream family was reaped");
+        assert!(
+            ops::get_physical(&store, &gkey).unwrap().is_none(),
+            "family delete removed the group record"
+        );
+        assert_eq!(rt.pending_reaps(), 1, "reap queued the latched sweep");
+        assert_eq!(
+            crate::lite::offset::dirty_len(&rt.offsets),
+            0,
+            "cached dirty group state dropped with the family"
+        );
+
+        // A not-yet-due stream family is passed over and never queued.
+        let live = crate::lite::model::meta_key(&prefix, b"p/live");
+        let mut batch = WriteBatch::default();
+        batch.put(
+            &live,
+            crate::lite::model::encode_meta_at(
+                &crate::lite::model::MetaPayload {
+                    created_ms: 1,
+                    last_ms: 1,
+                    last_seq: 0,
+                    len: 0,
+                    idle_ms: 60_000,
+                },
+                now_ms() + 60_000,
+            ),
+        );
+        batch.put(
+            codec::expire_index_key(&prefix, now_ms() + 60_000, &live),
+            b"",
+        );
+        ops::batch_write(&store, batch).unwrap();
+        let (purged, _) = sample_once(&store, now_ms(), 10, b"", Some(&rt));
+        assert_eq!(purged, 0);
+        assert_eq!(rt.pending_reaps(), 1, "live families never queue sweeps");
     }
 
     #[test]

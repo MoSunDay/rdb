@@ -301,6 +301,40 @@ is a pre-dispatch connection gate); arity is not checked for some
 commands until replay.
 
 
+## Command-surface expansion (Rust-only, 2026-09-05)
+
+The Go tree implemented only a small RESP subset. This round closes the Redis
+command surface to 188 registered names; the following families exist only in
+Rust (Go clients must treat them as new):
+
+- **String**: INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT, APPEND/STRLEN/GETSET/SETNX/
+  SETEX/PSETEX/GETDEL/SETRANGE/GETRANGE. Semantics notes: arithmetic preserves
+  TTL; GETSET clears it; SETRANGE that empties the value deletes the key;
+  INCRBYFLOAT replies shortest-roundtrip f64 (`3`, not `3.0`); SETNX's NX veto
+  fires for ANY existing key kind before any type check (`:0` on a hash key,
+  Redis parity) while reads error WRONGTYPE.
+- **Bits**: SETBIT/GETBIT/BITCOUNT/BITPOS/BITOP — MSB-first bit numbering
+  within each byte, validated byte-for-byte against live Redis 7.2.5.
+- **Server/meta**: COMMAND (bare/COUNT/INFO/DOCS/GETKEYS backed by a static
+  188-row arity/first/last/step table kept in sync by test), INFO (Server/
+  Cluster/Keyspace sections; Keyspace from the TTL-envelope index), DBSIZE
+  (estimate-num-keys), ECHO, SELECT 0-only, FLUSHDB (chunked delete that
+  preserves control-plane raft records; drops the in-process lite offset
+  cache FIRST so the 200ms flusher cannot resurrect orphan consumer-group
+  records — stale groups therefore read NOGROUP, Redis parity. FLUSHDB also
+  serializes with in-flight lite offset flush rounds via the stream latch
+  set, and double-clears the lite offset cache — before and after the chunked
+  wipe — so no orphan group records survive on the wiped keyspace;
+  stream-family deletion paths — XIDLE active-expire reap, DEL/EXPIRE of
+  stream keys, lazy idle purge on read — now invalidate cached group offsets
+  and queue a latched orphan sweep guarded against streams recreated between
+  family delete and sweep).
+- **Gap fills**: HMSET, ZREVRANGE, SINTERCARD, LMPOP, XREVRANGE.
+- **Routing**: LMPOP/SINTERCARD/BITOP derive their routing slot from argv[2]
+  (the first real key), not argv[1] — the numkeys token / operation word is
+  never hashed (`router::routing_key_index`). MULTI queue-time slot checks use
+  the same table.
+
 ## Full-text + vector search (FT.*, Rust-only)
 
 The Go archive has no search engine; the Rust tree ships one on the typed-record
