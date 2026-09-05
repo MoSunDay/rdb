@@ -57,7 +57,12 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
 
     let now = expire::now_ms();
-    let read = model::read_meta(&ctx.shared.store, &prefix, &stream);
+    let read = model::read_meta(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        Some(ctx.shared.lite.as_ref()),
+    );
     let (meta, fresh) = match read {
         Err(e) => return resp::append_error(ctx.out, &format!("ERR: xadd failed: {e}")),
         Ok(MetaRead::Purged) => {
@@ -261,10 +266,14 @@ pub async fn xtrim(ctx: &mut Ctx<'_>) {
         return;
     };
     let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
-    let Some(meta) = model::read_meta(&ctx.shared.store, &prefix, &stream)
-        .ok()
-        .and_then(|r| r.live())
-    else {
+    let Some(meta) = model::read_meta(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        Some(ctx.shared.lite.as_ref()),
+    )
+    .ok()
+    .and_then(|r| r.live()) else {
         return resp::append_int(ctx.out, 0);
     };
     let trim = meta.len.saturating_sub(maxlen) as usize;
@@ -321,10 +330,14 @@ pub async fn xdel(ctx: &mut Ctx<'_>) {
         return;
     };
     let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
-    let Some(meta) = model::read_meta(&ctx.shared.store, &prefix, &stream)
-        .ok()
-        .and_then(|r| r.live())
-    else {
+    let Some(meta) = model::read_meta(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        Some(ctx.shared.lite.as_ref()),
+    )
+    .ok()
+    .and_then(|r| r.live()) else {
         return resp::append_int(ctx.out, 0);
     };
     // Duplicate ids must count once each (the batch delete is not visible
@@ -373,7 +386,12 @@ pub async fn xidle(ctx: &mut Ctx<'_>) {
     if ctx.args.len() == 1 {
         // Report the CONFIGURED idle seconds from the meta payload: the meta
         // envelope carries no expire (TTLs live in the expire index).
-        let secs = match model::read_meta(&ctx.shared.store, &prefix, &stream) {
+        let secs = match model::read_meta(
+            &ctx.shared.store,
+            &prefix,
+            &stream,
+            Some(ctx.shared.lite.as_ref()),
+        ) {
             Ok(MetaRead::Live(m)) if m.idle_ms > 0 => m.idle_ms.div_ceil(1000) as i64,
             Ok(MetaRead::Live(_)) => -1,
             _ => -2,
@@ -393,7 +411,12 @@ pub async fn xidle(ctx: &mut Ctx<'_>) {
         return resp::append_error(ctx.out, "ERR invalid idle seconds");
     };
     let _guard = latch::lock(&ctx.shared.latch, &mkey).await;
-    let read = model::read_meta(&ctx.shared.store, &prefix, &stream);
+    let read = model::read_meta(
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        Some(ctx.shared.lite.as_ref()),
+    );
     let Some(meta) = read.ok().and_then(|r| r.live()) else {
         return resp::append_error(ctx.out, "ERR no such key");
     };

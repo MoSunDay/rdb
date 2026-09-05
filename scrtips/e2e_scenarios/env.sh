@@ -219,7 +219,9 @@ e2e_teardown () {
         [ -n "$pid" ] && wait "$pid" 2>/dev/null
     done
     E2E_PIDS=()
-    if [ "${E2E_KEEP_WORKDIR:-0}" != "1" ] && [ -n "$E2E_WORKDIR" ]; then
+    # run_all.sh documents RDB_E2E_KEEP_WORKDIR (the RDB_E2E_* namespace);
+    # keep honoring the short historical name too.
+    if [ "${RDB_E2E_KEEP_WORKDIR:-${E2E_KEEP_WORKDIR:-0}}" != "1" ] && [ -n "$E2E_WORKDIR" ]; then
         rm -rf "$E2E_WORKDIR"
     fi
 }

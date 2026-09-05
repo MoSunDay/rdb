@@ -262,6 +262,45 @@ pub fn for_each_from(
 /// Owned `(key, value)` pair list, as returned by the collect helpers.
 pub type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// Reverse-ordered scan DOWN from `from`: the iterator starts at the
+/// first key `<= from` (or the largest key below it) and walks
+/// descending; the callback returns `false` to stop early.
+/// `excl_from` skips a leading key equal to `from` (an exclusive upper
+/// bound). RocksDB's `iterate_upper_bound` is EXCLUSIVE, so pinning it
+/// at `from` would drop `from` itself (verified empirically); it is
+/// pinned at `from`'s successor (`from` ++ `\0`, which sorts strictly
+/// after `from`) to bound the seek while keeping `from` in the window.
+/// Iteration errors abort the scan and surface as `Err`, mirroring
+/// [`for_each_from`]'s contract.
+pub fn for_each_down_from(
+    store: &Store,
+    from: &[u8],
+    excl_from: bool,
+    f: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+) -> Result<(), String> {
+    let mut upper = from.to_vec();
+    upper.push(0);
+    let mut ropts = ReadOptions::default();
+    ropts.set_iterate_upper_bound(upper);
+    let mut iter = store
+        .db
+        .iterator_opt(IteratorMode::From(from, Direction::Reverse), ropts);
+    let mut skip_leading = excl_from;
+    for item in &mut iter {
+        let (k, v) = item.map_err(|e| e.to_string())?;
+        if skip_leading {
+            skip_leading = false;
+            if k.as_ref() == from {
+                continue;
+            }
+        }
+        if !f(&k, &v) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Collect up to `limit` `(physical key, value)` pairs with `prefix`.
 /// `limit == 0` means unbounded.
 pub fn prefix_iter_collect(store: &Store, prefix: &[u8], limit: usize) -> Result<KvPairs, String> {
@@ -400,6 +439,61 @@ mod tests {
         })
         .unwrap();
         assert_eq!(resumed, vec![b"70/b".to_vec(), b"70/c".to_vec()]);
+    }
+
+    /// D10: the descending twin visits `<= from` (inclusive start),
+    /// honors the stop signal, and `excl_from` skips a leading key
+    /// equal to `from` (exclusive cursor). The successor-pinned upper
+    /// bound keeps `from` itself inside the window.
+    #[test]
+    fn for_each_down_from_visits_descending_and_stops() {
+        let (_dir, store) = open_tmp();
+        rocksdb::set(&store, b"70/", b"10", b"1").unwrap();
+        rocksdb::set(&store, b"70/", b"20", b"2").unwrap();
+        rocksdb::set(&store, b"70/", b"30", b"3").unwrap();
+        // `from` does not exist: start at the first key <= it.
+        let mut seen = Vec::new();
+        for_each_down_from(&store, b"70/25", false, &mut |k, v| {
+            seen.push((k.to_vec(), v.to_vec()));
+            true
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                (b"70/20".to_vec(), b"2".to_vec()),
+                (b"70/10".to_vec(), b"1".to_vec()),
+            ]
+        );
+        // `from` exists and is inclusive: it is the first visit.
+        let mut incl = Vec::new();
+        for_each_down_from(&store, b"70/20", false, &mut |k, _| {
+            incl.push(k.to_vec());
+            true
+        })
+        .unwrap();
+        assert_eq!(incl, vec![b"70/20".to_vec(), b"70/10".to_vec()]);
+        // Exclusive start skips the cursor key itself.
+        let mut excl = Vec::new();
+        for_each_down_from(&store, b"70/20", true, &mut |k, _| {
+            excl.push(k.to_vec());
+            true
+        })
+        .unwrap();
+        assert_eq!(excl, vec![b"70/10".to_vec()]);
+        // Stop signal honored mid-scan.
+        let mut count = 0;
+        for_each_down_from(&store, b"70/30", false, &mut |_, _| {
+            count += 1;
+            count < 2
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+        // Starting below every key exhausts cleanly.
+        assert_eq!(
+            for_each_down_from(&store, b"70/05", false, &mut |_, _| true),
+            Ok(())
+        );
     }
 
     /// D9: reaching the range tail is a clean `Ok(())` -- the raw iterator

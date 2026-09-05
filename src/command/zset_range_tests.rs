@@ -329,3 +329,96 @@ fn zrange_family_missing_key_replies_empty_array() {
     assert_eq!(call(&s, "zrevrangebylex", &[b"none", b"+", b"-"]), empty);
     assert_eq!(call(&s, "zrange", &[b"none", b"0", b"-1", b"REV"]), empty);
 }
+
+/// ZREVRANGE is not yet in the registry; drive the handler directly.
+fn call_zrevrange(shared: &Shared, args: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let argv: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
+    let mut ctx = test_ctx(shared, PREFIX.to_vec(), argv, &mut out);
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime")
+        .block_on(crate::command::zset_range::zrevrange(&mut ctx));
+    out
+}
+
+/// ZREVRANGE: rank window read against the REVERSED order (0 = highest
+/// score), emitted descending; negatives count from the lowest-score
+/// end of that reversed order.
+#[test]
+fn zrevrange_rank_windows_descending() {
+    let (_g, s) = shared_for("127.0.0.1:40821");
+    call(
+        &s,
+        "zadd",
+        &[b"k", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"],
+    );
+    assert_eq!(
+        call_zrevrange(&s, &[b"k", b"0", b"-1"]),
+        b"*4\r\n$1\r\nd\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n".to_vec()
+    );
+    assert_eq!(
+        bulks_of(&call_zrevrange(&s, &[b"k", b"0", b"2"])),
+        vec![b"d".to_vec(), b"c".to_vec(), b"b".to_vec()]
+    );
+    assert_eq!(
+        bulks_of(&call_zrevrange(&s, &[b"k", b"1", b"2"])),
+        vec![b"c".to_vec(), b"b".to_vec()]
+    );
+    // Negative indexes address the reversed order's tail = lowest scores.
+    assert_eq!(
+        bulks_of(&call_zrevrange(&s, &[b"k", b"-2", b"-1"])),
+        vec![b"b".to_vec(), b"a".to_vec()]
+    );
+    // Clamped/empty windows and a missing key reply empty arrays.
+    assert_eq!(call_zrevrange(&s, &[b"k", b"9", b"10"]), b"*0\r\n".to_vec());
+    assert_eq!(call_zrevrange(&s, &[b"k", b"2", b"1"]), b"*0\r\n".to_vec());
+    assert_eq!(
+        call_zrevrange(&s, &[b"none", b"0", b"-1"]),
+        b"*0\r\n".to_vec()
+    );
+}
+
+/// WITHSCORES interleaves; anything but WITHSCORES is a syntax error and
+/// the arity floor is start+stop.
+#[test]
+fn zrevrange_withscores_and_errors() {
+    let (_g, s) = shared_for("127.0.0.1:40822");
+    call(
+        &s,
+        "zadd",
+        &[b"k", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"],
+    );
+    assert_eq!(
+        call_zrevrange(&s, &[b"k", b"0", b"1", b"WITHSCORES"]),
+        b"*4\r\n$1\r\nd\r\n$1\r\n4\r\n$1\r\nc\r\n$1\r\n3\r\n".to_vec()
+    );
+    assert_eq!(
+        call_zrevrange(&s, &[b"k", b"0", b"0", b"withscores"]),
+        b"*2\r\n$1\r\nd\r\n$1\r\n4\r\n".to_vec()
+    );
+    // Only WITHSCORES is accepted: LIMIT / BYSCORE / junk are syntax
+    // errors even before the indexes are looked at.
+    for opt in [&b"LIMIT"[..], &b"BYSCORE"[..], &b"junk"[..]] {
+        let args: Vec<&[u8]> = vec![b"k", b"0", b"-1", opt];
+        assert_eq!(
+            call_zrevrange(&s, &args),
+            b"-ERR syntax error\r\n".to_vec(),
+            "{opt:?}"
+        );
+    }
+    assert_eq!(
+        call_zrevrange(&s, &[b"k", b"0"]),
+        b"-ERR wrong number of arguments for 'zrevrange' command\r\n".to_vec()
+    );
+    assert_eq!(
+        call_zrevrange(&s, &[b"k", b"x", b"1"]),
+        b"-ERR value is not an integer or out of range\r\n".to_vec()
+    );
+    // Wrong type key.
+    call(&s, "set", &[b"str", b"v"]);
+    assert_eq!(
+        call_zrevrange(&s, &[b"str", b"0", b"-1"]),
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
+    );
+}

@@ -1,6 +1,8 @@
 //! LPOP/RPOP: one element (null bulk when missing) or a counted batch
 //! off either end; a list drained to empty is deleted. Same read-scan ->
-//! batch-build -> ONE-fsync shape as `list_cmd::commit_list`.
+//! batch-build -> ONE-fsync shape as `list_cmd::commit_list`. The
+//! pop core is factored into `pop_core` (latch held by the caller) so
+//! LMPOP (list_mpop) can drive it over several candidate keys.
 
 use rocksdb::WriteBatch;
 
@@ -36,33 +38,60 @@ async fn pop(ctx: &mut Ctx<'_>, left: bool, cmd: &str) {
         &keys_core::latch_key(&ctx.prefix_key, &key),
     )
     .await;
-    let (expire_ms, meta) =
-        match list_state(&ctx.shared.store, &ctx.prefix_key, &key, expire::now_ms()) {
-            ListState::List { expire_ms, meta } => (expire_ms, meta),
-            ListState::Missing => {
-                reply_pop_empty(ctx, count);
-                return;
+    let Some(elems) = pop_core(ctx, &key, left, count, cmd).await else {
+        return;
+    };
+    match count {
+        None => match elems.first() {
+            Some(e) => append_bulk(ctx.out, e),
+            None => append_null(ctx.out),
+        },
+        Some(_) => {
+            append_array(ctx.out, elems.len());
+            for e in &elems {
+                append_bulk(ctx.out, e);
             }
+        }
+    }
+}
+
+/// Core pop machinery shared by LPOP/RPOP and LMPOP. The caller holds
+/// the key's latch (LMPOP locks every candidate up front); this fetches
+/// the list, plans the removal off `left`, commits ONE batched fsync
+/// and returns the popped elements in reply order (the LPOP/RPOP single
+/// vs. counted shapes are the caller's). `None` = the error reply is
+/// already written (WRONGTYPE / commit failure); `Some(vec)` with an
+/// empty vec = nothing to pop (missing key or drained empty).
+pub(crate) async fn pop_core(
+    ctx: &mut Ctx<'_>,
+    key: &[u8],
+    left: bool,
+    count: Option<i64>,
+    cmd: &str,
+) -> Option<Vec<Vec<u8>>> {
+    let (expire_ms, meta) =
+        match list_state(&ctx.shared.store, &ctx.prefix_key, key, expire::now_ms()) {
+            ListState::List { expire_ms, meta } => (expire_ms, meta),
+            ListState::Missing => return Some(Vec::new()),
             ListState::WrongType => {
                 append_error(ctx.out, WRONGTYPE);
-                return;
+                return None;
             }
         };
     let len = meta.len();
     if len == 0 || count == Some(0) {
-        reply_pop_empty(ctx, count);
-        return;
+        return Some(Vec::new());
     }
     let n = match count {
         None => 1,
         Some(c) => (c as u64).min(len),
     };
     let elems = if n == 1 {
-        match pop_one(&ctx.shared.store, &ctx.prefix_key, &key, &meta, left) {
+        match pop_one(&ctx.shared.store, &ctx.prefix_key, key, &meta, left) {
             Ok((elem, _)) => vec![elem],
             Err(_) => {
                 append_error(ctx.out, &format!("ERR: {cmd} failed"));
-                return;
+                return None;
             }
         }
     } else {
@@ -70,7 +99,7 @@ async fn pop(ctx: &mut Ctx<'_>, left: bool, cmd: &str) {
         match list_ds::collect_range(
             &ctx.shared.store,
             &ctx.prefix_key,
-            &key,
+            key,
             &meta,
             window.0,
             window.1,
@@ -83,7 +112,7 @@ async fn pop(ctx: &mut Ctx<'_>, left: bool, cmd: &str) {
             }
             Err(_) => {
                 append_error(ctx.out, &format!("ERR: {cmd} failed"));
-                return;
+                return None;
             }
         }
     };
@@ -100,10 +129,10 @@ async fn pop(ctx: &mut Ctx<'_>, left: bool, cmd: &str) {
         // L entries come off the top (l_next-1 down), then R off the
         // bottom (r_base up): r_next stays, r_base moves up.
         for i in 0..take_l {
-            list_ds::del_l(&mut batch, &ctx.prefix_key, &key, meta.l_next - 1 - i);
+            list_ds::del_l(&mut batch, &ctx.prefix_key, key, meta.l_next - 1 - i);
         }
         for i in 0..take_r {
-            list_ds::del_r(&mut batch, &ctx.prefix_key, &key, meta.r_base() + i);
+            list_ds::del_r(&mut batch, &ctx.prefix_key, key, meta.r_base() + i);
         }
         after.l_next -= take_l;
         after.l_count -= take_l;
@@ -112,19 +141,19 @@ async fn pop(ctx: &mut Ctx<'_>, left: bool, cmd: &str) {
         // R entries come off the top (r_next-1 down), then L off the
         // bottom (l_base up): l_next stays, l_base moves up.
         for i in 0..take_r {
-            list_ds::del_r(&mut batch, &ctx.prefix_key, &key, meta.r_next - 1 - i);
+            list_ds::del_r(&mut batch, &ctx.prefix_key, key, meta.r_next - 1 - i);
         }
         for i in 0..take_l {
-            list_ds::del_l(&mut batch, &ctx.prefix_key, &key, meta.l_base() + i);
+            list_ds::del_l(&mut batch, &ctx.prefix_key, key, meta.l_base() + i);
         }
         after.r_next -= take_r;
         after.r_count -= take_r;
         after.l_count -= take_l;
     }
     let emptied = after.is_empty();
-    if commit_list(
+    if !commit_list(
         ctx,
-        &key,
+        key,
         expire_ms,
         if emptied { None } else { Some(&after) },
         batch,
@@ -132,23 +161,9 @@ async fn pop(ctx: &mut Ctx<'_>, left: bool, cmd: &str) {
     )
     .await
     {
-        match count {
-            None => append_bulk(ctx.out, &elems[0]),
-            Some(_) => {
-                append_array(ctx.out, elems.len());
-                for e in &elems {
-                    append_bulk(ctx.out, e);
-                }
-            }
-        }
+        return None; // commit_list already wrote the error reply
     }
-}
-
-fn reply_pop_empty(ctx: &mut Ctx<'_>, count: Option<i64>) {
-    match count {
-        None => append_null(ctx.out),
-        Some(_) => append_array(ctx.out, 0),
-    }
+    Some(elems)
 }
 
 /// LPOP key [count].

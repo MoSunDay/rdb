@@ -375,3 +375,74 @@ fn hash_cardinality_stays_exact_across_writes() {
     assert_eq!(int_of(&call(&s, "hlen", &[b"k"])), 1);
     assert_eq!(bulk_of(&call(&s, "hget", &[b"k", b"c"])), b"3".to_vec());
 }
+
+/// HMSET is not yet in the registry; drive the handler directly.
+fn call_hmset(shared: &Shared, args: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let argv: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
+    let mut ctx = test_ctx(shared, PREFIX.to_vec(), argv, &mut out);
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime")
+        .block_on(crate::command::hash_cmd::hmset(&mut ctx));
+    out
+}
+
+/// HMSET: same write path as HSET (fields land, meta count stays exact,
+/// the last HDEL removes the key) but the reply is always +OK.
+#[test]
+fn hmset_writes_fields_and_replies_ok() {
+    let (_g, s) = shared_for("127.0.0.1:40801");
+    assert_eq!(
+        call_hmset(&s, &[b"k", b"one", b"1", b"two", b"2"]),
+        b"+OK\r\n".to_vec()
+    );
+    assert_eq!(int_of(&call(&s, "hlen", &[b"k"])), 2);
+    assert_eq!(bulk_of(&call(&s, "hget", &[b"k", b"one"])), b"1".to_vec());
+    assert_eq!(bulk_of(&call(&s, "hget", &[b"k", b"two"])), b"2".to_vec());
+    // Overwrites still reply OK and never inflate the count.
+    assert_eq!(
+        call_hmset(&s, &[b"k", b"one", b"9", b"three", b"3"]),
+        b"+OK\r\n".to_vec()
+    );
+    assert_eq!(int_of(&call(&s, "hlen", &[b"k"])), 3);
+    assert_eq!(bulk_of(&call(&s, "hget", &[b"k", b"one"])), b"9".to_vec());
+    // Removing the last field deletes the key; HMSET then re-creates it.
+    assert_eq!(
+        int_of(&call(&s, "hdel", &[b"k", b"one", b"two", b"three"])),
+        3
+    );
+    assert_eq!(int_of(&call(&s, "exists", &[b"k"])), 0);
+    assert_eq!(call_hmset(&s, &[b"k", b"a", b"b"]), b"+OK\r\n".to_vec());
+    assert_eq!(int_of(&call(&s, "hlen", &[b"k"])), 1);
+}
+
+/// HMSET arity is HSET's: an even arg count or fewer than 3 args is a
+/// wrong-number error; a non-string kind replies WRONGTYPE.
+#[test]
+fn hmset_arity_and_wrongtype() {
+    let (_g, s) = shared_for("127.0.0.1:40802");
+    assert_eq!(
+        call_hmset(&s, &[b"k", b"f"]),
+        b"-ERR wrong number of arguments for 'hmset' command\r\n".to_vec()
+    );
+    assert_eq!(
+        call_hmset(&s, &[b"k"]),
+        b"-ERR wrong number of arguments for 'hmset' command\r\n".to_vec()
+    );
+    assert_eq!(
+        call_hmset(&s, &[b"k", b"f", b"v", b"g"]),
+        b"-ERR wrong number of arguments for 'hmset' command\r\n".to_vec()
+    );
+    // Raw string and foreign kinds are WRONGTYPE, and nothing is written.
+    set_raw(&s, b"str", b"v");
+    assert_eq!(
+        call_hmset(&s, &[b"str", b"f", b"v"]),
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
+    );
+    call(&s, "lpush", &[b"lst", b"x"]);
+    assert_eq!(
+        call_hmset(&s, &[b"lst", b"f", b"v"]),
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec()
+    );
+}

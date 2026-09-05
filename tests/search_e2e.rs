@@ -372,7 +372,9 @@ fn ft_search_reply_is_a_flat_array() {
         &call(
             &shared,
             "ft.create",
-            &[b"idx", b"SCHEMA", b"body", b"TEXT", b"vec", b"VECTOR", b"DIM", b"2"],
+            &[
+                b"idx", b"SCHEMA", b"body", b"TEXT", b"vec", b"VECTOR", b"DIM", b"2",
+            ],
         ),
         "create",
     );

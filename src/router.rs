@@ -76,6 +76,19 @@ pub fn moved_error_line(slot: u16, addr: &str) -> String {
     format!("MOVED {} {}", slot, addr)
 }
 
+/// 0-based argv index of a keyed command's ROUTING key. Nearly every
+/// keyed command carries its first key at argv[1]; LMPOP/SINTERCARD lead
+/// with a count token and BITOP with an operation token, so their first
+/// key (destination included) sits at argv[2]. The dispatch and MULTI
+/// queue paths both resolve the slot prefix from this position; handlers
+/// additionally CROSSSLOT-validate the full key list themselves.
+pub fn routing_key_index(cmd_lowercase: &str) -> usize {
+    match cmd_lowercase {
+        "lmpop" | "sintercard" | "bitop" => 2,
+        _ => 1,
+    }
+}
+
 /// Commands that bypass slot routing entirely (Go `command.Whitelist`,
 /// extended for the keyless key-space commands: SCAN's first arg is a
 /// cursor and KEYS' is a pattern, neither is a routing key; RANDOMKEY has
@@ -85,6 +98,12 @@ pub fn is_whitelisted(cmd_lowercase: &str) -> bool {
         cmd_lowercase,
         "ping"
             | "quit"
+            | "command"
+            | "info"
+            | "dbsize"
+            | "echo"
+            | "select"
+            | "flushdb"
             | "asking"
             | "config"
             | "cluster"
@@ -96,6 +115,7 @@ pub fn is_whitelisted(cmd_lowercase: &str) -> bool {
             | "xadd"
             | "xlen"
             | "xrange"
+            | "xrevrange"
             | "xtrim"
             | "xdel"
             | "xidle"
@@ -317,6 +337,17 @@ mod tests {
     }
 
     #[test]
+    fn routing_key_index_off_by_token() {
+        assert_eq!(routing_key_index("get"), 1);
+        assert_eq!(routing_key_index("mset"), 1);
+        assert_eq!(routing_key_index("zunionstore"), 1); // dest key at argv[1]
+        assert_eq!(routing_key_index("lmpop"), 2); // argv[1] is numkeys
+        assert_eq!(routing_key_index("sintercard"), 2); // argv[1] is numkeys
+        assert_eq!(routing_key_index("bitop"), 2); // argv[1] is the operation
+        assert_eq!(routing_key_index("unknown"), 1);
+    }
+
+    #[test]
     fn whitelist_membership() {
         for c in [
             "ping",
@@ -331,6 +362,13 @@ mod tests {
             "xadd",
             "xlen",
             "xrange",
+            "xrevrange",
+            "command",
+            "info",
+            "dbsize",
+            "echo",
+            "select",
+            "flushdb",
             "xtrim",
             "xdel",
             "xidle",

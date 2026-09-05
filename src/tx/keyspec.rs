@@ -29,13 +29,22 @@ pub enum Shape {
     Second,
     /// DEST NUMKEYS KEY... -- Z{UNION,INTER,DIFF}STORE family.
     ZStore,
+    /// OP KEY KEY... -- BITOP: every argument after the first (the
+    /// operation token) is a key (destination first).
+    Skip1,
+    /// NUMKEYS KEY... [options] -- SINTERCARD / LMPOP: args[0] is a
+    /// count, the next `numkeys` words are keys, the tail is options.
+    NumKeys,
 }
 
 /// Static shape of a command; unlisted commands use [`Shape::First`].
 pub fn shape_of(cmd: &str) -> Shape {
     match cmd {
         "ping" | "quit" | "config" | "cluster" | "raft" | "migrate" | "scan" | "keys"
-        | "randomkey" | "xread" | "xreadgroup" => Shape::None,
+        | "randomkey" | "xread" | "xreadgroup" | "command" | "info" | "dbsize" | "echo"
+        | "select" | "flushdb" => Shape::None,
+        "bitop" => Shape::Skip1,
+        "sintercard" | "lmpop" => Shape::NumKeys,
         "xgroup" | "xinfo" | "xpick" | "xack" => Shape::Second, // xidle keys at argv[1]
         // Lite PEL verbs: key at argv[1] (args[0]).
         "xpending" | "xclaim" | "xautoclaim" => Shape::First,
@@ -64,6 +73,21 @@ pub fn keys_of(cmd: &str, args: &[Vec<u8>]) -> Vec<Vec<u8>> {
             .collect(),
         Shape::FirstTwo => args.iter().take(2).cloned().collect(),
         Shape::Second => args.get(1).map(|k| vec![k.clone()]).unwrap_or_default(),
+        Shape::Skip1 => args.iter().skip(1).cloned().collect(),
+        Shape::NumKeys => {
+            // NUMKEYS KEY [KEY ...] [options]: parse the count like
+            // ZStore does; a malformed count keeps only the certain keys.
+            let Ok(numkeys) =
+                std::str::from_utf8(args.first().map(|v| v.as_slice()).unwrap_or(b""))
+                    .map(|s| s.parse::<usize>())
+            else {
+                return Vec::new();
+            };
+            let Ok(numkeys) = numkeys else {
+                return Vec::new();
+            };
+            args.iter().skip(1).take(numkeys).cloned().collect()
+        }
         Shape::ZStore => {
             // DEST NUMKEYS KEY [KEY ...] [WEIGHTS ...] [AGGREGATE ...]
             let Some(dest) = args.first() else {
@@ -163,6 +187,35 @@ mod tests {
         // malformed numkeys: only dest is certain
         let args = vec![b("dst"), b("x"), b("z1")];
         assert_eq!(keys_of("zinterstore", &args), vec![b("dst")]);
+    }
+
+    #[test]
+    fn new_keyless_and_counted_shapes() {
+        for c in ["command", "info", "dbsize", "echo", "select", "flushdb"] {
+            assert!(keys_of(c, &[b("x")]).is_empty(), "{c} carries no keys");
+        }
+        // BITOP skips the operation token.
+        assert_eq!(
+            keys_of("bitop", &[b("AND"), b("dst"), b("s1"), b("s2")]),
+            vec![b("dst"), b("s1"), b("s2")]
+        );
+        // NUMKEYS families stop at the count; option tails are not keys.
+        assert_eq!(
+            keys_of(
+                "sintercard",
+                &[b("2"), b("k1"), b("k2"), b("LIMIT"), b("1")]
+            ),
+            vec![b("k1"), b("k2")]
+        );
+        assert_eq!(
+            keys_of(
+                "lmpop",
+                &[b("2"), b("a"), b("b"), b("LEFT"), b("COUNT"), b("3")]
+            ),
+            vec![b("a"), b("b")]
+        );
+        // malformed count: nothing certain, handler re-validates.
+        assert!(keys_of("sintercard", &[b("x"), b("k1")]).is_empty());
     }
 
     #[test]

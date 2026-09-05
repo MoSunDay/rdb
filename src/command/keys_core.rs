@@ -183,7 +183,18 @@ pub async fn delete_records(
             expire::family_delete_entries(&mut batch, prefix, family, key, expire_ms);
             ops::batch_write_async(Arc::clone(&shared.store), batch)
                 .await
-                .map(|_| true)
+                .map(|_| {
+                    // Designed protection (today unreachable for streams:
+                    // lite records live under the PARENT-derived slot
+                    // prefix, DEL derives it from the full key name): a
+                    // deleted stream family must not leave dirty cached
+                    // group offsets behind, or the 200ms flusher writes
+                    // orphan group records onto the deleted family.
+                    if family == codec::STREAM_FAMILY {
+                        shared.lite.stream_reaped(prefix, key);
+                    }
+                    true
+                })
         }
     }
 }
@@ -209,8 +220,11 @@ pub async fn apply_ttl(
         return Ok(false);
     }
     let mut batch = WriteBatch::default();
+    let mut stream_deleted = false;
     if new_ms <= now {
         delete_batch(&mut batch, prefix, key, &state);
+        stream_deleted = matches!(&state, KeyState::Enveloped { kind, .. }
+            if codec::family_of(*kind) == Some(codec::STREAM_FAMILY));
     } else {
         match state {
             KeyState::RawString { value } => {
@@ -229,7 +243,14 @@ pub async fn apply_ttl(
     }
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
-        .map(|_| true)
+        .map(|_| {
+            // See delete_records: same designed protection for the
+            // past-deadline EXPIRE delete path.
+            if stream_deleted {
+                shared.lite.stream_reaped(prefix, key);
+            }
+            true
+        })
 }
 
 /// PERSIST: drop the TTL. Enveloped strings migrate back to bare records;
