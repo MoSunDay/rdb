@@ -366,10 +366,8 @@ async fn dead_participant_aborts_and_restart_recovers() {
 /// - autocommit DELETE of every row, coordinated by node2.
 #[tokio::test]
 async fn follower_coordinated_update_delete_reaches_all_slot_owners() {
-    let dir = std::env::temp_dir().join(format!(
-        "rdb-sql-follower-write-e2e-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("rdb-sql-follower-write-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let nodes = start_sql_cluster(&dir, 3).await;
@@ -388,9 +386,12 @@ async fn follower_coordinated_update_delete_reaches_all_slot_owners() {
     // Seed 40 rows from the leader: ids spread over all three slot
     // bands (the chance they all land on one node is ~(1/3)^39).
     let seed: Vec<String> = (1..=40).map(|i| format!("({}, 1000)", i)).collect();
-    c0.query_drop(format!("INSERT INTO items (id, amt) VALUES {}", seed.join(", ")))
-        .await
-        .expect("seed insert");
+    c0.query_drop(format!(
+        "INSERT INTO items (id, amt) VALUES {}",
+        seed.join(", ")
+    ))
+    .await
+    .expect("seed insert");
     let got = placement(&mut [Some(&mut c0), Some(&mut c1), Some(&mut c2)]).await;
     check_gathered(&got, &(1..=40).collect::<Vec<_>>(), "seeded");
 
@@ -403,8 +404,7 @@ async fn follower_coordinated_update_delete_reaches_all_slot_owners() {
     let n = c1.affected_rows() as usize;
     assert_eq!(n, 40, "UPDATE must affect every row, not just a band");
     for (i, c) in [&mut c0, &mut c1, &mut c2].iter_mut().enumerate() {
-        let rs: Vec<mysql_async::Row> =
-            c.query("SELECT DISTINCT amt FROM items").await.unwrap();
+        let rs: Vec<mysql_async::Row> = c.query("SELECT DISTINCT amt FROM items").await.unwrap();
         let mut v: Vec<i64> = rs
             .into_iter()
             .map(|r| match r.get::<MVal, _>(0) {
@@ -420,7 +420,6 @@ async fn follower_coordinated_update_delete_reaches_all_slot_owners() {
     // ---- explicit-txn transfer pair, coordinated by EVERY node ----
     // Whoever coordinates, both rows must actually move: the staged
     // writes fan out through 2PC at COMMIT.
-
 
     transfer_via(&mut c0, None, "node0", 1960, 2040).await;
     transfer_via(&mut c1, Some(&mut c0), "node1", 1920, 2080).await;
@@ -488,8 +487,10 @@ async fn transfer_via(
         Some(l) => l,
         None => coord,
     };
-    let rs: Vec<mysql_async::Row> =
-        reader.query("SELECT id, amt FROM items WHERE id IN (1, 2)").await.unwrap();
+    let rs: Vec<mysql_async::Row> = reader
+        .query("SELECT id, amt FROM items WHERE id IN (1, 2)")
+        .await
+        .unwrap();
     let mut got: Vec<(i64, i64)> = rs
         .into_iter()
         .map(|r| {
@@ -544,10 +545,7 @@ async fn stale_block_follower_reads_and_writes_at_the_cluster_frontier() {
         crc16(&k) % 16384
     };
 
-    let dir = std::env::temp_dir().join(format!(
-        "rdb-sql-stale-ts-e2e-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("rdb-sql-stale-ts-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let nodes = start_sql_cluster(&dir, 3).await;
@@ -568,11 +566,9 @@ async fn stale_block_follower_reads_and_writes_at_the_cluster_frontier() {
     // lease then sits still -- an idle block is never below the refill
     // low-water -- so node1's ts horizon is frozen at that early grant.
     let seed_id = (1..).find(|i| band(slot_of(*i)) == 1).unwrap();
-    c1.query_drop(format!(
-        "INSERT INTO items (id, amt) VALUES ({seed_id}, 5)"
-    ))
-    .await
-    .expect("follower seed");
+    c1.query_drop(format!("INSERT INTO items (id, amt) VALUES ({seed_id}, 5)"))
+        .await
+        .expect("follower seed");
 
     // The leader pushes the raft cursor a couple of blocks past every
     // possible early grant (~3 x 4096 ts are handed out before the
@@ -637,7 +633,8 @@ async fn stale_block_follower_reads_and_writes_at_the_cluster_frontier() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert_eq!(
-        matched, want.len() as u64,
+        matched,
+        want.len() as u64,
         "every row must match across passes, not just the pre-frontier ones"
     );
 
@@ -645,8 +642,7 @@ async fn stale_block_follower_reads_and_writes_at_the_cluster_frontier() {
     // the whole table reads back (gather) and every amt moved exactly
     // once (5 -> 6 for the seed, 1000 -> 1001 for the pushed rows).
     for (i, c) in [&mut c0, &mut c1, &mut c2].iter_mut().enumerate() {
-        let rs: Vec<mysql_async::Row> =
-            c.query("SELECT DISTINCT amt FROM items").await.unwrap();
+        let rs: Vec<mysql_async::Row> = c.query("SELECT DISTINCT amt FROM items").await.unwrap();
         let mut amts: Vec<i64> = rs
             .into_iter()
             .map(|r| match r.get::<MVal, _>(0) {

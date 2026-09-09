@@ -7,8 +7,8 @@ pub mod ast;
 pub mod error;
 pub(crate) mod expr;
 pub(crate) mod query;
-pub mod starrocks;
 pub(crate) mod session;
+pub mod starrocks;
 pub(crate) mod table;
 pub(crate) mod translate;
 

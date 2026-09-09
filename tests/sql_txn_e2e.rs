@@ -379,7 +379,7 @@ async fn multi_statement_txn_applies_every_update() {
         "UPDATE mu SET v = 'a2' WHERE id = 1",
         "UPDATE mu SET v = 'c2' WHERE v = 'c'", // matches the staged INSERT only
         "UPDATE mu SET v = 'a3' WHERE v = 'a2'", // matches this txn's own staged UPDATE
-        "UPDATE mu SET v = 'b2' WHERE id = 2", // third target row, same txn
+        "UPDATE mu SET v = 'b2' WHERE id = 2",  // third target row, same txn
         "COMMIT",
     ] {
         a.query_drop(sql)

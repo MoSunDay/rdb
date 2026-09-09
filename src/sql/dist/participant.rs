@@ -437,7 +437,10 @@ mod tests {
     fn conflict_ts_rejects_non_conflict_reasons() {
         assert_eq!(conflict_ts("dup: duplicate entry for key"), None);
         assert_eq!(conflict_ts("conflict: unparsable row key"), None);
-        assert_eq!(conflict_ts("conflict: write-write conflict on row committed at ts "), None);
+        assert_eq!(
+            conflict_ts("conflict: write-write conflict on row committed at ts "),
+            None
+        );
         assert_eq!(conflict_ts(""), None);
     }
 }

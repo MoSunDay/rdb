@@ -123,13 +123,8 @@ pub async fn insert(
     // Write frontier before planning: the plan's ts range (2PC) or the
     // local alloc below must stamp above the txn's read point; both
     // allocate one ts per row.
-    shared
-        .sql_ts
-        .reserve_write_frontier(read_ts, n)
-        .await;
-    if let Some(plan) =
-        dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)?
-    {
+    shared.sql_ts.reserve_write_frontier(read_ts, n).await;
+    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await
             .map(|_| ExecOutcome::Affected(n));
@@ -365,9 +360,7 @@ pub async fn update(
         .sql_ts
         .reserve_write_frontier(read_ts, dist_writes.len() as u64)
         .await;
-    if let Some(plan) =
-        dist::plan::try_plan_simple(shared, read_ts, &schema, &dist_writes, &idx)?
-    {
+    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &dist_writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await
             .map(|_| ExecOutcome::Affected(plans.len() as u64));
@@ -522,12 +515,10 @@ async fn matched_rows(
     // applied ts (a follower coordinating an UPDATE would otherwise
     // match at its stale ts-block tail and silently miss rows stamped
     // above it). Txn mode keeps the snapshot pinned at BEGIN.
-    let read_ts = txn
-        .map(|t| t.read_ts)
-        .unwrap_or_else(|| {
-            shared.sql_ts.sync_cursor_frontier();
-            shared.sql_ts.now()
-        });
+    let read_ts = txn.map(|t| t.read_ts).unwrap_or_else(|| {
+        shared.sql_ts.sync_cursor_frontier();
+        shared.sql_ts.now()
+    });
     // Same fan-out verdict as a SELECT: per-owner bands when the
     // cluster is ready (UPDATE/DELETE reject columnar tables before
     // this point, so the band gather is the only distributed shape).

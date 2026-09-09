@@ -301,7 +301,9 @@ impl ClusterTs {
         let Ok(r) = self.deps.raft.try_read() else {
             return;
         };
-        let cursor = state::raft_get(&r, TS_CURSOR_KEY).parse::<u64>().unwrap_or(0);
+        let cursor = state::raft_get(&r, TS_CURSOR_KEY)
+            .parse::<u64>()
+            .unwrap_or(0);
         drop(r);
         if cursor > 0 {
             let mut st = self.state.lock().unwrap();

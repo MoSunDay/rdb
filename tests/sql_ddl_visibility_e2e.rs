@@ -92,7 +92,10 @@ async fn wait_table(conn: &mut mysql_async::Conn, table: &str, node: &ProcNode) 
 
 /// Key_name cells of SHOW INDEX (third column: Table, Non_unique, Key_name...).
 async fn index_names(conn: &mut mysql_async::Conn) -> Vec<String> {
-    let rs: Vec<mysql_async::Row> = conn.query("SHOW INDEX FROM orders_t").await.expect("show index");
+    let rs: Vec<mysql_async::Row> = conn
+        .query("SHOW INDEX FROM orders_t")
+        .await
+        .expect("show index");
     rs.into_iter()
         .map(|r| match r.get::<MVal, _>(2) {
             Some(MVal::Bytes(b)) => String::from_utf8(b).unwrap(),

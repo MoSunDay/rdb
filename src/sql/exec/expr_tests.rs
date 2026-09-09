@@ -314,10 +314,7 @@ fn eval_int_div_mod_wrap_extremes() {
     };
     let lit = |i: i64| Expr::Lit(Value::Int(i));
     let min = i64::MIN;
-    assert_eq!(
-        eval_str(&bin(Div, lit(min), lit(-1))),
-        Ok(Value::Int(min))
-    );
+    assert_eq!(eval_str(&bin(Div, lit(min), lit(-1))), Ok(Value::Int(min)));
     assert_eq!(eval_str(&bin(Mod, lit(min), lit(-1))), Ok(Value::Int(0)));
     // divide / modulo by zero stays NULL
     assert!(matches!(
