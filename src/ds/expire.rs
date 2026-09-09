@@ -719,6 +719,8 @@ mod tests {
                 delivered_seq: 0,
                 committed_ms: 1,
                 committed_seq: 0,
+                ordered: false,
+                inflight_max: 0,
             }),
         );
         ops::batch_write(&store, batch).unwrap();
@@ -732,6 +734,8 @@ mod tests {
                 delivered: crate::lite::model::EntryId { ms: 1, seq: 0 },
                 committed: crate::lite::model::EntryId { ms: 1, seq: 0 },
                 pending: 0,
+                ordered: false,
+                inflight_max: 0,
             },
         );
         crate::lite::offset::ack(
@@ -739,6 +743,7 @@ mod tests {
             &stream,
             b"g",
             &[crate::lite::model::EntryId { ms: 2, seq: 0 }],
+            None,
         )
         .unwrap();
         assert_eq!(crate::lite::offset::dirty_len(&rt.offsets), 1);

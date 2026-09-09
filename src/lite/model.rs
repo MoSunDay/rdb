@@ -177,8 +177,21 @@ pub struct GroupPayload {
     pub delivered_ms: u64,
     pub delivered_seq: u64,
     /// Ack watermark -- the restart resume point (at-least-once).
+    /// Kafka-committed-offset semantics: it only ever advances over a
+    /// CONTIGUOUS acked prefix (see `offset::ack`), never past a
+    /// surviving pending row.
     pub committed_ms: u64,
     pub committed_seq: u64,
+    /// Ordered-consumer-group flag (queue-exclusive ownership, ordered
+    /// delivery, in-flight cap). Defaults false on legacy records.
+    #[serde(default)]
+    pub ordered: bool,
+    /// Per-queue unacked (in-flight) entry cap for ordered groups;
+    /// 1 = strict serial (RocketMQ-orderly equivalent), larger =
+    /// Kafka-style prefetch pipeline. 0 means "unset" and is
+    /// normalized to 1 on load; unordered groups keep 0.
+    #[serde(default)]
+    pub inflight_max: u64,
 }
 
 fn encode_json<T: Serialize>(payload: &T) -> Vec<u8> {
@@ -208,6 +221,16 @@ pub fn current_expire(store: &Store, prefix: &[u8], stream: &[u8]) -> u64 {
 
 pub fn encode_meta(meta: &MetaPayload) -> Vec<u8> {
     encode_json(meta)
+}
+
+/// Normalize the persisted in-flight cap: ordered groups run with at
+/// least 1 (1 = strict serial); unordered groups carry 0.
+pub fn normalize_inflight(ordered: bool, inflight_max: u64) -> u64 {
+    if ordered {
+        inflight_max.max(1)
+    } else {
+        0
+    }
 }
 
 pub fn encode_group(group: &GroupPayload) -> Vec<u8> {

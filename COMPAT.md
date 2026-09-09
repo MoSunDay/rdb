@@ -157,10 +157,30 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     quota); a blocking all-`>` XREADGROUP parks ONE waiter registered under every
     `>`-stream meta key (any stream waking it serves the read).
   - XACK's reply counts WATERMARK advancement, not pending rows removed (an older-than-
-    watermark id still acks `:0` while its PEL row is deleted).
+    watermark id still acks `:0` while its PEL row is deleted). The committed watermark
+    is a Kafka-style committed offset: it only advances over the CONTIGUOUS acked prefix
+    (an ack beyond the first surviving PEL row sticks at `head_after_ack` and is NOT
+    remembered — such ids may be redelivered; duplicates, never loss). The group
+    record (kind 0x0E) is persisted synchronously only when the committed watermark
+    actually advances.
   - XCLAIM supports only the FORCE / JUSTID options (IDLE/TIME/RETRYCOUNT/LASTID are
     syntax errors); XAUTOCLAIM returns the Redis>=7 3-element reply (with deleted-ids),
-    COUNT defaults to 100 with a 10x scan cap.
+    COUNT defaults to 100 with a 10x scan cap. For ORDERED groups both are HEAD-ONLY:
+    only the PEL head (smallest pending id) can transfer queue ownership; a failed
+    min-idle claim does not flip ownership, and FORCE on an id beyond the head is
+    suppressed (the head still wins).
+  - XGROUP CREATE accepts `ORDERED [INFLIGHT <n>]` (rdb extension, calibrated to
+    Kafka's ordering model): an ordered group's queue is owned EXCLUSIVELY by one
+    consumer at a time — in-memory lease (default 30s, no coordinator); a fenced-out
+    or deposed consumer's `XREADGROUP ... >` delivers nothing (empty `*-1`, blocked
+    readers re-park), a full in-flight window likewise delivers nothing until acks
+    free slots, and an idle-expired lease migrates to the next asker with an epoch
+    bump (takeovers wake parked contenders via the stream meta key). INFLIGHT is the
+    prefetch knob (1 = strict serial, the default; requires ORDERED); ownership state
+    is in-memory only — a restart drops it along with all connections.
+  - XINFO GROUPS replies 7 field/value pairs (14 elements): name, last-delivered-id,
+    committed-id, ordered, inflight, owner (nil when unowned), epoch (0 for unordered
+    groups). PEL rows carry the owning epoch for observability.
   - Explicit-id XREADGROUP (any id other than `>`) reads only that consumer's own PEL
     history from disk; consumer idle times derive from the PEL's delivered_ms (no
     per-activity tracking).

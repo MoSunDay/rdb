@@ -21,6 +21,7 @@ pub mod group;
 pub mod info;
 pub mod model;
 pub mod offset;
+pub mod ordered;
 pub mod park_wait;
 pub mod pel;
 pub mod pending;
@@ -94,9 +95,22 @@ pub fn stat_bump(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Ordering::Relaxed);
 }
 
+/// Default ordered-group ownership lease: a queue whose owner has been
+/// silent this long is considered abandoned and migrates to the next
+/// asking consumer (idle takeover; XCLAIM/XAUTOCLAIM bypass it via
+/// min-idle-time).
+pub const DEFAULT_LEASE_MS: u64 = 30_000;
+
 /// Lite runtime state hung off `state::Shared`.
 pub struct Runtime {
     pub offsets: offset::OffsetCache,
+    /// Ordered-group queue ownership (see `ordered`); in-memory by
+    /// design: ownership is process-local (a restart drops every
+    /// connection, so pre-restart zombies cannot exist) and a lazy
+    /// re-acquire rebuilds it on the first `>` read.
+    pub owners: Mutex<ordered::OwnerMap>,
+    /// Ownership lease window (test hook; see DEFAULT_LEASE_MS).
+    lease_ms: std::sync::atomic::AtomicU64,
     /// Per-parent round-robin cursors.
     pub picks: Mutex<HashMap<Vec<u8>, u64>>,
     /// Consumers already registered this process, (stream, group,
@@ -117,8 +131,20 @@ impl Runtime {
     /// validates after this drops the entry in `drop_superseded` -- and
     /// queue the latched sweep that removes orphans a round already
     /// past validation may still write (see [`reap_stream`]).
+    /// Ordered-group lease window (tests shrink it to exercise idle
+    /// takeover without sleeping out the production default).
+    pub fn set_lease_ms(&self, ms: u64) {
+        self.lease_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn lease_ms(&self) -> u64 {
+        self.lease_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn stream_reaped(&self, prefix: &[u8], stream: &[u8]) {
         offset::remove_stream(&self.offsets, stream);
+        ordered::drop_stream(&self.owners, stream);
         self.reaps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -168,6 +194,8 @@ impl Runtime {
 pub fn new_runtime() -> Runtime {
     Runtime {
         offsets: offset::new_cache(),
+        owners: Mutex::new(HashMap::new()),
+        lease_ms: std::sync::atomic::AtomicU64::new(DEFAULT_LEASE_MS),
         picks: Mutex::new(HashMap::new()),
         consumers: Mutex::new(HashSet::new()),
         reaps: Mutex::new(Vec::new()),

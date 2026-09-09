@@ -37,12 +37,17 @@ pub const PEND_TAG: u8 = 0x00;
 /// Registry keys sort strictly after every PEL row of the same group.
 pub const CONSUMER_TAG: u8 = 0x01;
 
-/// One pending record: who holds it, since when, how many times handed out.
+/// One pending record: who holds it, since when, how many times handed
+/// out. `epoch` is the ordered-group ownership generation the row was
+/// delivered under (0 = unordered group or legacy row); a pure
+/// observability/fencing stamp, never part of reply payloads.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PendState {
     pub consumer: Vec<u8>,
     pub delivered_ms: u64,
     pub times_delivered: u64,
+    #[serde(default)]
+    pub epoch: u64,
 }
 
 /// Consumer-registry record (XGROUP CREATECONSUMER / first delivery).
@@ -220,6 +225,66 @@ pub fn scan_consumers(
         true
     })?;
     Ok(out)
+}
+
+/// Smallest pending id of the group (`None` when the PEL is empty):
+/// the head-of-line of the queue -- the only takeover point in ordered
+/// groups (XCLAIM/XAUTOCLAIM).
+pub fn first_pending(
+    store: &Store,
+    prefix: &[u8],
+    stream: &[u8],
+    group: &[u8],
+) -> Result<Option<EntryId>, String> {
+    Ok(
+        scan_pend(store, prefix, stream, group, model::MIN_ID, Some(1))?
+            .into_iter()
+            .next()
+            .map(|row| row.id),
+    )
+}
+
+/// First pending row that SURVIVES an ack of `acked` strictly past
+/// `committed`, bounded by `max_acked`: the contiguous-prefix gap probe
+/// for the Kafka-semantics committed watermark (`offset::ack`). Rows at
+/// or below `committed` never block advancement (SETID rewinds may
+/// leave them behind); the walk stops at the first survivor -- in the
+/// common in-order case that is exactly one row.
+pub fn head_after_ack(
+    store: &Store,
+    prefix: &[u8],
+    stream: &[u8],
+    group: &[u8],
+    committed: EntryId,
+    acked: &std::collections::HashSet<EntryId>,
+    max_acked: EntryId,
+) -> Result<Option<EntryId>, String> {
+    let base = pend_entry_base(prefix, stream, group);
+    let start = super::claim::succ_id(committed)
+        .map(|id| pend_key(prefix, stream, group, id))
+        .unwrap_or_else(|| base.clone());
+    let mut head = None;
+    ops::for_each_from(store, &start, false, &mut |k, _v| {
+        if !k.starts_with(&base) {
+            return false; // left the group's PEL window: no survivors
+        }
+        let suffix = &k[base.len()..];
+        if suffix.len() != 16 {
+            return false; // defensive: treat as window end
+        }
+        let ms = u64::from_be_bytes(suffix[..8].try_into().unwrap_or([0; 8]));
+        let seq = u64::from_be_bytes(suffix[8..].try_into().unwrap_or([0; 8]));
+        let id = EntryId { ms, seq };
+        if id > max_acked {
+            return false; // beyond the acked range: no gap there
+        }
+        if !acked.contains(&id) {
+            head = Some(id); // survivor inside the range: the gap
+            return false;
+        }
+        true // acked row: about to be deleted, keep walking
+    })?;
+    Ok(head)
 }
 
 /// Exact pending-row count of the group (backlog reload after restart).

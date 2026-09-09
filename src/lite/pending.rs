@@ -233,6 +233,7 @@ mod tests {
                 consumer: consumer.to_vec(),
                 delivered_ms,
                 times_delivered: times,
+                epoch: 0,
             },
         }
     }

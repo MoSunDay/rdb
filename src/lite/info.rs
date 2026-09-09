@@ -55,7 +55,10 @@ fn groups_info(ctx: &mut Ctx<'_>, stream: &[u8], prefix: &[u8]) {
     };
     resp::append_array(ctx.out, groups.len());
     for (name, p) in groups {
-        resp::append_array(ctx.out, 6);
+        // 7 pairs: the Redis-ish trio plus the ordered-group surface
+        // (always present; owner is nil unless an ordered group has a
+        // live owner this process).
+        resp::append_array(ctx.out, 14);
         resp::append_bulk(ctx.out, &name);
         resp::append_bulk_string(ctx.out, "last-delivered-id");
         append_id_field(
@@ -72,6 +75,24 @@ fn groups_info(ctx: &mut Ctx<'_>, stream: &[u8], prefix: &[u8]) {
                 ms: p.committed_ms,
                 seq: p.committed_seq,
             },
+        );
+        resp::append_bulk_string(ctx.out, "ordered");
+        resp::append_int(ctx.out, i64::from(p.ordered));
+        resp::append_bulk_string(ctx.out, "inflight");
+        resp::append_int(
+            ctx.out,
+            model::normalize_inflight(p.ordered, p.inflight_max) as i64,
+        );
+        resp::append_bulk_string(ctx.out, "owner");
+        match super::ordered::peek(&ctx.shared.lite.owners, stream, &name) {
+            Some(o) => resp::append_bulk(ctx.out, &o.consumer),
+            None => resp::append_null(ctx.out),
+        }
+        resp::append_bulk_string(ctx.out, "epoch");
+        resp::append_int(
+            ctx.out,
+            super::ordered::peek(&ctx.shared.lite.owners, stream, &name)
+                .map_or(0, |o| o.epoch as i64),
         );
     }
 }

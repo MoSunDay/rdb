@@ -91,6 +91,8 @@ fn lazy_idle_purge_invalidates_offset_cache_and_sweep_kills_orphans() {
             delivered_seq: 1,
             committed_ms: 1,
             committed_seq: 1,
+            ordered: false,
+            inflight_max: 0,
         }),
     );
     rdb::store::ops::batch_write(&shared.store, batch).expect("plant orphan");

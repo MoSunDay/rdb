@@ -44,7 +44,8 @@ fn group_start(stream_last: Option<EntryId>, arg: &[u8]) -> Result<EntryId, ()> 
     }
 }
 
-/// `XGROUP <CREATE|DESTROY|SETID> <stream> <group> [<id|$> [MKSTREAM]]`
+/// `XGROUP <CREATE|DESTROY|SETID> <stream> <group> [<id|$> [MKSTREAM]
+/// [ORDERED [INFLIGHT <n>]]]`
 /// plus `<CREATECONSUMER|DELCONSUMER> <stream> <group> <consumer>`
 /// (consumer-registry rows in the kind-0x0F window, see `pel.rs`).
 pub async fn xgroup(ctx: &mut Ctx<'_>) {
@@ -72,13 +73,45 @@ pub async fn xgroup(ctx: &mut Ctx<'_>) {
 }
 
 async fn create(ctx: &mut Ctx<'_>) {
-    // XGROUP CREATE <stream> <group> <id|$> [MKSTREAM]
-    let mkstream = ctx.args.len() == 5 && ctx.args[4].eq_ignore_ascii_case(b"MKSTREAM");
-    if !matches!(ctx.args.len(), 4 | 5) || (ctx.args.len() == 5 && !mkstream) {
+    // XGROUP CREATE <stream> <group> <id|$> [MKSTREAM] [ORDERED [INFLIGHT <n>]]
+    // ORDERED (rdb extension): queue-exclusive ownership + ordered
+    // delivery + in-flight cap -- Kafka partition-order semantics over
+    // the PEL protocol (see `ordered`).
+    if ctx.args.len() < 4 {
         return resp::append_error(
             ctx.out,
             "ERR wrong number of arguments for 'xgroup create' command",
         );
+    }
+    let (mut mkstream, mut ordered, mut inflight) = (false, false, 0u64);
+    let mut i = 4;
+    while i < ctx.args.len() {
+        let a = &ctx.args[i];
+        if a.eq_ignore_ascii_case(b"MKSTREAM") && !mkstream {
+            mkstream = true;
+        } else if a.eq_ignore_ascii_case(b"ORDERED") && !ordered {
+            ordered = true;
+        } else if a.eq_ignore_ascii_case(b"INFLIGHT") && inflight == 0 && i + 1 < ctx.args.len() {
+            match std::str::from_utf8(&ctx.args[i + 1])
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+            {
+                Some(n) if n >= 1 => inflight = n,
+                _ => {
+                    return resp::append_error(
+                        ctx.out,
+                        "ERR value is not an integer or out of range",
+                    )
+                }
+            }
+            i += 1;
+        } else {
+            return resp::append_error(ctx.out, "ERR syntax error");
+        }
+        i += 1;
+    }
+    if inflight > 0 && !ordered {
+        return resp::append_error(ctx.out, "ERR syntax error");
     }
     let Some((stream, prefix)) = super::entries::stream_of(ctx, 1) else {
         return;
@@ -129,6 +162,7 @@ async fn create(ctx: &mut Ctx<'_>) {
             model::encode_meta(&fresh),
         );
     }
+    let inflight_max = model::normalize_inflight(ordered, inflight);
     batch.put(
         &gkey,
         model::encode_group(&GroupPayload {
@@ -137,6 +171,8 @@ async fn create(ctx: &mut Ctx<'_>) {
             delivered_seq: start.seq,
             committed_ms: start.ms,
             committed_seq: start.seq,
+            ordered,
+            inflight_max,
         }),
     );
     if let Err(e) = ctx.commit(batch).await {
@@ -161,6 +197,8 @@ async fn create(ctx: &mut Ctx<'_>) {
             delivered: start,
             committed: start,
             pending: 0,
+            ordered,
+            inflight_max,
         },
     );
     wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
@@ -199,6 +237,7 @@ async fn destroy(ctx: &mut Ctx<'_>) {
         wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
     }
     offset::remove_group(&ctx.shared.lite.offsets, &stream, &group);
+    super::ordered::drop_group(&ctx.shared.lite.owners, &stream, &group);
     ctx.shared.lite.forget_group(&stream, &group);
     resp::append_int(ctx.out, i64::from(existed));
 }
@@ -282,6 +321,9 @@ async fn delconsumer(ctx: &mut Ctx<'_>) {
         return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
     }
     offset::bump_pending(&ctx.shared.lite.offsets, &stream, &group, -(purged as i64));
+    // An ordered queue owned by the departing consumer becomes free NOW
+    // (no lease wait): the next `>` reader takes it over.
+    super::ordered::release_consumer(&ctx.shared.lite.owners, &stream, &group, &consumer);
     ctx.shared.lite.forget_consumer(&stream, &group, &consumer);
     resp::append_int(ctx.out, purged as i64);
 }

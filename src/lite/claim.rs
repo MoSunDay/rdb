@@ -93,12 +93,14 @@ pub(crate) fn read_entry(
 /// delivery clock refreshes; `times_delivered` bumps unless the claim is
 /// JUSTID-only (an ownership move is not a delivery, the old count
 /// stays). FORCE-created rows have no prior count and start at 1.
+/// `epoch` stamps the ordered-group ownership generation (0 = unordered).
 pub(crate) fn claimed_state(
     old_times: u64,
     fresh: bool,
     justid: bool,
     consumer: &[u8],
     now: u64,
+    epoch: u64,
 ) -> pel::PendState {
     pel::PendState {
         consumer: consumer.to_vec(),
@@ -108,6 +110,7 @@ pub(crate) fn claimed_state(
             (false, false) => old_times + 1,
             (false, true) => old_times,
         },
+        epoch,
     }
 }
 
@@ -172,6 +175,56 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
         return nogroup(ctx.out, &stream, &group);
     }
     let now = expire::now_ms();
+    // Ordered groups: takeover is QUEUE-granular -- only the PEL HEAD is
+    // claimable (there is no taking half a batch from under the owner;
+    // deeper rows free up as the new owner works down the head). FORCE
+    // minting beyond the head would break log order, so it is suppressed
+    // too (non-head ids are silently ignored, like Redis's non-pending
+    // ones).
+    let mut epoch = 0u64;
+    let ordered = offset::load(
+        &ctx.shared.lite.offsets,
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        &group,
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|st| st.ordered);
+    if ordered {
+        // The head row must exist, be the claimed id, and be idle
+        // enough (FORCE does not bypass a pending row's idle gate);
+        // otherwise the claim is empty and NO takeover happens.
+        let head = pel::scan_pend(
+            &ctx.shared.store,
+            &prefix,
+            &stream,
+            &group,
+            model::MIN_ID,
+            Some(1),
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next());
+        let claimable = head.as_ref().is_some_and(|row| {
+            ids.contains(&row.id) && now.saturating_sub(row.state.delivered_ms) >= min_idle
+        });
+        if claimable {
+            ids.retain(|id| Some(*id) == head.as_ref().map(|row| row.id));
+            // The claiming consumer is the new owner from here on: bump
+            // the generation so the deposed owner's later `>` reads
+            // deliver nothing (zombie fencing, Kafka-generation style).
+            epoch = super::ordered::force_takeover(
+                &ctx.shared.lite.owners,
+                &stream,
+                &group,
+                &consumer,
+                now,
+            );
+        } else {
+            ids.clear();
+        }
+    }
     let mut batch = rocksdb::WriteBatch::default();
     register_consumer(ctx, &mut batch, &prefix, &stream, &group, &consumer, now);
     let mut frames: Vec<entries::Entry> = Vec::new();
@@ -221,6 +274,7 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
                 justid,
                 &consumer,
                 now,
+                epoch,
             )),
         );
         match fields {
@@ -230,6 +284,11 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
     }
     if let Err(e) = ctx.commit(batch).await {
         return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}"));
+    }
+    if ordered && !(frames.is_empty() && claimed_ids.is_empty()) {
+        // Takeover happened: wake blocked readers so a fenced-out former
+        // owner (and any contender) re-checks immediately.
+        crate::ds::wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
     }
     if force_created > 0 {
         offset::bump_pending(
@@ -259,16 +318,19 @@ mod tests {
 
     #[test]
     fn claimed_state_bumps_unless_justid_and_starts_fresh_at_one() {
-        let st = claimed_state(4, false, false, b"c2", 1234);
+        let st = claimed_state(4, false, false, b"c2", 1234, 0);
         assert_eq!(st.consumer, b"c2".to_vec());
         assert_eq!(st.delivered_ms, 1234);
         assert_eq!(st.times_delivered, 5); // plain claim: 4 -> 5
                                            // JUSTID moves ownership only: count and delivery stay untouched.
-        let st = claimed_state(4, false, true, b"c2", 1234);
+        let st = claimed_state(4, false, true, b"c2", 1234, 0);
         assert_eq!(st.times_delivered, 4);
         assert_eq!(st.delivered_ms, 1234);
         // FORCE-created rows have no prior count: always 1, JUSTID or not.
-        assert_eq!(claimed_state(0, true, false, b"c2", 1).times_delivered, 1);
-        assert_eq!(claimed_state(0, true, true, b"c2", 1).times_delivered, 1);
+        assert_eq!(
+            claimed_state(0, true, false, b"c2", 1, 0).times_delivered,
+            1
+        );
+        assert_eq!(claimed_state(0, true, true, b"c2", 1, 0).times_delivered, 1);
     }
 }
