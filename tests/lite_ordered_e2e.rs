@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::lite::{call, open_shared, shared_at, text};
+use common::lite::{call, open_shared, pel_rows, shared_at, text};
 use rdb::conf;
 use rdb::state;
 
@@ -302,7 +302,116 @@ fn ordered_config_survives_a_restart() {
     assert!(text(&read_new(&shared, b"g", b"c2")) == "*-1\r\n");
 }
 
+#[test]
+fn ordered_setid_rewind_replays_under_ownership() {
+    let (shared, path) = shared_at("44316");
+    for i in 1..=3u8 {
+        call(
+            &shared,
+            "xadd",
+            &[
+                b"o/q0",
+                format!("1-{i}").as_bytes(),
+                b"f",
+                &[b'v', b'0' + i],
+            ],
+        );
+    }
+    // INFLIGHT 2 + COUNT 1 reads: one entry per read while the second
+    // window slot stays free. SETID rewinds the watermarks but frees
+    // NO window (only an ack does), so with strict serial (inflight 1)
+    // the full window would keep the owner parked out and the rewind
+    // could never replay anything.
+    call(
+        &shared,
+        "xgroup",
+        &[
+            b"create",
+            b"o/q0",
+            b"g",
+            b"0-0",
+            b"ordered",
+            b"inflight",
+            b"2",
+        ],
+    );
+    let r = text(&read_one(&shared, b"g", b"c1"));
+    assert!(r.contains("v1") && !r.contains("v2"), "{r}");
+    assert_eq!(
+        call(&shared, "xack", &[b"o/q0", b"g", b"1-1"]),
+        b":1\r\n".to_vec()
+    );
+    let r = text(&read_one(&shared, b"g", b"c1"));
+    assert!(r.contains("v2") && !r.contains("v3"), "{r}");
+    // SETID rewinds BOTH watermarks; the PEL and the queue ownership
+    // are untouched.
+    assert_eq!(
+        call(&shared, "xgroup", &[b"setid", b"o/q0", b"g", b"1-1"]),
+        b"+OK\r\n".to_vec()
+    );
+    let info = text(&call(&shared, "xinfo", &[b"groups", b"o/q0"]));
+    assert!(
+        info.contains("1-1") && info.contains("ordered"),
+        "watermarks rewound: {info}"
+    );
+    // Ownership NOT released by the rewind: c2 stays fenced out.
+    assert_eq!(read_one(&shared, b"g", b"c2"), b"*-1\r\n".to_vec());
+    // The owner replays from 1-1: the already-pending 1-2 row is
+    // re-OWNED (not re-counted) with its delivery count carried over
+    // and bumped.
+    let r = text(&read_one(&shared, b"g", b"c1"));
+    assert!(
+        r.contains("v2") && !r.contains("v3"),
+        "replay 1-2 only: {r}"
+    );
+    let rows = pel_rows(&call(
+        &shared,
+        "xpending",
+        &[b"o/q0", b"g", b"-", b"+", b"10"],
+    ));
+    let row12 = rows
+        .iter()
+        .find(|row| row[1] == "1-2")
+        .expect("1-2 still pending");
+    assert_eq!(row12[5], ":2", "times_delivered carried over + bumped");
+    // Ack the contiguous tail: the committed prefix advances to 1-3
+    // (1-3 was never delivered, but it sits beyond the watermark with
+    // no surviving pending row in between).
+    assert_eq!(
+        call(&shared, "xack", &[b"o/q0", b"g", b"1-2", b"1-3"]),
+        b":2\r\n".to_vec()
+    );
+    let info = text(&call(&shared, "xinfo", &[b"groups", b"o/q0"]));
+    assert!(info.contains("1-3"), "prefix committed: {info}");
+    // SETID persists the rewound group record in its own synchronous
+    // commit (and the ack above persisted the advanced watermark), so
+    // the restart assertion needs no flusher sleep: delivery resumes
+    // at committed 1-3 and the group is still ordered + exclusive.
+    drop(shared);
+    let conf = conf::Config {
+        bind: "127.0.0.1:44316".to_string(),
+        ..Default::default()
+    };
+    let shared = open_shared(&conf, &path);
+    assert_eq!(read_one(&shared, b"g", b"c1"), b"*-1\r\n".to_vec());
+    assert_eq!(read_one(&shared, b"g", b"c2"), b"*-1\r\n".to_vec());
+    call(&shared, "xadd", &[b"o/q0", b"2-1", b"f", b"v4"]);
+    assert!(text(&read_one(&shared, b"g", b"c1")).contains("v4"));
+    assert_eq!(read_one(&shared, b"g", b"c2"), b"*-1\r\n".to_vec());
+}
+
 // ---- helpers -------------------------------------------------------------
+
+/// `>` read capped at COUNT 1: one delivery per call.
+fn read_one(shared: &state::Shared, group: &[u8], consumer: &[u8]) -> Vec<u8> {
+    call(
+        shared,
+        "xreadgroup",
+        &[
+            b"group", group, consumer, b"count", b"1", b"streams", b"o/q0", b">",
+        ],
+    )
+}
 
 fn id_of(reply_text: &str) -> String {
     reply_text

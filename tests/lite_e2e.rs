@@ -361,6 +361,98 @@ async fn block_wakes_on_xadd_over_wire() {
     );
 }
 
+#[tokio::test]
+async fn ordered_block_wakes_on_xack_over_wire() {
+    // Contract: XACK frees the ordered in-flight window (PEL row gone)
+    // and a parked full-window `>` BLOCK reader must be served the next
+    // entry (1-2, already in the log -- no XADD will ever fire)
+    // promptly, not parked out its whole 15s BLOCK. xack notifies the
+    // stream's meta key for exactly this; the blocking loop also
+    // re-validates on its own, so this bounds the END-TO-END latency:
+    // if parking ever stops re-validating, dropping the notify fails
+    // the 5s bound fast instead of hanging the suite.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = std::env::temp_dir().join(format!("rdb-lite-xack-wake-{}", std::process::id()));
+        let mut node = spawn_node(&dir, 0, true, None);
+        // 30s spawn window (not 10s): see block_wakes_on_xadd_over_wire.
+        wait_resp_ready(&mut node, 30).await;
+        let t = common::TOKEN;
+        for (id, val) in [(&b"1-1"[..], &b"v1"[..]), (&b"1-2"[..], &b"v2"[..])] {
+            let r = cmd_one_shot(&node.resp, t, &[b"xadd", b"o/q0", id, b"f", val]).await;
+            assert!(contains_bytes(&r, id), "xadd {r:?}");
+        }
+        assert!(text(
+            &cmd_one_shot(
+                &node.resp,
+                t,
+                &[b"xgroup", b"create", b"o/q0", b"g", b"0-0", b"ordered"]
+            )
+            .await
+        )
+        .contains("OK"));
+        // Strict serial (inflight 1): the owner takes 1-1 and the
+        // window is now full (delivered-but-unacked). The delivery
+        // reply is a nested array: cmd_full_reply drains it whole
+        // (read_one resolves only line-shaped replies).
+        assert!(text(
+            &common::lite::cmd_full_reply(
+                &node.resp,
+                t,
+                &[
+                    b"xreadgroup",
+                    b"group",
+                    b"g",
+                    b"c1",
+                    b"streams",
+                    b"o/q0",
+                    b">"
+                ],
+                400
+            )
+            .await
+        )
+        .contains("v1"));
+        // The OWNER parks (a fenced non-owner would wait for a
+        // takeover instead): only its own ack can free the slot.
+        let mut parked = park_reader(
+            &node.resp,
+            t,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"g",
+                b"c1",
+                b"BLOCK",
+                b"15000",
+                b"STREAMS",
+                b"o/q0",
+                b">",
+            ],
+        )
+        .await;
+        let started = std::time::Instant::now();
+        // A separate connection acks 1-1: one PEL row gone, window
+        // freed. (read_one returns the int line without its CRLF.)
+        assert_eq!(
+            text(&cmd_one_shot(&node.resp, t, &[b"xack", b"o/q0", b"g", b"1-1"]).await),
+            ":1"
+        );
+        // The parked owner must be served 1-2 promptly after the ack,
+        // not parked out the full 15s BLOCK.
+        let r = read_until(&mut parked, b"v2", 5).await;
+        assert!(
+            contains_bytes(&r, b"1-2") && contains_bytes(&r, b"v2"),
+            "reply {r:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "served right after the ack, not parked out"
+        );
+    })
+    .await
+    .expect("ordered BLOCK reader never woken by XACK");
+}
+
 #[test]
 fn lite_metrics_series_exposed() {
     let (shared, _dir) = shared_at("43006");

@@ -9,7 +9,7 @@
 //! watermark (Lite semantics), not pending rows removed.
 
 use crate::command::Ctx;
-use crate::ds::latch;
+use crate::ds::{latch, wait};
 use crate::monitor;
 use crate::resp::codec as resp;
 
@@ -160,6 +160,13 @@ pub async fn xack(ctx: &mut Ctx<'_>) {
                     -(pend_hits.len() as i64),
                 );
             }
+            // An ack frees ordered in-flight window slots (PEL rows
+            // gone and/or the watermark advanced): a parked full-window
+            // `>` BLOCK reader must re-check now instead of sleeping
+            // out its whole budget. Every other window-affecting op
+            // (XADD / XCLAIM / XAUTOCLAIM / group ops) already
+            // notifies; a key with no waiter is a no-op.
+            wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
         }
         n
     } else {

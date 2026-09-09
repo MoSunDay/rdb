@@ -129,7 +129,8 @@ Lite Mode 条目。
   （`*-1`，BLOCK 读者重新 park），接管唤醒该流 meta 键下的等待者。
 - **INFLIGHT 是吞吐旋钮**：1（默认）= 严格串行（RocketMQ orderly 等价），
   >1 = Kafka 式预取流水线；窗口满（`inflight_max - pending ≤ 0`）同样空回，
-  ACK 腾位。`pending` 按 PEL **去重行数** 计（重投不重复计数）。
+  ACK 腾位并唤醒该流 meta 键下 park 的满窗读者。`pending` 按 PEL **去重行数**
+  计（重投不重复计数）。
 - 满窗口不靠 `>` 迁移（卡死工作走 P2 接管）；所有权随进程重启一并消失
   （重启本就断开所有连接，无跨进程僵尸）。XGROUP DESTROY/DELCONSUMER、
   FLUSHDB、流回收同步清理所有权。
