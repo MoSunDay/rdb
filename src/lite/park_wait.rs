@@ -19,7 +19,7 @@ use super::read::{StreamEntries, StreamSpec};
 const MAX_SLICE_MS: u64 = 86_400_000;
 
 /// One wake probe: where to park (the stream's meta key, notified by
-/// XADD and group ops alike) and what counts as "data landed" (an
+/// XADD, XACK and group ops alike) and what counts as "data landed" (an
 /// entry past `after`).
 pub(crate) struct ParkTarget {
     key: Vec<u8>,
@@ -57,9 +57,10 @@ fn unregister_all(ctx: &Ctx<'_>, keys: &[Vec<u8>], waiter: &Arc<Waiter>) {
 ///
 /// A SIGNALLED park that still finds no entries returns
 /// `Some(Ok(vec![]))` -- "woke, nothing new": the signal may come from
-/// a group op (DESTROY / SETID also notify the meta key), and the
-/// XREADGROUP caller must re-validate (NOGROUP, rewound watermarks)
-/// rather than sleep out its BLOCK. Plain XREAD re-parks.
+/// a group op or an XACK that freed the ordered delivery window
+/// (DESTROY / SETID also notify the meta key), and the XREADGROUP
+/// caller must re-validate (NOGROUP, rewound watermarks, a freed
+/// window) rather than sleep out its BLOCK. Plain XREAD re-parks.
 pub(crate) async fn wait_targets(
     ctx: &mut Ctx<'_>,
     targets: &[ParkTarget],
