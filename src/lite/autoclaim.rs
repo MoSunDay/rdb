@@ -79,6 +79,36 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
         Err(e) => return resp::append_error(ctx.out, &format!("ERR: xautoclaim failed: {e}")),
     };
     let now = expire::now_ms();
+    // Ordered groups: queue-granularity takeover -- only the PEL HEAD is
+    // claimable (deeper rows stay with the owner until the new owner
+    // works down to them). A successful head claim flips ownership and
+    // bumps the fencing epoch; an empty result leaves ownership alone.
+    let ordered = super::offset::load(
+        &ctx.shared.lite.offsets,
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        &group,
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|st| st.ordered);
+    let head = if ordered {
+        pel::scan_pend(
+            &ctx.shared.store,
+            &prefix,
+            &stream,
+            &group,
+            model::MIN_ID,
+            Some(1),
+        )
+        .ok()
+        .and_then(|rs| rs.into_iter().next())
+        .map(|row| row.id)
+    } else {
+        None
+    };
+    let mut epoch = 0u64;
     let mut batch = rocksdb::WriteBatch::default();
     register_consumer(ctx, &mut batch, &prefix, &stream, &group, &consumer, now);
     let budget = count.saturating_mul(SCAN_BUDGET_FACTOR);
@@ -94,6 +124,14 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
         }
         scanned += 1;
         last_scanned = Some(row.id);
+        if ordered && Some(row.id) != head {
+            // Beyond the (idle-gated) head: not claimable in ordered
+            // mode; keep scanning so the cursor still advances.
+            if claimed > 0 {
+                break; // head claimed: stop right there
+            }
+            continue;
+        }
         if now.saturating_sub(row.state.delivered_ms) < min_idle {
             continue; // not idle enough: keeps waiting with its owner
         }
@@ -106,6 +144,17 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
                 deleted.push(row.id);
             }
             Ok(Some(fields)) => {
+                if ordered && epoch == 0 {
+                    // A successful head claim takes the queue: bump the
+                    // fencing epoch over the deposed owner.
+                    epoch = super::ordered::force_takeover(
+                        &ctx.shared.lite.owners,
+                        &stream,
+                        &group,
+                        &consumer,
+                        now,
+                    );
+                }
                 batch.put(
                     pel::pend_key(&prefix, &stream, &group, row.id),
                     pel::encode_pend(&claimed_state(
@@ -114,6 +163,7 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
                         justid,
                         &consumer,
                         now,
+                        epoch,
                     )),
                 );
                 if justid {
@@ -127,6 +177,11 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
     }
     if let Err(e) = ctx.commit(batch).await {
         return resp::append_error(ctx.out, &format!("ERR: xautoclaim failed: {e}"));
+    }
+    if ordered && epoch > 0 {
+        // Takeover happened: wake blocked readers (the fenced former
+        // owner and any contender) to re-check immediately.
+        crate::ds::wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
     }
     // Redis >= 7 shape: [next-cursor, claimed entries (or ids), deleted ids].
     // The cursor is the SUCCESSOR of the last scanned row: scanning is

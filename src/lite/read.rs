@@ -425,7 +425,49 @@ async fn deliver_new(
         let Some(st) = group_state(ctx, s, group) else {
             return Err(DeliverErr::NoGroup(s.stream.clone()));
         };
-        let v = entries::scan_entries(&ctx.shared.store, &s.prefix, &s.stream, st.delivered, count)
+        // Ordered groups: queue-exclusive ownership + in-flight cap.
+        // The cap is the throughput knob -- 1 (default) is strict
+        // serial (RocketMQ-orderly equivalent), a larger window is a
+        // Kafka-style prefetch pipeline; a fenced-out or window-full
+        // queue simply delivers nothing this round (a blocked reader
+        // re-parks and retries on the next wake -- takeovers notify
+        // the stream's meta key).
+        let mut cap = count;
+        let mut epoch = 0u64;
+        if st.ordered {
+            let window = st.inflight_max.saturating_sub(st.pending);
+            if window == 0 {
+                continue; // in-flight window full: acks free slots
+            }
+            match super::ordered::acquire(
+                &ctx.shared.lite.owners,
+                &s.stream,
+                group,
+                consumer,
+                now_ms,
+                ctx.shared.lite.lease_ms(),
+            ) {
+                super::ordered::Access::Own {
+                    epoch: live,
+                    took_over,
+                } => {
+                    epoch = live;
+                    if took_over {
+                        // Ownership changed hands (or was freshly taken):
+                        // wake parked contenders so a blocked would-be
+                        // owner re-checks instead of sleeping out its
+                        // BLOCK budget.
+                        crate::ds::wait::notify(
+                            &ctx.shared.wait_hub,
+                            &model::meta_key(&s.prefix, &s.stream),
+                        );
+                    }
+                    cap = (window as usize).min(count);
+                }
+                super::ordered::Access::Busy { .. } => continue, // fenced out
+            }
+        }
+        let v = entries::scan_entries(&ctx.shared.store, &s.prefix, &s.stream, st.delivered, cap)
             .map_err(DeliverErr::Store)?;
         if v.is_empty() {
             continue;
@@ -472,6 +514,7 @@ async fn deliver_new(
                     consumer: consumer.to_vec(),
                     delivered_ms: now_ms,
                     times_delivered: times,
+                    epoch,
                 }),
             );
         }

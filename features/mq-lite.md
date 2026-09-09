@@ -105,8 +105,44 @@ Lite Mode 条目。
 - `rdb_lite_backlog` gauge：各组缓存 pending 计数之和；首次加载组时从盘上重算。
 - bench 新增工况：`xadd` / `xreadgroup` / `xack`。
 
+## 有序消费组与 Kafka 校准语义（P0/P1/P2）
+
+对齐 Kafka 语义模型的三件套：**P1 提交语义**、**P0 顺序消费**、**P2 有序接管**
+（P3 同 key 同队列 = `XPICK ... pick_hash`，本批已落地，不在本批变更）。
+
+### P1：提交水位 = Kafka committed offset（连续前缀提交）
+- `XACK` 后组已提交水位（kind-0x0E 记录）只在 **被 ACK 的连续前缀** 上推进：
+  候选 = `head_after_ack`（从 `succ(committed)` 起 PEL 首条幸存 pending 行以下的
+  最大已 ACK id）；跨洞 ACK 不推进水位。
+- 越过空隙的 ACK id **不记忆**：其 PEL 行仍随 `XACK` 删除，但水位冻结在幸存
+  pending 行以下；重启/回卷到已提交水位后**按日志重投**这些条目
+  （at-least-once，宁可重复、绝不丢失）。`XACK` 回复计数仍按越过旧水位的 id 计。
+- 组记录只在水位实际推进时同步落盘（未推进的 ACK 只删 PEL 行）；重启回卷到
+  已提交水位，重投未提交尾部。
+
+### P0：有序消费组（队列独占所有权 + 有序投递）
+- `XGROUP CREATE ... ORDERED [INFLIGHT <n>]`（rdb 扩展；INFLIGHT 依赖 ORDERED，
+  有序组最小归一为 1）：组内队列同一时刻**至多一个消费者持有**。
+- 所有权为**内存态租约**（默认 30s，无协调者，测试钩子
+  `shared.lite.set_lease_ms`）：`XREADGROUP ... >` 即申领；租约空闲过期后下个
+  申领者接管并 **epoch 递增**——被废黜/被隔离消费者的 `>` 读一律空回
+  （`*-1`，BLOCK 读者重新 park），接管唤醒该流 meta 键下的等待者。
+- **INFLIGHT 是吞吐旋钮**：1（默认）= 严格串行（RocketMQ orderly 等价），
+  >1 = Kafka 式预取流水线；窗口满（`inflight_max - pending ≤ 0`）同样空回，
+  ACK 腾位。`pending` 按 PEL **去重行数** 计（重投不重复计数）。
+- 满窗口不靠 `>` 迁移（卡死工作走 P2 接管）；所有权随进程重启一并消失
+  （重启本就断开所有连接，无跨进程僵尸）。XGROUP DESTROY/DELCONSUMER、
+  FLUSHDB、流回收同步清理所有权。
+
+### P2：有序接管只认 PEL 头
+- ORDERED 组的 `XCLAIM`/`XAUTOCLAIM` **只从 PEL 头**（最小 pending id）转移
+  所有权：min-idle 预检失败的 claim **不翻转所有权**；FORCE 越过头被抑制
+  （头仍然赢）；XAUTOCLAIM 单轮最多认领头一行。成功接管后 epoch 递增并唤醒
+  等待者；PEL 行携带所属 epoch（可观测性）。
+
 ## 关联
 - 实现：[agents/rust](../agents/rust/index.md)（`lite/` 模块族）
 - 偏差总表：[COMPAT.md](../COMPAT.md)
 - 首次落地：[changelog 2026-08-17 lite-mode](./changelog/2026-08-17/lite-mode.md)
-- 本批落地：[changelog 2026-08-21](./changelog/2026-08-21/mq-lite-engine-and-kafka-decision.md)
+- 引擎补齐：[changelog 2026-08-21](./changelog/2026-08-21/mq-lite-engine-and-kafka-decision.md)
+- 本批落地：[changelog 2026-09-09](./changelog/2026-09-09/mq-ordered-groups.md)

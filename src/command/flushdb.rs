@@ -41,6 +41,7 @@ pub async fn flushdb(ctx: &mut Ctx<'_>) {
     // resurrect an orphan group record on the wiped keyspace (the cache
     // is read-through; dropping it only costs a reload on next use).
     crate::lite::offset::clear_all(&ctx.shared.lite.offsets);
+    crate::lite::ordered::clear(&ctx.shared.lite.owners);
     let mut cursor: Vec<u8> = Vec::new();
     loop {
         let mut chunk: Vec<Vec<u8>> = Vec::with_capacity(FLUSH_PAGE);
@@ -82,6 +83,7 @@ pub async fn flushdb(ctx: &mut Ctx<'_>) {
     // those marks describe streams whose records the wipe just deleted,
     // so the next flush round must not write them back.
     crate::lite::offset::clear_all(&ctx.shared.lite.offsets);
+    crate::lite::ordered::clear(&ctx.shared.lite.owners);
     drop(guards);
     append_string(ctx.out, "OK");
 }

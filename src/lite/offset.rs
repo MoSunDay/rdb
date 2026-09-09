@@ -29,6 +29,12 @@ pub struct GroupState {
     /// first load after a restart, then maintained by delivery (+n),
     /// XACK (-n) and XGROUP DELCONSUMER (-k) deltas.
     pub pending: u64,
+    /// Ordered-group flag (queue-exclusive ownership + in-flight cap);
+    /// persisted in the GroupPayload so it survives restarts.
+    pub ordered: bool,
+    /// Per-queue unacked-entry cap; normalized to >= 1 for ordered
+    /// groups (0 only on unordered ones).
+    pub inflight_max: u64,
 }
 
 /// Cache keys are RAW BYTES `(stream, group)`, never lossy-decoded
@@ -93,6 +99,8 @@ pub fn load(
             seq: p.committed_seq,
         },
         pending,
+        ordered: p.ordered,
+        inflight_max: super::model::normalize_inflight(p.ordered, p.inflight_max),
     };
     write.map.insert(key, st);
     Ok(Some(st))
@@ -119,21 +127,52 @@ pub fn advance_delivered(cache: &OffsetCache, stream: &[u8], group: &[u8], id: E
     }
 }
 
-/// XACK: `committed = max(committed, max id)`; returns how many of `ids`
-/// were beyond the old watermark (the "newly acked" count).
-pub fn ack(cache: &OffsetCache, stream: &[u8], group: &[u8], ids: &[EntryId]) -> Option<usize> {
+/// XACK, Kafka committed-offset semantics: the committed watermark is a
+/// POSITION that only ever advances over a CONTIGUOUS acked prefix.
+/// `head_after` is the first pending row that survives this ack beyond
+/// the old watermark (None = no survivor up to the max acked id,
+/// computed by `pel::head_after_ack` under the stream latch); the
+/// watermark stops right below it, so a restart can never resume PAST
+/// an unacked entry (the old `max(committed, id)` skip-commit could
+/// lose delivered-but-unacked messages). Ids acked beyond a gap still
+/// count in the reply and stay acked on the PEL side -- the tail is
+/// redelivered later (at-least-once duplicates, never loss). Returns
+/// how many of `ids` were beyond the old watermark.
+pub fn ack(
+    cache: &OffsetCache,
+    stream: &[u8],
+    group: &[u8],
+    ids: &[EntryId],
+    head_after: Option<EntryId>,
+) -> Option<usize> {
     let mut write = cache.inner.write().unwrap();
     let key = (stream.to_vec(), group.to_vec());
     let st = write.map.get_mut(&key)?;
     let old = st.committed;
     let mut count = 0usize;
     for id in ids {
-        if *id > st.committed {
-            st.committed = *id;
-        }
         if *id > old {
             count += 1;
         }
+    }
+    // Contiguous-prefix candidate: the largest acked id with no
+    // surviving pending row between the old watermark and itself.
+    let max_acked = ids.iter().max().copied().unwrap_or(old);
+    let candidate = match head_after {
+        None => max_acked,
+        // Ids at/after the gap head cannot advance the position; ids
+        // strictly below it are contiguous by construction (the head
+        // IS the first survivor).
+        Some(h) => ids
+            .iter()
+            .copied()
+            .filter(|id| *id < h)
+            .max()
+            .unwrap_or(old),
+    }
+    .max(old);
+    if candidate > st.committed {
+        st.committed = candidate;
     }
     if st.committed > old {
         if st.committed > st.delivered {
@@ -264,6 +303,8 @@ pub fn build_flush_batch(dirty: &DirtySnapshot) -> Option<WriteBatch> {
             delivered_seq: st.delivered.seq,
             committed_ms: st.committed.ms,
             committed_seq: st.committed.seq,
+            ordered: st.ordered,
+            inflight_max: st.inflight_max,
         };
         batch.put(
             model::group_key(&prefix, stream, group),
@@ -277,21 +318,29 @@ pub fn build_flush_batch(dirty: &DirtySnapshot) -> Option<WriteBatch> {
 mod tests {
     use super::*;
 
+    fn st(committed_ms: u64) -> GroupState {
+        GroupState {
+            created_ms: 1,
+            delivered: EntryId {
+                ms: committed_ms,
+                seq: 0,
+            },
+            committed: EntryId {
+                ms: committed_ms,
+                seq: 0,
+            },
+            pending: 0,
+            ordered: false,
+            inflight_max: 0,
+        }
+    }
+
     #[test]
     fn ack_counts_and_clamps() {
         let c = new_cache();
-        insert_new(
-            &c,
-            b"t/q0",
-            b"g",
-            GroupState {
-                created_ms: 1,
-                delivered: EntryId { ms: 10, seq: 0 },
-                committed: EntryId { ms: 10, seq: 0 },
-                pending: 0,
-            },
-        );
-        // in-order acks: 2 of 3 beyond the watermark
+        insert_new(&c, b"t/q0", b"g", st(10));
+        // in-order acks (no surviving pending row): 2 of 3 beyond the
+        // watermark, committed advances to the max acked id.
         assert_eq!(
             ack(
                 &c,
@@ -301,13 +350,14 @@ mod tests {
                     EntryId { ms: 11, seq: 0 },
                     EntryId { ms: 12, seq: 0 },
                     EntryId { ms: 9, seq: 9 }
-                ]
+                ],
+                None
             ),
             Some(2)
         );
         // re-ack of old ids counts nothing
         assert_eq!(
-            ack(&c, b"t/q0", b"g", &[EntryId { ms: 11, seq: 0 }]),
+            ack(&c, b"t/q0", b"g", &[EntryId { ms: 11, seq: 0 }], None),
             Some(0)
         );
         assert_eq!(dirty_len(&c), 1);
@@ -317,53 +367,91 @@ mod tests {
         assert_eq!(dirty_len(&c), 0);
         // unknown group: no crash, None
         assert_eq!(
-            ack(&c, b"t/q0", b"nope", &[EntryId { ms: 1, seq: 0 }]),
+            ack(&c, b"t/q0", b"nope", &[EntryId { ms: 1, seq: 0 }], None),
             None
         );
     }
 
     #[test]
-    fn set_position_and_remove() {
+    fn ack_stops_at_the_first_surviving_pending_row() {
         let c = new_cache();
-        insert_new(
-            &c,
-            b"t/q0",
-            b"g",
-            GroupState {
-                created_ms: 1,
-                delivered: EntryId { ms: 50, seq: 0 },
-                committed: EntryId { ms: 40, seq: 0 },
-                pending: 0,
-            },
+        insert_new(&c, b"t/q0", b"g", st(10));
+        // Out-of-order ack: 12-0 acked while 11-0 stays pending. The
+        // reply still counts it, but the watermark must NOT skip the
+        // gap -- Kafka committed-offset semantics (a skip would make a
+        // restart resume past an unacked message: silent loss).
+        assert_eq!(
+            ack(
+                &c,
+                b"t/q0",
+                b"g",
+                &[EntryId { ms: 12, seq: 0 }],
+                Some(EntryId { ms: 11, seq: 0 })
+            ),
+            Some(1)
         );
-        set_position(&c, b"t/q0", b"g", EntryId { ms: 5, seq: 5 });
-        assert_eq!(dirty_len(&c), 1);
-        let b = build_flush_batch(&flush_dirty(&c)).unwrap();
-        assert!(!b.is_empty());
-        remove_stream(&c, b"t/q0");
-        assert_eq!(dirty_len(&c), 0);
-        assert_eq!(ack(&c, b"t/q0", b"g", &[EntryId { ms: 9, seq: 0 }]), None);
+        assert!(
+            flush_dirty(&c).is_empty(),
+            "the gap froze the position: nothing new to persist"
+        );
+        // Gap closes: 11-0 acked, next survivor is 13-0. The position
+        // moves to the contiguous prefix max -- 11-0. The earlier acked
+        // 12-0 is NOT remembered (no acked-set state): it lies in the
+        // redelivered tail, at-least-once duplicates by contract.
+        assert_eq!(
+            ack(
+                &c,
+                b"t/q0",
+                b"g",
+                &[EntryId { ms: 11, seq: 0 }],
+                Some(EntryId { ms: 13, seq: 0 })
+            ),
+            Some(1)
+        );
+        assert_eq!(flush_dirty(&c)[0].1.committed, EntryId { ms: 11, seq: 0 });
+        // All acked below the max acked id: position = max acked.
+        assert_eq!(
+            ack(&c, b"t/q0", b"g", &[EntryId { ms: 14, seq: 0 }], None),
+            Some(1)
+        );
+        assert_eq!(flush_dirty(&c)[0].1.committed, EntryId { ms: 14, seq: 0 });
+        // A gap with NO acked id below it moves nothing (the ack still
+        // counts -- the id IS acked on the PEL side, just not committed).
+        assert_eq!(
+            ack(
+                &c,
+                b"t/q0",
+                b"g",
+                &[EntryId { ms: 20, seq: 0 }],
+                Some(EntryId { ms: 15, seq: 0 })
+            ),
+            Some(1)
+        );
+        assert!(flush_dirty(&c).is_empty());
     }
 
     #[test]
-    fn drop_superseded_keeps_only_current_snapshots() {
+    fn set_position_and_remove() {
         let c = new_cache();
-        insert_new(
-            &c,
-            b"t/q0",
-            b"g",
-            GroupState {
-                created_ms: 1,
-                delivered: EntryId { ms: 10, seq: 0 },
-                committed: EntryId { ms: 10, seq: 0 },
-                pending: 0,
-            },
-        );
-        // Flush round A snapshots committed=20; a newer ack (committed=30)
-        // lands BEFORE A's write: A's stale snapshot must be dropped.
-        ack(&c, b"t/q0", b"g", &[EntryId { ms: 20, seq: 0 }]).unwrap();
+        insert_new(&c, b"t/q0", b"g", st(10));
+        set_position(&c, b"t/q0", b"g", EntryId { ms: 5, seq: 5 });
+        assert_eq!(dirty_len(&c), 1);
+        // A rewind re-dirties the entry (delivered moves back with it).
+        let flushed = flush_dirty(&c);
+        assert_eq!(flushed[0].1.delivered, EntryId { ms: 5, seq: 5 });
+        remove_stream(&c, b"t/q0");
+        assert_eq!(dirty_len(&c), 0);
+    }
+
+    #[test]
+    fn drop_superseded_keeps_current_states_only() {
+        let c = new_cache();
+        insert_new(&c, b"t/q0", b"g", st(10));
+        // Flush round A snapshots committed=20; a NEWER ack lands
+        // BEFORE A's write: A's stale snapshot must be dropped.
+        ack(&c, b"t/q0", b"g", &[EntryId { ms: 20, seq: 0 }], None).unwrap();
         let round_a = flush_dirty(&c);
-        ack(&c, b"t/q0", b"g", &[EntryId { ms: 30, seq: 0 }]).unwrap();
+        ack(&c, b"t/q0", b"g", &[EntryId { ms: 30, seq: 0 }], None).unwrap();
         assert!(drop_superseded(&c, round_a).is_empty(), "superseded");
         assert_eq!(dirty_len(&c), 1, "the newer state stays dirty");
         // Round B (committed=30) is still current: it survives and keeps
@@ -373,7 +461,7 @@ mod tests {
         assert_eq!(round_b[0].1.committed, EntryId { ms: 30, seq: 0 });
         // A group removed between snapshot and write is also dropped:
         // writing it would resurrect a deleted group record.
-        ack(&c, b"t/q0", b"g", &[EntryId { ms: 40, seq: 0 }]).unwrap();
+        ack(&c, b"t/q0", b"g", &[EntryId { ms: 40, seq: 0 }], None).unwrap();
         let round_c = flush_dirty(&c);
         remove_stream(&c, b"t/q0");
         assert!(drop_superseded(&c, round_c).is_empty(), "removed group");
@@ -382,20 +470,10 @@ mod tests {
     #[test]
     fn dirty_keys_peek_does_not_drain() {
         let c = new_cache();
-        insert_new(
-            &c,
-            b"t/q0",
-            b"g",
-            GroupState {
-                created_ms: 1,
-                delivered: EntryId { ms: 10, seq: 0 },
-                committed: EntryId { ms: 10, seq: 0 },
-                pending: 0,
-            },
-        );
+        insert_new(&c, b"t/q0", b"g", st(10));
         // Nothing dirty yet: the peek is empty.
         assert!(dirty_keys(&c).is_empty());
-        ack(&c, b"t/q0", b"g", &[EntryId { ms: 20, seq: 0 }]).unwrap();
+        ack(&c, b"t/q0", b"g", &[EntryId { ms: 20, seq: 0 }], None).unwrap();
         // Peek lists the dirty (stream, group) pair without draining --
         // the flush round derives its latch keys from this snapshot.
         assert_eq!(dirty_keys(&c), vec![(b"t/q0".to_vec(), b"g".to_vec())]);
