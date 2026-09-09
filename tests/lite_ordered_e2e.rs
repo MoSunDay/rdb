@@ -15,6 +15,8 @@ mod common;
 use common::lite::{call, open_shared, pel_rows, shared_at, text};
 use rdb::conf;
 use rdb::state;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn read_new(shared: &state::Shared, group: &[u8], consumer: &[u8]) -> Vec<u8> {
     call(
@@ -398,6 +400,115 @@ fn ordered_setid_rewind_replays_under_ownership() {
     call(&shared, "xadd", &[b"o/q0", b"2-1", b"f", b"v4"]);
     assert!(text(&read_one(&shared, b"g", b"c1")).contains("v4"));
     assert_eq!(read_one(&shared, b"g", b"c2"), b"*-1\r\n".to_vec());
+}
+
+// ---- gated BLOCK parking (full window / fenced reader) -----------------
+
+/// A full-window owner parked on BLOCK must truly PARK, not spin on
+/// the backlog probe: no reply until the ack frees the window (only
+/// then can `>` deliver), and the XACK's meta-key notify -- not a
+/// timeout -- is what wakes it. Pre-fix, this reader busy-spun its
+/// whole budget and the XACK notify was dead code on this path.
+#[test]
+fn full_window_block_reader_wakes_on_ack() {
+    let (s, _dir) = shared_at("44317");
+    let shared = Arc::new(s);
+    call(&shared, "xadd", &[b"o/q0", b"1-1", b"f", b"v1"]);
+    call(&shared, "xadd", &[b"o/q0", b"1-2", b"f", b"v2"]);
+    call(
+        &shared,
+        "xgroup",
+        &[b"create", b"o/q0", b"g", b"0-0", b"ordered"],
+    );
+    // Strict serial: c1 owns the queue and its window is now FULL
+    // (1-1 delivered, unacked).
+    assert!(text(&read_one(&shared, b"g", b"c1")).contains("v1"));
+    // The owner parks on a dedicated thread: `call` blocks inside its
+    // own current-thread runtime and the park pool thread wakes it
+    // (parking is Condvar-based -- no tokio timer is involved).
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let parked = Arc::clone(&shared);
+    let t0 = Instant::now();
+    let reader = std::thread::spawn(move || {
+        let _ = tx.send(call(
+            &parked,
+            "xreadgroup",
+            &[
+                b"group", b"g", b"c1", b"block", b"20000", b"streams", b"o/q0", b">",
+            ],
+        ));
+    });
+    // 300ms in, still parked: the window is full and nothing but the
+    // ack below can free it, so an early reply is a semantics break.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        rx.try_recv().is_err(),
+        "full-window BLOCK must not reply early"
+    );
+    assert_eq!(
+        call(&shared, "xack", &[b"o/q0", b"g", b"1-1"]),
+        b":1\r\n".to_vec()
+    );
+    let reply = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("parked reader wakes on the ack's meta-key notify");
+    let r = text(&reply);
+    assert!(r.contains("v2"), "next entry delivered after the ack: {r}");
+    // A parked reader that missed the notify would sleep out all 20s;
+    // 5s is already generous for the whole round trip (the pre-fix
+    // spin also replied right at the ack -- the try_recv above plus
+    // this bound pin the parking contract from both sides).
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    reader.join().expect("reader thread");
+}
+
+/// A fenced reader parked on BLOCK must retry its takeover at LEASE
+/// granularity: lease expiry is passive (no XADD, nothing pending to
+/// ack, no group op -- no signal ever fires for it), so the only
+/// possible wake is the reader's own lease-capped park slice. Without
+/// the slice cap a parked fenced reader sleeps out its whole budget.
+#[test]
+fn fenced_block_reader_takes_over_on_lease_expiry() {
+    let (s, _dir) = shared_at("44318");
+    let shared = Arc::new(s);
+    shared.lite.set_lease_ms(150);
+    call(&shared, "xadd", &[b"o/q0", b"1-1", b"f", b"v1"]);
+    call(&shared, "xadd", &[b"o/q0", b"1-2", b"f", b"v2"]);
+    call(
+        &shared,
+        "xgroup",
+        &[b"create", b"o/q0", b"g", b"0-0", b"ordered"],
+    );
+    // c1 owns the queue; the ack frees the window but only DELIVERY
+    // refreshes a lease, so c1 stays owner with a fresh 150ms lease.
+    assert!(text(&read_one(&shared, b"g", b"c1")).contains("v1"));
+    assert_eq!(
+        call(&shared, "xack", &[b"o/q0", b"g", b"1-1"]),
+        b":1\r\n".to_vec()
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let parked = Arc::clone(&shared);
+    let reader = std::thread::spawn(move || {
+        let _ = tx.send(call(
+            &parked,
+            "xreadgroup",
+            &[
+                b"group", b"g", b"c2", b"block", b"20000", b"streams", b"o/q0", b">",
+            ],
+        ));
+    });
+    // NOTHING further happens on this side: no append, no pending row
+    // to ack, no group op. c2 is fenced out with the window OPEN, so
+    // only its own lease-granular slice can hand it the queue.
+    let reply = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("fenced reader retries takeover at lease granularity");
+    let r = text(&reply);
+    assert!(r.contains("v2"), "c2 took over and delivered the tail: {r}");
+    // The takeover is observable: c2 is the live owner now.
+    let info = text(&call(&shared, "xinfo", &[b"groups", b"o/q0"]));
+    assert!(info.contains("c2"), "ownership migrated to c2: {info}");
+    reader.join().expect("reader thread");
 }
 
 // ---- helpers -------------------------------------------------------------

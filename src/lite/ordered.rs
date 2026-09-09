@@ -52,6 +52,15 @@ pub enum Access {
     Busy { epoch: u64 },
 }
 
+/// Whether an ownership lease is still fresh at `now_ms`. Shared by
+/// [`acquire`] (the real takeover decision) and read-only probes so a
+/// probe can never disagree with the takeover arithmetic -- a fenced
+/// reader parking past an expiry it should have taken (or retrying one
+/// it cannot) would both be liveness bugs.
+pub fn lease_live(owner_active_ms: u64, now_ms: u64, lease_ms: u64) -> bool {
+    now_ms.saturating_sub(owner_active_ms) < lease_ms
+}
+
 /// Try to (re)acquire the queue for `consumer`. Free queues and expired
 /// leases are taken immediately (idle migration); a fresh foreign lease
 /// is respected (`Busy`).
@@ -90,7 +99,7 @@ pub fn acquire(
                 took_over: false,
             }
         }
-        Some(o) if now_ms.saturating_sub(o.active_ms) >= lease_ms => {
+        Some(o) if !lease_live(o.active_ms, now_ms, lease_ms) => {
             let epoch = o.epoch + 1;
             map.insert(
                 key,
@@ -215,6 +224,27 @@ pub fn peek(
         .cloned()
 }
 
+/// Read-only counterpart of [`acquire`] for probes (the blocking-read
+/// gate): could `consumer` take the queue RIGHT NOW -- free, already
+/// owned, or the holder's lease expired? Never mutates: unlike acquire
+/// it neither grants nor refreshes a lease, so polling it from park
+/// re-checks is side-effect free and safe to repeat.
+pub fn ownership_open(
+    owners: &std::sync::Mutex<HashMap<OwnerKey, Owner>>,
+    stream: &[u8],
+    group: &[u8],
+    consumer: &[u8],
+    now_ms: u64,
+    lease_ms: u64,
+) -> bool {
+    match peek(owners, stream, group) {
+        // Never acquired (or released): the next asker takes it.
+        None => true,
+        Some(o) if o.consumer == consumer => true,
+        Some(o) => !lease_live(o.active_ms, now_ms, lease_ms),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +308,44 @@ mod tests {
         assert_eq!(force_takeover(&m, b"t/q0", b"g", b"c1", 150), 1);
         assert_eq!(force_takeover(&m, b"t/q0", b"g", b"c2", 200), 2);
         assert_eq!(peek(&m, b"t/q0", b"g").unwrap().consumer, b"c2".to_vec());
+    }
+
+    #[test]
+    fn ownership_open_mirrors_acquire_without_side_effects() {
+        let m = owners();
+        acquire(&m, b"t/q0", b"g", b"c1", 100, 30_000);
+        // Free queues and self-ownership read open to the probe.
+        assert!(ownership_open(&m, b"t/free", b"g", b"c1", 100, 30_000));
+        assert!(ownership_open(&m, b"t/q0", b"g", b"c1", 100, 30_000));
+        // A fresh foreign lease is closed.
+        assert!(!ownership_open(&m, b"t/q0", b"g", b"c2", 100, 30_000));
+        // The expiry boundary agrees with acquire bit-for-bit: one ms
+        // before the lease it stays closed, exactly AT it both the
+        // probe opens and the takeover succeeds.
+        assert!(!ownership_open(
+            &m,
+            b"t/q0",
+            b"g",
+            b"c2",
+            100 + 30_000 - 1,
+            30_000
+        ));
+        assert!(ownership_open(
+            &m,
+            b"t/q0",
+            b"g",
+            b"c2",
+            100 + 30_000,
+            30_000
+        ));
+        // Probing never refreshed the lease: the takeover still lands.
+        assert_eq!(
+            acquire(&m, b"t/q0", b"g", b"c2", 100 + 30_000, 30_000),
+            Access::Own {
+                epoch: 2,
+                took_over: true
+            }
+        );
     }
 
     #[test]

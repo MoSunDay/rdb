@@ -16,9 +16,11 @@ use crate::store::ops;
 use super::entries::{self, Entry};
 use super::model::{self, EntryId, MetaRead};
 use super::offset;
+use super::ordered;
 use super::park_wait::{park_target, remaining_ms, wait_targets, ParkTarget};
 use super::pel;
 use crate::monitor;
+use crate::state;
 
 struct ReadOpts {
     count: usize,
@@ -211,14 +213,14 @@ pub async fn xread(ctx: &mut Ctx<'_>) {
             };
             let targets: Vec<ParkTarget> = specs
                 .iter()
-                .map(|s| park_target(s, spec_after(s), opts.count))
+                .map(|s| park_target(s, spec_after(s), opts.count, false))
                 .collect();
             loop {
                 let Some(budget) = remaining_ms(end, ms) else {
                     nil_array(ctx.out);
                     break;
                 };
-                match wait_targets(ctx, &targets, budget).await {
+                match wait_targets(ctx, &targets, budget, &never_gated).await {
                     None => {
                         nil_array(ctx.out);
                         break;
@@ -300,6 +302,56 @@ fn group_state(ctx: &Ctx<'_>, s: &StreamSpec, group: &[u8]) -> Option<offset::Gr
     offset::load(cache, &ctx.shared.store, &s.prefix, &s.stream, group)
         .ok()
         .flatten()
+}
+
+/// Read-side gate for ORDERED `>` streams: could this consumer deliver
+/// right now? Mirrors deliver_new's door -- in-flight window > 0 AND
+/// ownership acquirable -- WITHOUT any of its side effects (no latch,
+/// no acquire, no delivery), so a blocked reader can PARK on the closed
+/// gate instead of spinning against it. `true` = gate closed: the
+/// window is full or another consumer holds a fresh ownership lease.
+fn ordered_gate_closed(
+    shared: &state::Shared,
+    s: &StreamSpec,
+    group: &[u8],
+    consumer: &[u8],
+    st: &offset::GroupState,
+) -> bool {
+    if !st.ordered {
+        return false;
+    }
+    // Same window arithmetic as deliver_new: pending counts live PEL
+    // rows, acks free slots.
+    if st.inflight_max.saturating_sub(st.pending) == 0 {
+        return true;
+    }
+    !ordered::ownership_open(
+        &shared.lite.owners,
+        &s.stream,
+        group,
+        consumer,
+        crate::ds::expire::now_ms(),
+        shared.lite.lease_ms(),
+    )
+}
+
+/// Cheap gate re-check for parked readers (runs after every waiter
+/// registration): cached offset state and the owner map ONLY -- no
+/// store IO, no latches -- so it never stalls the park loop. A missing
+/// cache entry (the group was evicted by a reap/DESTROY) reads OPEN:
+/// the loop head then re-validates the group authoritatively instead
+/// of parking on a group that may be gone.
+fn gate_open_cached(shared: &state::Shared, s: &StreamSpec, group: &[u8], consumer: &[u8]) -> bool {
+    match offset::peek_cached(&shared.lite.offsets, &s.stream, group) {
+        None => true,
+        Some(st) => !ordered_gate_closed(shared, s, group, consumer, &st),
+    }
+}
+
+/// Plain XREAD's park re-check: no group, no window, no owner -- its
+/// targets are never gated, so the probe can never open.
+fn never_gated(_: &StreamSpec) -> bool {
+    false
 }
 
 /// Per-stream id of an XREADGROUP STREAMS list: `>` (new deliveries)
@@ -429,9 +481,13 @@ async fn deliver_new(
         // The cap is the throughput knob -- 1 (default) is strict
         // serial (RocketMQ-orderly equivalent), a larger window is a
         // Kafka-style prefetch pipeline; a fenced-out or window-full
-        // queue simply delivers nothing this round (a blocked reader
-        // re-parks and retries on the next wake -- takeovers notify
-        // the stream's meta key).
+        // queue simply delivers nothing this round. A blocked reader
+        // PARKS on that closed gate instead of spinning: such streams
+        // park as gated targets woken by the stream's meta-key signals
+        // (XADD / XACK / takeover / SETID / DESTROY) plus
+        // lease-granular slices -- lease expiry never notifies -- and
+        // re-probe the gate after every registration (see
+        // ordered_gate_closed / park_wait).
         let mut cap = count;
         let mut epoch = 0u64;
         if st.ordered {
@@ -670,12 +726,24 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
         let targets: Vec<ParkTarget> = fresh
             .iter()
             .enumerate()
-            .map(|(idx, s)| park_target(s, snapshots[idx], opts.count))
+            .map(|(idx, s)| {
+                // Gated flags are recomputed EVERY iteration: the ack,
+                // takeover or expiry that moves a gate between rounds
+                // must not be cached stale across them.
+                let gated = group_state(ctx, s, &group)
+                    .is_some_and(|st| ordered_gate_closed(ctx.shared, s, &group, &consumer, &st));
+                park_target(s, snapshots[idx], opts.count, gated)
+            })
             .collect();
         if targets.is_empty() {
             return nil_array(ctx.out);
         }
-        match wait_targets(ctx, &targets, left).await {
+        // Park-side gate probe: cache + owner-map reads only (see
+        // gate_open_cached) -- wait_targets calls it after every waiter
+        // registration, so it must never touch the store or latches.
+        let shared = ctx.shared;
+        let gate_open = |s: &StreamSpec| gate_open_cached(shared, s, &group, &consumer);
+        match wait_targets(ctx, &targets, left, &gate_open).await {
             None => return nil_array(ctx.out),
             Some(Err(e)) => {
                 return resp::append_error(ctx.out, &format!("ERR: xreadgroup failed: {e}"))
