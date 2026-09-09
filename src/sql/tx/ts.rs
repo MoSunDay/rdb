@@ -77,7 +77,8 @@ impl Oracle {
 
     /// Reserve `n` consecutive timestamps at once (one write batch stamps
     /// many versions); the range is `[start, start+n)`.
-    pub fn alloc_n(&self, n: u64) -> std::ops::Range<u64> {        match self.cluster.get() {
+    pub fn alloc_n(&self, n: u64) -> std::ops::Range<u64> {
+        match self.cluster.get() {
             Some(core) if core.active() => {
                 let r = core.alloc_n(n);
                 // Keep the local counter above every cluster grant so a

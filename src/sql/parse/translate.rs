@@ -396,9 +396,11 @@ fn translate_set(set: sqlparser::ast::Set) -> SqlResult<Statement> {
         | SqlSet::ParenthesizedAssignments { .. } => Err(SqlError::unsupported(format!(
             "{set} (session/transaction settings)"
         ))),
-        SqlSet::SingleAssignment { ref variable, ref values, .. } => {
-            super::session::reject_session_var(variable, values, &set)
-        }
+        SqlSet::SingleAssignment {
+            ref variable,
+            ref values,
+            ..
+        } => super::session::reject_session_var(variable, values, &set),
         SqlSet::MultipleAssignments {
             ref assignments, ..
         } => {

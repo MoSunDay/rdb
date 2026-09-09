@@ -186,10 +186,8 @@ async fn three_autocommit_inserts_keep_every_batch_visible() {
     let third = "127.0.0.1:32713".to_string();
     // Ready three member cluster; THIS node is addrs[0] (band owner of
     // the low slots), exactly like the raft leader in the repro.
-    *shared.topology.write().unwrap() = topology::refresh(&format!(
-        "{},{},{}",
-        shared.conf.bind, foreign, third
-    ));
+    *shared.topology.write().unwrap() =
+        topology::refresh(&format!("{},{},{}", shared.conf.bind, foreign, third));
     ddl::run(
         &shared,
         parse_statement("CREATE TABLE cl (k BIGINT PRIMARY KEY) ENGINE=columnar").unwrap(),
@@ -242,7 +240,8 @@ async fn three_autocommit_inserts_keep_every_batch_visible() {
             "COUNT(*) after '{sql}': earlier batches must stay visible"
         );
         assert_eq!(
-            *ks.last().unwrap(), expected,
+            *ks.last().unwrap(),
+            expected,
             "batch '{sql}' appended its own rows"
         );
     }

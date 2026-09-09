@@ -113,7 +113,11 @@ fn alloc_n_reallocates_above_read_point_after_observed_commit() {
     assert!(ts.degraded());
     // And the refiller's next fetch floor covers the observed commit, so
     // the fresh block re-anchors above it instead of reusing stale grants.
-    assert!(install_block(&mut ts.state.lock().unwrap(), r.end + 1, r.end + 9));
+    assert!(install_block(
+        &mut ts.state.lock().unwrap(),
+        r.end + 1,
+        r.end + 9
+    ));
     assert_eq!(ts.alloc_n(2), r.end + 1..r.end + 3);
 }
 
@@ -465,7 +469,11 @@ async fn reserve_write_frontier_refetches_a_short_tail_above_the_floor() {
     // Above any floor, but only 8 stamps left for a 4000-ts plan. The
     // cursor sits at the lease end (the leader authorized exactly this
     // block), so the re-lease must start there.
-    install_block(&mut ts.state.lock().unwrap(), lo + TS_BLOCK - 8, lo + TS_BLOCK);
+    install_block(
+        &mut ts.state.lock().unwrap(),
+        lo + TS_BLOCK - 8,
+        lo + TS_BLOCK,
+    );
     raft.write()
         .unwrap()
         .kv

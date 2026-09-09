@@ -238,7 +238,10 @@ mod tests {
 
     fn put_outcome(store: &crate::store::Store, id: &str, rec: &participant::OutcomeRecord) {
         let mut batch = WriteBatch::default();
-        batch.put(participant::outcome_key(id), serde_json::to_vec(rec).unwrap());
+        batch.put(
+            participant::outcome_key(id),
+            serde_json::to_vec(rec).unwrap(),
+        );
         ops::batch_write(store, batch).unwrap();
     }
 
@@ -248,7 +251,11 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("A".to_string(), vec![(vec![1u8], Some(vec![2u8]))]);
         map.insert("B".to_string(), vec![(vec![3u8], None)]);
-        put_outcome(&store, "t1", &participant::coordinator_outcome(true, 7, map));
+        put_outcome(
+            &store,
+            "t1",
+            &participant::coordinator_outcome(true, 7, map),
+        );
         assert_eq!(status_body(&store, "t1", "A"), "committed [[[1],[2]]]\n");
         assert_eq!(status_body(&store, "t1", "B"), "committed [[[3],null]]\n");
         // A node absent from the map gets an empty slice, never
@@ -278,7 +285,11 @@ mod tests {
         let (_dir, store) = open_test_store();
         let mut map = BTreeMap::new();
         map.insert("A".to_string(), vec![(vec![1u8], Some(vec![2u8]))]);
-        put_outcome(&store, "t3", &participant::coordinator_outcome(true, 7, map));
+        put_outcome(
+            &store,
+            "t3",
+            &participant::coordinator_outcome(true, 7, map),
+        );
         assert_eq!(
             participant::status(&store, "t3", "A"),
             super::super::proto::Outcome::Committed {
@@ -287,14 +298,19 @@ mod tests {
         );
         assert_eq!(
             participant::status(&store, "t3", "C"),
-            super::super::proto::Outcome::Committed { index_ops: Vec::new() }
+            super::super::proto::Outcome::Committed {
+                index_ops: Vec::new()
+            }
         );
         put_outcome(
             &store,
             "t4",
             &participant::coordinator_outcome(false, 7, BTreeMap::new()),
         );
-        assert_eq!(participant::status(&store, "t4", "A"), super::super::proto::Outcome::Aborted);
+        assert_eq!(
+            participant::status(&store, "t4", "A"),
+            super::super::proto::Outcome::Aborted
+        );
         assert_eq!(status_body(&store, "t4", "A"), "aborted\n");
         assert_eq!(status_body(&store, "t5", "A"), "unknown\n");
     }

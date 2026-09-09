@@ -87,8 +87,7 @@ impl CatalogTxn<'_> {
         };
         let ticket = state::raft_apply_start(self.raft, &entry)?;
         state::raft_apply_await(ticket).await?;
-        self.applied
-            .push((catalog_key(&schema.name), entry.value));
+        self.applied.push((catalog_key(&schema.name), entry.value));
         Ok(())
     }
 

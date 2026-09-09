@@ -360,7 +360,10 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
     // plan (or the local batch below) allocates one ts per staged
     // write plus one per appended segment.
     let want = txn.writes.len() as u64 + txn.appends.len() as u64;
-    shared.sql_ts.reserve_write_frontier(txn.read_ts, want).await;
+    shared
+        .sql_ts
+        .reserve_write_frontier(txn.read_ts, want)
+        .await;
     if let Some(plan) = crate::sql::dist::plan::try_plan_txn(shared, txn)? {
         return crate::sql::dist::twopc::run(shared, &plan).await;
     }

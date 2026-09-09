@@ -126,7 +126,16 @@ fn decide_commit_flips_meta_live_and_registers() {
         &[pending(columnar_schema(), 100)],
     )
     .unwrap();
-    let hi = participant::decide(&shared.store, &dir, &registry, "t1", &shared.conf.bind, true, &[]).unwrap();
+    let hi = participant::decide(
+        &shared.store,
+        &dir,
+        &registry,
+        "t1",
+        &shared.conf.bind,
+        true,
+        &[],
+    )
+    .unwrap();
     assert_eq!(hi, 100, "marker commit_ts is the visibility point");
     let meta = stored_meta(&shared).expect("meta still present");
     assert_eq!(meta.state, SegmentState::Live);
@@ -136,7 +145,16 @@ fn decide_commit_flips_meta_live_and_registers() {
     assert_eq!(segs[0].state, SegmentState::Live);
     assert!(participant::read_marker(&shared.store, "t1").is_none());
     // idempotent replay: marker gone, decide is a no-op that returns 0
-    let hi = participant::decide(&shared.store, &dir, &registry, "t1", &shared.conf.bind, true, &[]).unwrap();
+    let hi = participant::decide(
+        &shared.store,
+        &dir,
+        &registry,
+        "t1",
+        &shared.conf.bind,
+        true,
+        &[],
+    )
+    .unwrap();
     assert_eq!(hi, 0);
     assert_eq!(stored_meta(&shared).unwrap().state, SegmentState::Live);
 }
@@ -161,7 +179,16 @@ fn decide_abort_deletes_meta_file_and_registry_entry() {
     .unwrap();
     // simulate a commit-flip already registered, then abort must undo it
     registry.insert(&stored_meta(&shared).unwrap());
-    participant::decide(&shared.store, &dir, &registry, "t2", &shared.conf.bind, false, &[]).unwrap();
+    participant::decide(
+        &shared.store,
+        &dir,
+        &registry,
+        "t2",
+        &shared.conf.bind,
+        false,
+        &[],
+    )
+    .unwrap();
     assert!(stored_meta(&shared).is_none(), "meta key deleted");
     assert!(
         !dir.join(writer::segment_file_name(TABLE_ID, SEGMENT_ID))

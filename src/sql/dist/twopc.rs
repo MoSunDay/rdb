@@ -184,7 +184,10 @@ async fn decide_all(
         }
         // An abort is also the lease-expiry default, so a failed abort
         // outcome record only slows convergence; never a safety gate.
-        eprintln!("sql2pc: abort outcome write failed for {}: {e}", plan.txn_id);
+        eprintln!(
+            "sql2pc: abort outcome write failed for {}: {e}",
+            plan.txn_id
+        );
     }
     broadcast_decides(shared, plan, commit, voted).await;
     Ok(())
@@ -209,7 +212,15 @@ async fn broadcast_decides(shared: &Shared, plan: &CommitPlan, commit: bool, vot
             let txn_id = plan.txn_id.clone();
             let bind = shared.conf.bind.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                participant::decide(&store, &dir, &registry, &txn_id, &bind, commit, &ops_for_addr)
+                participant::decide(
+                    &store,
+                    &dir,
+                    &registry,
+                    &txn_id,
+                    &bind,
+                    commit,
+                    &ops_for_addr,
+                )
             })
             .await;
             // Self slice: the coordinator allocated the ts range, so its
@@ -228,9 +239,7 @@ async fn broadcast_decides(shared: &Shared, plan: &CommitPlan, commit: bool, vot
         };
         match client::request(&sql_rpc, &req).await {
             Ok(Resp::Ack) | Ok(Resp::Vote { .. }) => {}
-            Ok(other) => {
-                retry_decide(sql_rpc, req, format!("unexpected reply {other:?}"))
-            }
+            Ok(other) => retry_decide(sql_rpc, req, format!("unexpected reply {other:?}")),
             Err(e) => retry_decide(sql_rpc, req, e),
         }
     }
@@ -283,7 +292,9 @@ mod tests {
     fn conflict(at: u64, after: u64) -> SqlError {
         SqlError::new(
             ErrorCode::WriteConflict,
-            format!("conflict: write-write conflict on row committed at ts {at} after read ts {after}"),
+            format!(
+                "conflict: write-write conflict on row committed at ts {at} after read ts {after}"
+            ),
         )
     }
 
