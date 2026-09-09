@@ -127,6 +127,10 @@ Lite Mode 条目。
   `shared.lite.set_lease_ms`）：`XREADGROUP ... >` 即申领；租约空闲过期后下个
   申领者接管并 **epoch 递增**——被废黜/被隔离消费者的 `>` 读一律空回
   （`*-1`，BLOCK 读者重新 park），接管唤醒该流 meta 键下的等待者。
+- **BLOCK 读者的门控停靠**：满窗或被隔离的 `>` BLOCK 读者不空转扫描积压，
+  而是挂在该流 meta 键上 park，由窗口/所有权事件（XADD、XACK 腾位、接管、
+  SETID、DESTROY）唤醒；租约过期本身无信号，故 park 切片 cap 到租约粒度，
+  被 fence 的读者按租约自行醒来重试接管（每次注册后复查门控，无丢通知窗口）。
 - **INFLIGHT 是吞吐旋钮**：1（默认）= 严格串行（RocketMQ orderly 等价），
   >1 = Kafka 式预取流水线；窗口满（`inflight_max - pending ≤ 0`）同样空回，
   ACK 腾位并唤醒该流 meta 键下 park 的满窗读者。`pending` 按 PEL **去重行数**

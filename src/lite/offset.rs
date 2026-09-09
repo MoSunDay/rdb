@@ -116,6 +116,21 @@ pub fn insert_new(cache: &OffsetCache, stream: &[u8], group: &[u8], st: GroupSta
         .insert((stream.to_vec(), group.to_vec()), st);
 }
 
+/// Cached-only group peek for cheap read-side probes (the blocking
+/// read's gate re-check): NO lazy load, NO store IO, so it stays safe
+/// to call after every waiter registration. `None` only means "not
+/// cached right now" (the command path evicts on reaps/DESTROY);
+/// callers wanting the durable truth use [`load`].
+pub fn peek_cached(cache: &OffsetCache, stream: &[u8], group: &[u8]) -> Option<GroupState> {
+    cache
+        .inner
+        .read()
+        .unwrap()
+        .map
+        .get(&(stream.to_vec(), group.to_vec()))
+        .copied()
+}
+
 /// XREADGROUP `>`: advance the memory-only delivery watermark.
 pub fn advance_delivered(cache: &OffsetCache, stream: &[u8], group: &[u8], id: EntryId) {
     let mut write = cache.inner.write().unwrap();
