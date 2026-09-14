@@ -18,9 +18,10 @@ Commit: (working-tree, 随本提交入库)
 - **W0.2 备份实例只读门禁 + active-expire 清扫**（`src/command/readonly.rs` 新增 /
   `src/command/mod.rs` / `src/resp/conn.rs` / `src/main.rs`）：
   `backup_bind` 监听器对非只读命令统一回 Redis 标准错误
-  `READONLY You can't write against a read only replica.`——允许清单 78 条（纯读 +
-  协议/元命令 + MULTI 控制），在 `dispatch` 查表后、路由前拦截（EXEC 重放同路径覆盖），
-  MULTI 入队时同样拦截并置 dirty（EXEC 整体 EXECABORT）。Go 的 BackupServer 无此门禁
+  `READONLY You can't write against a read only replica.`——允许清单（纯读 +
+  协议/元命令 + MULTI 控制，条目以 `src/command/readonly.rs` 的 `ALLOWED` 为准），
+  在 `dispatch` 查表后、路由前拦截（EXEC 重放同路径覆盖），MULTI 入队时同样拦截
+  并置 dirty（EXEC 整体 EXECABORT）。Go 的 BackupServer 无此门禁
   （COMPAT.md「Intentional deviations」已记录）。备份 store 另起独立
   `spawn_active_expire` 清扫（此前只有普通监听器的 store 被清扫）。
   新增 e2e `tests/backup_readonly_e2e.rs`（真实进程 + 双监听器：写命令逐条 -READONLY、

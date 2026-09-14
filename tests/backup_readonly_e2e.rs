@@ -115,13 +115,18 @@ async fn backup_listener_rejects_writes_with_readonly_and_keeps_reads() {
     assert_eq!(nil, b"$-1", "get on empty backup store: {nil:?}");
 
     // Every non-read command gets the Redis-standard replica error.
-    let writes: [&[&[u8]]; 6] = [
+    let writes: [&[&[u8]]; 8] = [
         &[b"SET", b"bk", b"1"],
         &[b"DEL", b"bk"],
         &[b"INCR", b"bk"],
         &[b"FLUSHDB"],
         &[b"EXPIRE", b"bk", b"1"],
         &[b"RESTORE", b"bk", b"0", b"\x00"],
+        // XIDLE is denied in ALL forms: the `<secs>` form persists stream
+        // meta + TTL entries (lite::append), and the name-based gate
+        // rejects the bare query form too.
+        &[b"XIDLE", b"s", b"30"],
+        &[b"XIDLE", b"s"],
     ];
     for args in writes {
         let r = cmd_one_shot(&backup, TOKEN, args).await;
