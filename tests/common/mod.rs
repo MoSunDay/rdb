@@ -324,6 +324,62 @@ pub fn spawn_node_sql(dir: &Path, id: usize, bootstrap: bool, join_http: Option<
     panic!("rdb kept dying at startup; see stderr.log in {node_dir:?}");
 }
 
+/// Spawn node `id` with the OPTIONAL READ-ONLY BACKUP LISTENER enabled:
+/// base yaml from `write_config` (no SQL plane), then `backup_bind` +
+/// `backup_store_path` appended as extra top-level keys (the binary only
+/// binds the backup RESP listener -- backed by its OWN store -- when
+/// `backup_bind` is non-empty). Returns the node plus the backup RESP
+/// bind address; the same EADDRINUSE respawn loop as `spawn_node_sql`.
+pub fn spawn_node_backup(
+    dir: &Path,
+    id: usize,
+    bootstrap: bool,
+    join_http: Option<&str>,
+) -> (ProcNode, String) {
+    let node_dir = dir.join(format!("node{id}"));
+    std::fs::create_dir_all(&node_dir).expect("create node dir");
+    for _ in 0..SPAWN_ATTEMPTS {
+        let (resp, raft, http, monitor, backup) = (
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+        );
+        let config_path = node_dir.join("conf.yaml");
+        write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor, "");
+        std::fs::write(
+            &config_path,
+            format!(
+                "{}backup_bind: \"{backup}\"\nbackup_store_path: \"{}/backup_store/\"\n",
+                std::fs::read_to_string(&config_path).expect("read back conf.yaml"),
+                node_dir.display()
+            ),
+        )
+        .expect("append backup keys");
+        let stderr_path = node_dir.join("stderr.log");
+        let mut child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
+        if !matches!(early_exit_kind(&mut child, &stderr_path), Some(true)) {
+            return (
+                ProcNode {
+                    dir: node_dir,
+                    config_path,
+                    stderr_path,
+                    child,
+                    resp,
+                    raft,
+                    http,
+                    monitor,
+                    mysql: String::new(),
+                    sql_rpc: String::new(),
+                },
+                backup,
+            );
+        }
+    }
+    panic!("rdb kept dying at startup; see stderr.log in {node_dir:?}");
+}
+
 /// Poll the node's MySQL port until it accepts connections.
 pub async fn wait_mysql_ready(node: &ProcNode, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);

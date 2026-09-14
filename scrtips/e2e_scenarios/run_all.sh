@@ -34,6 +34,16 @@ echo "binary: ${RDB_BIN:-$HERE/../../target/release/rdb}"
 if [ -f target/release/rdb ]; then
     echo "git:    $(git rev-parse --short HEAD 2>/dev/null || echo 'n/a')  bin mtime: $(date -r target/release/rdb '+%s')"
 fi
+
+# W0.4 pre-flight: the binary under test must carry the LIFO-disabled
+# startup banner (compile-time cfg-selected literal; the DANGER variant
+# means the binary can freeze under load -- reject it before any run).
+RDB_BIN_PATH="${RDB_BIN:-$HERE/../../target/release/rdb}"
+if ! LC_ALL=C grep -aq 'tokio LIFO slot: disabled' "$RDB_BIN_PATH"; then
+    echo "FATAL: $RDB_BIN_PATH lacks the 'tokio LIFO slot: disabled' banner"
+    echo "       (built without --cfg tokio_unstable; rebuild via .cargo/config.toml)" >&2
+    exit 1
+fi
 for s in "${scenarios[@]}"; do
     name="$(basename "$s")"
     echo "---- $name ----"

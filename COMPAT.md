@@ -20,7 +20,11 @@ scheduling, not to write load. Evidence:
   catches up.
 
 If you build the binary without `.cargo/config.toml` in scope (e.g. building from outside the
-repository root), set `RUSTFLAGS='--cfg tokio_unstable'`. At startup the binary now
+repository root), set `RUSTFLAGS='--cfg tokio_unstable'`. Since M0 this is enforced at compile
+time: `src/build_guard.rs` fails any `full`-feature build that lacks the cfg (`compile_error!`);
+the store-only slice (`--no-default-features --features store`) is exempt (it never spawns the
+rdb runtime), and `[build] rustdocflags` mirrors the cfg so doc-tests compile too. CI proves
+both directions: a `RUSTFLAGS=''` full build must fail, the store slice must still build. At startup the binary now
 logs one line stating whether the cfg took effect (`tokio LIFO slot: disabled ...`) or not
 (`tokio LIFO slot: ENABLED (DANGER: ...)`) — check it after any build-pipeline change that
 overrides RUSTFLAGS. Without the cfg, the code falls
@@ -139,6 +143,19 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
 - **Storage fsync**: RocksDB WAL defaults vs Go pebble/bolt fsync-per-commit — durability
   windows are comparable but not bit-identical.
 - **Monitor**: Prometheus text format and metric/label names match Go's collector.
+- **Backup listener is actually read-only**: Go's `BackupServer` (mode "backup") executed
+  whatever it was sent; Rust gates the `backup_bind` listener with the Redis-standard
+  `-READONLY You can't write against a read only replica.` for every non-read command
+  (allowlist: `src/command/readonly.rs`; enforced in `command::dispatch` — which EXEC replays
+  re-enter — and at MULTI queue time, where a write also marks the transaction dirty →
+  EXECABORT). `XIDLE` is denied in all forms: its `XIDLE <stream> <secs>` form persists
+  stream meta + TTL entries (`lite/append.rs`) and the gate is name-based, so the bare
+  query form is denied too. Lazy-expiry purge on read paths still runs on the backup
+  listener — deleting already-TTL-dead data is the same semantics as the backup
+  active-expire sweep, not a client-visible write. The backup store additionally gets
+  its own active-expire sweep
+  (`spawn_active_expire` on the backup `Shared`), so keys landing there vanish on schedule
+  without needing a read; previously only the normal listener's store was swept.
 - **Lite Mode (RocketMQ-style, rdb extension)**: parent topics with dynamic per-group queues
   exposed through Streams-verb commands (XADD/XLEN/XRANGE/XTRIM/XDEL/XIDLE/XREAD/XREADGROUP/
   XACK/XGROUP [CREATE|DESTROY|CREATECONSUMER|DELCONSUMER]/XPENDING/XCLAIM/XAUTOCLAIM/

@@ -55,7 +55,7 @@
 - 目标用户陈述：**目标是 Redis SDK 用户**。若一个 Kafka 应用无法更换客户端 SDK，那是
   另一个量级的项目——前提是先做数据面复制，再谈协议。
 
-## Lite MQ 面规范（本批落地）
+## Lite MQ 面规范（已落地）
 
 以下为规范（spec），由 `src/lite/`（`pel.rs` / `pending.rs` / `claim.rs` / `autoclaim.rs` / `read.rs` /
 `park_wait.rs` / `group.rs` / `ack.rs`）实现；对 Redis 的偏差总表见 [COMPAT.md](../COMPAT.md)
@@ -108,7 +108,7 @@ Lite Mode 条目。
 ## 有序消费组与 Kafka 校准语义（P0/P1/P2）
 
 对齐 Kafka 语义模型的三件套：**P1 提交语义**、**P0 顺序消费**、**P2 有序接管**
-（P3 同 key 同队列 = `XPICK ... pick_hash`，本批已落地，不在本批变更）。
+（P3 同 key 同队列 = `XPICK ... pick_hash`，已落地）。
 
 ### P1：提交水位 = Kafka committed offset（连续前缀提交）
 - `XACK` 后组已提交水位（kind-0x0E 记录）只在 **被 ACK 的连续前缀** 上推进：

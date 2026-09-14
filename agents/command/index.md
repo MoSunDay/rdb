@@ -1,4 +1,4 @@
-Commit: d481b1d708c248f86be394189d01ca7305fc8528
+Commit: 98e17a5
 # command
 
 > **已归档**：Go 实现已移至 `archive/go/internal/command`（git mv 保留历史，不再维护）。当前实现见 [agents/rust/index.md](../rust/index.md)。以下内容描述归档前的 Go 实现。

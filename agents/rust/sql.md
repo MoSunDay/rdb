@@ -1,4 +1,4 @@
-Commit: d481b1d708c248f86be394189d01ca7305fc8528
+Commit: 98e17a5
 # rdb/sql（SQL 数据面：MySQL 接入 + MVCC 事务 + 分布式执行）
 
 ## 职责

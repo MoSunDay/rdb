@@ -483,6 +483,11 @@ async fn do_main() {
         // M3: the read-only backup listener shares the cluster core so
         // its `now()` snapshot reads track the global sequence too.
         shared.sql_ts.enable_cluster(cluster_ts.clone());
+        // The backup store gets its own active-expire sweep: whatever
+        // lands there (restore/replication channel) must vanish on
+        // schedule even if never read; the listener itself is
+        // -READONLY-gated (see command::readonly).
+        ds::expire::spawn_active_expire(Arc::clone(&shared));
         let listener = match resp::bind(&backup_conf.bind) {
             Ok(l) => l,
             Err(e) => {
@@ -522,7 +527,8 @@ async fn do_main() {
     // allocator (no-op until `cluster init` flips cluster_ready).
     shared.sql_ts.enable_cluster(cluster_ts.clone());
     // Active expiration loop (data-plane background task; sees the normal
-    // listener's store -- the backup listener is read-only by design).
+    // listener's store -- the backup store gets its OWN sweep spawned in
+    // the backup-listener block, whose listener is also -READONLY-gated).
     ds::expire::spawn_active_expire(Arc::clone(&shared));
     // Lite Mode: periodic group-offset flush + stream gauges.
     rdb::lite::spawn_background(Arc::clone(&shared));

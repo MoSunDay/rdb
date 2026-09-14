@@ -9,6 +9,8 @@
 //! (default) adds every other module. See `Cargo.toml` `[features]`.
 
 pub mod store;
+// Compile-time tokio_unstable guard; see build_guard.rs.
+pub mod build_guard;
 
 #[cfg(feature = "full")]
 pub mod command;
