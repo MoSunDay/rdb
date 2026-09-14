@@ -35,7 +35,15 @@ pub async fn run(
 ) -> SqlResult<(Vec<ColMeta>, Vec<Vec<Value>>)> {
     let (read_ts, txn) = match sess.txn.as_ref() {
         Some(t) => (t.read_ts, Some(t)),
-        None => (shared.sql_ts.now(), None),
+        None => {
+            // Autocommit read point: fold the raft cursor frontier
+            // before sampling `now()`, same as BEGIN / the write path
+            // -- otherwise a just-committed write stays invisible to a
+            // cross-connection read for up to one refill tick + FSM
+            // lag. In-txn reads keep the ts pinned at BEGIN.
+            shared.sql_ts.sync_cursor_frontier();
+            (shared.sql_ts.now(), None)
+        }
     };
     let ctes = CteScope::default();
     run_at(shared, read_ts, txn, &q, &ctes).await
