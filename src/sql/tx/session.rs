@@ -360,10 +360,21 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
     // plan (or the local batch below) allocates one ts per staged
     // write plus one per appended segment.
     let want = txn.writes.len() as u64 + txn.appends.len() as u64;
+    // Strict when any row write's slot owner is remote (the commit will
+    // run as 2PC): an unreachable ts authority then vetoes the commit
+    // with a retryable error instead of stamping GAP-fallback versions.
+    // Appends always ride the coordinator's own slice, so only row
+    // writes decide (the same keys `dist::plan::build` routes).
+    let probes: Vec<Vec<u8>> = txn
+        .writes
+        .keys()
+        .map(|(table_id, pk)| crate::sql::dist::row_probe(*table_id, pk))
+        .collect();
+    let strict = crate::sql::dist::any_remote_owner(shared, &probes);
     shared
         .sql_ts
-        .reserve_write_frontier(txn.read_ts, want)
-        .await;
+        .reserve_write_frontier(txn.read_ts, want, strict)
+        .await?;
     if let Some(plan) = crate::sql::dist::plan::try_plan_txn(shared, txn)? {
         return crate::sql::dist::twopc::run(shared, &plan).await;
     }

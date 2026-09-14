@@ -122,8 +122,18 @@ pub async fn insert(
     let read_ts = shared.sql_ts.now();
     // Write frontier before planning: the plan's ts range (2PC) or the
     // local alloc below must stamp above the txn's read point; both
-    // allocate one ts per row.
-    shared.sql_ts.reserve_write_frontier(read_ts, n).await;
+    // allocate one ts per row. Strict when any row or index entry has a
+    // remote owner (2PC): fail fast rather than stamp a GAP.
+    let mut probes: Vec<Vec<u8>> = pk_keys
+        .iter()
+        .map(|pk| dist::row_probe(schema.id, pk))
+        .collect();
+    probes.extend(idx.iter().map(|(k, _)| k.clone()));
+    let strict = dist::any_remote_owner(shared, &probes);
+    shared
+        .sql_ts
+        .reserve_write_frontier(read_ts, n, strict)
+        .await?;
     if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await
@@ -356,10 +366,18 @@ pub async fn update(
     let read_ts = shared.sql_ts.now();
     // Write frontier before planning (same rationale as INSERT); the
     // plan allocates one ts per write (pk moves add a tombstone).
+    // Strict when any write or index entry has a remote owner (2PC):
+    // fail fast rather than stamp a GAP.
+    let mut probes: Vec<Vec<u8>> = dist_writes
+        .iter()
+        .map(|(pk, _)| dist::row_probe(schema.id, pk))
+        .collect();
+    probes.extend(idx.iter().map(|(k, _)| k.clone()));
+    let strict = dist::any_remote_owner(shared, &probes);
     shared
         .sql_ts
-        .reserve_write_frontier(read_ts, dist_writes.len() as u64)
-        .await;
+        .reserve_write_frontier(read_ts, dist_writes.len() as u64, strict)
+        .await?;
     if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &dist_writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await
@@ -455,11 +473,18 @@ pub async fn delete(
     let writes: dist::plan::SimpleWrites = pk_keys.iter().map(|pk| (pk.clone(), None)).collect();
     let read_ts = shared.sql_ts.now();
     // Write frontier before planning (same rationale as INSERT); the
-    // plan allocates one ts per write.
+    // plan allocates one ts per write. Strict when any row or index
+    // entry has a remote owner (2PC): fail fast rather than stamp a GAP.
+    let mut probes: Vec<Vec<u8>> = pk_keys
+        .iter()
+        .map(|pk| dist::row_probe(schema.id, pk))
+        .collect();
+    probes.extend(idx.iter().map(|(k, _)| k.clone()));
+    let strict = dist::any_remote_owner(shared, &probes);
     shared
         .sql_ts
-        .reserve_write_frontier(read_ts, writes.len() as u64)
-        .await;
+        .reserve_write_frontier(read_ts, writes.len() as u64, strict)
+        .await?;
     if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await

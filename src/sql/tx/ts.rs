@@ -20,6 +20,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
+
 use super::global::ClusterTs;
 
 /// Timestamp oracle + live-snapshot registry.
@@ -126,14 +128,26 @@ impl Oracle {
         }
     }
 
-    /// Best-effort pre-commit hook (cluster mode): make the locally
-    /// reserved block serve timestamps above `floor` by folding in the
-    /// raft-replicated cursor and re-leasing past a stale tail. See
-    /// [`ClusterTs::reserve_write_frontier`]. No-op in local mode.
-    pub async fn reserve_write_frontier(&self, floor: u64, want: u64) {
+    /// Pre-commit hook (cluster mode): make the locally reserved block
+    /// serve timestamps above `floor` by folding in the raft-replicated
+    /// cursor and re-leasing past a stale tail. `strict` (the write set
+    /// has a remote slot owner: the commit runs as 2PC) surfaces an
+    /// unreachable ts authority as a RETRYABLE 1213 instead of letting
+    /// the alloc degrade to the GAP fallback -- distributed commits
+    /// must never stamp fallback versions. Lenient callers (purely
+    /// local writes) keep the degraded fallback. No-op in local mode.
+    pub async fn reserve_write_frontier(
+        &self,
+        floor: u64,
+        want: u64,
+        strict: bool,
+    ) -> SqlResult<()> {
         if let Some(core) = self.cluster_core() {
-            core.reserve_write_frontier(floor, want).await;
+            core.reserve_write_frontier(floor, want, strict)
+                .await
+                .map_err(|e| SqlError::new(ErrorCode::WriteConflict, e))?;
         }
+        Ok(())
     }
 
     /// Fold the raft-replicated cursor into this node's read-point

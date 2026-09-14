@@ -415,7 +415,7 @@ async fn reserve_write_frontier_rebases_a_stale_tail_above_the_frontier() {
         .kv
         .insert(TS_CURSOR_KEY.to_string(), frontier.to_string());
 
-    ts.reserve_write_frontier(frontier - 1, 4).await;
+    ts.reserve_write_frontier(frontier - 1, 4, false).await.unwrap();
 
     assert!(!ts.degraded(), "a successful re-lease clears degradation");
     let r = ts.alloc_n(4);
@@ -444,7 +444,7 @@ async fn reserve_write_frontier_keeps_a_tail_already_above_the_frontier() {
         .kv
         .insert(TS_CURSOR_KEY.to_string(), lo.to_string());
 
-    ts.reserve_write_frontier(3 * TS_BLOCK, 4).await;
+    ts.reserve_write_frontier(3 * TS_BLOCK, 4, false).await.unwrap();
 
     assert_eq!(ts.alloc_n(4), lo..lo + 4, "fresh tail still serves");
     assert_eq!(
@@ -479,7 +479,7 @@ async fn reserve_write_frontier_refetches_a_short_tail_above_the_floor() {
         .kv
         .insert(TS_CURSOR_KEY.to_string(), (lo + TS_BLOCK).to_string());
 
-    ts.reserve_write_frontier(lo, 4000).await;
+    ts.reserve_write_frontier(lo, 4000, false).await.unwrap();
 
     let r = ts.alloc_n(4000);
     assert_eq!(
@@ -496,11 +496,62 @@ async fn alloc_above_degrades_only_when_the_leader_is_unreachable() {
     // leader, reserve_write_frontier must hand the alloc a real block.
     let (raft, topo) = stub_leader();
     let ts = ClusterTs::new(deps_of(&raft, &topo));
-    ts.reserve_write_frontier(0, 2 * TS_BLOCK).await;
+    ts.reserve_write_frontier(0, 2 * TS_BLOCK, false).await.unwrap();
     assert_eq!(
         ts.alloc_n(2 * TS_BLOCK),
         1..1 + 2 * TS_BLOCK,
         "a fresh node leases a real block, not the GAP fallback"
     );
     assert!(!ts.degraded());
+}
+
+/// A follower with an unresolvable leader (empty `sql_nodes` registry:
+/// `leader_http_addr` -> None) makes every block fetch fail.
+fn unreachable_follower() -> ClusterTs {
+    let st = RaftState {
+        is_leader: false,
+        leader_addr: "raft-x".to_string(),
+        kv: BTreeMap::new(),
+        ..RaftState::default()
+    };
+    let topo = Arc::new(RwLock::new(topology::refresh("a,b,c")));
+    ClusterTs::new(deps_of(&Arc::new(RwLock::new(st)), &topo))
+}
+
+#[tokio::test]
+async fn reserve_strict_fails_rather_than_stamp_a_gap() {
+    // TSO discipline: a distributed commit (write set spans remote
+    // owners) must NEVER stamp GAP-fallback versions -- no later cursor
+    // ride can cover them, and newest-ts-wins would bury the write
+    // silently. When the ts authority is unreachable the strict reserve
+    // fails with the retryable authority error instead.
+    let ts = unreachable_follower();
+    let err = ts
+        .reserve_write_frontier(0, 8, true)
+        .await
+        .expect_err("strict reserve must fail fast");
+    assert_eq!(err, TS_AUTHORITY_UNREACHABLE);
+    assert!(
+        !ts.degraded(),
+        "no alloc happened: the strict path stamped nothing"
+    );
+}
+
+#[tokio::test]
+async fn reserve_lenient_keeps_the_local_degraded_fallback() {
+    // A purely local write keeps the frozen degraded semantics: the
+    // lenient reserve stays Ok and the alloc falls back above
+    // `last_cursor + TS_FALLBACK_GAP`, which a same-node refill later
+    // re-anchors (see `alloc_above_degrades_only_when_the_leader_is_unreachable`).
+    let ts = unreachable_follower();
+    ts.reserve_write_frontier(0, 8, false)
+        .await
+        .expect("lenient reserve keeps best-effort semantics");
+    let r = ts.alloc_n(8);
+    assert!(ts.degraded(), "unreachable authority: local alloc degrades");
+    assert_eq!(
+        r,
+        TS_FALLBACK_GAP + 1..TS_FALLBACK_GAP + 9,
+        "the fallback jumps the gap above the (absent) cursor"
+    );
 }
