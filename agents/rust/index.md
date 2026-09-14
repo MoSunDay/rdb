@@ -37,7 +37,7 @@ Commit: 98e17a5
   - `list_mpop.rs`：LMPOP（numkeys 多键首非空）；`lite/range_rev.rs`：XREVRANGE（倒序迭代器 `for_each_down_from`）；另有 HMSET/ZREVRANGE/SINTERCARD 补齐；
   - `cluster.rs`：CLUSTER（init/nodes/test 等，拓扑读 `state::Shared.topology`）；
   - `raft_cmd.rs`：RAFT（help/stats/leader/nodes/set/get）；
-  - `migrate.rs`：MIGRATE 数据面（host/port/key/db/timeout + KEYS 批量 dump→ASKING→RESTORE）
+  - `migrate/`：MIGRATE 模块（W1.0 按职责拆分）——`data.rs` 数据面（host/port/key/db/timeout + KEYS 批量 dump→ASKING→RESTORE）
     + `migrate task <slot> <src> <dst>` 编排（SETSLOT MIGRATING/IMPORTING/NODE/STABLE +
     GETKEYSINSLOT 排空，任务 JSON 经 raft 键 `migrate_task` 复制）；线格式 `ds/dump.rs`，
     出站客户端 `resp/client.rs`。
