@@ -12,7 +12,7 @@ use crate::resp::codec::{
     append_array, append_bulk_string, append_error, append_int, append_string,
 };
 use crate::rtypes;
-use crate::state;
+use crate::state::{self, Shared};
 use crate::topology;
 use crate::utils;
 
@@ -289,6 +289,29 @@ fn cluster_test(ctx: &mut Ctx<'_>) {
     append_error(ctx.out, "MOVED 5465 127.0.0.1:32681");
 }
 
+/// The `sql_nodes` seed entry merging the initializing leader's own
+/// binds into the raft-replicated registry (the same `NodeBinds` main
+/// registers through the ticker); `None` when already current
+/// (idempotent re-init skips the write).
+fn sql_nodes_seed_entry(shared: &Shared) -> Option<rtypes::RaftLogEntryData> {
+    use crate::sql::tx::nodes::{merged_registry, NodeBinds, SQL_NODES_KEY};
+    let binds = NodeBinds {
+        resp: shared.conf.bind.clone(),
+        raft: shared.conf.raft_tcp_address.clone(),
+        http: shared.conf.http_address.clone(),
+        mysql: shared.conf.mysql_bind.clone(),
+        sql_rpc: shared.conf.sql_rpc_bind.clone(),
+    };
+    let current = {
+        let raft = shared.raft.read().unwrap();
+        state::raft_get(&raft, SQL_NODES_KEY)
+    };
+    merged_registry(&current, &binds).map(|value| rtypes::RaftLogEntryData {
+        key: SQL_NODES_KEY.to_string(),
+        value,
+    })
+}
+
 async fn cluster_init(ctx: &mut Ctx<'_>) {
     if ctx.args.len() < 2 {
         append_error(ctx.out, "cluster init [instances]");
@@ -319,7 +342,31 @@ async fn cluster_init(ctx: &mut Ctx<'_>) {
         Err(e) => Err(e),
     };
     match result {
-        Ok(()) => append_string(ctx.out, "done"),
+        Ok(()) => {
+            // Region-metadata-style seeding: the initializing leader
+            // merges its own binds into `sql_nodes` via a second raft
+            // apply BEFORE replying, so followers can resolve
+            // `leader_http_addr` (ts block leases) the moment the FSM
+            // entry replicates -- not one registration-tick later. A
+            // failed seed does not fail INIT (the 3s registration loop
+            // re-covers it); the reply stays the Go-parity `done`.
+            if let Some(entry) = sql_nodes_seed_entry(ctx.shared) {
+                let seeded = {
+                    let mut raft = ctx.shared.raft.write().unwrap();
+                    state::raft_apply_start(&mut raft, &entry)
+                };
+                let seeded = match seeded {
+                    Ok(ticket) => state::raft_apply_await(ticket).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = seeded {
+                    eprintln!(
+                        "sql nodes: seed at cluster init failed: {e} (registration loop retries)"
+                    );
+                }
+            }
+            append_string(ctx.out, "done")
+        }
         Err(_) => append_error(ctx.out, "Raft Apply failed"),
     }
 }
@@ -397,6 +444,32 @@ mod tests {
     }
 
     #[test]
+    fn init_seeds_leader_binds_into_sql_nodes() {
+        let (_guard, shared) = shared_for("127.0.0.1:40205");
+        assert_eq!(
+            call(&shared, &[b"init", INSTANCES.as_bytes()]),
+            b"+done\r\n"
+        );
+        // The seed rides the SAME apply-to-reply window as INIT itself:
+        // by the time `+done` returns the raft registry must already
+        // resolve the initializing leader's binds (region metadata is
+        // raft-written at creation, not discovered a tick later).
+        let raft = shared.raft.read().unwrap();
+        let raw = state::raft_get(&raft, "sql_nodes");
+        drop(raft);
+        assert!(
+            raw.contains("127.0.0.1:40205") && raw.contains("127.0.0.1:22681"),
+            "seeded registry must carry the leader binds: {raw}"
+        );
+        // Idempotent re-init: the merge is a no-op and the reply stays
+        // the Go-parity `done`.
+        assert_eq!(
+            call(&shared, &[b"init", INSTANCES.as_bytes()]),
+            b"+done\r\n"
+        );
+    }
+
+    #[test]
     fn init_refused_when_not_leader() {
         let (_guard, shared) = shared_for("127.0.0.1:40203");
         shared.raft.write().unwrap().leader_addr = "10.0.0.1:22681".to_string();
@@ -414,7 +487,8 @@ mod tests {
             b"+done\r\n"
         );
         *shared.topology.write().unwrap() = topology::refresh(INSTANCES);
-        // One apply: term "1" + commit_index "1" -> epoch "11".
+        // Two applies ride INIT: the instances entry and the sql_nodes
+        // seed (term "1" + commit_index "2" -> epoch "12").
         let body = concat!(
             "cluster_state:true\n",
             "cluster_slots_assigned:16384\n",
@@ -423,8 +497,8 @@ mod tests {
             "cluster_slots_fail:0\n",
             "cluster_known_nodes:3\n",
             "cluster_size:3\n",
-            "cluster_current_epoch:11\n",
-            "cluster_my_epoch:11\n",
+            "cluster_current_epoch:12\n",
+            "cluster_my_epoch:12\n",
             "cluster_stats_messages_sent:0\n",
             "cluster_stats_messages_received:0\n",
         );

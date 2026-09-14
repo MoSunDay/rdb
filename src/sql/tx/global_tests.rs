@@ -415,7 +415,9 @@ async fn reserve_write_frontier_rebases_a_stale_tail_above_the_frontier() {
         .kv
         .insert(TS_CURSOR_KEY.to_string(), frontier.to_string());
 
-    ts.reserve_write_frontier(frontier - 1, 4, false).await.unwrap();
+    ts.reserve_write_frontier(frontier - 1, 4, false)
+        .await
+        .unwrap();
 
     assert!(!ts.degraded(), "a successful re-lease clears degradation");
     let r = ts.alloc_n(4);
@@ -444,7 +446,9 @@ async fn reserve_write_frontier_keeps_a_tail_already_above_the_frontier() {
         .kv
         .insert(TS_CURSOR_KEY.to_string(), lo.to_string());
 
-    ts.reserve_write_frontier(3 * TS_BLOCK, 4, false).await.unwrap();
+    ts.reserve_write_frontier(3 * TS_BLOCK, 4, false)
+        .await
+        .unwrap();
 
     assert_eq!(ts.alloc_n(4), lo..lo + 4, "fresh tail still serves");
     assert_eq!(
@@ -496,7 +500,9 @@ async fn alloc_above_degrades_only_when_the_leader_is_unreachable() {
     // leader, reserve_write_frontier must hand the alloc a real block.
     let (raft, topo) = stub_leader();
     let ts = ClusterTs::new(deps_of(&raft, &topo));
-    ts.reserve_write_frontier(0, 2 * TS_BLOCK, false).await.unwrap();
+    ts.reserve_write_frontier(0, 2 * TS_BLOCK, false)
+        .await
+        .unwrap();
     assert_eq!(
         ts.alloc_n(2 * TS_BLOCK),
         1..1 + 2 * TS_BLOCK,
