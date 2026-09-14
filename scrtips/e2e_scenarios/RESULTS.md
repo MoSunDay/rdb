@@ -1,8 +1,18 @@
 # E2E scenario results -- rdb real-client acceptance
 
-Last full green run: **2026-08-30T18:55Z**, git `711c1b2`,
-binary `target/release/rdb` (mtime 2026-08-31 02:33 local).
+Last full green run: **2026-09-14**, git `c74def1`,
+binary `target/release/rdb`.
 Runner: `run_all.sh` -> **4 pass, 0 fail**.
+
+2026-09-14: re-validated around the ts-authority fail-fast + CLUSTER
+INIT seeding fix (commits `525777c`/`c74def1`). `scenario_mysql_orders.sh`
+PASS x5 with the fixed binary; the pre-fix binary (`f75c617`, built in a
+scratch worktree) also passed 5/5 on this quiet host -- the historical
+silent-lost-update failure is load/timing dependent (prior changelog
+notes host load ~140), so the scenario run here serves as regression
+coverage only; the correctness proof lives in unit + integration tests
+(`reserve_write_frontier` strict/lenient, `sql_2pc_e2e`,
+`cluster_init_seeds_leader_binds_in_sql_nodes`).
 
 2026-08-31: `scenario_vector_search.sh` re-run PASS after extracting
 `vector_helpers.sh` (line-budget split, logic moved verbatim); release
