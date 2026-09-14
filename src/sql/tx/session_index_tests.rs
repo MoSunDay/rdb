@@ -142,3 +142,84 @@ async fn commit_rejects_unique_clash_against_committed_owner() {
     let visible = crate::sql::exec::scan::visible_rows(&shared.store, &s, oracle.now()).unwrap();
     assert_eq!(visible.len(), 1);
 }
+
+#[tokio::test]
+async fn commit_fails_fast_when_only_the_index_plane_is_remote() {
+    // Regression (W1 Part A): `dist::plan::build` routes unique
+    // reservations and secondary ops by their OWN slots, so a txn whose
+    // row slots are all local can still commit as 2PC when an index
+    // plane hashes to a remote owner. The strict-reserve probe set must
+    // include the index keys: with the ts authority unreachable such a
+    // commit fails fast (1213, retryable) instead of stamping
+    // GAP-fallback versions through 2PC.
+    use crate::sql::index::keys::index_slot;
+    use crate::sql::tx::global::{ClusterTs, ClusterTsDeps};
+    use crate::sql::tx::nodes::NodeBinds;
+    use crate::topology;
+
+    let mut shared = shared();
+    // Ready 3-node world, this node = "b:2": slots 0..=5461 on a:1,
+    // 5462..=10922 local, 10923..=16383 on c:3.
+    *shared.topology.write().unwrap() = topology::refresh("a:1,b:2,c:3");
+    shared.conf.bind = "b:2".to_string();
+    // Pick a table id whose v-index plane is remote while some row pk
+    // hashes local (row and index planes hash different inputs).
+    let (table_id, pk) = (1..=64u32)
+        .filter_map(|id| {
+            let idx_remote = crate::sql::dist::any_remote_owner(
+                &shared,
+                &[crate::store::rocksdb::slot_prefix(index_slot(id, 1))],
+            );
+            let local_pk = (0..64i64).find(|&pk| {
+                !crate::sql::dist::any_remote_owner(
+                    &shared,
+                    &[crate::sql::dist::row_probe(id, &pk_key(pk))],
+                )
+            });
+            (idx_remote && local_pk.is_some()).then(|| (id, local_pk.unwrap()))
+        })
+        .next()
+        .expect("some table id splits row-local/index-remote");
+    let s = indexed_schema(table_id, "t");
+    seed_catalog(&shared, &s);
+    // Follower whose leader resolves to no http address in sql_nodes:
+    // every block fetch fails, so the ts authority is unreachable.
+    {
+        let mut r = shared.raft.write().unwrap();
+        r.is_leader = false;
+        r.leader_addr = "raft-x".to_string();
+    }
+    shared
+        .sql_ts
+        .enable_cluster(std::sync::Arc::new(ClusterTs::new(ClusterTsDeps {
+            raft: std::sync::Arc::clone(&shared.raft),
+            topo: std::sync::Arc::clone(&shared.topology),
+            binds: NodeBinds {
+                resp: "b:2".to_string(),
+                raft: "raft-b".to_string(),
+                http: "http-b".to_string(),
+                mysql: String::new(),
+                sql_rpc: String::new(),
+            },
+            token: "tok".to_string(),
+        })));
+
+    let oracle = &shared.sql_ts;
+    let mut txn = begin(oracle);
+    stage_upsert(
+        &mut txn,
+        &s,
+        vec![Value::Int(pk), Value::Str("a".into()), Value::Int(10)],
+    )
+    .unwrap();
+    let err = commit(&shared, txn).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::WriteConflict);
+    assert!(
+        err.msg.contains("ts authority unreachable"),
+        "strict reserve error, got: {}",
+        err.msg
+    );
+    // The veto fired before any alloc or write: nothing was stamped.
+    let visible = crate::sql::exec::scan::visible_rows(&shared.store, &s, oracle.now()).unwrap();
+    assert!(visible.is_empty());
+}

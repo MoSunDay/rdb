@@ -360,16 +360,29 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
     // plan (or the local batch below) allocates one ts per staged
     // write plus one per appended segment.
     let want = txn.writes.len() as u64 + txn.appends.len() as u64;
-    // Strict when any row write's slot owner is remote (the commit will
-    // run as 2PC): an unreachable ts authority then vetoes the commit
-    // with a retryable error instead of stamping GAP-fallback versions.
-    // Appends always ride the coordinator's own slice, so only row
-    // writes decide (the same keys `dist::plan::build` routes).
-    let probes: Vec<Vec<u8>> = txn
+    // Index ops derived BEFORE the reserve: the strict predicate must
+    // see the same key set `dist::plan::build` routes -- row versions
+    // PLUS unique reservations and secondary ops, each by its own slot.
+    // A txn whose rows are all local can still run as 2PC when an index
+    // plane hashes to a remote owner, and must fail fast then too.
+    let schemas = written_schemas(shared, txn);
+    // Index maintenance BEFORE the rows land: old row sides are
+    // recovered from the store at the txn's own snapshot (the same
+    // versions its reads would have seen), unique claims are validated
+    // against them, and the entry ops ride in the same commit batch.
+    let idx = commit_index_ops(shared, txn, &schemas)?;
+    // Strict when any row OR index write's slot owner is remote (the
+    // commit will run as 2PC): an unreachable ts authority then vetoes
+    // the commit with a retryable error instead of stamping GAP-fallback
+    // versions. Appends always ride the coordinator's own slice, so
+    // rows and index entries decide (`try_plan_txn` re-derives `idx`
+    // -- pure reads, tolerating the duplication).
+    let mut probes: Vec<Vec<u8>> = txn
         .writes
         .keys()
         .map(|(table_id, pk)| crate::sql::dist::row_probe(*table_id, pk))
         .collect();
+    probes.extend(idx.iter().map(|(k, _)| k.clone()));
     let strict = crate::sql::dist::any_remote_owner(shared, &probes);
     shared
         .sql_ts
@@ -379,12 +392,6 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
         return crate::sql::dist::twopc::run(shared, &plan).await;
     }
     conflict_check(&shared.store, txn)?;
-    let schemas = written_schemas(shared, txn);
-    // Index maintenance BEFORE the rows land: old row sides are
-    // recovered from the store at the txn's own snapshot (the same
-    // versions its reads would have seen), unique claims are validated
-    // against them, and the entry ops ride in the same commit batch.
-    let idx = commit_index_ops(shared, txn, &schemas)?;
     // Rows and columnar appends share ONE ts range and publish in one
     // atomic batch: rows take the head, one ts per columnar table's
     // segment takes the tail (BTreeMap order = deterministic).

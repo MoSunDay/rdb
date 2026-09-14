@@ -2,6 +2,11 @@
 
 Commit: 525777c, c74def1
 
+> **2026-09-14 复审补口**：复审发现 `commit_inner`（显式 BEGIN..COMMIT 路径）的
+> strict 探测集只含行键，而 2PC 判定（`dist::plan::build`）同时路由索引键——
+> 「行全本地、索引面落远端」的事务仍会以宽松预留走 2PC 盖 GAP。已于当日修复
+>（探测集并入索引键 + 回归测试），见文末补记。
+
 ## 背景
 
 `scrtips/e2e_scenarios/scenario_mysql_orders.sh` 压测下曾出现「主键更新静默丢失」。
@@ -54,3 +59,22 @@ w1 迁移收尾（2026-09-15/w1-migrate-split-and-read-point.md）已定位根�
   c74def1 均 5/5 PASS——未复现确定性的 FAIL→PASS 转变（历史失败依赖宿主机负载 ~140
   的时序窗口），本轮场景结果仅作回归覆盖，正确性证明由单测与 e2e 承担。全套
   run_all.sh 4/4 PASS。
+
+## 补记：显式事务 strict 探测集并入索引键（复审发现）
+
+复审（2026-09-14）发现 Part A 在显式事务路径上不闭合：`commit_inner` 的 strict
+判定只探测**行键**，但决定是否 2PC 的 `dist::plan::build` 同时按各自 slot 路由
+唯一索引预约与二级索引 ops（索引 slot = crc16(table_id++col_pos)，与行 slot 属主
+可不同）。「行键全本地、索引键属远端」的显式事务因此拿到 `strict=false`，leader
+不可达时照样以 GAP 巨型 ts 走 2PC 提交——恰是本修复要消灭的 bug 类别（三个
+autocommit 路径与 backfill 探测集本就正确，仅此一处不一致，且原注释误称
+"the same keys plan::build routes"）。
+
+修复：`written_schemas`/`commit_index_ops` 提至预留之前（纯读，`try_plan_txn`
+内部重算 idx 可容忍重复计算；本地路径复用提升后的结果，总计算次数不变），
+probes 并入 idx 键，与 `exec/write.rs` 既有模式对齐；修正注释。
+
+回归测试：`session_index_tests::commit_fails_fast_when_only_the_index_plane_is_remote`
+（行本地/索引远端/authority 不可达 → 1213 且零落盘；修复前红、修复后绿）。
+验证：`cargo test` 全量通过（lib 882 + 全部集成/e2e 套件 0 失败），
+`clippy --all-targets` 无告警。
