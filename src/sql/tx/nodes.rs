@@ -28,6 +28,11 @@ pub const SQL_NODES_KEY: &str = "sql_nodes";
 
 /// Self-registration cadence (idempotent; skips no-op writes).
 const REGISTER_INTERVAL: Duration = Duration::from_secs(3);
+/// Fast poll catching the `cluster_ready` edge so the first
+/// registration lands within a quarter second of `CLUSTER INIT`
+/// (the 3s ticker alone would leave up to one full interval of
+/// unresolvable binds).
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// One node's listener addresses, replicated in the registry so peers
 /// can resolve the leader's control-API address.
@@ -123,13 +128,41 @@ pub async fn register_foreign(deps: &ClusterTsDeps, binds: &NodeBinds) -> Result
     Ok(true)
 }
 
+/// One leader-gated registration round: leaders self-write their binds
+/// through raft; followers forward them to the current leader over
+/// `/sql/nodes` so 2PC routing can resolve their sql_rpc port.
+async fn register_round(deps: &ClusterTsDeps) {
+    let is_leader = deps.raft.read().unwrap().is_leader;
+    let out = if is_leader {
+        register_once(deps).await.map(|_| ())
+    } else {
+        forward_binds(deps).await
+    };
+    if let Err(e) = out {
+        eprintln!("sql nodes: registration round failed: {e} (retry)");
+    }
+}
+
 /// Self-registration loop (leader-gated retry, like the existing
 /// backup-map init loop): runs only once the cluster topology is ready.
-/// Leaders self-write; followers forward their binds to the current
-/// leader over `/sql/nodes` so their sql_rpc port is discoverable for
-/// 2PC routing (see module doc).
+/// `CLUSTER INIT` can flip the topology at any instant inside the 3s
+/// tick, and every node sits in this loop BEFORE the cluster exists --
+/// so a fast poll (250ms) catches the ready edge and registers on the
+/// spot, instead of waiting out the remainder of the interval. Leaders
+/// self-write; followers forward their binds to the current leader
+/// over `/sql/nodes` so their sql_rpc port is discoverable for 2PC
+/// routing (see module doc).
 pub fn spawn_register(deps: ClusterTsDeps) {
     tokio::spawn(async move {
+        let mut fast = tokio::time::interval(READY_POLL_INTERVAL);
+        fast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        fast.tick().await; // consume the immediate first tick
+        while !deps.topo.read().unwrap().cluster_ready {
+            fast.tick().await;
+        }
+        // The ready edge itself: register this round, then keep the
+        // cadence (Go sleeps before the first registration).
+        register_round(&deps).await;
         let mut ticker = tokio::time::interval(REGISTER_INTERVAL);
         ticker.tick().await; // Go sleeps before the first registration
         loop {
@@ -137,17 +170,7 @@ pub fn spawn_register(deps: ClusterTsDeps) {
             if !deps.topo.read().unwrap().cluster_ready {
                 continue;
             }
-            let is_leader = deps.raft.read().unwrap().is_leader;
-            let out = if is_leader {
-                register_once(&deps).await.map(|_| ())
-            } else {
-                // Followers cannot raft-write: forward the binds to the
-                // leader so 2PC routing can resolve our sql_rpc port.
-                forward_binds(&deps).await
-            };
-            if let Err(e) = out {
-                eprintln!("sql nodes: registration round failed: {e} (retry)");
-            }
+            register_round(&deps).await;
         }
     });
 }

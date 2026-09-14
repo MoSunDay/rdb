@@ -262,6 +262,25 @@ async fn drill_py_scenario_again_three_real_processes() {
     );
 }
 
+/// `CLUSTER INIT` seeds the initializing leader's binds into the
+/// raft-replicated `sql_nodes` registry THROUGH THE SAME REPLY WINDOW:
+/// the moment `+done` returns, `raft get sql_nodes` must already
+/// resolve the leader -- followers can then lease ts blocks at once,
+/// with no 3s registration window in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_init_seeds_leader_binds_in_sql_nodes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (nodes, leader) = bring_up_cluster(dir.path()).await;
+    let binds: Vec<String> = nodes.iter().map(|n| n.resp.clone()).collect();
+    cluster_init(&nodes[leader], &binds).await;
+    let reg = cmd_one_shot(&nodes[leader].resp, TOKEN, &[b"raft", b"get", b"sql_nodes"]).await;
+    assert!(
+        contains_bytes(&reg, nodes[leader].resp.as_bytes()),
+        "leader binds must be seeded at CLUSTER INIT (reply window): {reg:?}\n{}",
+        all_ctx(&nodes)
+    );
+}
+
 /// D7b regression: the join decision must follow PERSISTED RAFT STATE,
 /// not data-dir existence. A first join against a dead join address dies
 /// fatally (Go parity), but by then the process has already created the
