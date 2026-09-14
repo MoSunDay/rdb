@@ -155,6 +155,28 @@ pub fn owner_of_key(r: &Routing, key: &[u8]) -> Option<String> {
     slot_of_key(key).map(|s| owner(r, s))
 }
 
+/// Slot-prefixed probe key of one row write (raw table id + pk bytes,
+/// the same crc16 `row::slot_of` every commit path hashes with). Only
+/// the `"slot/"` prefix feeds [`owner_of_key`], so the probe needs no
+/// schema and no ts.
+pub fn row_probe(table_id: u32, pk: &[u8]) -> Vec<u8> {
+    crate::store::rocksdb::slot_prefix(crate::sql::storage::row::slot_of(table_id, pk))
+}
+
+/// Would any of these physical (slot-prefixed) keys be written on a
+/// REMOTE node? The pre-commit ts reserve uses this as its `strict`
+/// predicate: a distributed commit fails fast (1213, retryable) when
+/// the ts authority is unreachable instead of stamping GAP-fallback
+/// versions; purely local write sets keep the degraded fallback (a
+/// same-node refill re-anchors those).
+pub fn any_remote_owner(shared: &Shared, keys: &[Vec<u8>]) -> bool {
+    let Some(r) = routing(shared) else {
+        return false; // single-node world: every write is local
+    };
+    keys.iter()
+        .any(|k| owner_of_key(&r, k).is_some_and(|owner| owner != r.host))
+}
+
 /// Slot prefix of a physical key (`"1234/..."` -> 1234), if well formed.
 pub fn slot_of_key(key: &[u8]) -> Option<u16> {
     let slash = key.iter().position(|&b| b == b'/')?;
@@ -210,6 +232,44 @@ mod tests {
         let mut key = b"0/".to_vec();
         key.extend_from_slice(&[0x20]);
         assert_eq!(owner_of_key(&r, &key), Some("a:1".to_string()));
+    }
+
+    #[test]
+    fn any_remote_owner_flags_only_foreign_slots() {
+        // Not cluster-ready: every write counts as local (the local
+        // fast path never enters 2PC, so no fail-fast either).
+        let mut shared = crate::state::testutil::shared_with(crate::state::testutil::test_config());
+        assert!(!any_remote_owner(
+            &shared,
+            &[b"0/x".to_vec(), b"16383/x".to_vec()]
+        ));
+        // Ready 3-node topology, this node = "b:2": slots 0..=5461 sit
+        // on a:1, 5462..=10922 on b:2 (local), 10923.. on c:3.
+        *shared.topology.write().unwrap() = crate::topology::refresh("a:1,b:2,c:3");
+        shared.conf.bind = "b:2".to_string();
+        assert!(!any_remote_owner(
+            &shared,
+            &[b"5462/x".to_vec(), b"10922/x".to_vec()]
+        ));
+        assert!(any_remote_owner(
+            &shared,
+            &[b"5462/x".to_vec(), b"0/x".to_vec()]
+        ));
+        assert!(any_remote_owner(&shared, &[b"10923/x".to_vec()]));
+    }
+
+    #[test]
+    fn row_probe_carries_the_row_plane_slot() {
+        // The probe is the same "<slot>/" prefix `row::version_key`
+        // stamps, so ownership matches the plan's participant routing.
+        let table_id = 7u32;
+        let pk = b"pk-bytes";
+        let slot = crate::sql::storage::row::slot_of(table_id, pk);
+        assert_eq!(
+            row_probe(table_id, pk),
+            crate::store::rocksdb::slot_prefix(slot)
+        );
+        assert_eq!(slot_of_key(&row_probe(table_id, pk)), Some(slot));
     }
 
     #[test]

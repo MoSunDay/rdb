@@ -57,6 +57,12 @@ pub const TS_FALLBACK_GAP: u64 = 4 << 20;
 /// are served by the requester's own (unbounded) local fallback.
 pub const MAX_REMOTE_BLOCK: u64 = 1 << 20;
 
+/// Strict-reserve failure text (surfaces as SQL 1213, retryable): the
+/// ts authority could not be reached to lease a block above the write
+/// frontier, and a distributed commit must not stamp GAP-fallback
+/// versions (no cursor ride can ever cover them).
+pub const TS_AUTHORITY_UNREACHABLE: &str = "sql ts: ts authority unreachable, no block above the write frontier (distributed commits fail fast; retry)";
+
 /// Refill cadence; also how fast a degraded node recovers its floor.
 const REFILL_INTERVAL: Duration = Duration::from_millis(200);
 /// Fetch the next block once the current one is half drained.
@@ -145,6 +151,13 @@ pub fn carve(st: &mut TsState, n: u64) -> Option<Range<u64>> {
 /// `floor` (the requester already granted everything below it).
 pub fn carve_above_floor(st: &mut TsState, n: u64, floor: u64) -> Option<Range<u64>> {
     (st.block_lo >= floor).then(|| carve(st, n)).flatten()
+}
+
+/// Would the reserved tail serve an imminent alloc of `want` stamps
+/// above `floor` -- the same availability [`carve_above_floor`] grants?
+/// Pure read (consumes nothing); the strict reserve verdict uses it.
+pub fn tail_covers(st: &TsState, floor: u64, want: u64) -> bool {
+    st.block_lo >= floor && remaining(st) >= want
 }
 
 /// Degraded fallback: a locally-bumped range above every grant this node
@@ -353,38 +366,43 @@ impl ClusterTs {
     /// mid-refill-tick (allocs never fetch) and would degrade to the
     /// GAP fallback, whose stamps no cursor ride can ever cover. So:
     /// fold in the live cursor, drop a stale or short tail, lease
-    /// `want.max(TS_BLOCK)` above the frontier. Best-effort: when the
-    /// leader is unreachable the caller's alloc falls back above
-    /// `last_cursor` (frozen degraded semantics), which this sync
-    /// already anchored.
-    pub async fn reserve_write_frontier(&self, floor: u64, want: u64) {
+    /// `want.max(TS_BLOCK)` above the frontier. With `strict` (the
+    /// write set has a remote slot owner: the commit runs as 2PC) an
+    /// unreachable authority fails with [`TS_AUTHORITY_UNREACHABLE`]
+    /// instead -- a distributed commit must never stamp fallback
+    /// versions. Lenient callers (purely local writes) keep the frozen
+    /// degraded semantics: a same-node refill re-anchors them.
+    pub async fn reserve_write_frontier(
+        &self,
+        floor: u64,
+        want: u64,
+        strict: bool,
+    ) -> Result<(), String> {
         if !self.active() {
-            return;
+            return Ok(()); // local mode: nothing degrades, nothing to veto
         }
         self.sync_cursor_frontier();
         let floor = floor.max(self.state.lock().unwrap().observed_floor + 1);
-        let serves = |st: &TsState| st.block_lo >= floor && remaining(st) >= want;
-        {
-            let st = self.state.lock().unwrap();
-            if serves(&st) {
-                return;
-            }
-        }
-        {
+        if !tail_covers(&self.state.lock().unwrap(), floor, want) {
             // Discard the stale or short tail (block_lo == block_hi
-            // empties it).
-            let mut st = self.state.lock().unwrap();
-            if !serves(&st) {
-                st.block_lo = st.block_hi;
+            // empties it); the fetch below re-leases above the frontier.
+            {
+                let mut st = self.state.lock().unwrap();
+                if !tail_covers(&st, floor, want) {
+                    st.block_lo = st.block_hi;
+                }
+            }
+            if let Ok((lo, hi)) = self.fetch_serialized(want.max(TS_BLOCK), floor).await {
+                let mut st = self.state.lock().unwrap();
+                if install_block(&mut st, lo, hi) {
+                    st.degraded = false;
+                }
             }
         }
-        let Ok((lo, hi)) = self.fetch_serialized(want.max(TS_BLOCK), floor).await else {
-            return;
-        };
-        let mut st = self.state.lock().unwrap();
-        if install_block(&mut st, lo, hi) {
-            st.degraded = false;
+        if strict && !tail_covers(&self.state.lock().unwrap(), floor, want) {
+            return Err(TS_AUTHORITY_UNREACHABLE.to_string());
         }
+        Ok(())
     }
 
     /// Lease `n` timestamps for a REMOTE follower (`/sql/ts`): carve

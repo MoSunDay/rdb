@@ -395,6 +395,16 @@ async fn backfill_index(shared: &Shared, schema: &TableSchema, index: &IndexRef)
     // another node, one local batch otherwise (single-node world or
     // every key on this node).
     let no_writes: dist::plan::SimpleWrites = Vec::new();
+    // Reserve the write frontier first like every other commit path:
+    // the index-only plan still allocates one ts (the 2PC txn id), and
+    // it must clear `read_ts` without degrading to the GAP fallback.
+    // Strict when any entry key has a remote owner (2PC backfill).
+    let probes: Vec<Vec<u8>> = ops.iter().map(|(k, _)| k.clone()).collect();
+    let strict = dist::any_remote_owner(shared, &probes);
+    shared
+        .sql_ts
+        .reserve_write_frontier(read_ts, 1, strict)
+        .await?;
     if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, schema, &no_writes, &ops)? {
         return dist::twopc::run(shared, &plan).await;
     }
