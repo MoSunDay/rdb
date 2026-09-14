@@ -422,8 +422,17 @@ contract; module map lives in `agents/rust/sql.md`.
 - **Timestamps**: node-local atomic oracle when the cluster is not ready; once
   `CLUSTER INIT` lands, block allocation through the raft leader (`sql_ts_cursor`,
   HTTP `/sql/ts?n=` on the leader, 4096-ts blocks, cursor persisted via raft BEFORE a
-  block is served). Unreachable leader degrades to locally-bumped ranges above the last
-  known global watermark (monotonicity over availability of strict ordering).
+  block is served). `CLUSTER INIT` itself seeds the leader's binds into the raft
+  `sql_nodes` registry through a second apply awaited inside the same `+done` reply
+  window (region-metadata-style: peers resolve the ts authority the moment the FSM
+  entry replicates), and the registration loop fast-polls (250ms) the `cluster_ready`
+  edge. Intentional deviation (TSO discipline): a commit whose write set spans remote
+  slot owners (2PC) FAILS FAST with MySQL 1213 (retryable) when the ts authority
+  cannot lease a block above the write frontier — it never stamps locally-bumped GAP
+  ranges, because no later cursor ride can cover them and newest-ts-wins would bury
+  the write silently. Purely local writes keep the degraded fallback above the last
+  known global watermark (monotonicity over availability of strict ordering); a
+  same-node refill re-anchors them.
 - **Transactions**: `BEGIN`/`COMMIT`/`ROLLBACK` snapshot isolation — reads pinned at the
   txn read_ts (registered with the oracle), writes staged in a per-session write set,
   first-committer-wins write-write validation (MySQL error 1213). DDL inside a txn is

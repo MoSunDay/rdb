@@ -43,16 +43,21 @@ Commit: 98e17a5
 - `temporal.rs` + `temporal_tests.rs`：时间域纯函数——儒略日 civil 数学
   （`days_from_civil`/`civil_from_days`，checked 运算）、canonical/紧凑字面量解析与
   格式化（微秒 6 位、为 0 不渲染）、`now_micros`/`today_days`（UTC 墙钟）。
-- `tx/`：`ts.rs`（Oracle：本地原子 / 集群模式切换）、`global.rs`（raft 块授权：
-  `sql_ts_cursor` 先持久后发放、4096 块、HTTP `/sql/ts`、降级单调回退）、`nodes.rs`
-  （`sql_nodes` 注册表：raft addr → 各 bind）、`session.rs`（快照事务：写集暂存、
+- `tx/`：`ts.rs`（Oracle：本地原子 / 集群模式切换，预约失败映射 1213）、`global.rs`
+  （raft 块授权：`sql_ts_cursor` 先持久后发放、4096 块、HTTP `/sql/ts`；
+  `reserve_write_frontier(floor, want, strict)`——写集含远端属主（2PC）时 strict：
+  leader 不可达即拒绝盖章，绝不本地 GAP；纯本地写宽松：降级单调回退，同节点 refill
+  重锚）、`nodes.rs`（`sql_nodes` 注册表：raft addr → 各 bind；`cluster_ready` 边沿
+  250ms 快轮询注册 + 3s 循环兜底）、`session.rs`（快照事务：写集暂存、
   own-write 叠合、首提交者胜冲突检测、索引维护入提交批、SAVEPOINT 栈——marker 快照
   整张写集 + append 长度 + 当时 latch）、`latch.rs`（锁读注册表：`(table_id,pk)`
   进程级、all-or-nothing、同 owner 重入、冲突 1205 快败、多节点 veto）。
 - `index/`：二级/唯一索引键（`keys.rs`，索引 slot=`crc16(table_id++col_pos)`）、
   行变迁→索引操作推导与维护（`maintain.rs`、`mod.rs` 查找/范围/唯一属主）。
 - `plan/`：单表访问路径（IndexLookup vs SeqScan，sargable =/IN/BETWEEN，>1000 pk 回退）。
-- `dist/`：节点间 SQL RPC（`sql_rpc_bind`，u32 长度前缀 JSON）——`twopc.rs` 协调者、
+- `dist/`：节点间 SQL RPC（`sql_rpc_bind`，u32 长度前缀 JSON）——`mod.rs` 公共件含
+  `row_probe`/`any_remote_owner`（行平面 slot 探测写集是否跨远端属主，strict 预约判定）、
+  `twopc.rs` 协调者、
   `participant.rs` 参与者（PREPARE/DECIDE 各为单原子批 + 参与者标记）、`plan.rs`
   （写计划按 slot 归属分组）、`gather.rs`（按 band scatter-gather 读）、`recover.rs`
   （在疑标记经 `/sql2pc/status` 决议，60s 租期 presumed-abort）。
@@ -67,7 +72,9 @@ Commit: 98e17a5
 - 时间戳：集群未就绪=本地原子；就绪后所有 alloc 经 leader 块授权，游标先 raft 持久；
   `now()` 骑集群游标前沿（`sync_cursor_frontier`，允许读旧快照，禁止回退）；写路径
   先按读点预留写前沿（`reserve_write_frontier`/`alloc_n_above`，过期或过短的本地
-  块尾作废重租），保证本节点写入的 ts 高于它已读到的版本。
+  块尾作废重租），保证本节点写入的 ts 高于它已读到的版本；ts authority 不可达时，
+  跨远端属主的提交 fail-fast（1213，GAP 无 cursor 可覆盖、newest-wins 会静默掩埋），
+  纯本地写保留 GAP 降级。
 - 2PC：提交决议先落本地库再广播（outcome 落库失败 = 提交失败：不发出任何 Decide，
   尽力广播 abort，客户端收到可重试 WriteConflict）；status 应答（HTTP 与 TxnStatus）
   只含请求节点名下的索引切片（outcome 记录按节点映射：协调者含全部参与者、参与者

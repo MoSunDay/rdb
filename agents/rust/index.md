@@ -35,7 +35,7 @@ Commit: 98e17a5
   - `cmd_meta/`（表 `table.rs`/查找 `mod.rs`/测试 `tests.rs` 三文件）：`COMMANDS` 静态表（188 条 arity/first/last/step），注册表双向同步测试 + 路由键↔队列键（`routing_key_index` vs `keyspec::keys_of`）交叉校验锁定；
   - `server_cmd.rs`：COMMAND（COUNT/INFO/DOCS/GETKEYS）/INFO（Server/Cluster/Keyspace）/DBSIZE/ECHO/SELECT；`flushdb.rs`：FLUSHDB（分块删、保控制面记录、与 Lite offset 刷盘轮次互斥 + 双重 clear 防孤儿消费组记录复活）；`keyspace_role.rs`：全键空间物理记录分类（Root/Member/Foreign，DBSIZE 计数与 FLUSHDB 擦除共用）；
   - `list_mpop.rs`：LMPOP（numkeys 多键首非空）；`lite/range_rev.rs`：XREVRANGE（倒序迭代器 `for_each_down_from`）；另有 HMSET/ZREVRANGE/SINTERCARD 补齐；
-  - `cluster.rs`：CLUSTER（init/nodes/test 等，拓扑读 `state::Shared.topology`）；
+  - `cluster.rs`：CLUSTER（init/nodes/test 等，拓扑读 `state::Shared.topology`；init 在 `+done` 窗口内二次 apply 把 leader binds 种进 `sql_nodes`，`cluster info` epoch 计两次）；
   - `raft_cmd.rs`：RAFT（help/stats/leader/nodes/set/get）；
   - `migrate/`：MIGRATE 模块（W1.0 按职责拆分）——`data.rs` 数据面（host/port/key/db/timeout + KEYS 批量 dump→ASKING→RESTORE）
     + `migrate task <slot> <src> <dst>` 编排（SETSLOT MIGRATING/IMPORTING/NODE/STABLE +
