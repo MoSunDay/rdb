@@ -29,6 +29,7 @@ pub mod list_ops;
 pub mod list_rewrite;
 pub mod migrate;
 pub mod raft_cmd;
+pub mod readonly;
 pub mod server_cmd;
 pub mod set_cmd;
 pub mod set_scan;
@@ -407,6 +408,16 @@ pub(crate) async fn dispatch(
             return false;
         }
     };
+
+    // Backup listener: read-only gate (Redis replica semantics). Runs
+    // after lookup so unknown commands keep their specific error, and
+    // covers EXEC replays too (they re-enter dispatch). Go's BackupServer
+    // had no such gate.
+    if shared.mode == state::Mode::Backup && !readonly::allowed(&first) {
+        codec::append_error(out, readonly::ERROR);
+        observe(shared, &first, false, start);
+        return false;
+    }
 
     // Slot routing for non-whitelisted commands.
     let mut prefix_key: Vec<u8> = Vec::new();

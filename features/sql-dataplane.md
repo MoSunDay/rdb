@@ -1,4 +1,4 @@
-Commit: d481b1d708c248f86be394189d01ca7305fc8528
+Commit: 98e17a5
 # SQL 数据面（MySQL 协议 + 分布式事务）
 
 ## 能力

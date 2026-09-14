@@ -303,6 +303,7 @@ fn is_tx_control(first: &str) -> bool {
 /// * unknown command                       -> dirty
 /// * blocking command (`keyspec::may_block`) -> dirty
 /// * MIGRATE / RAFT (cluster admin)        -> dirty
+/// * write on a backup listener            -> dirty (-READONLY)
 /// * arity / MOVED (same checks as dispatch) -> dirty
 /// * keys hashing to another slot          -> dirty (CROSSSLOT)
 fn queue_command(
@@ -323,6 +324,13 @@ fn queue_command(
             out,
             &format!("ERR command '{first}' is not allowed in transactions"),
         );
+        conn.mark_dirty();
+        return;
+    }
+    // Backup listener: writes are rejected at queue time as well; the
+    // transaction goes dirty, so EXEC aborts wholesale (EXECABORT).
+    if shared.mode == state::Mode::Backup && !command::readonly::allowed(first) {
+        codec::append_error(out, command::readonly::ERROR);
         conn.mark_dirty();
         return;
     }

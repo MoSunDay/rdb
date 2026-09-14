@@ -2,5 +2,9 @@
 # the multi-thread scheduler's LIFO slot loses task wakeups on this host
 # (all workers park while runnable tasks sit queued; freezes 6s+).
 # See COMPAT.md "tokio LIFO slot freeze" for the full root cause.
+# rustdocflags mirror rustflags because rustdoc does NOT read
+# [build] rustflags -- without it the doc-test build would compile the
+# lib without the cfg and src/build_guard.rs would (wrongly) fire.
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
+rustdocflags = ["--cfg", "tokio_unstable"]

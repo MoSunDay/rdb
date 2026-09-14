@@ -1,4 +1,4 @@
-Commit: (working-tree, 随本提交入库)
+Commit: 4f73b39 (XACK 唤醒) + 98e17a5 (门控停靠)
 
 # Lite MQ 有序组收尾：XACK 唤醒满窗 BLOCK 读者；SETID×ORDERED e2e
 

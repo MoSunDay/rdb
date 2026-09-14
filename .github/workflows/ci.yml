@@ -7,6 +7,7 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 concurrency:
@@ -49,3 +50,48 @@ jobs:
 
       - name: release build
         run: cargo build --release --workspace
+
+      # Guard steps: prove src/build_guard.rs actually fires when the
+      # tokio_unstable cfg is missing (empty RUSTFLAGS overrides the
+      # committed .cargo/config.toml build.rustflags).
+      - name: "build guard: full build must fail without tokio_unstable cfg"
+        run: |
+          if RUSTFLAGS='' cargo build --release >/tmp/guard.log 2>&1; then
+            echo '::error::full build succeeded without --cfg tokio_unstable (guard did not fire)'
+            exit 1
+          fi
+          grep -q 'build_guard' /tmp/guard.log || {
+            echo '::error::build failed but not via the build guard:'; cat /tmp/guard.log; exit 1;
+          }
+      - name: "build guard: store-only slice is exempt"
+        run: RUSTFLAGS='' cargo build --release --no-default-features --features store
+
+  release:
+    name: tag release (linux-amd64)
+    needs: rust
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rocksdb build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: release build
+        run: cargo build --release --workspace
+      - name: package
+        run: tar -czf "rdb-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C target/release rdb
+      - name: github release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "rdb-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
+            --title "rdb ${GITHUB_REF_NAME}" \
+            --generate-notes

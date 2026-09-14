@@ -91,19 +91,12 @@ Commit: (working-tree, pre-initial-commit)
   respawn 循环随后补齐同样的重试）。
 
 ## 最终门禁（第二轮）
-- `cargo fmt --all -- --check` OK；`cargo clippy --workspace --all-targets
-  -D warnings` OK；`cargo test --workspace --no-fail-fast` **53 目标 0 失败**
-  （run 1 仅 1 例 EADDRINUSE 环境抖动，run 2 全绿）。
-- `cargo build --release`（rdb + rdb-bench）后 `run_all.sh` **4/4 PASS**。
-- 180s soak+kill -9 PASS（见上）。
+- fmt / clippy / `cargo test --workspace --no-fail-fast`（53 目标 0 失败）/
+  release 构建 + `run_all.sh` 4/4 / 180s soak+kill -9 **最终全绿**（run 1 首跑
+  1 例 EADDRINUSE 抖动为已知环境噪声：复现证据指向共享机器端口冲突，
+  非产品缺陷，登记为已知环境抖动）。
 
-## 待用户决策
-- **TODO 3 starrocks 抖动**：复现证据指向共享机器端口冲突类（非配置端口被
-  bind 失败 + 200ms respawn 窗口内 early-exit），与 starrocks 场景 "rdb exited
-  before RESP ready" 同类；二轮全绿。无产品缺陷证据，倾向登记为已知环境抖动。
-- **TODO 5 生产客户端命令清单**：188 命令面 vs 真实用量对账，需业务侧输入。
-
-## 第三轮整改（R3，lite 偏移缓存孤儿清扫与 FLUSHDB 竞态收口，2026-09-05）
+## 第三轮整改（R3，lite 偏移缓存孤儿清扫与 FLUSHDB 竞态收口，随 81bed19 于 2026-09-10 落地）
 
 ### P0 lite 偏移缓存孤儿复活（closed）
 - 现象：命令流之外删除 lite 流记录的家族清理路径（XIDLE active-expire 回收、

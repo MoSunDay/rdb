@@ -90,6 +90,24 @@ _e2e_wait_ping () { # idx -> 0 when RESP port answers PING
     return 1
 }
 
+# W0.4: every node's stderr must carry the "LIFO slot disabled" startup
+# banner -- a binary built without --cfg tokio_unstable prints the DANGER
+# variant instead (see COMPAT.md "tokio LIFO slot freeze").
+_e2e_assert_lifo () {
+    local i log
+    for i in $(seq 0 $((E2E_NODES - 1))); do
+        log="$E2E_WORKDIR/node$i.log"
+        if grep -q 'DANGER' "$log" 2>/dev/null; then
+            echo "FATAL: node$i built WITHOUT tokio_unstable cfg (see $log)" >&2
+            return 1
+        fi
+        if ! grep -q 'tokio LIFO slot: disabled' "$log" 2>/dev/null; then
+            echo "FATAL: node$i missing 'tokio LIFO slot: disabled' banner (see $log)" >&2
+            return 1
+        fi
+    done
+}
+
 _e2e_wait_leader () { # any monitor /metrics shows raft_stats{status="Leader"}
     for _ in $(seq 1 "$E2E_WAIT_TIMEOUT"); do
         local i
@@ -170,6 +188,7 @@ e2e_start_cluster () {
         _e2e_wait_ping "$i" || {
             echo "FATAL: node$i RESP not ready" >&2; return 1; }
     done
+    _e2e_assert_lifo || return 1
     _e2e_wait_leader || { echo "FATAL: no leader elected" >&2; return 1; }
     _e2e_cluster_init || { echo "FATAL: CLUSTER INIT failed" >&2; return 1; }
     _e2e_wait_sql_registry || { echo "FATAL: sql_rpc registry incomplete" >&2; return 1; }
