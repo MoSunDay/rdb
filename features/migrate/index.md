@@ -14,7 +14,7 @@ Commit: 98e17a5
   `-ERR <阶段>: <对端错误原文>`（如 `src MIGRATING: ERR Unknown node ...`）。
 - `migrate list`：单条 bulk，内容为任务 JSON。
 
-## 编排流程（`command/migrate.rs` 的 `run_migration`）
+## 编排流程（`command/migrate/task.rs` 的 `run_migration`）
 1. 计算 node-id：`md5_with40(addr)`（40 位 hex，与 `CLUSTER SETSLOT` 的 id 体系一致）；
 2. src：`CLUSTER SETSLOT <slot> MIGRATING <dst-id>`；dst：`IMPORTING <src-id>`；
 3. 循环：src 上 `CLUSTER GETKEYSINSLOT <slot> 1000` → 空则结束；否则
