@@ -84,3 +84,15 @@ idx 由 1 次变 2 次——probes 一算 + `try_plan_txn` 内部一算），pro
 唯一冲突（`DupEntry`，MySQL 1062）现先于 strict 预留的不可达否决（1213）浮出：
 「2PC + authority 不可达 + 唯一冲突」同现时客户端改见 1062 而非 1213，两条路径
 均为零落盘的干净中止（等价于更早失败，语义无回归）。
+
+差分实证（2026-09-15 补充，闭合复审遗留「高负载差分信号」）：16 核宿主机，
+自旋压载两档 ~145（≈9 倍超售，3+3 轮）与 ~410（≈25 倍，1+1 轮）。pre-fix
+基线 `22c402f`（= `525777c^`，含 f75c617 读点折叠）4 轮场景全 PASS，但每轮
+节点日志均命中 2 次 `sql ts: block refill failed: leader http addr unknown
+(sql_nodes) (degraded fallback active)`——降级窗口 100% 命中；post-fix
+`c5e8d63` 同负载 4 轮零命中，且无 1213 外漏（种窗后该窗口不复存在）。两侧
+均未出现 `no block left`（GAP fallback ts 实际消耗）：关键 transfer 提交始终
+落在注册完成后（场景的 EXPLAIN 轮询门与 sql_nodes 注册同乘 3s ticker、同步
+拉伸），且基线已含读点折叠，故历史确定性场景 FAIL 未在本差分复现（其依赖
+折叠前栈的时序）。结论：日志级差分闭合（修复每轮消除窗口命中），场景级
+FAIL→PASS 差分不可达，正确性证明仍由单测与 e2e 承担。
