@@ -71,10 +71,16 @@ autocommit 路径与 backfill 探测集本就正确，仅此一处不一致，�
 "the same keys plan::build routes"）。
 
 修复：`written_schemas`/`commit_index_ops` 提至预留之前（纯读，`try_plan_txn`
-内部重算 idx 可容忍重复计算；本地路径复用提升后的结果，总计算次数不变），
-probes 并入 idx 键，与 `exec/write.rs` 既有模式对齐；修正注释。
+内部重算 idx 可容忍重复计算；本地路径复用提升后的结果、计算次数不变，2PC 路径
+idx 由 1 次变 2 次——probes 一算 + `try_plan_txn` 内部一算），probes 并入 idx 键，
+与 `exec/write.rs` 既有模式对齐；修正注释。
 
 回归测试：`session_index_tests::commit_fails_fast_when_only_the_index_plane_is_remote`
 （行本地/索引远端/authority 不可达 → 1213 且零落盘；修复前红、修复后绿）。
 验证：`cargo test` 全量通过（lib 882 + 全部集成/e2e 套件 0 失败），
 `clippy --all-targets` 无告警。
+
+知悉项（2026-09-15 复审裁决非阻断）：错误序微变——提升后的 `commit_index_ops`
+唯一冲突（`DupEntry`，MySQL 1062）现先于 strict 预留的不可达否决（1213）浮出：
+「2PC + authority 不可达 + 唯一冲突」同现时客户端改见 1062 而非 1213，两条路径
+均为零落盘的干净中止（等价于更早失败，语义无回归）。
