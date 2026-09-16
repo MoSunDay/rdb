@@ -4,8 +4,10 @@
 # WHY nightly and not on push: load-only regressions -- the tokio
 # LIFO-slot scheduler freeze class being the concrete example -- do not
 # reproduce in unit tests or the short-lived CI jobs; they only show up
-# under sustained load, and the 180s soak inside run_all.sh is too slow
-# to gate every push. The soak's RDB_SOAK_P99_MAX_MS gate (default
+# under sustained load, and the kill -9 soak (soak_kill9.sh, 180s
+# default load window) is too slow to gate every push. That soak is run
+# by this workflow, not by run_all.sh (which only globs the 4 fast
+# scenario_*.sh cases). The soak's RDB_SOAK_P99_MAX_MS gate (default
 # 1000ms, deliberately generous) is what actually catches them: clients
 # stay error-free while p99 balloons to multi-seconds.
 #
@@ -33,7 +35,7 @@ env:
 jobs:
   soak:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -71,7 +73,7 @@ jobs:
       # Bench/e2e artifacts are deliberately written to /tmp (outside the
       # torn-down per-scenario workdir) so they survive for upload.
       - name: upload soak/e2e diagnostics
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: soak-diagnostics
