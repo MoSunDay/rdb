@@ -483,6 +483,13 @@ async fn do_main() {
         // M3: the read-only backup listener shares the cluster core so
         // its `now()` snapshot reads track the global sequence too.
         shared.sql_ts.enable_cluster(cluster_ts.clone());
+        // Restart clock fencing for the read-only plane as well: its
+        // snapshot reads must sit above whatever ts the backup store's
+        // own data carries, or every row would be invisible after a
+        // restart (same floor key, recovered from the backup store).
+        shared
+            .sql_ts
+            .advance_to(sql::tx::floor::recover(&shared.store));
         // The backup store gets its own active-expire sweep: whatever
         // lands there (restore/replication channel) must vanish on
         // schedule even if never read; the listener itself is
@@ -526,6 +533,13 @@ async fn do_main() {
     // M3: swap the normal listener's oracle onto the cluster-global
     // allocator (no-op until `cluster init` flips cluster_ready).
     shared.sql_ts.enable_cluster(cluster_ts.clone());
+    // Restart clock fencing BEFORE any SQL listener comes up: replay
+    // the persisted ts floor into the oracle. `advance_to` is a max on
+    // BOTH clock backends (local counter fetch_max + cluster
+    // observe_floor), so this is exact for single-machine boots and a
+    // harmless lower-bound no-op on a cluster node whose raft cursor
+    // already sits higher.
+    shared.sql_ts.advance_to(sql::tx::floor::recover(&store));
     // Active expiration loop (data-plane background task; sees the normal
     // listener's store -- the backup store gets its OWN sweep spawned in
     // the backup-listener block, whose listener is also -READONLY-gated).

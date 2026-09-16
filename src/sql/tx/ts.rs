@@ -238,4 +238,21 @@ mod tests {
         o.unregister_snapshot(7);
         assert_eq!(o.watermark(), 10);
     }
+
+    #[test]
+    fn advance_to_floor_keeps_allocations_above_it() {
+        // Boot recovery: the persisted floor replays through the same
+        // entry point 2PC participants use; a raised floor must keep
+        // every later grant strictly above it (kill -9 restart never
+        // rewinds the clock past committed rows).
+        let o = Oracle::new();
+        assert_eq!(o.alloc(), 1);
+        o.advance_to(500);
+        assert!(o.alloc() > 500);
+        assert!(o.now() > 500);
+        // Idempotent and monotonic: replaying a LOWER floor is a no-op.
+        o.advance_to(499);
+        let prev = o.now();
+        assert!(o.alloc() > prev);
+    }
 }

@@ -244,7 +244,36 @@ pub fn vote(
     })
     .map_err(|e| e.to_string())?;
     batch.put(marker_key(txn_id), marker);
+    // Same-batch ts floor (restart clock fencing, see tx::floor): the
+    // staged versions carry ts values up to the coordinator's
+    // watermark; a crash between Prepare and Decide still leaves the
+    // floor above every staged ts, so the recovery replay (or the
+    // lease-expiry abort) can never rewind the clock past them. Only
+    // stamped when something ts-bearing is staged: an index-ops-only
+    // slice stamps nothing (0 would REGRESS the persisted floor).
+    let hi = staged_max_ts(entries, segments);
+    if hi > 0 {
+        crate::sql::tx::floor::stamp(&mut batch, hi);
+    }
     ops::batch_write(store, batch).map(|_| Vote::Yes)
+}
+
+/// Highest ts any staged record in a Prepare batch carries: the max of
+/// the row version keys' ts suffixes and the columnar segments' commit
+/// ts (the coordinator's `commit_ts` argument is only the range START).
+fn staged_max_ts(
+    entries: &[Entry],
+    segments: &[crate::sql::columnar::commit::PendingSegment],
+) -> u64 {
+    let mut hi = segments.iter().map(|s| s.commit_ts).max().unwrap_or(0);
+    for e in entries {
+        if e.kind == EntryKind::RowPrepared {
+            if let Some((.., ts)) = row::parse_version_key(&e.key) {
+                hi = hi.max(ts);
+            }
+        }
+    }
+    hi
 }
 
 /// DECIDE (and recovery's replay of one): apply the decision
@@ -344,6 +373,13 @@ pub fn decide(
         outcome_key(txn_id),
         serde_json::to_vec(&rec).map_err(|e| e.to_string())?,
     );
+    // Same-batch ts floor, only when this decision made something
+    // visible: hi == 0 means the node had no marker (idempotent replay
+    // or a foreign txn) and the batch is bookkeeping only -- stamping 0
+    // would regress the persisted floor below earlier commits.
+    if commit && hi > 0 {
+        crate::sql::tx::floor::stamp(&mut batch, hi);
+    }
     ops::batch_write(store, batch).map(|_| hi)
 }
 
