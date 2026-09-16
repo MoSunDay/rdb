@@ -37,7 +37,7 @@ store = []
 
 [dependencies]
 rocksdb = "0.24"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 md-5 = "0.10"
@@ -60,6 +60,10 @@ jieba-rs = { version = "0.10", optional = true }
 serde_yaml = { version = "0.9", optional = true }
 
 [dev-dependencies]
+# start_paused clock-control for the state.rs advance-tick tests; a
+# dev-dependency entry unifies the feature set, so test builds keep
+# test-util while normal builds compile tokio without it.
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 # tests/sql_e2e.rs hand-rolls the mysql_native_password scramble.
 sha1 = "0.10"
