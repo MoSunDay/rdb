@@ -385,12 +385,34 @@ fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
             .unwrap_or(SqlType::VarChar),
         Expr::Agg { func, arg, .. } => match func {
             AggFunc::Count => SqlType::Int,
-            // SUM keeps its integer width; AVG always yields a double.
-            AggFunc::Sum => match arg.as_deref() {
-                Some(a) if result_type(a, scope) == SqlType::Int => SqlType::Int,
+            // SUM keeps its integer width; a DECIMAL argument sums to
+            // an exact decimal at the column scale (agg.rs decimal_sum)
+            // and AVG divides at scale+4 (avg_values -> div_decimal
+            // caps at MAX_DECIMAL_SCALE). Declaring DOUBLE here would
+            // mislabel the wire column (SDK clients parse the exact
+            // text cell as a float, e.g. mycli shows 0.6 for "0.60")
+            // and the binary encoder rejects decimal cells on
+            // non-NEWDECIMAL columns outright (conv.rs DecimalCell).
+            AggFunc::Sum => match arg.as_deref().map(|a| result_type(a, scope)) {
+                Some(SqlType::Int) => SqlType::Int,
+                Some(SqlType::Decimal { scale, .. }) => SqlType::Decimal {
+                    precision: crate::sql::storage::schema::MAX_DECIMAL_SCALE,
+                    scale,
+                },
                 _ => SqlType::Double,
             },
-            AggFunc::Avg => SqlType::Double,
+            AggFunc::Avg => match arg.as_deref().map(|a| result_type(a, scope)) {
+                Some(SqlType::Int) => SqlType::Decimal {
+                    precision: crate::sql::storage::schema::MAX_DECIMAL_SCALE,
+                    scale: 4,
+                },
+                Some(SqlType::Decimal { scale, .. }) => SqlType::Decimal {
+                    precision: crate::sql::storage::schema::MAX_DECIMAL_SCALE,
+                    scale: (scale + 4)
+                        .min(crate::sql::storage::schema::MAX_DECIMAL_SCALE),
+                },
+                _ => SqlType::Double,
+            },
             AggFunc::Min | AggFunc::Max => arg
                 .as_deref()
                 .map(|a| result_type(a, scope))
@@ -412,12 +434,39 @@ fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
             | BinOp::Gt
             | BinOp::GtEq => SqlType::Bool,
             _ => {
-                if result_type(left, scope) == SqlType::Double
-                    || result_type(right, scope) == SqlType::Double
-                {
+                let (lt, rt) = (result_type(left, scope), result_type(right, scope));
+                if lt == SqlType::Double || rt == SqlType::Double {
                     SqlType::Double
                 } else {
-                    SqlType::Int
+                    // Exact decimal arithmetic stays NEWDECIMAL: the
+                    // value path (expr_decimal.rs) computes Add/Sub/Mod
+                    // at the coarser scale, Mul at sa+sb, Div at sa+4
+                    // -- mirroring those scales keeps SDK clients and
+                    // the binary encoder on the decimal track instead
+                    // of parsing exact text cells as ints/floats.
+                    let dec_scale = |t: &SqlType| match t {
+                        SqlType::Decimal { scale, .. } => Some(*scale),
+                        _ => None,
+                    };
+                    let wide = crate::sql::storage::schema::MAX_DECIMAL_SCALE;
+                    match (dec_scale(&lt), dec_scale(&rt)) {
+                        (None, None) => SqlType::Int,
+                        (Some(a), Some(b)) => SqlType::Decimal {
+                            precision: wide,
+                            scale: match op {
+                                BinOp::Mul => a.saturating_add(b).min(wide),
+                                BinOp::Div => a.saturating_add(4).min(wide),
+                                _ => a.max(b),
+                            },
+                        },
+                        (Some(a), None) | (None, Some(a)) => SqlType::Decimal {
+                            precision: wide,
+                            scale: match op {
+                                BinOp::Div => a.saturating_add(4).min(wide),
+                                _ => a,
+                            },
+                        },
+                    }
                 }
             }
         },

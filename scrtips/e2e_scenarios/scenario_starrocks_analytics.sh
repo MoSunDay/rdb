@@ -238,4 +238,57 @@ wait_value "g: mycli count for sr_events" "$PORT" \
 assert_eq "g: mysql client count for sr_events" "10" \
     "$(sql_raw "$PORT" 'SELECT COUNT(*) FROM sr_events')"
 
+# ---- h. multi-column PK model + DECIMAL value column --------------------
+# PRIMARY KEY(k1, k2) is the composite-pk row store (W2.1): upserts
+# dedup on the FULL tuple, DECIMAL(10,2) values are exact (W2.0), and
+# DISTRIBUTED BY HASH accepts multi-column lists (parse/starrocks.rs
+# ident_list + ddl.rs per-column existence check). DECIMAL only rides
+# row stores -- the columnar engine rejects it (see the rejection
+# matrix below).
+expect_ok "h: CREATE sr_mpk composite PK model" "$PORT" \
+    "CREATE TABLE sr_mpk (k1 BIGINT NOT NULL, k2 VARCHAR(32) NOT NULL, v DECIMAL(10,2) NULL) PRIMARY KEY(k1, k2) DISTRIBUTED BY HASH(k1, k2) BUCKETS 3"
+assert_contains "h: sr_mpk in SHOW TABLES" "sr_mpk" \
+    "$(sql_exec "$PORT" 'SHOW TABLES')"
+expect_ok "h: seed sr_mpk (k1=1 twice, k1=2 once)" "$PORT" \
+    "INSERT INTO sr_mpk (k1, k2, v) VALUES (1, 'a', 0.1), (1, 'b', 0.2), (2, 'c', 0.1)"
+# same (k1,k2) again: latest wins on the full tuple
+expect_ok "h: re-INSERT (1,'a') upserts" "$PORT" \
+    "INSERT INTO sr_mpk (k1, k2, v) VALUES (1, 'a', 0.3)"
+wait_value "h: upsert keeps exactly 3 rows" "$PORT" \
+    "SELECT COUNT(*) FROM sr_mpk" "3"
+wait_value "h: (1,'a') carries the NEW v (0.3 -> 0.30)" "$PORT" \
+    "SELECT v FROM sr_mpk WHERE k1 = 1 AND k2 = 'a'" "0.30"
+wait_value "h: (1,'b') keeps its own v" "$PORT" \
+    "SELECT v FROM sr_mpk WHERE k1 = 1 AND k2 = 'b'" "0.20"
+# decimal aggregation over the PK model rows: SUM at column scale
+wait_value "h: SUM(v) is exact at the column scale (0.30+0.20+0.10)" "$PORT" \
+    "SELECT SUM(v) FROM sr_mpk" "0.60"
+wait_value "h: SUM(v) GROUP BY k1 ledger" "$PORT" \
+    "SELECT k1, SUM(v) FROM sr_mpk GROUP BY k1 ORDER BY k1" \
+    "$(printf '1\t0.50\n2\t0.10')"
+# surface: both key columns PRI, v typed decimal(10,2)
+assert_contains "h: DESCRIBE flags k1 PRI" "k1,bigint,NO,PRI" \
+    "$(sql_raw "$PORT" 'DESCRIBE sr_mpk' | tr '\t' ',')"
+assert_contains "h: DESCRIBE flags k2 PRI" "k2,varchar,NO,PRI" \
+    "$(sql_raw "$PORT" 'DESCRIBE sr_mpk' | tr '\t' ',')"
+assert_contains "h: DESCRIBE types v decimal(10,2)" "v,decimal(10,2),YES," \
+    "$(sql_raw "$PORT" 'DESCRIBE sr_mpk' | tr '\t' ',')"
+
+# ---- i. new rejections: composite-pk types & columnar DECIMAL ----------
+# composite pk columns are narrowed to Int/VarChar/Date/DateTime
+# (exec/ddl.rs): a DOUBLE key column is 1235 with the type named.
+expect_err "i: DOUBLE in a composite pk rejected" "$PORT" \
+    "CREATE TABLE sr_bad_dbl (k1 BIGINT, k2 DOUBLE, v INT) PRIMARY KEY(k1, k2) DISTRIBUTED BY HASH(k1) BUCKETS 1" \
+    "1235" "composite PRIMARY KEY column 'k2' has type double"
+# DECIMAL needs the row store: the columnar (DUPLICATE) engine has no
+# decimal segment encoding (exec/ddl.rs DECIMAL guard).
+expect_err "i: DECIMAL on a columnar table rejected" "$PORT" \
+    "CREATE TABLE sr_bad_dec (k BIGINT NOT NULL, v DECIMAL(10,2)) DUPLICATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1" \
+    "1235" "DECIMAL columns are not supported on columnar tables"
+# loud rejections leave no table behind (MySQL 1146 on read)
+expect_err "i: rejected sr_bad_dbl was NOT created" "$PORT" \
+    "SELECT COUNT(*) FROM sr_bad_dbl" "1146" "doesn't exist"
+expect_err "i: rejected sr_bad_dec was NOT created" "$PORT" \
+    "SELECT COUNT(*) FROM sr_bad_dec" "1146" "doesn't exist"
+
 e2e_finish "$SCENARIO"
