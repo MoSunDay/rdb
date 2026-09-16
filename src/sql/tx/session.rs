@@ -29,6 +29,7 @@ use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog;
 use crate::sql::storage::row;
 use crate::sql::storage::schema::{Engine, TableSchema, Value};
+use crate::sql::tx::floor;
 use crate::sql::tx::Oracle;
 use crate::state::Shared;
 use crate::store::ops;
@@ -330,6 +331,11 @@ pub fn build_commit_batch(
         };
         batch.put(key, val);
     }
+    // Same-batch ts floor (restart clock fencing, see tx::floor): the
+    // caller re-stamps with the WHOLE txn's range end - 1 when columnar
+    // segment metas (which take the range's tail timestamps) join this
+    // batch -- last stamp wins, so the floor stays the batch max.
+    floor::stamp(&mut batch, ts_range.end - 1);
     Ok(batch)
 }
 
@@ -412,6 +418,9 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
         );
         metas.push(meta);
     }
+    // Segment metas took the range's tail timestamps: re-stamp the floor
+    // with the WHOLE txn's max (last stamp in the batch wins).
+    floor::stamp(&mut batch, ts.end - 1);
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
         .map_err(SqlError::from)?;

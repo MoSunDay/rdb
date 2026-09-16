@@ -202,6 +202,9 @@ pub async fn commit_segment(
     let encoded = meta::encode_meta(&meta).map_err(|e| SqlError::new(ErrorCode::Unknown, e))?;
     let mut batch = WriteBatch::default();
     batch.put(meta::meta_key(meta.table_id, meta.segment_id), encoded);
+    // Same-batch ts floor (the meta is visible at commit_ts; restart
+    // clock fencing, see tx::floor).
+    crate::sql::tx::floor::stamp(&mut batch, commit_ts);
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
         .map_err(SqlError::from)?;
