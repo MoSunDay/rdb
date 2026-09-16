@@ -103,3 +103,32 @@ Validation: hang test 8x green (~5 s each), race test 4x green,
 full workspace suite under `taskset -c 0-3 --test-threads=4` green
 (1151 tests; hung indefinitely before), fmt + clippy 1.98
 `-D warnings` green.
+
+## I. Post-fix red → green: follower-lag assert + CI telemetry (4c4a19a)
+
+After the hang fix landed (8065e6e) the CI test step finished in 8
+minutes but red — logs are 403 for anonymous readers, so the failing
+test was unknown. Reproduced locally in a 3x full-suite loop on 4
+pinned cores: `drill_py_scenario_again_three_real_processes` failed
+1-in-3 with a nil bulk reply for `raft get rk1` on one node.
+
+Root cause (test bug, not product): the drill asserted `raft get rk1`
+on EVERY node immediately after `raft set` returned +OK. +OK means
+quorum commit; a lagging follower can answer before applying the
+entry. Same file already polls for exactly this in the depkey /
+rejoinkey loops — the rk1 check was the odd one out.
+
+Fix: poll with a 10 s deadline (process_cluster_e2e.rs), matching the
+file's own convention. Post-fix: 10/10 drill-binary stress runs and
+3/3 full-suite runs green locally; CI run 35160609179 test step green
+(9m45s, first green test step since fca9112).
+
+Also in this push window (933ba4d): ci.yml test step now (a) emits
+failing test names as `::error` annotations — readable via the
+anonymous check-runs API, since log downloads stay 403 — and (b) has
+`timeout-minutes: 60` so any future hang fails fast instead of
+burning the 360-min job cap.
+
+Outstanding: the B-side failover flake (one failure in a 2x10
+concurrent-binary stress loop, heavier than CI load, not reproducible
+4/4 serial) — revisit only if CI annotations name it.
