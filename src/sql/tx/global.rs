@@ -433,9 +433,13 @@ impl ClusterTs {
 
     /// One fetch under `fetch_mux` (refiller and `/sql/ts` share it so
     /// two fetches can never compute the same `lo` from one cursor).
+    /// The leadership snapshot is taken BEFORE the mux: blocking on the
+    /// raft read lock while holding the mux inverts the lock order
+    /// against any raft write guard that ends up waiting on a ts
+    /// fetch, a proven leader-wide deadlock.
     async fn fetch_serialized(&self, want: u64, floor: u64) -> Result<(u64, u64), String> {
-        let _fetch = self.fetch_mux.lock().await;
         let is_leader = self.deps.raft.read().unwrap().is_leader;
+        let _fetch = self.fetch_mux.lock().await;
         if is_leader {
             leader_fetch(&self.deps, want, floor).await
         } else {

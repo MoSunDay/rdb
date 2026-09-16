@@ -64,6 +64,17 @@ pub struct CatalogTxn<'a> {
     applied: Vec<(String, String)>,
 }
 
+/// One catalog mutation handed to raft: the (key, value) pair plus the
+/// ticket whose await commits it. Built under the raft write guard;
+/// awaited strictly AFTER the guard is dropped (holding the guard
+/// across `raft_apply_await` deadlocks the leader: apply progress, ts
+/// refill and the raft/HTTP serve paths all take the same RwLock).
+pub struct QueuedApply {
+    pub key: String,
+    pub value: String,
+    pub ticket: state::ApplyTicket,
+}
+
 impl CatalogTxn<'_> {
     /// The FSM view behind the held write guard: DDL decisions
     /// (lookups, id allocation) read through it so they see exactly the
@@ -77,46 +88,47 @@ impl CatalogTxn<'_> {
         &self.applied
     }
 
-    /// Persist a schema (upsert) through raft; awaits commit. A txn may
-    /// apply several mutations before its guard is released.
-    pub async fn put(&mut self, schema: &TableSchema) -> Result<(), String> {
+    /// Queue a schema upsert. Commit by awaiting the ticket AFTER the
+    /// guard is released, then [`record`](Self::record) the pair.
+    pub fn queue_put(&mut self, schema: &TableSchema) -> Result<QueuedApply, String> {
         let value = serde_json::to_string(schema).map_err(|e| e.to_string())?;
-        let entry = RaftLogEntryData {
-            key: catalog_key(&schema.name),
-            value,
-        };
-        let ticket = state::raft_apply_start(self.raft, &entry)?;
-        state::raft_apply_await(ticket).await?;
-        self.applied.push((catalog_key(&schema.name), entry.value));
-        Ok(())
+        self.queue_entry(&catalog_key(&schema.name), value)
     }
 
-    /// Remove a table's schema. The tombstone value carries the dropped
+    /// Queue a schema drop. The tombstone value carries the dropped
     /// table's id (a bare decimal, never valid TableSchema JSON), so id
     /// allocation stays monotone across drop+recreate cycles even after
     /// restarts; readers treat unparseable values as absent.
-    pub async fn drop(&mut self, table: &str, id: u32) -> Result<(), String> {
-        let entry = RaftLogEntryData {
-            key: catalog_key(table),
-            value: id.to_string(),
-        };
-        let ticket = state::raft_apply_start(self.raft, &entry)?;
-        state::raft_apply_await(ticket).await?;
-        self.applied.push((catalog_key(table), id.to_string()));
-        Ok(())
+    pub fn queue_drop(&mut self, table: &str, id: u32) -> Result<QueuedApply, String> {
+        self.queue_entry(&catalog_key(table), id.to_string())
     }
 
-    /// One raw FSM entry through the same replicated path (used for the
-    /// AUTO_INCREMENT next-value counter under `sql_sequence/`).
-    pub async fn put_kv(&mut self, key: &str, value: &str) -> Result<(), String> {
+    /// Queue one raw FSM entry (used for the AUTO_INCREMENT next-value
+    /// counter under `sql_sequence/`).
+    pub fn queue_put_kv(&mut self, key: &str, value: &str) -> Result<QueuedApply, String> {
+        self.queue_entry(key, value.to_string())
+    }
+
+    /// Queue one replicated entry: `raft_apply_start` only, so the
+    /// raft write guard is never held across an await. Callers await
+    /// the ticket after dropping the guard, then `record` the pair.
+    fn queue_entry(&mut self, key: &str, value: String) -> Result<QueuedApply, String> {
         let entry = RaftLogEntryData {
             key: key.to_string(),
-            value: value.to_string(),
+            value: value.clone(),
         };
         let ticket = state::raft_apply_start(self.raft, &entry)?;
-        state::raft_apply_await(ticket).await?;
-        self.applied.push((key.to_string(), value.to_string()));
-        Ok(())
+        Ok(QueuedApply {
+            key: key.to_string(),
+            value,
+            ticket,
+        })
+    }
+
+    /// Record a committed apply so the replication barrier (see
+    /// [`super::replicate`]) can replay it to the peers.
+    pub fn record(&mut self, queued: QueuedApply) {
+        self.applied.push((queued.key, queued.value));
     }
 }
 
