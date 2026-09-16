@@ -486,10 +486,26 @@ async fn do_main() {
         // Restart clock fencing for the read-only plane as well: its
         // snapshot reads must sit above whatever ts the backup store's
         // own data carries, or every row would be invisible after a
-        // restart (same floor key, recovered from the backup store).
-        shared
-            .sql_ts
-            .advance_to(sql::tx::floor::recover(&shared.store));
+        // restart (same floor key, recovered from the backup store). A
+        // MISSING key means this store predates the floor mechanism
+        // (in-place binary upgrade): recover the clock from the data
+        // itself (one-shot scan) and stamp the key so no later boot
+        // ever scans again.
+        let key_floor = sql::tx::floor::recover(&shared.store);
+        let floor = if key_floor > 0 {
+            key_floor
+        } else {
+            sql::tx::floor::scan_max_ts(&shared.store)
+        };
+        if key_floor == 0 && floor > 0 {
+            let mut batch = rocksdb::WriteBatch::default();
+            sql::tx::floor::stamp(&mut batch, floor);
+            if let Err(e) = store::ops::batch_write(&shared.store, batch) {
+                eprintln!("sql ts: boot floor stamp after scan failed: {e}");
+            }
+            eprintln!("sql ts: boot floor scan recovered {floor}");
+        }
+        shared.sql_ts.advance_to(floor);
         // The backup store gets its own active-expire sweep: whatever
         // lands there (restore/replication channel) must vanish on
         // schedule even if never read; the listener itself is
@@ -538,8 +554,26 @@ async fn do_main() {
     // BOTH clock backends (local counter fetch_max + cluster
     // observe_floor), so this is exact for single-machine boots and a
     // harmless lower-bound no-op on a cluster node whose raft cursor
-    // already sits higher.
-    shared.sql_ts.advance_to(sql::tx::floor::recover(&store));
+    // already sits higher. A MISSING floor key means this store was
+    // written by a pre-floor binary (in-place upgrade): recover the
+    // clock from the data itself (one-shot scan) and STAMP the key so
+    // every later boot takes the cheap key path -- the first boot after
+    // the upgrade is the only one that pays the scan.
+    let key_floor = sql::tx::floor::recover(&store);
+    let floor = if key_floor > 0 {
+        key_floor
+    } else {
+        sql::tx::floor::scan_max_ts(&store)
+    };
+    if key_floor == 0 && floor > 0 {
+        let mut batch = rocksdb::WriteBatch::default();
+        sql::tx::floor::stamp(&mut batch, floor);
+        if let Err(e) = store::ops::batch_write(&store, batch) {
+            eprintln!("sql ts: boot floor stamp after scan failed: {e}");
+        }
+        eprintln!("sql ts: boot floor scan recovered {floor}");
+    }
+    shared.sql_ts.advance_to(floor);
     // Active expiration loop (data-plane background task; sees the normal
     // listener's store -- the backup store gets its OWN sweep spawned in
     // the backup-listener block, whose listener is also -READONLY-gated).

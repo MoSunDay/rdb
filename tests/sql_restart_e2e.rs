@@ -252,3 +252,148 @@ async fn kill9_restart_keeps_committed_rows_visible() {
         node.ctx()
     );
 }
+
+/// `(id, v)` pairs of this suite's `t` table, ordered by id.
+async fn t_rows(c: &mut mysql_async::Conn) -> Vec<(i64, String)> {
+    rows(c, "SELECT id, v FROM t ORDER BY id")
+        .await
+        .iter()
+        .map(|r| (m_int(&r[0]), m_str(&r[1])))
+        .collect()
+}
+
+/// In-place upgrade from a pre-floor binary: the store holds committed
+/// rows but NO `sql_ts_floor` key (old binaries never stamped one). A
+/// naive boot reports floor 0, the oracle restarts at 1 and every row
+/// goes invisible -- the boot path must instead recover the clock by
+/// SCANNING the store's own versions, stamp the key so the scan is
+/// strictly one-shot, and keep the data visible across every restart
+/// after that.
+#[tokio::test]
+async fn missing_floor_key_boot_scan_recovers_the_clock() {
+    let dir = std::env::temp_dir().join(format!("rdb-sql-floorscan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut node = spawn_node_mysql(&dir, 0, true, None);
+    wait_resp_ready(&mut node, 30).await;
+    wait_mysql_ready(&node, 15).await;
+    let mut c = connect(&node).await;
+
+    ddl(
+        &mut c,
+        "CREATE TABLE t (id BIGINT, v VARCHAR(64)) PRIMARY KEY(id)",
+    )
+    .await;
+    run(
+        &mut c,
+        "INSERT INTO t (id, v) VALUES (1, 'one'), (2, 'two')",
+    )
+    .await;
+    run(&mut c, "UPDATE t SET v = 'one-upd' WHERE id = 1").await;
+    assert_eq!(
+        t_rows(&mut c).await,
+        vec![(1, "one-upd".to_string()), (2, "two".to_string())]
+    );
+
+    // ---- stop, then strip the floor key straight out of the store ----
+    node.kill_now();
+    let store_dir = node.dir.join(&node.resp); // data_path(store_path, bind)
+    assert!(
+        store_dir.join("CURRENT").is_file(),
+        "expected a RocksDB store at {}",
+        store_dir.display()
+    );
+    {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = rocksdb::DB::open(&opts, store_dir.to_str().unwrap()).expect("open store");
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_sync(true);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete(rdb::sql::tx::floor::FLOOR_KEY);
+        db.write_opt(batch, &wo).expect("delete floor key");
+        assert!(
+            db.get(rdb::sql::tx::floor::FLOOR_KEY)
+                .expect("get floor key")
+                .is_none(),
+            "floor key must be gone before the restart"
+        );
+    } // DB handle dropped: the lock is released for the respawn
+
+    // ---- first post-"upgrade" boot: the scan must fence the clock ----
+    node.respawn();
+    wait_resp_ready(&mut node, 30).await;
+    wait_mysql_ready(&node, 15).await;
+    let mut c = connect(&node).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = t_rows(&mut c).await;
+        if got.len() == 2 {
+            assert_eq!(
+                got,
+                vec![(1, "one-upd".to_string()), (2, "two".to_string())],
+                "rows invisible after floor-less upgrade boot\n{}",
+                node.ctx()
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rows invisible after floor-less upgrade boot\n{}",
+            node.ctx()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // Same-pk rewrite must land on top, not be shadowed.
+    run(&mut c, "UPDATE t SET v = 'post-scan' WHERE id = 1").await;
+    assert_eq!(
+        t_rows(&mut c).await,
+        vec![(1, "post-scan".to_string()), (2, "two".to_string())]
+    );
+
+    // The scan branch must have STAMPED the floor key: kill before any
+    // further write dependencies and read the key back directly.
+    node.kill_now();
+    {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = rocksdb::DB::open(&opts, store_dir.to_str().unwrap()).expect("reopen store");
+        let raw = db
+            .get(rdb::sql::tx::floor::FLOOR_KEY)
+            .expect("get floor key")
+            .expect("scan branch must stamp the floor key");
+        let stamped = u64::from_be_bytes(raw[..8].try_into().expect("8-byte floor"));
+        assert!(
+            stamped >= 3,
+            "stamped floor {stamped} must cover 3 versions"
+        );
+    }
+
+    // ---- second boot: the key exists now, so no scan must run again ----
+    node.respawn();
+    wait_resp_ready(&mut node, 30).await;
+    wait_mysql_ready(&node, 15).await;
+    let mut c = connect(&node).await;
+    assert_eq!(
+        t_rows(&mut c).await,
+        vec![(1, "post-scan".to_string()), (2, "two".to_string())],
+        "rows lost across the scan-free second boot\n{}",
+        node.ctx()
+    );
+    run(&mut c, "INSERT INTO t (id, v) VALUES (3, 'third')").await;
+    assert_eq!(
+        t_rows(&mut c).await,
+        vec![
+            (1, "post-scan".to_string()),
+            (2, "two".to_string()),
+            (3, "third".to_string()),
+        ]
+    );
+
+    // Exactly ONE scan line across all three boots of this stderr log.
+    node.kill_now();
+    let log = std::fs::read_to_string(&node.stderr_path).expect("read stderr log");
+    let scans = log.matches("sql ts: boot floor scan recovered").count();
+    assert_eq!(scans, 1, "boot scan must be strictly one-shot\n{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
