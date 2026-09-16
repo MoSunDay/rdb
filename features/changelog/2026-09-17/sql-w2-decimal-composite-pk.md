@@ -64,8 +64,11 @@ W2 迭代目标：SQL 数据面补齐精确数值类型与复合主键，并收�
   mysql 8.0.44 客户端）。
 - 升级演练：upgrade_rehearsal.sh 94 断言 × 2 次连续全绿（含冷构建，自动清理
   worktree/scratch）。
-- soak：运行中——待回填：时长、写次数、p99（ms）、慢请求数（>1s）、错误数、
-  beacon 缺口数、kill -9 轮次恢复情况。
+- soak（手动触发 900s，与 nightly 同参 RDB_SOAK_SECS=900）：PASS。healthy 窗口
+  450s 串行 INCR 136,129 次 ack，rtt avg 25.8ms / p50 20.9ms / p99 66.3ms；
+  kill -9 后同 store 重启，计数器 = last-acked+1（恰一笔 in-flight，符合契约）；
+  post_restart 窗口 avg 48.3ms / p50 19.6ms / p99 204.4ms（重启后 compaction
+  积压尾部），两窗口零客户端错误，p99 全程低于 1000ms 门限。
 - 集群索引点查：仍为 scatter-gather 退化（`gatherable()` 结构性分流，EXPLAIN
   Gather banner）——维持现状并已在 `features/sql-dataplane.md` 限制清单明示，
   非 flag。
