@@ -13,10 +13,11 @@ Commit: 98e17a5
 - `front/`：MySQL 接入——握手/auth（`auth.rs`，用户密码取自 `mysql_*` 配置）、
   shim（query/prepare/execute 到 `exec::execute` 的桥，按语句是否 INSERT 决定 OK 包
   是否携带会话 last_insert_id）、线协议值转换（`conv.rs`：文本/二进制 cell 双向，
-  含 DATE/DATETIME 二进制 cell 与预编译参数解码；列定义按 ColMeta 置
-  `NOT_NULL_FLAG`/`PRI_KEY_FLAG`）、
+  含 DATE/DATETIME 二进制 cell、DECIMAL 的 NEWDECIMAL 文本 cell 与预编译参数解码；
+  列定义按 ColMeta 置 `NOT_NULL_FLAG`/`PRI_KEY_FLAG`）、
   会话变量拦截（`vars.rs`，`SELECT @@var`）、连接收尾回滚未决事务（`serve.rs`）。
-- `parse/`：sqlparser 驱动的 AST→内部 IR（`translate.rs`），错误码→MySQL 错误号
+- `parse/`：sqlparser 驱动的 AST→内部 IR（`translate.rs` + `translate_type.rs`：
+  列类型翻译，DECIMAL(p,s)/NUMERIC 的 p 1..=38 校验），错误码→MySQL 错误号
   （`error.rs`：1213 写写冲突、1062 唯一冲突、1027 节点不可达等）；`query.rs`
   （复合查询翻译：UNION [ALL]/WITH CTE/派生表——INTERSECT/EXCEPT/BY NAME/
   WITH RECURSIVE 1235 大声拒绝）；`starrocks.rs`（StarRocks 表模型预解析：
@@ -30,7 +31,9 @@ Commit: 98e17a5
   DUP 模型 schema pk 不打 key 标志）、`set_ops.rs`（复合查询执行：CTE 物化、
   UNION 拼装/去重/拓宽）、`relation.rs`（`Relation` + CTE 作用域）、`subquery.rs`
   （标量/IN 子查询提升改写，相关改写按 BadField + "unknown column" 前缀匹配）、
-  `agg.rs`、`expr.rs`（三值 NOT/IN；`length()` 字节 / `char_length()` 字符）、
+  `agg.rs`、`expr.rs`（三值 NOT/IN；`length()` 字节 / `char_length()` 字符）与
+  `expr_decimal.rs`（i128 精确十进制算术：`/` 长除 scale+4 half-away-from-zero、
+  列 scale 舍入 fit_column/1292）、
   `show.rs`、`render.rs`（EXPLAIN，含复合计划）、`ddl.rs`（`catalog_txn`/
   `DdlPlan{mutations, schema, changed}`：table-id 分配与目录变更在同一 raft 写守卫
   窗口内单决策生效，索引回填 mutations 随决策落盘）、`sequence.rs`
@@ -43,7 +46,10 @@ Commit: 98e17a5
 - `temporal.rs` + `temporal_tests.rs`：时间域纯函数——儒略日 civil 数学
   （`days_from_civil`/`civil_from_days`，checked 运算）、canonical/紧凑字面量解析与
   格式化（微秒 6 位、为 0 不渲染）、`now_micros`/`today_days`（UTC 墙钟）。
-- `tx/`：`ts.rs`（Oracle：本地原子 / 集群模式切换，预约失败映射 1213）、`global.rs`
+- `tx/`：`ts.rs`（Oracle：本地原子 / 集群模式切换，预约失败映射 1213）、`floor.rs`
+  （持久时钟下限：保留键 `\x00sql_ts_floor` 随每个打戳批原子捎带最大 ts，boot
+  `advance_to` 恢复（normal+backup 监听）；键缺失=pre-floor 库原地升级，boot 一次
+  性全键空间扫描取 max 并立即落键）、`global.rs`
   （raft 块授权：`sql_ts_cursor` 先持久后发放、4096 块、HTTP `/sql/ts`；
   `reserve_write_frontier(floor, want, strict)`——写集含远端属主（2PC）时 strict：
   leader 不可达即拒绝盖章，绝不本地 GAP；纯本地写宽松：降级单调回退，同节点 refill
@@ -70,6 +76,8 @@ Commit: 98e17a5
 - 版本键 ts 后缀取反（`!ts`）：同 pk 新版本在前；`visible_value` 取 `ts ≤ read_ts`
   的首个非 0x02 版本。
 - 时间戳：集群未就绪=本地原子；就绪后所有 alloc 经 leader 块授权，游标先 raft 持久；
+  两种形态都有跨重启下限——`\x00sql_ts_floor` 保留键（本地批捎带持久化，boot
+  `advance_to`；见 `tx/floor.rs`），时钟绝不回退（回退会让旧版本行遮蔽重写）；
   `now()` 骑集群游标前沿（`sync_cursor_frontier`，允许读旧快照，禁止回退）；写路径
   先按读点预留写前沿（`reserve_write_frontier`/`alloc_n_above`，过期或过短的本地
   块尾作废重租），保证本节点写入的 ts 高于它已读到的版本；ts authority 不可达时，
@@ -98,8 +106,11 @@ Commit: 98e17a5
   `sql_dist_read_e2e.rs`（3 进程 2PC 写与 scatter-gather 读、FOR UPDATE veto 与
   索引表 EXPLAIN 退化）、`auto_increment_e2e.rs`（自增分配/重启续号/3 节点唯一 id/
   OK 包 last_insert_id）、
-  `sql_types_e2e.rs`（DATE/DATETIME：字面量往返、谓词、类型化元数据、预编译
-  二进制 cell 与参数、唯一索引、UNION 宽化、不支持/零值时间字面量大声拒绝）、
+  `sql_types_e2e.rs`（DATE/DATETIME 与 DECIMAL：字面量往返、谓词、类型化元数据、
+  预编译二进制 cell 与参数、唯一索引、UNION 宽化、不支持/零值时间字面量大声拒绝）、
+  `sql_composite_pk_e2e.rs`（复合 pk：全元组去重、唯一索引 1062、部分键 WHERE、
+  NUL 转义保序、重启持久化）、`sql_restart_e2e.rs`（单机 kill -9 重启可见性：
+  ts floor 键 + 缺键时 boot 一次性扫描恢复）、
   `mysql_compat_e2e.rs`（MySQL 语义回归：NOT/IN 三值等）、
   `columnar_e2e.rs`（列存单机 + 3 节点集群扇出读）、
   `starrocks_model_e2e.rs`（表模型：单机 PK upsert/DUP 追加/拒绝矩阵含
