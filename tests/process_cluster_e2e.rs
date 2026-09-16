@@ -243,14 +243,24 @@ async fn drill_py_scenario_again_three_real_processes() {
         nodes[leader].ctx()
     );
     for n in &nodes {
-        let r = cmd_one_shot(&n.resp, TOKEN, &[b"raft", b"get", b"rk1"]).await;
-        assert_eq!(
-            r,
-            b"$3\r\nrv1",
-            "raft get rk1 must see the replicated value (bulk frame) on {}\n{}",
-            n.resp,
-            n.ctx()
-        );
+        // Quorum commit (+OK) can precede apply on a lagging follower;
+        // poll until the local FSM exposes the replicated value (same
+        // pattern as the depkey/rejoinkey loops below).
+        let want = b"$3\r\nrv1".to_vec();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = cmd_one_shot(&n.resp, TOKEN, &[b"raft", b"get", b"rk1"]).await;
+            if r == want {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "raft get rk1 must see the replicated value (bulk frame) on {}\nlast={r:?}\n{}",
+                n.resp,
+                n.ctx()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     // 9. unknown command, verbatim Go text.
