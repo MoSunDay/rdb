@@ -23,7 +23,7 @@ use opensrv_mysql::{
 use tokio::io::AsyncWrite;
 
 use crate::sql::exec::ColMeta;
-use crate::sql::storage::schema::{SqlType, Value};
+use crate::sql::storage::schema::{format_decimal, SqlType, Value};
 use crate::sql::temporal::{self, MICROS_PER_DAY};
 
 /// Engine type of one decoded parameter, or a human-readable rejection
@@ -48,6 +48,11 @@ fn inner_to_value(inner: ValueInner<'_>, coltype: ColumnType) -> Result<Value, S
             }
         }
         ValueInner::Double(f) => Ok(Value::Double(f)),
+        ValueInner::Bytes(b) if coltype == ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+            let s = std::str::from_utf8(b)
+                .map_err(|_| "Incorrect DECIMAL value: parameter is not utf8".to_string())?;
+            Value::parse_decimal(s)
+        }
         ValueInner::Bytes(b) => match std::str::from_utf8(b) {
             Ok(s) => Ok(Value::Str(s.to_string())),
             Err(_) => Ok(Value::Bytes(b.to_vec())),
@@ -141,6 +146,9 @@ pub fn sql_type_to_mysql(t: SqlType) -> ColumnType {
         SqlType::Bool => ColumnType::MYSQL_TYPE_TINY,
         SqlType::Int => ColumnType::MYSQL_TYPE_LONGLONG,
         SqlType::Double => ColumnType::MYSQL_TYPE_DOUBLE,
+        // DECIMAL rides MySQL's own NEWDECIMAL wire type; cells are the
+        // fixed-point text spelling in both protocols.
+        SqlType::Decimal { .. } => ColumnType::MYSQL_TYPE_NEWDECIMAL,
         SqlType::Date => ColumnType::MYSQL_TYPE_DATE,
         SqlType::DateTime => ColumnType::MYSQL_TYPE_DATETIME,
         SqlType::VarChar => ColumnType::MYSQL_TYPE_VAR_STRING,
@@ -160,6 +168,11 @@ pub fn sql_type_column(name: &str, table: &str, t: SqlType) -> Column {
 /// never overclaim: opensrv's binary encoder rejects a NULL cell for a
 /// NOT_NULL-flagged column, so only plain table columns with known
 /// schema flags may set them.
+///
+/// opensrv-mysql 0.7.0's `Column` carries no `column_length`/`decimals`
+/// fields -- its writer hardcodes length 1024 and decimals 0x00 -- so
+/// NEWDECIMAL columns announce themselves by type alone; clients read
+/// the scale off the cell text (MySQL's own NEWDECIMAL wire form).
 fn column_with(name: &str, table: &str, t: SqlType, colflags: ColumnFlags) -> Column {
     Column {
         table: table.to_string(),
@@ -211,6 +224,7 @@ where
         Value::Bool(b) => w.write_col(i8::from(*b)),
         Value::Int(i) => w.write_col(*i),
         Value::Double(f) => w.write_col(*f),
+        Value::Decimal(m, s) => w.write_col(DecimalCell(*m, *s)),
         Value::Date(d) => w.write_col(DateCell(*d)),
         Value::DateTime(us) => w.write_col(DateTimeCell(*us)),
         Value::Str(s) => w.write_col(s.as_str()),
@@ -283,15 +297,37 @@ impl ToMysqlValue for DateTimeCell {
     }
 }
 
+/// One DECIMAL cell: fixed-point mantissa + scale. Both wire forms
+/// carry the canonical decimal text (`schema::format_decimal`), exactly
+/// how MySQL ships NEWDECIMAL -- the binary protocol also embeds the
+/// length-prefixed string.
+#[derive(Debug)]
+struct DecimalCell(i128, u8);
+
+impl ToMysqlValue for DecimalCell {
+    fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        write_lenenc_text(w, format_decimal(self.0, self.1).as_bytes())
+    }
+
+    fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
+        match c.coltype {
+            ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+                write_lenenc_text(w, format_decimal(self.0, self.1).as_bytes())
+            }
+            _ => Err(bad_col(self, c)),
+        }
+    }
+}
+
 /// Length-prefixed text cell: one length byte + payload. Temporal
-/// spellings are at most 26 bytes, well inside the one-byte lenenc
-/// range (< 252), which is exactly what opensrv's `write_lenenc_str`
-/// emits for our sizes.
+/// spellings are at most 26 bytes and decimal cells at most ~41, well
+/// inside the one-byte lenenc range (< 252), which is exactly what
+/// opensrv's `write_lenenc_str` emits for our sizes.
 fn write_lenenc_text<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() >= 252 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "temporal text cell exceeds one-byte lenenc length",
+            "text cell exceeds one-byte lenenc length",
         ));
     }
     w.write_all(&[bytes.len() as u8])?;
@@ -329,6 +365,53 @@ mod tests {
             param(ValueInner::Bytes(&[0xff, 0xfe])),
             Ok(Value::Bytes(vec![0xff, 0xfe]))
         );
+    }
+
+    /// NEWDECIMAL parameters arrive as their fixed-point text and must
+    /// decode exactly; other column types keep the string passthrough.
+    #[test]
+    fn newdecimal_params_parse_exactly() {
+        let dec =
+            |b: &[u8]| inner_to_value(ValueInner::Bytes(b), ColumnType::MYSQL_TYPE_NEWDECIMAL);
+        assert_eq!(dec(b"-12.345"), Ok(Value::Decimal(-12345, 3)));
+        assert_eq!(dec(b"0"), Ok(Value::Decimal(0, 0)));
+        assert!(dec(b"1.2.3").is_err());
+        assert!(dec(&[0xff]).is_err());
+        // The same bytes under a non-decimal column stay a string.
+        assert_eq!(
+            inner_to_value(
+                ValueInner::Bytes(b"12.5"),
+                ColumnType::MYSQL_TYPE_VAR_STRING
+            ),
+            Ok(Value::Str("12.5".to_string()))
+        );
+    }
+
+    /// Decimal cells ship their fixed-point text on both wire forms.
+    #[test]
+    fn decimal_cells_render_fixed_point_text() {
+        let dcol = sql_type_column(
+            "d",
+            "t",
+            SqlType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        );
+        let mut buf = Vec::new();
+        DecimalCell(123, 2).to_mysql_text(&mut buf).unwrap();
+        assert_eq!(buf, b"\x041.23");
+        buf.clear();
+        DecimalCell(-5, 2).to_mysql_bin(&mut buf, &dcol).unwrap();
+        assert_eq!(buf, b"\x05-0.05");
+        buf.clear();
+        DecimalCell(1230, 3).to_mysql_bin(&mut buf, &dcol).unwrap();
+        assert_eq!(buf, b"\x051.230");
+        // A non-NEWDECIMAL column rejects the cell (mismatch guard).
+        let scol = sql_type_column("s", "t", SqlType::VarChar);
+        assert!(DecimalCell(1, 0)
+            .to_mysql_bin(&mut Vec::new(), &scol)
+            .is_err());
     }
 
     #[test]
@@ -468,6 +551,13 @@ mod tests {
             (SqlType::Bool, ColumnType::MYSQL_TYPE_TINY),
             (SqlType::Int, ColumnType::MYSQL_TYPE_LONGLONG),
             (SqlType::Double, ColumnType::MYSQL_TYPE_DOUBLE),
+            (
+                SqlType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                ColumnType::MYSQL_TYPE_NEWDECIMAL,
+            ),
             (SqlType::VarChar, ColumnType::MYSQL_TYPE_VAR_STRING),
             (SqlType::Blob, ColumnType::MYSQL_TYPE_BLOB),
         ];

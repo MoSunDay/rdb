@@ -58,7 +58,7 @@ fn show_columns(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
             .map(|c| {
                 vec![
                     Value::Str(c.name.clone()),
-                    Value::Str(type_name(c.sql_type).to_string()),
+                    Value::Str(type_name(c.sql_type)),
                     Value::Str(if c.nullable { "YES" } else { "NO" }.to_string()),
                     Value::Str(key_flag(&schema, &c.name).to_string()),
                     Value::Str("NULL".to_string()),
@@ -128,16 +128,18 @@ fn show_indexes(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
     })
 }
 
-/// MySQL-ish type names (narrow v1 domain).
-fn type_name(t: SqlType) -> &'static str {
+/// MySQL-ish type names (narrow v1 domain). DECIMAL spells its full
+/// `decimal(p,s)` form (the pair is the type).
+fn type_name(t: SqlType) -> String {
     match t {
-        SqlType::Bool => "bool",
-        SqlType::Int => "bigint",
-        SqlType::Double => "double",
-        SqlType::Date => "date",
-        SqlType::DateTime => "datetime",
-        SqlType::VarChar => "varchar",
-        SqlType::Blob => "blob",
+        SqlType::Bool => "bool".to_string(),
+        SqlType::Int => "bigint".to_string(),
+        SqlType::Double => "double".to_string(),
+        SqlType::Decimal { precision, scale } => format!("decimal({precision},{scale})"),
+        SqlType::Date => "date".to_string(),
+        SqlType::DateTime => "datetime".to_string(),
+        SqlType::VarChar => "varchar".to_string(),
+        SqlType::Blob => "blob".to_string(),
     }
 }
 
@@ -199,7 +201,8 @@ mod tests {
         ddl::run(
             &shared,
             parse_statement(
-                "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL, d DOUBLE NOT NULL)",
+                "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL, d DOUBLE NOT NULL, \
+                 amount DECIMAL(18,4) NULL)",
             )
             .unwrap(),
         )
@@ -232,6 +235,10 @@ mod tests {
         assert_eq!(cell(2, 1), "double");
         assert_eq!(cell(2, 2), "NO", "declared NOT NULL");
         assert_eq!(cell(0, 4), "NULL");
+        // DECIMAL spells its full width/scale form.
+        assert_eq!(cell(3, 0), "amount");
+        assert_eq!(cell(3, 1), "decimal(18,4)");
+        assert_eq!(cell(3, 2), "YES");
 
         // unknown table errors
         let err = run(

@@ -4,7 +4,7 @@ use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, UnaryOperator};
 
 use crate::sql::parse::ast::{AggFunc, BinOp, Expr};
 use crate::sql::parse::error::{SqlError, SqlResult};
-use crate::sql::storage::schema::Value;
+use crate::sql::storage::schema::{Value, MAX_DECIMAL_SCALE};
 
 pub(crate) fn translate_expr(e: &SqlExpr) -> SqlResult<Expr> {
     use SqlExpr as S;
@@ -210,12 +210,52 @@ fn translate_function(f: &sqlparser::ast::Function) -> SqlResult<Expr> {
     Ok(Expr::Func { name, args })
 }
 
+/// Exact decimal literal of a plain `int.frac` number token: the digits
+/// fold into an i128 mantissa one place at a time -- f64 is never
+/// entered, so `0.1` stays exactly 1/10. Exponent spellings and anything
+/// past 38 significant digits (the i128 digit budget) fall back to
+/// Double (None), MySQL's own treatment of over-wide literals.
+fn exact_number_literal(n: &str) -> Option<Value> {
+    if !n.contains('.') || n.contains(['e', 'E']) {
+        return None;
+    }
+    let (int_part, frac_part) = n.split_once('.')?;
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let scale = frac_part.len();
+    if scale > usize::from(MAX_DECIMAL_SCALE) {
+        return None;
+    }
+    // Leading zeros carry no precision; the fold below cannot overflow
+    // once the significant digit count fits the mantissa budget.
+    let significant = format!("{int_part}{frac_part}")
+        .trim_start_matches('0')
+        .len();
+    if significant > usize::from(MAX_DECIMAL_SCALE) {
+        return None;
+    }
+    let mut mantissa: i128 = 0;
+    for b in int_part.bytes().chain(frac_part.bytes()) {
+        mantissa = mantissa
+            .checked_mul(10)?
+            .checked_add(i128::from(b - b'0'))?;
+    }
+    Some(Value::Decimal(mantissa, scale as u8))
+}
+
 pub(crate) fn translate_value(v: &sqlparser::ast::ValueWithSpan) -> SqlResult<Value> {
     use sqlparser::ast::Value as SqlValue;
     Ok(match &v.value {
         SqlValue::Number(n, _) => {
             if let Ok(i) = n.parse::<i64>() {
                 Value::Int(i)
+            } else if let Some(v) = exact_number_literal(n) {
+                v
             } else {
                 n.parse::<f64>()
                     .map(Value::Double)
