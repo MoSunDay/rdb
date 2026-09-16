@@ -5,8 +5,7 @@
 //! executor only ever sees runnable shapes.
 
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, CreateTableOptions, DataType, ExactNumberInfo,
-    Expr as SqlExpr, FromTable, ObjectName, ObjectNamePart, SetExpr, SqlOption,
+    CreateTableOptions, Expr as SqlExpr, FromTable, ObjectName, ObjectNamePart, SetExpr, SqlOption,
     Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
 };
 use sqlparser::dialect::MySqlDialect;
@@ -15,9 +14,10 @@ use sqlparser::parser::Parser;
 use crate::sql::parse::ast::*;
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 pub(crate) use crate::sql::parse::expr::translate_expr;
+pub(crate) use crate::sql::parse::translate_type;
 
 use crate::sql::parse::starrocks::StarRocksModel;
-use crate::sql::storage::schema::{Engine, KeyModel, SqlType, Value};
+use crate::sql::storage::schema::{Engine, KeyModel, Value};
 
 /// Parse one SQL string; exactly one statement expected (clients send one).
 /// StarRocks table-model clauses lift out first (see `parse::starrocks`).
@@ -485,45 +485,65 @@ fn translate_create_table(
     let mut columns = Vec::new();
     let mut inline_pk: Option<String> = None;
     for col in &c.columns {
-        let (spec, pk) = translate_column(col)?;
+        let (spec, pk) = translate_type::translate_column(col)?;
         if pk {
+            if inline_pk.is_some() {
+                return Err(SqlError::unsupported("multiple inline PRIMARY KEY columns"));
+            }
             inline_pk = Some(spec.name.clone());
         }
         columns.push(spec);
     }
-    let mut pk = inline_pk;
+    // Pk columns in declaration order: inline `col ... PRIMARY KEY`
+    // contributes one; a `PRIMARY KEY (a, b, ...)` table constraint
+    // contributes its whole list (multi-column pks, composite support).
+    // Mixing the two forms, or two constraints, still rejects.
+    let mut pk: Vec<String> = inline_pk.into_iter().collect();
     for constraint in &c.constraints {
         match constraint {
             TableConstraint::PrimaryKey(cons) => {
-                if pk.is_some() || cons.columns.len() != 1 {
-                    let why = "exactly one primary-key column is required";
-                    return Err(SqlError::unsupported(why));
+                if !pk.is_empty() {
+                    return Err(SqlError::unsupported("multiple PRIMARY KEY definitions"));
                 }
-                pk = Some(match &cons.columns[0].column.expr {
-                    SqlExpr::Identifier(id) => id.value.clone(),
-                    other => return Err(SqlError::unsupported(format!("PRIMARY KEY {other}"))),
-                });
+                for col in &cons.columns {
+                    pk.push(match &col.column.expr {
+                        SqlExpr::Identifier(id) => id.value.clone(),
+                        other => return Err(SqlError::unsupported(format!("PRIMARY KEY {other}"))),
+                    });
+                }
             }
             _ => return Err(SqlError::unsupported("other table constraints")),
         }
     }
-    // DUPLICATE model: StarRocks has no pk; the first dup-key column
-    // becomes the schema pk (metadata only -- the columnar engine
-    // never dedups on it, see ddl::build_schema).
-    let pk = match pk {
-        Some(pk) => pk,
-        None if sr.is_some_and(|m| m.kind == KeyModel::Duplicate) => sr.unwrap().keys[0].clone(),
-        _ => return Err(SqlError::unsupported("need exactly one PK column")),
-    };
-    if columns
-        .iter()
-        .filter(|c| c.name.eq_ignore_ascii_case(&pk))
-        .count()
-        != 1
-    {
-        return Err(SqlError::parse(format!(
-            "PRIMARY KEY column '{pk}' not defined"
-        )));
+    if pk.is_empty() {
+        // DUPLICATE model: StarRocks has no pk; the first dup-key column
+        // becomes the schema pk (metadata only -- the columnar engine
+        // never dedups on it, see ddl::build_schema).
+        if sr.is_some_and(|m| m.kind == KeyModel::Duplicate) {
+            pk.push(sr.unwrap().keys[0].clone());
+        } else {
+            return Err(SqlError::unsupported("need a PRIMARY KEY"));
+        }
+    }
+    // Every pk column must exist exactly once, and a composite pk may
+    // not name the same column twice.
+    let mut seen: Vec<&str> = Vec::new();
+    for p in &pk {
+        let hits = columns
+            .iter()
+            .filter(|c| c.name.eq_ignore_ascii_case(p))
+            .count();
+        if hits != 1 {
+            return Err(SqlError::parse(format!(
+                "PRIMARY KEY column '{p}' not defined"
+            )));
+        }
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(p)) {
+            return Err(SqlError::parse(format!(
+                "duplicate column '{p}' in primary key"
+            )));
+        }
+        seen.push(p);
     }
     Ok(Statement::CreateTable {
         name,
@@ -559,98 +579,6 @@ fn table_engine(opts: &CreateTableOptions) -> Engine {
         }
     }
     Engine::Row
-}
-
-fn translate_column(col: &SqlColumnDef) -> SqlResult<(ColumnSpec, bool)> {
-    let sql_type = translate_type(&col.data_type)?;
-    let mut nullable = true;
-    let mut pk = false;
-    let mut auto_increment = false;
-    for opt in &col.options {
-        match &opt.option {
-            ColumnOption::Null => nullable = true,
-            ColumnOption::NotNull => nullable = false,
-            ColumnOption::PrimaryKey(_) => {
-                pk = true;
-                nullable = false;
-            }
-            ColumnOption::Unique(_) => {} // use CREATE UNIQUE INDEX instead
-            ColumnOption::Default(_) => {} // defaults are client-evaluated in v1
-            ColumnOption::Comment(_) => {}
-            ColumnOption::DialectSpecific(_)
-                if opt.to_string().eq_ignore_ascii_case("AUTO_INCREMENT") =>
-            {
-                auto_increment = true;
-            }
-            _ => {
-                return Err(SqlError::unsupported(format!(
-                    "column option {}",
-                    opt.option
-                )))
-            }
-        }
-    }
-    Ok((
-        ColumnSpec {
-            name: col.name.value.clone(),
-            sql_type,
-            nullable,
-            auto_increment,
-        },
-        pk,
-    ))
-}
-
-fn translate_type(t: &DataType) -> SqlResult<SqlType> {
-    use DataType::*;
-    Ok(match t {
-        Bool | Boolean => SqlType::Bool,
-        TinyInt(_) | Int2(_) | SmallInt(_) | MediumInt(_) | Int(_) | Int4(_) | Integer(_)
-        | Int8(_) | BigInt(_) => SqlType::Int,
-        Float(_) | Float4 | Real | Double(_) | Float8 | DoublePrecision => SqlType::Double,
-        Varchar(_) | CharVarying(_) | Char(_) | Character(_) | CharacterVarying(_) | Text
-        | TinyText | MediumText | LongText | String(_) => SqlType::VarChar,
-        Varbinary(_) | Binary(_) | Blob(_) | TinyBlob | MediumBlob | LongBlob | Bytea => {
-            SqlType::Blob
-        }
-        // DATE is days since the epoch, DATETIME microseconds (see
-        // `temporal`); TIMESTAMP parses as DATETIME. The optional fsp
-        // is ignored -- storage is always microsecond precision.
-        Date => SqlType::Date,
-        Datetime(_) | Timestamp(_, _) => SqlType::DateTime,
-        // DECIMAL/DEC/NUMERIC share one exact fixed-point type. A bare
-        // DECIMAL is MySQL's DECIMAL(10,0); precision must fit the i128
-        // mantissa (<= 38 digits) and scale must not exceed precision.
-        Decimal(info) | Dec(info) | Numeric(info) => decimal_type(info)?,
-        other => {
-            return Err(SqlError::unsupported(format!(
-                "column type {other} (v1: BOOL/INT/DOUBLE/DECIMAL/VARCHAR/BLOB/DATE/DATETIME/TIMESTAMP)"
-            )))
-        }
-    })
-}
-
-/// DECIMAL width/scale: bare = (10,0); precision 1..=38, scale 0..=precision.
-fn decimal_type(info: &ExactNumberInfo) -> SqlResult<SqlType> {
-    let (precision, scale) = match info {
-        ExactNumberInfo::None => (10i64, 0i64),
-        ExactNumberInfo::Precision(p) => (*p as i64, 0),
-        ExactNumberInfo::PrecisionAndScale(p, s) => (*p as i64, *s),
-    };
-    if !(1..=38).contains(&precision) {
-        return Err(SqlError::unsupported(format!(
-            "DECIMAL precision {precision} out of range 1..=38"
-        )));
-    }
-    if !(0..=precision).contains(&scale) {
-        return Err(SqlError::unsupported(format!(
-            "DECIMAL scale {scale} out of range 0..={precision}"
-        )));
-    }
-    Ok(SqlType::Decimal {
-        precision: precision as u8,
-        scale: scale as u8,
-    })
 }
 
 fn translate_insert(i: sqlparser::ast::Insert) -> SqlResult<Statement> {

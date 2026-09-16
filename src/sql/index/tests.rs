@@ -30,7 +30,7 @@ fn schema() -> TableSchema {
                 nullable: true,
             },
         ],
-        pk: "id".into(),
+        pk: vec!["id".to_string()],
         auto_increment: None,
         engine: Engine::Row,
         key_model: KeyModel::MySql,
@@ -82,7 +82,7 @@ fn insert_ops<'r>(
 fn put_rows(shared: &Shared, s: &TableSchema, ts: u64, rows: &[Vec<Value>]) {
     let mut batch = rocksdb::WriteBatch::default();
     for r in rows {
-        let pk_key = row::pk_encode(&r[s.pk_index()]).unwrap();
+        let pk_key = row::pk_encode_row(s, r).unwrap();
         batch.put(
             row::version_key(s, row::row_slot(s, &pk_key), &pk_key, ts),
             row::encode_row(s, r).unwrap(),
@@ -97,7 +97,7 @@ fn seed(shared: &Shared, s: &TableSchema, ts: u64, rows: &[Vec<Value>]) {
     put_rows(shared, s, ts, rows);
     let pk_keys: Vec<Vec<u8>> = rows
         .iter()
-        .map(|r| row::pk_encode(&r[s.pk_index()]).unwrap())
+        .map(|r| row::pk_encode_row(s, r).unwrap())
         .collect();
     let mut ops = IndexOps::new();
     for def in &s.indexes {

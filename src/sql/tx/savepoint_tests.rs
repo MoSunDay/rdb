@@ -24,7 +24,7 @@ fn schema(id: u32, name: &str) -> TableSchema {
                 nullable: true,
             },
         ],
-        pk: "id".into(),
+        pk: vec!["id".to_string()],
         engine: Engine::Row,
         indexes: vec![],
         key_model: KeyModel::MySql,

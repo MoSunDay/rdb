@@ -303,7 +303,7 @@ fn expand_items(items: &[SelectItem], scope: &FromScope) -> SqlResult<Vec<(Expr,
                                 name: col.clone(),
                                 sql_type: side.types[i],
                                 nullable: side.nullable[i],
-                                primary: side.key_pos == Some(i),
+                                primary: side.key_pos.contains(&i),
                             },
                         ));
                     }
@@ -342,7 +342,7 @@ fn col_flags(e: &Expr, scope: &FromScope) -> (bool, bool) {
     for side in &scope.sides {
         if idx >= side.offset && idx < side.offset + side.columns.len() {
             let i = idx - side.offset;
-            return (side.nullable[i], side.key_pos == Some(i));
+            return (side.nullable[i], side.key_pos.contains(&i));
         }
     }
     (true, false)

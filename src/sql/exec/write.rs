@@ -17,6 +17,7 @@ use crate::sql::exec::expr::{coerce, eval, SingleTableScope};
 use crate::sql::exec::scan::{self, FromScope};
 use crate::sql::exec::select::{filter_rows, order_rows};
 use crate::sql::exec::sequence;
+use crate::sql::exec::write_probe;
 use crate::sql::exec::{ExecOutcome, SqlSession};
 use crate::sql::index::maintain::{self, Transition};
 use crate::sql::index::{self, RowSide};
@@ -120,20 +121,16 @@ pub async fn insert(
         .map(|(r, pk)| (pk.clone(), Some(r)))
         .collect();
     let read_ts = shared.sql_ts.now();
-    // Write frontier before planning: the plan's ts range (2PC) or the
-    // local alloc below must stamp above the txn's read point; both
-    // allocate one ts per row. Strict when any row or index entry has a
-    // remote owner (2PC): fail fast rather than stamp a GAP.
-    let mut probes: Vec<Vec<u8>> = pk_keys
-        .iter()
-        .map(|pk| dist::row_probe(schema.id, pk))
-        .collect();
-    probes.extend(idx.iter().map(|(k, _)| k.clone()));
-    let strict = dist::any_remote_owner(shared, &probes);
-    shared
-        .sql_ts
-        .reserve_write_frontier(read_ts, n, strict)
-        .await?;
+    // Write frontier before planning (see write_probe): one ts per row.
+    write_probe::reserve(
+        shared,
+        schema.id,
+        read_ts,
+        n,
+        pk_keys.iter().map(|k| k.as_slice()),
+        &idx,
+    )
+    .await?;
     if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await
@@ -281,10 +278,11 @@ pub async fn update(
         if new == *old {
             continue; // unchanged rows write no version
         }
-        // PK reassignment = tombstone the old pk + insert the new.
-        let tombstone_old_pk = (new[schema.pk_index()] != old[schema.pk_index()])
-            .then(|| pk_key_of(&schema, old))
-            .transpose()?;
+        // PK reassignment = tombstone the old pk + insert the new
+        // (any pk column changing moves the row's physical key).
+        let new_pk_key = pk_key_of(&schema, &new)?;
+        let old_pk_key = pk_key_of(&schema, old)?;
+        let tombstone_old_pk = (new_pk_key != old_pk_key).then_some(old_pk_key);
         plans.push(Planned {
             tombstone_old_pk,
             old: old.clone(),
@@ -364,20 +362,17 @@ pub async fn update(
         dist_writes.push((pk_key_of(&schema, &p.values)?, Some(&p.values)));
     }
     let read_ts = shared.sql_ts.now();
-    // Write frontier before planning (same rationale as INSERT); the
-    // plan allocates one ts per write (pk moves add a tombstone).
-    // Strict when any write or index entry has a remote owner (2PC):
-    // fail fast rather than stamp a GAP.
-    let mut probes: Vec<Vec<u8>> = dist_writes
-        .iter()
-        .map(|(pk, _)| dist::row_probe(schema.id, pk))
-        .collect();
-    probes.extend(idx.iter().map(|(k, _)| k.clone()));
-    let strict = dist::any_remote_owner(shared, &probes);
-    shared
-        .sql_ts
-        .reserve_write_frontier(read_ts, dist_writes.len() as u64, strict)
-        .await?;
+    // Write frontier before planning (see write_probe): one ts per
+    // write, pk moves add a tombstone.
+    write_probe::reserve(
+        shared,
+        schema.id,
+        read_ts,
+        dist_writes.len() as u64,
+        dist_writes.iter().map(|(pk, _)| pk.as_slice()),
+        &idx,
+    )
+    .await?;
     if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &dist_writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await
@@ -472,19 +467,16 @@ pub async fn delete(
     // M3 2PC hook (see the INSERT path note).
     let writes: dist::plan::SimpleWrites = pk_keys.iter().map(|pk| (pk.clone(), None)).collect();
     let read_ts = shared.sql_ts.now();
-    // Write frontier before planning (same rationale as INSERT); the
-    // plan allocates one ts per write. Strict when any row or index
-    // entry has a remote owner (2PC): fail fast rather than stamp a GAP.
-    let mut probes: Vec<Vec<u8>> = pk_keys
-        .iter()
-        .map(|pk| dist::row_probe(schema.id, pk))
-        .collect();
-    probes.extend(idx.iter().map(|(k, _)| k.clone()));
-    let strict = dist::any_remote_owner(shared, &probes);
-    shared
-        .sql_ts
-        .reserve_write_frontier(read_ts, writes.len() as u64, strict)
-        .await?;
+    // Write frontier before planning (see write_probe): one ts per row.
+    write_probe::reserve(
+        shared,
+        schema.id,
+        read_ts,
+        writes.len() as u64,
+        pk_keys.iter().map(|k| k.as_slice()),
+        &idx,
+    )
+    .await?;
     if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)? {
         return dist::twopc::run(shared, &plan)
             .await
@@ -708,9 +700,10 @@ fn apply_assignments(
     Ok(new)
 }
 
-/// Encoded primary key of a full-width row.
+/// Encoded primary key of a full-width row (all pk columns, in pk
+/// order; one component for single-column pks).
 fn pk_key_of(schema: &TableSchema, values: &[Value]) -> SqlResult<Vec<u8>> {
-    row::pk_encode(&values[schema.pk_index()]).map_err(SqlError::from)
+    row::pk_encode_row(schema, values).map_err(SqlError::from)
 }
 
 /// Index-entry ops of one autocommit batch (no-op for indexless tables):

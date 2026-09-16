@@ -35,10 +35,11 @@ pub struct ScopeSide {
     pub types: Vec<SqlType>,
     /// Per-column nullability, parallel to `columns` (from the schema).
     pub nullable: Vec<bool>,
-    /// Position of the pk column when this side is a real table whose
-    /// key is a real row-store key; `None` for derived relations and the
-    /// DUPLICATE model (its "pk" is recorded metadata, not a key).
-    pub key_pos: Option<usize>,
+    /// Positions of the pk columns when this side is a real table
+    /// whose key is a real row-store key (composite pks list every
+    /// column); empty for derived relations and the DUPLICATE model
+    /// (its "pk" is recorded metadata, not a key).
+    pub key_pos: Vec<usize>,
     /// Offset of this side's first column in the joined row.
     pub offset: usize,
 }
@@ -394,14 +395,14 @@ pub fn join_sources(
     if left_outer {
         for side in &mut scope.sides {
             side.nullable = vec![true; side.columns.len()];
-            side.key_pos = None;
+            side.key_pos = Vec::new();
         }
     }
     for mut side in r.scope.sides {
         side.offset += left_width;
         if right_outer {
             side.nullable = vec![true; side.columns.len()];
-            side.key_pos = None;
+            side.key_pos = Vec::new();
         }
         scope.sides.push(side);
     }
@@ -532,9 +533,9 @@ pub fn table_side(schema: &TableSchema, alias: &Option<String>) -> ScopeSide {
     // The DUP model's "pk" is recorded metadata, not a dedup key (see
     // the build_schema comment in ddl.rs), so it is no wire PRI_KEY.
     let key_pos = if schema.key_model == KeyModel::Duplicate {
-        None
+        Vec::new()
     } else {
-        schema.column_index(&schema.pk)
+        schema.pk_indices()
     };
     ScopeSide {
         qualifier: alias.clone().unwrap_or_else(|| schema.name.clone()),

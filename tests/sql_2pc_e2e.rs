@@ -663,3 +663,80 @@ async fn stale_block_follower_reads_and_writes_at_the_cluster_frontier() {
         n.kill_now();
     }
 }
+
+/// Composite `PRIMARY KEY(a, b)` through the same 3-process 2PC path:
+/// the write set's row keys are the ENCODED multi-column pk, so slot
+/// placement, upsert dedup and row-probe reservations must all key on
+/// the full tuple. A follower coordinates the UPDATE/DELETE to prove
+/// the staged writes reach every slot owner.
+#[tokio::test]
+async fn composite_pk_2pc_writes_span_slot_bands() {
+    let dir = std::env::temp_dir().join(format!("rdb-sql-cpk-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nodes = start_sql_cluster(&dir, 3).await;
+    let mut c0 = connect(&nodes[0]).await;
+    let mut c1 = connect(&nodes[1]).await;
+    let mut c2 = connect(&nodes[2]).await;
+
+    ddl(
+        &mut c0,
+        "CREATE TABLE cpk (a INT, b VARCHAR(16), v BIGINT NOT NULL) PRIMARY KEY(a, b)",
+    )
+    .await;
+    wait_table(&mut c1, "cpk", &nodes[1]).await;
+    wait_table(&mut c2, "cpk", &nodes[2]).await;
+
+    // 30 distinct (a, b) tuples; `a` repeats so only the TUPLE is a
+    // unique key -- the values span all three slot bands.
+    let rows: Vec<String> = (0..30)
+        .map(|i| format!("({}, 'k{}', {})", i % 5, i, 100 + i))
+        .collect();
+    c0.query_drop(format!(
+        "INSERT INTO cpk (a, b, v) VALUES {}",
+        rows.join(", ")
+    ))
+    .await
+    .expect("seed composite insert");
+    for (i, c) in [&mut c0, &mut c1, &mut c2].iter_mut().enumerate() {
+        let got = ids(c, "SELECT v FROM cpk ORDER BY a, b").await;
+        let mut want: Vec<i64> = (0..30).map(|i| 100 + i).collect();
+        want.sort_unstable();
+        assert_eq!(got.len(), 30, "node {i}: every tuple visible exactly once");
+        got.iter()
+            .zip(want.iter())
+            .for_each(|(g, w)| assert_eq!(g, w));
+    }
+
+    // upsert: same tuple replaces, a differing single column is a NEW key
+    c1.query_drop("INSERT INTO cpk (a, b, v) VALUES (0, 'k0', 999), (0, 'new', 7), (1, 'k1', 888)")
+        .await
+        .expect("composite upsert via follower");
+    assert_eq!(c1.affected_rows(), 3);
+    assert_eq!(
+        ids(&mut c0, "SELECT v FROM cpk WHERE a = 0 AND b = 'k0'").await,
+        vec![999]
+    );
+    assert_eq!(ids(&mut c0, "SELECT COUNT(*) FROM cpk").await, vec![31]);
+
+    // full-tuple WHERE UPDATE coordinated by the other follower
+    c2.query_drop("UPDATE cpk SET v = 0 WHERE a = 1 AND b = 'k6'")
+        .await
+        .expect("composite update");
+    assert_eq!(c2.affected_rows(), 1);
+    assert_eq!(
+        ids(&mut c0, "SELECT v FROM cpk WHERE a = 1 AND b = 'k6'").await,
+        vec![0]
+    );
+
+    // full-tuple WHERE DELETE
+    c2.query_drop("DELETE FROM cpk WHERE a = 1 AND b = 'k6'")
+        .await
+        .expect("composite delete");
+    assert_eq!(c2.affected_rows(), 1);
+    assert_eq!(ids(&mut c0, "SELECT COUNT(*) FROM cpk").await, vec![30]);
+
+    for mut n in nodes {
+        n.kill_now();
+    }
+}

@@ -47,7 +47,7 @@ fn dist(cols: &[&str], buckets: u32) -> Distribution {
 fn build_schema_starrocks_pk_model() {
     let cols = [int_spec("k"), spec("v", SqlType::VarChar, true)];
     let m = sr_model(KeyModel::PrimaryKey, &["k"], Some(dist(&["k"], 8)));
-    let s = build_schema(1, "t", &cols, "k", Engine::Row, Some(&m)).unwrap();
+    let s = build_schema(1, "t", &cols, &["k".to_string()], Engine::Row, Some(&m)).unwrap();
     assert_eq!(s.key_model, KeyModel::PrimaryKey);
     assert_eq!(s.engine, Engine::Row, "PK tables stay row-store");
     assert!(!s.columns[0].nullable, "PK coerced NOT NULL");
@@ -60,12 +60,20 @@ fn build_schema_starrocks_pk_model() {
 fn build_schema_model_engine_matrix() {
     let cols = [int_spec("k"), spec("v", SqlType::VarChar, true)];
     let pk = sr_model(KeyModel::PrimaryKey, &["k"], None);
-    let e = build_schema(0, "t", &cols, "k", Engine::Columnar, Some(&pk)).unwrap_err();
+    let e = build_schema(
+        0,
+        "t",
+        &cols,
+        &["k".to_string()],
+        Engine::Columnar,
+        Some(&pk),
+    )
+    .unwrap_err();
     assert_eq!(e.code, ErrorCode::NotSupported);
     assert!(e.msg.contains("PRIMARY KEY tables are row-store"));
 
     let dup = sr_model(KeyModel::Duplicate, &["k"], None);
-    let s = build_schema(2, "t", &cols, "k", Engine::Row, Some(&dup)).unwrap();
+    let s = build_schema(2, "t", &cols, &["k".to_string()], Engine::Row, Some(&dup)).unwrap();
     assert_eq!(s.engine, Engine::Columnar, "dup implies columnar");
     assert_eq!(s.key_model, KeyModel::Duplicate);
 }
@@ -76,8 +84,8 @@ fn build_schema_model_engine_matrix() {
 fn build_schema_starrocks_dup_keeps_nullability() {
     let cols = [int_spec("k"), spec("v", SqlType::VarChar, true)];
     let m = sr_model(KeyModel::Duplicate, &["k", "v"], Some(dist(&["k"], 3)));
-    let s = build_schema(3, "t", &cols, "k", Engine::Row, Some(&m)).unwrap();
-    assert_eq!(s.pk, "k");
+    let s = build_schema(3, "t", &cols, &["k".to_string()], Engine::Row, Some(&m)).unwrap();
+    assert_eq!(s.pk, vec!["k".to_string()]);
     assert!(
         s.columns[0].nullable,
         "dup-key pk is metadata, stays nullable"
@@ -90,12 +98,20 @@ fn build_schema_starrocks_dup_keeps_nullability() {
 fn build_schema_validates_distribution() {
     let cols = [int_spec("k")];
     let bad_col = sr_model(KeyModel::Duplicate, &["k"], Some(dist(&["nope"], 2)));
-    let e = build_schema(0, "t", &cols, "k", Engine::Row, Some(&bad_col)).unwrap_err();
+    let e = build_schema(
+        0,
+        "t",
+        &cols,
+        &["k".to_string()],
+        Engine::Row,
+        Some(&bad_col),
+    )
+    .unwrap_err();
     assert_eq!(e.code, ErrorCode::BadField);
     assert!(e.msg.contains("unknown column 'nope' in DISTRIBUTED BY"));
 
     let zero = sr_model(KeyModel::Duplicate, &["k"], Some(dist(&["k"], 0)));
-    let e = build_schema(0, "t", &cols, "k", Engine::Row, Some(&zero)).unwrap_err();
+    let e = build_schema(0, "t", &cols, &["k".to_string()], Engine::Row, Some(&zero)).unwrap_err();
     assert!(e.msg.contains("BUCKETS must be at least 1"));
 }
 
@@ -116,7 +132,7 @@ async fn starrocks_ddl_persists_model_in_catalog() {
     .unwrap();
     let s = catalog::lookup(&shared, "pk_t").unwrap().expect("created");
     assert_eq!(s.key_model, KeyModel::PrimaryKey);
-    assert_eq!(s.pk, "k");
+    assert_eq!(s.pk, vec!["k".to_string()]);
     assert_eq!(s.distribution.as_ref().unwrap().buckets, 8);
 
     run(
@@ -132,16 +148,24 @@ async fn starrocks_ddl_persists_model_in_catalog() {
     let s = catalog::lookup(&shared, "dup_t").unwrap().expect("created");
     assert_eq!(s.key_model, KeyModel::Duplicate);
     assert_eq!(s.engine, Engine::Columnar);
-    assert_eq!(s.pk, "k1");
+    assert_eq!(s.pk, vec!["k1".to_string()]);
     assert!(s.columns[0].nullable, "dup key keeps nullability");
 
-    // multi-column PK model is Phase 4; the injected constraint
-    // trips the single-pk check with its usual message (at parse
-    // time -- translation is where the check lives).
-    let e = parse_statement(
-        "CREATE TABLE wide (a INT, b INT) PRIMARY KEY(a, b) DISTRIBUTED BY HASH(a)",
+    // multi-column PRIMARY KEY is supported: all key columns become
+    // the composite pk.
+    run(
+        &shared,
+        parse_statement(
+            "CREATE TABLE wide (a INT, b INT) PRIMARY KEY(a, b) DISTRIBUTED BY HASH(a)",
+        )
+        .unwrap(),
     )
-    .unwrap_err();
-    assert_eq!(e.code, ErrorCode::NotSupported);
-    assert!(e.msg.contains("exactly one primary-key"), "{}", e.msg);
+    .await
+    .unwrap();
+    let s = catalog::lookup(&shared, "wide").unwrap().expect("created");
+    assert_eq!(s.pk, vec!["a".to_string(), "b".to_string()]);
+    assert!(
+        s.columns.iter().all(|c| !c.nullable),
+        "pk columns forced NOT NULL"
+    );
 }

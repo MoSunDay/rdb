@@ -241,7 +241,7 @@ mod tests {
                     nullable: true,
                 },
             ],
-            pk: "id".into(),
+            pk: vec!["id".to_string()],
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],

@@ -36,7 +36,7 @@ impl Relation {
                 types: self.columns.iter().map(|c| c.sql_type).collect(),
                 // A derived relation has no declared nullability or key.
                 nullable: vec![true; self.columns.len()],
-                key_pos: None,
+                key_pos: Vec::new(),
                 offset: 0,
             }],
         }
