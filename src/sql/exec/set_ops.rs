@@ -152,6 +152,17 @@ fn widen(a: SqlType, b: SqlType) -> SqlResult<SqlType> {
     match (a, b) {
         (x, y) if x == y => Ok(x),
         (Int, Double) | (Double, Int) => Ok(Double),
+        // Decimal families widen to the coarser scale (Ints under a
+        // decimal column lift to scale 0) and to Double against it.
+        (Decimal { scale: sa, .. }, Decimal { scale: sb, .. }) => Ok(Decimal {
+            precision: crate::sql::storage::schema::MAX_DECIMAL_SCALE,
+            scale: sa.max(sb),
+        }),
+        (Decimal { scale, .. }, Int) | (Int, Decimal { scale, .. }) => Ok(Decimal {
+            precision: crate::sql::storage::schema::MAX_DECIMAL_SCALE,
+            scale,
+        }),
+        (Decimal { .. }, Double) | (Double, Decimal { .. }) => Ok(Double),
         // A date column under a datetime column widens to datetime, so
         // dedup ordering and rendering use full precision.
         (Date, DateTime) | (DateTime, Date) => Ok(DateTime),
@@ -163,21 +174,44 @@ fn widen(a: SqlType, b: SqlType) -> SqlResult<SqlType> {
 }
 
 /// Normalize cells widened by [`widen`]: Date cells of a column typed
-/// DateTime lift to midnight microseconds. (Int cells of a widened
-/// Double column flow through untouched, as they always have.)
+/// DateTime lift to midnight microseconds, and widened decimal columns
+/// carry every cell at the column scale (Int lifts exactly, Decimal
+/// rescales half-away-from-zero, Decimal under Double coarsens) -- so
+/// dedup and rendering see one spelling per value.
 fn widen_cells(columns: &[crate::sql::exec::ColMeta], rows: &mut [Vec<Value>]) -> SqlResult<()> {
+    use crate::sql::exec::expr_decimal::{decimal_to_f64, pow10, rescale_decimal};
     for row in rows {
         for (col, cell) in columns.iter().zip(row.iter_mut()) {
-            if let (Value::Date(d), SqlType::DateTime) = (&*cell, col.sql_type) {
-                *cell = Value::DateTime(
-                    d.checked_mul(crate::sql::temporal::MICROS_PER_DAY)
-                        .ok_or_else(|| {
+            match (&*cell, col.sql_type) {
+                (Value::Date(d), SqlType::DateTime) => {
+                    *cell = Value::DateTime(
+                        d.checked_mul(crate::sql::temporal::MICROS_PER_DAY)
+                            .ok_or_else(|| {
+                                SqlError::new(
+                                    ErrorCode::NotSupported,
+                                    format!("date {d} out of DATETIME range"),
+                                )
+                            })?,
+                    );
+                }
+                (Value::Int(i), SqlType::Decimal { scale, .. }) => {
+                    *cell = Value::Decimal(
+                        i128::from(*i).checked_mul(pow10(scale)).ok_or_else(|| {
                             SqlError::new(
                                 ErrorCode::NotSupported,
-                                format!("date {d} out of DATETIME range"),
+                                format!("integer {i} out of DECIMAL({scale}) range"),
                             )
                         })?,
-                );
+                        scale,
+                    );
+                }
+                (Value::Decimal(m, s), SqlType::Decimal { scale, .. }) => {
+                    *cell = Value::Decimal(rescale_decimal(*m, *s, scale)?, scale);
+                }
+                (Value::Decimal(m, s), SqlType::Double) => {
+                    *cell = Value::Double(decimal_to_f64(*m, *s));
+                }
+                _ => {}
             }
         }
     }

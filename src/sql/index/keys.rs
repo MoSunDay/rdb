@@ -123,6 +123,9 @@ pub fn split_tail(tail: &[u8], ty: SqlType) -> Option<(&[u8], &[u8])> {
         SqlType::Bool => 2,
         // Date/DateTime ride the same tag + 8B key layout as Int.
         SqlType::Int | SqlType::Double | SqlType::Date | SqlType::DateTime => 9,
+        // Decimal keys are tag + 16B mantissa: fixed width, so the
+        // split is deterministic without a terminator.
+        SqlType::Decimal { .. } => 17,
         SqlType::VarChar | SqlType::Blob => tail[1..].iter().position(|&b| b == 0x00)? + 2,
     };
     tail.split_at_checked(fixed)
@@ -149,6 +152,8 @@ pub fn value_display(v: &Value) -> String {
         Value::Bool(b) => format!("{}", *b as u8),
         Value::Int(i) => i.to_string(),
         Value::Double(d) => format!("{d}"),
+        // Numeric, unquoted (MySQL duplicate-entry style).
+        Value::Decimal(m, s) => crate::sql::storage::schema::format_decimal(*m, *s),
         // Canonical civil spellings, quoted like strings.
         Value::Date(d) => format!("'{}'", temporal::format_date(*d)),
         Value::DateTime(us) => format!("'{}'", temporal::format_datetime(*us)),

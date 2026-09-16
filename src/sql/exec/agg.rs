@@ -6,9 +6,10 @@
 //! rewritten tree then evaluates on the group's representative row.
 
 use crate::sql::exec::expr::{cmp_values, eval};
+use crate::sql::exec::expr_decimal::{decimal_to_f64, div_decimal, rescale_decimal};
 use crate::sql::exec::scan::FromScope;
 use crate::sql::parse::ast::{AggFunc, Expr};
-use crate::sql::parse::error::SqlResult;
+use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::schema::Value;
 
 /// One evaluation unit: a row (ungrouped query) or a group of rows.
@@ -106,15 +107,24 @@ fn eval_aggregate(e: &Expr, scope: &FromScope, rows: &[Vec<Value>]) -> SqlResult
     }
     match func {
         AggFunc::Count => Ok(Value::Int(vals.len() as i64)),
-        AggFunc::Sum => Ok(sum_values(&vals)),
-        AggFunc::Avg => Ok(avg_values(&vals)),
+        AggFunc::Sum => sum_values(&vals),
+        AggFunc::Avg => avg_values(&vals),
         AggFunc::Min | AggFunc::Max => Ok(min_max(&vals, matches!(func, AggFunc::Max))),
     }
 }
 
-fn sum_values(vals: &[Value]) -> Value {
+/// Whether every value is exact numeric (Int/Decimal, no Double).
+fn all_exact(vals: &[Value]) -> bool {
+    !vals.is_empty()
+        && !vals.iter().any(|v| matches!(v, Value::Double(_)))
+        && vals
+            .iter()
+            .all(|v| matches!(v, Value::Int(_) | Value::Decimal(..)))
+}
+
+fn sum_values(vals: &[Value]) -> SqlResult<Value> {
     if vals.is_empty() {
-        return Value::Null; // SUM over no non-NULL rows is NULL
+        return Ok(Value::Null); // SUM over no non-NULL rows is NULL
     }
     if vals.iter().all(|v| matches!(v, Value::Int(_))) {
         // Overflow-promotion is out of scope for v1: i64 wrapping sum.
@@ -124,30 +134,74 @@ fn sum_values(vals: &[Value]) -> Value {
             };
             acc.wrapping_add(*i)
         });
-        return Value::Int(sum);
+        return Ok(Value::Int(sum));
+    }
+    // Decimal (alone or mixed with Int) sums exactly at the coarser
+    // input scale; a Double anywhere keeps the double path below.
+    if all_exact(vals) {
+        let (m, s) = decimal_sum(vals)?;
+        return Ok(Value::Decimal(m, s));
     }
     // Mixed/non-numeric input (e.g. SUM over temporal or string cells)
     // sums only the numeric members; with none, SUM is NULL like AVG
     // (an empty f64 iterator sums to -0.0 in Rust, not 0.0 -- avoid
     // rendering that as a bogus "-0" cell).
-    match vals.iter().filter_map(as_num).reduce(|a, b| a + b) {
+    Ok(match vals.iter().filter_map(as_num).reduce(|a, b| a + b) {
         Some(s) => Value::Double(s),
         None => Value::Null,
-    }
+    })
 }
 
-fn avg_values(vals: &[Value]) -> Value {
+fn avg_values(vals: &[Value]) -> SqlResult<Value> {
+    // AVG of exact numerics divides the exact sum by the row count
+    // through the decimal division (scale + 4, like MySQL).
+    if all_exact(vals) {
+        let (m, s) = decimal_sum(vals)?;
+        return div_decimal(m, vals.len() as i128, s, 0);
+    }
     let nums: Vec<f64> = vals.iter().filter_map(as_num).collect();
-    match nums.len() {
+    Ok(match nums.len() {
         0 => Value::Null,
         n => Value::Double(nums.iter().sum::<f64>() / n as f64),
+    })
+}
+
+/// Exact fixed-point sum of Int/Decimal values at the coarser scale;
+/// mantissa overflow is a loud error, never a wrap.
+fn decimal_sum(vals: &[Value]) -> SqlResult<(i128, u8)> {
+    let overflow = || SqlError::new(ErrorCode::NotSupported, "decimal SUM overflow".to_string());
+    let scale = vals
+        .iter()
+        .map(|v| match v {
+            Value::Decimal(_, s) => *s,
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    let mut acc: i128 = 0;
+    for v in vals {
+        let (m, s) = match v {
+            Value::Decimal(m, s) => (*m, *s),
+            Value::Int(i) => (i128::from(*i), 0),
+            other => {
+                return Err(SqlError::new(
+                    ErrorCode::NotSupported,
+                    format!("SUM({other:?})"),
+                ))
+            }
+        };
+        acc = acc
+            .checked_add(rescale_decimal(m, s, scale).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
     }
+    Ok((acc, scale))
 }
 
 fn as_num(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
         Value::Double(d) => Some(*d),
+        Value::Decimal(m, s) => Some(decimal_to_f64(*m, *s)),
         _ => None,
     }
 }
@@ -198,3 +252,7 @@ pub fn has_agg(e: &Expr) -> bool {
         Expr::Func { args, .. } => args.iter().any(has_agg),
     }
 }
+
+#[cfg(test)]
+#[path = "agg_tests.rs"]
+mod agg_tests;

@@ -107,6 +107,8 @@ fn lit_display(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Double(d) => d.to_string(),
+        // Numeric literals render unquoted, like Int/Double above.
+        Value::Decimal(m, s) => crate::sql::storage::schema::format_decimal(*m, *s),
         // Canonical civil spellings, quoted like string literals.
         Value::Date(d) => format!("'{}'", crate::sql::temporal::format_date(*d)),
         Value::DateTime(us) => format!("'{}'", crate::sql::temporal::format_datetime(*us)),
