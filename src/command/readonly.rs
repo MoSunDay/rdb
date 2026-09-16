@@ -100,6 +100,23 @@ pub const ALLOWED: &[&str] = &[
     "vdim",
     "vgetattr",
     "vsim",
+    // JSON reads (mirror the string/hash read families: they only decode
+    // the stored document). Every mutating JSON verb stays out: set/del/
+    // forget rewrite the key, numincrby/strappend/arrappend/arrpop/
+    // arrinsert/arrtrim mutate the document in place.
+    "json.get",
+    "json.mget",
+    "json.type",
+    "json.strlen",
+    "json.arrindex",
+    "json.arrlen",
+    "json.objkeys",
+    "json.objlen",
+    // Search reads. FT.CREATE/ADD/DEL/DROP/DROPINDEX/BUILD mutate the
+    // index store (keyspace entries + build state) and stay out; only
+    // FT.INFO and FT.SEARCH are pure reads over the current index.
+    "ft.info",
+    "ft.search",
     // Transaction controls (queue-time gate still rejects queued writes).
     "multi",
     "exec",
@@ -164,10 +181,51 @@ mod tests {
             "cluster",
             "raft",
             "migrate",
+            // Mutating JSON verbs: rewrite the key or the document.
+            "json.set",
+            "json.del",
+            "json.forget",
+            "json.numincrby",
+            "json.strappend",
+            "json.arrappend",
+            "json.arrpop",
+            "json.arrinsert",
+            "json.arrtrim",
+            // Index-store mutations, not reads.
+            "ft.create",
+            "ft.add",
+            "ft.del",
+            "ft.drop",
+            "ft.dropindex",
+            "ft.build",
         ] {
             assert!(
                 !allowed(cmd),
                 "'{cmd}' must be denied on the backup listener"
+            );
+        }
+    }
+
+    /// The JSON/FT read families are allowed: a failover to the backup
+    /// listener keeps `json.get`/`ft.search` serving, symmetric with the
+    /// string/hash/vector read families.
+    #[test]
+    fn json_reads_and_ft_reads_are_allowed() {
+        for cmd in [
+            "json.get",
+            "json.mget",
+            "json.type",
+            "json.strlen",
+            "json.arrindex",
+            "json.arrlen",
+            "json.objkeys",
+            "json.objlen",
+            "ft.info",
+            "ft.search",
+        ] {
+            assert!(
+                allowed(cmd),
+                "'{cmd}' must be allowed on the backup listener"
             );
         }
     }

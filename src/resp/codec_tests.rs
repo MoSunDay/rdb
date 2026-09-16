@@ -156,6 +156,35 @@ fn inline_unbalanced_quotes() {
 }
 
 #[test]
+fn inline_unterminated_line_is_capped_at_64kb() {
+    // Redis `PROTO_INLINE_MAX_SIZE` parity: the cap is strictly greater,
+    // so exactly 64KB of newline-free bytes still waits for its '\n'...
+    assert!(matches!(
+        parse_command(&[b'x'; 64 * 1024]),
+        ParseOutcome::Incomplete
+    ));
+    // ...while one byte past it is a protocol error, not an unbounded
+    // Incomplete that buffers until the 1GB cumulative cap.
+    assert_eq!(
+        err_msg(&[b'x'; 64 * 1024 + 1]),
+        "Protocol error: too big inline request"
+    );
+}
+
+#[test]
+fn inline_line_with_newline_beyond_64kb_still_parses() {
+    // The cap only applies while the line is UNTERMINATED: with a '\n'
+    // anywhere in the buffer the line parses regardless of length.
+    let mut buf = b"get ".to_vec();
+    buf.extend(std::iter::repeat_n(b'x', 70 * 1024));
+    buf.extend_from_slice(b"\r\n");
+    let (args, _) = complete(&buf);
+    assert_eq!(args[0], b"get");
+    assert_eq!(args[1].len(), 70 * 1024);
+    assert!(args[1].iter().all(|&b| b == b'x'));
+}
+
+#[test]
 fn multibulk_count_is_capped() {
     // A huge (or negative) "*N" header must error before the parser
     // preallocates for `count` elements.

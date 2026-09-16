@@ -1,0 +1,81 @@
+# Nightly soak gate: LONG kill -9 soak (durability + p99 latency
+# assertion) plus the full real-CLI e2e scenario suite.
+#
+# WHY nightly and not on push: load-only regressions -- the tokio
+# LIFO-slot scheduler freeze class being the concrete example -- do not
+# reproduce in unit tests or the short-lived CI jobs; they only show up
+# under sustained load, and the 180s soak inside run_all.sh is too slow
+# to gate every push. The soak's RDB_SOAK_P99_MAX_MS gate (default
+# 1000ms, deliberately generous) is what actually catches them: clients
+# stay error-free while p99 balloons to multi-seconds.
+#
+# The LIFO regression guard itself is run_all.sh's W0.4 pre-flight: it
+# greps the built binary for the 'tokio LIFO slot: disabled' banner and
+# hard-fails otherwise; .cargo/config.toml supplies --cfg tokio_unstable
+# to every cargo invocation (same as ci.yml).
+#
+# No secrets: env.sh derives RDB_E2E_TOKEN from /dev/urandom when unset,
+# so nothing token-shaped is inlined here.
+name: soak
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # nightly, off the hour to dodge top-of-hour load
+  workflow_dispatch:
+
+concurrency:
+  group: soak-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # clang/libclang-dev: librocksdb-sys bundled C/C++ build (same as
+      # ci.yml). redis-tools: the e2e harness drives redis-cli (with
+      # REDISCLI_AUTH exported by env.sh). curl: /metrics probes.
+      - name: Install rocksdb build + e2e deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev redis-tools curl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      # Builds both rdb and rdb-bench; committed .cargo/config.toml adds
+      # --cfg tokio_unstable so the LIFO-slot disable path is compiled in.
+      - name: release build (rdb + rdb-bench)
+        run: cargo build --release --workspace
+
+      # 900s load window (default is 180s): half healthy load, SIGKILL,
+      # respawn on the same store, then a post-restart load round. The
+      # script self-asserts durability (acked-INCR counter) and the
+      # RDB_SOAK_P99_MAX_MS latency gate on every bench round.
+      - name: long kill -9 soak (durability + p99 latency gate)
+        run: RDB_SOAK_SECS=900 RDB_E2E_PORT_BASE=32900 bash scrtips/e2e_scenarios/soak_kill9.sh
+
+      # Exit code = number of failed scenarios; a non-zero exit fails
+      # this step (nothing swallows it).
+      - name: full e2e scenario suite
+        run: bash scrtips/e2e_scenarios/run_all.sh
+
+      # Bench/e2e artifacts are deliberately written to /tmp (outside the
+      # torn-down per-scenario workdir) so they survive for upload.
+      - name: upload soak/e2e diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-diagnostics
+          path: |
+            /tmp/rdb_soak_bench_*.out
+            /tmp/rdb_e2e_*.out
+          if-no-files-found: ignore

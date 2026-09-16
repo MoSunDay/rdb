@@ -21,6 +21,15 @@
 #      and a post-restart bench round stays error-free.
 #
 # Usage: RDB_SOAK_SECS=180 RDB_E2E_PORT_BASE=32900 bash soak_kill9.sh
+#
+# Env knobs (beyond env.sh's RDB_E2E_* namespace):
+#   RDB_SOAK_SECS       total load window in seconds, default 180
+#   RDB_SOAK_P99_MAX_MS per-bench-round rtt p99 budget in ms, default
+#                       1000; 0 disables the gate. 1000 is deliberately
+#                       generous: it must catch multi-second freezes
+#                       (the tokio LIFO-slot regression class) on shared
+#                       CI runners without flaking on runner disk noise
+#                       from the fsync-per-write workload.
 # (not named scenario_*: deliberately outside run_all.sh's default set)
 set -uo pipefail
 
@@ -29,6 +38,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/env.sh"
 
 RDB_SOAK_SECS="${RDB_SOAK_SECS:-180}"      # total load window
+RDB_SOAK_P99_MAX_MS="${RDB_SOAK_P99_MAX_MS:-1000}" # rtt p99 gate per round; 0 = off
 RDB_SOAK_HALF=$((RDB_SOAK_SECS / 2))       # kill point
 BENCH="$E2E_ROOT/target/release/rdb-bench"
 [ -x "$BENCH" ] || { echo "FAIL: $BENCH missing (build bench first)"; exit 1; }
@@ -100,17 +110,47 @@ while True:
 PY
 WRITER_PID=$!
 
-bench_round () { # label secs -> 0 on zero-error run
+bench_round () { # label secs -> 0 on zero-error, in-budget-p99 run
     local label=$1 secs=$2
     local out="${BENCH_OUT_PREFIX}_${label}.out"
     echo "-- bench $label (${secs}s, mixed, 8x16) against $NODE0"
     if "$BENCH" --addr "$NODE0" --token "$RDB_E2E_TOKEN" --workload mixed \
         --clients 8 --pipeline 16 --duration "$secs" >"$out" 2>&1; then
         echo "ok   - bench $label: zero client errors ($out)"
+        p99_gate "$label" "$out" || return 1
         return 0
     fi
     _e2e_fail "bench $label reported errors (see $out)"
     return 1
+}
+
+# Latency gate on every successful bench round (healthy + post-restart):
+# rdb-bench prints a parseable stats block, one line being
+#   rtt_ms avg=<f> p50=<f> p99=<f> max=<f>
+# (bench/src/stats.rs). Zero client errors is necessary but not
+# sufficient -- a load-only regression (e.g. the tokio LIFO-slot freeze)
+# keeps every client error-free while p99 balloons to multi-seconds.
+p99_gate () { # label out -> 0 on pass or gate disabled
+    local label=$1 out=$2 max="$RDB_SOAK_P99_MAX_MS"
+    if [ "$max" = "0" ]; then
+        echo "ok   - bench $label: p99 gate disabled (RDB_SOAK_P99_MAX_MS=0)"
+        return 0
+    fi
+    local p99
+    p99="$(awk -F'p99=' '/^rtt_ms/{split($2,a," "); print a[1]; exit}' "$out")"
+    case "$p99" in
+    '' | *[!0-9.eE+-]*)
+        _e2e_fail "bench $label p99 unparseable from rtt_ms line (see $out)"
+        return 1
+        ;;
+    esac
+    # awk exits 0 exactly when p99 > max (numeric compare; 0 otherwise).
+    if awk -v v="$p99" -v m="$max" 'BEGIN{exit !(v>m)}'; then
+        _e2e_fail "bench $label p99 ${p99}ms exceeds RDB_SOAK_P99_MAX_MS=${max}ms (see $out)"
+        return 1
+    fi
+    echo "ok   - bench $label: p99 ${p99}ms within RDB_SOAK_P99_MAX_MS=${max}ms"
+    return 0
 }
 
 # ---- 1. healthy window ----

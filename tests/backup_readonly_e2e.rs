@@ -178,3 +178,53 @@ async fn backup_listener_rejects_writes_with_readonly_and_keeps_reads() {
     );
     node.kill_now();
 }
+
+/// Regression for the JSON/FT read gap in the gate: after a failover to
+/// the backup listener, `JSON.GET` and `FT.SEARCH` must serve (pure
+/// reads over the backup store, symmetric with GET/VSIM), while the
+/// mutating JSON/FT verbs keep replying -READONLY. `JSON.GET` on a
+/// missing key is a RESP null (not the gate error), and `FT.SEARCH`
+/// on an unknown index surfaces its OWN error -- proof the request
+/// reached the command, not the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_listener_serves_json_and_ft_reads_but_denies_mutations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut node, backup) = spawn_node_backup(dir.path(), 0, true, None);
+    wait_resp_ready(&mut node, 30).await;
+    wait_backup_ready(&backup, &node, 30).await;
+
+    // Pure reads pass the gate; the backup store is empty, so a missing
+    // key yields the RESP null bulk, exactly like GET.
+    let nil = cmd_one_shot(&backup, TOKEN, &[b"JSON.GET", b"missing"]).await;
+    assert_eq!(nil, b"$-1", "json.get on missing key: {nil:?}");
+
+    // JSON writes stay behind the gate.
+    let wrote = cmd_one_shot(&backup, TOKEN, &[b"JSON.SET", b"bk", b"1"]).await;
+    assert!(
+        contains_bytes(&wrote, READONLY_ERR),
+        "json.set must reply -READONLY: {wrote:?}"
+    );
+
+    // FT.SEARCH is a read: it runs and fails on its own terms (the
+    // backup store has no such index), NOT with the gate error.
+    let searched = cmd_one_shot(&backup, TOKEN, &[b"FT.SEARCH", b"noidx", b"term"]).await;
+    assert!(
+        contains_bytes(&searched, b"ERR unknown index"),
+        "ft.search must report the missing index, got {searched:?}"
+    );
+
+    // Index mutations stay behind the gate.
+    let created = cmd_one_shot(&backup, TOKEN, &[b"FT.CREATE", b"idx"]).await;
+    assert!(
+        contains_bytes(&created, READONLY_ERR),
+        "ft.create must reply -READONLY: {created:?}"
+    );
+
+    // The process survived everything above.
+    assert!(
+        node.child.try_wait().unwrap().is_none(),
+        "rdb must still be alive\n{}",
+        node.ctx()
+    );
+    node.kill_now();
+}
