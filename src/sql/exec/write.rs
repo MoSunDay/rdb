@@ -144,6 +144,8 @@ pub async fn insert(
         put_version(&mut batch, &schema, values, ts.start + i as u64)?;
     }
     maintain::apply_ops(&mut batch, idx);
+    // Same-batch ts floor (restart clock fencing, see tx::floor).
+    tx::floor::stamp(&mut batch, ts.end - 1);
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
         .map_err(SqlError::from)?;
@@ -394,6 +396,8 @@ pub async fn update(
         next += 1;
     }
     maintain::apply_ops(&mut batch, idx);
+    // Same-batch ts floor (restart clock fencing, see tx::floor).
+    tx::floor::stamp(&mut batch, ts.end - 1);
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
         .map_err(SqlError::from)?;
@@ -493,6 +497,8 @@ pub async fn delete(
         );
     }
     maintain::apply_ops(&mut batch, idx);
+    // Same-batch ts floor (restart clock fencing, see tx::floor).
+    tx::floor::stamp(&mut batch, ts.end - 1);
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
         .map_err(SqlError::from)?;

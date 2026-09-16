@@ -1,6 +1,7 @@
 //! SQL transaction machinery: timestamp oracle (M1: node-local) and,
 //! from M2 on, MVCC snapshot sessions, conflict detection and GC.
 
+pub mod floor;
 pub mod global;
 pub mod latch;
 pub mod nodes;
