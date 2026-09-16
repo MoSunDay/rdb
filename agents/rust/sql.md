@@ -31,7 +31,7 @@ Commit: 98e17a5
   UNION 拼装/去重/拓宽）、`relation.rs`（`Relation` + CTE 作用域）、`subquery.rs`
   （标量/IN 子查询提升改写，相关改写按 BadField + "unknown column" 前缀匹配）、
   `agg.rs`、`expr.rs`（三值 NOT/IN；`length()` 字节 / `char_length()` 字符）、
-  `show.rs`、`render.rs`（EXPLAIN，含复合计划）、`ddl.rs`（`catalog_txn`/
+  `show.rs`、`render.rs`（EXPLAIN，含复合计划）、`ddl.rs`（`catalog_txn`/`catalog_apply`：进程级 `DDL_MUX` 串行整个 DDL（decide→queue→commit-await），raft 写锁只在 decide+queue 瞬间持有，commit 一律锁外 await——锁跨 await 会饿死 leader 的 raft/HTTP 服务与 ts refill（4 核 CI 实证挂死）；
   `DdlPlan{mutations, schema, changed}`：table-id 分配与目录变更在同一 raft 写守卫
   窗口内单决策生效，索引回填 mutations 随决策落盘）、`sequence.rs`
   （AUTO_INCREMENT 分配：leader 串行 RMW + 批量预留 64、`LAST_INSERT_ID()`）。

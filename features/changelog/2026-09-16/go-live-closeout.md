@@ -60,3 +60,46 @@ Commit: 本批次（26e79d0..最终提交）
 本机存在 `/root/opencode` 外部租户进程，会在工作区留下未提交 WIP（DECIMAL 支持等）
 且阶段性破坏本地编译。本批所有验证在 `.verify-wt` 隔离 worktree（共享
 `CARGO_TARGET_DIR`）完成；主工作区仅做文件级选择性提交，未触碰其 WIP。
+
+## H. CI test-step hang — root cause fixed (post-closeout)
+
+The first post-push CI run's `cargo test --workspace` step never
+finished (last green baseline: 7 min; this run burned the whole
+360-min job cap). Reproduced locally under the CI-shaped constraint
+(`taskset -c 0-3` + `--test-threads=4`): `sql_dist_read_e2e::
+for_update_vetoed_and_explain_degrades_on_indexed_table` hangs
+forever with the leader node wedged — raft listener backlog full
+(peers stuck in SYN-SENT), an established raft conn with 2.6 MB
+unread, every RaftState accessor starved.
+
+Root cause (gdb stacks): `exec::ddl::catalog_apply`/`catalog_txn`
+(and `exec::sequence`'s AUTO_INCREMENT bump) held the
+`shared.raft.write()` guard across `handle.block_on(txn.put(..))`,
+i.e. across the raft commit await. `sql::tx::global::
+fetch_serialized` additionally blocked on `raft.read()` while
+holding `fetch_mux` — an ABBA inversion. With the guard never
+released, the leader's raft/HTTP serve paths and ts refill all
+starve on the same RwLock and the cluster freezes. Never seen
+locally before because the race window needs the slow 4-core CI
+timing.
+
+Fix (queue-then-await, never a guard across an await):
+- `sql/storage/catalog.rs`: `CatalogTxn` gains sync
+  `queue_put/queue_drop/queue_put_kv` returning a `QueuedApply`
+  (key, value, ticket) + `record`; the async put/drop/put_kv are
+  gone.
+- `sql/exec/ddl.rs`: both guard windows only `begin` + `decide` +
+  `queue`; commits are awaited after the guard drops. Whole-DDL
+  serialization (decide → queue → commit) moves to a process
+  `DDL_MUX` tokio Mutex so `concurrent_create_tables_stay_isolated`
+  (exactly one CREATE wins, loser gets 1050) keeps its ordering via
+  the FSM `live_kv` view.
+- `sql/exec/sequence.rs`: AUTO_INCREMENT bump queues under the
+  guard, awaits the commit after it.
+- `sql/tx/global.rs`: `fetch_serialized` snapshots `is_leader`
+  BEFORE taking `fetch_mux`, removing the lock-order inversion.
+
+Validation: hang test 8x green (~5 s each), race test 4x green,
+full workspace suite under `taskset -c 0-3 --test-threads=4` green
+(1151 tests; hung indefinitely before), fmt + clippy 1.98
+`-D warnings` green.

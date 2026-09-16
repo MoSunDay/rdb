@@ -7,9 +7,11 @@
 //! (`catalog_txn` below). That guard is the DDL mutex: two concurrent
 //! CREATEs can never both observe the same max table id, and two CREATE
 //! INDEX statements can never both pass the same existence check.
-//! Because the `CatalogTxn` borrows the guard across its awaits, the
-//! window must stay off the async executors (the futures the MySQL shim
-//! polls must stay `Send`), hence `spawn_blocking`.
+//! Because the `CatalogTxn` borrows the guard, the window must stay
+//! off the async executors (the futures the MySQL shim polls must stay
+//! `Send`), hence `spawn_blocking`. The guard is released before any
+//! commit await: holding it across `raft_apply_await` deadlocks the
+//! leader (see `catalog_txn`).
 //!
 //! Physical rows of a dropped row-engine table are intentionally left
 //! orphaned: the catalog tombstone makes them unreachable, and a
@@ -38,7 +40,7 @@ use crate::sql::storage::catalog::{self, CatalogTxn};
 use crate::sql::storage::replicate;
 use crate::sql::storage::row;
 use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, KeyModel, SqlType, TableSchema};
-use crate::state::{RaftState, Shared};
+use crate::state::{self, RaftState, Shared};
 use crate::store::ops;
 
 pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
@@ -111,63 +113,91 @@ impl DdlPlan {
     }
 }
 
-/// Run `begin` + the txn method while holding the raft write guard, on
-/// the blocking pool (`CatalogTxn`'s guard borrow spans its await).
-/// Kept for single-mutation follow-ups that need no decision (the
+/// Serializes whole DDLs (decide -> queue -> commit-await) without
+/// holding the raft write guard across any await: the second CREATE
+/// must not run its existence check before the first one's commit is
+/// visible in the FSM's `live_kv` (the original design got this
+/// ordering by blocking on the raft guard through the commit; that
+/// guard-across-await starved the leader's raft/HTTP serve paths and
+/// ts refill -- a proven 4-core hang, see `catalog_txn`).
+static DDL_MUX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Run `begin` + queue the single mutation inside ONE raft write-guard
+/// window on the blocking pool, then await the commit AFTER the guard
+/// is dropped: the guard must never span an await (apply progress, ts
+/// refill and the raft/HTTP serve paths all take the same RwLock;
+/// holding it across `raft_apply_await` deadlocks the leader). Kept
+/// for single-mutation follow-ups that need no decision (the
 /// AUTO_INCREMENT counter lifecycle).
 async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<()> {
+    let _ddl = DDL_MUX.lock().await;
     let raft = Arc::clone(&shared.raft);
-    let handle = tokio::runtime::Handle::current();
-    let applied = tokio::task::spawn_blocking(move || {
+    let queued = tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();
         let mut txn: CatalogTxn<'_> = catalog::begin(&mut guard, "DDL").map_err(SqlError::from)?;
-        match mutation {
-            CatalogMutation::Put(schema) => handle.block_on(txn.put(&schema)),
-            CatalogMutation::Drop(schema) => handle.block_on(txn.drop(&schema.name, schema.id)),
-            CatalogMutation::Kv { key, value } => handle.block_on(txn.put_kv(&key, &value)),
+        let queued = match mutation {
+            CatalogMutation::Put(schema) => txn.queue_put(&schema),
+            CatalogMutation::Drop(schema) => txn.queue_drop(&schema.name, schema.id),
+            CatalogMutation::Kv { key, value } => txn.queue_put_kv(&key, &value),
         }
         .map_err(SqlError::from)?;
-        Ok::<_, SqlError>(txn.applied().to_vec())
+        Ok::<_, SqlError>(queued)
     })
     .await
     .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))??;
+    state::raft_apply_await(queued.ticket)
+        .await
+        .map_err(SqlError::from)?;
+    let applied = vec![(queued.key, queued.value)];
     // The ack implies follower visibility: hold the response until the
     // peers' FSMs serve the mutation (best-effort, see `replicate`).
     replicate::wait_peers_serve(shared, &applied).await;
     Ok(())
 }
 
-/// Run `decide` + its mutations inside ONE raft write-guard window on
-/// the blocking pool: schema reads (lookup / id allocation / index
-/// pre-checks) and the catalog write are atomic, so two concurrent
-/// CREATEs can never observe the same max table id and two CREATE INDEX
-/// statements can never both pass the same existence check. `decide`
-/// sees the FSM view through the held guard and must only do cheap
-/// reads (plus local store reads for the unique-index pre-check).
+/// Run `decide` + queue its mutations inside ONE raft write-guard
+/// window on the blocking pool: schema reads (lookup / id allocation /
+/// index pre-checks) and the queued catalog writes are atomic, so two
+/// concurrent CREATEs can never observe the same max table id and two
+/// CREATE INDEX statements can never both pass the same existence
+/// check. `decide` sees the FSM view through the held guard and must
+/// only do cheap reads (plus local store reads for the unique-index
+/// pre-check). The commits are awaited AFTER the guard is dropped: the
+/// guard must never span an await (see `catalog_apply`).
 async fn catalog_txn<F>(shared: &Shared, decide: F) -> SqlResult<DdlPlan>
 where
     F: FnOnce(&RaftState) -> SqlResult<DdlPlan> + Send + 'static,
 {
+    let _ddl = DDL_MUX.lock().await;
     let raft = Arc::clone(&shared.raft);
-    let handle = tokio::runtime::Handle::current();
-    let (plan, applied) = tokio::task::spawn_blocking(move || {
+    let (plan, queued) = tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();
         // begin() keeps the leadership check FIRST (a follower must get
         // the "requires the raft leader" error, not a decision error).
         let mut txn: CatalogTxn<'_> = catalog::begin(&mut guard, "DDL").map_err(SqlError::from)?;
         let mut plan = decide(txn.state())?;
+        let mut queued = Vec::with_capacity(plan.mutations.len());
         for mutation in std::mem::take(&mut plan.mutations) {
-            match mutation {
-                CatalogMutation::Put(schema) => handle.block_on(txn.put(&schema)),
-                CatalogMutation::Drop(schema) => handle.block_on(txn.drop(&schema.name, schema.id)),
-                CatalogMutation::Kv { key, value } => handle.block_on(txn.put_kv(&key, &value)),
+            let q = match mutation {
+                CatalogMutation::Put(schema) => txn.queue_put(&schema),
+                CatalogMutation::Drop(schema) => txn.queue_drop(&schema.name, schema.id),
+                CatalogMutation::Kv { key, value } => txn.queue_put_kv(&key, &value),
             }
             .map_err(SqlError::from)?;
+            queued.push(q);
         }
-        Ok::<_, SqlError>((plan, txn.applied().to_vec()))
+        Ok::<_, SqlError>((plan, queued))
     })
     .await
     .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))??;
+    let mut applied = Vec::with_capacity(queued.len());
+    for q in queued {
+        state::raft_apply_await(q.ticket)
+            .await
+            .map_err(SqlError::from)?;
+        applied.push((q.key, q.value));
+    }
     // The ack implies follower visibility: hold the response until the
     // peers' FSMs serve the mutation (best-effort, see `replicate`).
     replicate::wait_peers_serve(shared, &applied).await;

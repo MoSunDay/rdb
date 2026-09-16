@@ -25,7 +25,12 @@ use std::sync::Arc;
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog;
 use crate::sql::storage::schema::Value;
-use crate::state::Shared;
+use crate::state::{self, Shared};
+
+/// What one AUTO_INCREMENT assign round returns from the blocking
+/// pool: the stamped rows, the session's first auto id, and the queued
+/// counter bump (if any) to commit after the raft guard is dropped.
+type AssignOutcome = (Vec<Vec<Value>>, Option<i64>, Option<catalog::QueuedApply>);
 
 /// Ids reserved per raft round-trip when a statement auto-allocates.
 /// Multi-row INSERTs of up to this size cost one replicated write.
@@ -96,25 +101,35 @@ pub async fn allocate(
     ai: usize,
 ) -> SqlResult<(Vec<Vec<Value>>, Option<i64>)> {
     let raft = Arc::clone(&shared.raft);
-    let handle = tokio::runtime::Handle::current();
     let table = table.to_string();
-    let out = tokio::task::spawn_blocking(move || -> SqlResult<(Vec<Vec<Value>>, Option<i64>)> {
-        let mut guard = raft.write().unwrap();
-        let floor = catalog::sequence_next_state(&guard, &table);
-        let walk = assign(&mut rows, ai, floor);
-        let target = persist_target(floor, &walk);
-        if target > floor {
-            let mut txn =
-                catalog::begin(&mut guard, "AUTO_INCREMENT allocation").map_err(SqlError::from)?;
-            handle
-                .block_on(txn.put_kv(&catalog::sequence_key(&table), &target.to_string()))
-                .map_err(SqlError::from)?;
-        }
-        Ok((rows, walk.first_auto))
-    })
-    .await
-    .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))??;
-    Ok(out)
+    // Queue the counter bump under the raft write guard, await the
+    // commit after the guard is dropped: the guard must never span an
+    // await (see `exec::ddl::catalog_apply`).
+    let (rows, first_auto, queued) =
+        tokio::task::spawn_blocking(move || -> SqlResult<AssignOutcome> {
+            let mut guard = raft.write().unwrap();
+            let floor = catalog::sequence_next_state(&guard, &table);
+            let walk = assign(&mut rows, ai, floor);
+            let target = persist_target(floor, &walk);
+            let mut queued = None;
+            if target > floor {
+                let mut txn = catalog::begin(&mut guard, "AUTO_INCREMENT allocation")
+                    .map_err(SqlError::from)?;
+                queued = Some(
+                    txn.queue_put_kv(&catalog::sequence_key(&table), &target.to_string())
+                        .map_err(SqlError::from)?,
+                );
+            }
+            Ok((rows, walk.first_auto, queued))
+        })
+        .await
+        .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))??;
+    if let Some(q) = queued {
+        state::raft_apply_await(q.ticket)
+            .await
+            .map_err(SqlError::from)?;
+    }
+    Ok((rows, first_auto))
 }
 
 /// Process-wide mirror of the session's `last_insert_id`, read by
