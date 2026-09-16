@@ -12,7 +12,7 @@
 //! (tag byte + payload), but with SQL-specific kind bytes (0x20/0x21/0x22)
 //! that do not collide with the RESP families recorded there.
 
-use crate::sql::storage::schema::{SqlType, Value};
+use crate::sql::storage::schema::{SqlType, Value, MAX_DECIMAL_SCALE};
 
 /// Physical record kinds of the SQL data plane (RESP kinds end at 0x12,
 /// 0xFD is the expire index; SQL starts at 0x20).
@@ -39,6 +39,12 @@ pub fn encode_typed(value: &Value) -> Vec<u8> {
         Value::Double(d) => {
             out.push(0x03);
             out.extend_from_slice(&d.to_bits().to_be_bytes());
+        }
+        // Fixed-point decimal: scale byte + 16B BE mantissa.
+        Value::Decimal(m, s) => {
+            out.push(0x08);
+            out.push(*s);
+            out.extend_from_slice(&m.to_be_bytes());
         }
         Value::Date(i) => {
             out.push(0x06);
@@ -99,6 +105,20 @@ pub fn decode_typed(bytes: &[u8]) -> Result<(Value, &[u8]), String> {
                 rest,
             ))
         }
+        // Fixed-point decimal: scale byte + 16B BE mantissa.
+        0x08 => {
+            let (scale, rest) = rest.split_first().ok_or("decimal scale truncated")?;
+            if *scale > MAX_DECIMAL_SCALE {
+                return Err(format!("decimal scale {scale} exceeds maximum"));
+            }
+            let (raw, rest) = rest
+                .split_at_checked(16)
+                .ok_or("decimal payload truncated")?;
+            Ok((
+                Value::Decimal(i128::from_be_bytes(raw.try_into().unwrap()), *scale),
+                rest,
+            ))
+        }
         0x07 => {
             let (raw, rest) = rest
                 .split_at_checked(8)
@@ -140,6 +160,11 @@ pub fn encode_key(value: &Value) -> Result<Vec<u8>, String> {
         Value::Int(i) => key_int(0x02, *i),
         Value::Date(i) => key_int(0x06, *i),
         Value::DateTime(i) => key_int(0x07, *i),
+        // Fixed-width decimal: tag + 16B sign-flipped mantissa. The
+        // scale is NOT in the bytes -- key decode is schema-driven
+        // (`SqlType::Decimal.scale`), and fixed width means index tails
+        // split deterministically without a terminator.
+        Value::Decimal(m, _) => key_decimal(*m),
         Value::Double(d) => {
             let bits = d.to_bits();
             // Positive doubles keep the sign bit set (sorts after
@@ -182,6 +207,15 @@ fn key_int(tag: u8, i: i64) -> Vec<u8> {
     v
 }
 
+/// Fixed-width decimal key component: tag + 16B BE mantissa with the
+/// sign bit flipped, so byte order equals numeric order.
+fn key_decimal(m: i128) -> Vec<u8> {
+    let mut v = Vec::with_capacity(17);
+    v.push(0x08);
+    v.extend_from_slice(&(m ^ i128::MIN).to_be_bytes());
+    v
+}
+
 /// Decode one order-preserving key value of a known type. Returns the value
 /// and the remaining bytes (callers chaining fixed-type keys).
 pub fn decode_key(bytes: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String> {
@@ -195,6 +229,21 @@ pub fn decode_key(bytes: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String> {
             let (raw, r) = rest.split_at_checked(8).ok_or("int key truncated")?;
             (
                 Value::Int(i64::from_be_bytes(raw.try_into().unwrap()) ^ i64::MIN),
+                r,
+            )
+        }
+        // Scale comes from the schema, never the bytes (see
+        // `encode_key`): the mantissa alone decides the ordering.
+        (0x08, SqlType::Decimal { scale, .. }) => {
+            if scale > MAX_DECIMAL_SCALE {
+                return Err(format!("decimal scale {scale} exceeds maximum"));
+            }
+            let (raw, r) = rest.split_at_checked(16).ok_or("decimal key truncated")?;
+            (
+                Value::Decimal(
+                    i128::from_be_bytes(raw.try_into().unwrap()) ^ i128::MIN,
+                    scale,
+                ),
                 r,
             )
         }
@@ -251,6 +300,32 @@ pub fn decode_key(bytes: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic xorshift64* PRNG: no external rng crate, and the
+    /// seed makes every failure reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        /// Full-width i128 mantissa, sign included.
+        fn next_i128(&mut self) -> i128 {
+            let lo = u128::from(self.next_u64());
+            let hi = u128::from(self.next_u64());
+            ((hi << 64) | lo) as i128
+        }
+
+        fn next_scale(&mut self) -> u8 {
+            [0u8, 2, 9, 38][(self.next_u64() % 4) as usize]
+        }
+    }
 
     #[test]
     fn typed_round_trip_all_kinds() {
@@ -350,5 +425,135 @@ mod tests {
             assert_eq!(back, Value::DateTime(us));
             assert!(rest.is_empty());
         }
+    }
+    #[test]
+    fn decimal_typed_round_trip_and_scale_guard() {
+        for (m, s) in [
+            (0i128, 0u8),
+            (-1, 2),
+            (12345, 9),
+            (i128::MIN, 38),
+            (i128::MAX, 38),
+        ] {
+            let enc = encode_typed(&Value::Decimal(m, s));
+            let (back, rest) = decode_typed(&enc).expect("decode");
+            assert_eq!(back, Value::Decimal(m, s));
+            assert!(rest.is_empty());
+        }
+        // Trailing bytes survive (chained payloads).
+        let mut enc = encode_typed(&Value::Decimal(-7, 3));
+        enc.extend_from_slice(&[0xCC]);
+        let (back, rest) = decode_typed(&enc).expect("decode");
+        assert_eq!(back, Value::Decimal(-7, 3));
+        assert_eq!(rest, &[0xCC]);
+        // Scale beyond the cap is corrupt, not clampable.
+        assert!(decode_typed(&[0x08, 39, 0]).is_err());
+        // Truncated mantissa.
+        assert!(decode_typed(&[0x08, 2, 0, 0, 0]).is_err());
+        assert!(decode_typed(&[0x08]).is_err());
+    }
+
+    #[test]
+    fn decimal_key_order_scan_neighbors_strictly_increase() {
+        // Exhaustive scan: every adjacent pair of mantissae in
+        // -2000..2000 must encode strictly increasing bytes.
+        let key = |m: i128| encode_key(&Value::Decimal(m, 2)).unwrap();
+        for m in -2000i128..2000 {
+            assert!(key(m) < key(m + 1), "order broken at {m}");
+        }
+    }
+
+    #[test]
+    fn decimal_key_order_boundaries_and_powers_of_ten() {
+        let key = |m: i128| encode_key(&Value::Decimal(m, 0)).unwrap();
+        assert!(key(i128::MIN) < key(i128::MIN + 1));
+        assert!(key(i128::MAX - 1) < key(i128::MAX));
+        assert!(key(i128::MIN) < key(0));
+        assert!(key(0) < key(i128::MAX));
+        // Sign change is the sharpest boundary.
+        assert!(key(-1) < key(0));
+        assert!(key(0) < key(1));
+        // Power-of-ten mantissa neighbors (digit rollovers).
+        for k in 0..=38 {
+            let p = 10i128.pow(k);
+            assert!(key(p - 1) < key(p), "10^{k}");
+            assert!(key(p) < key(p + 1), "10^{k}");
+            assert!(key(-p - 1) < key(-p), "-10^{k}");
+            assert!(key(-p) < key(-p + 1), "-10^{k}");
+        }
+    }
+
+    #[test]
+    fn decimal_key_order_random_pairs_across_scales() {
+        // The key encoding ignores scale: ordering is the mantissa's.
+        // Random full-width pairs at scales {0,2,9,38} must hold.
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        for _ in 0..2000 {
+            let a = rng.next_i128();
+            let b = rng.next_i128();
+            let sa = rng.next_scale();
+            let sb = rng.next_scale();
+            let ka = encode_key(&Value::Decimal(a, sa)).unwrap();
+            let kb = encode_key(&Value::Decimal(b, sb)).unwrap();
+            assert_eq!(a.cmp(&b), ka.cmp(&kb), "({a},{sa}) vs ({b},{sb})");
+        }
+    }
+
+    #[test]
+    fn decimal_key_round_trip_schema_driven_scale() {
+        for (m, s) in [
+            (0i128, 0u8),
+            (-12345, 2),
+            (1, 9),
+            (i128::MIN, 38),
+            (i128::MAX, 0),
+        ] {
+            let enc = encode_key(&Value::Decimal(m, s)).unwrap();
+            assert_eq!(enc.len(), 17, "fixed-width decimal key");
+            let ty = SqlType::Decimal {
+                precision: 38,
+                scale: s,
+            };
+            let (back, rest) = decode_key(&enc, ty).expect("decode");
+            assert_eq!(back, Value::Decimal(m, s));
+            assert!(rest.is_empty());
+            // Chained tail after the fixed-width component.
+            let mut chained = enc.clone();
+            chained.extend_from_slice(&[0xEE]);
+            let (back, rest) = decode_key(&chained, ty).expect("decode");
+            assert_eq!(back, Value::Decimal(m, s));
+            assert_eq!(rest, &[0xEE]);
+        }
+        // Truncated mantissa is a loud error.
+        let ty = SqlType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        assert!(decode_key(&[0x08, 0, 0], ty).is_err());
+    }
+
+    #[test]
+    fn decimal_tag_collides_with_no_other_type() {
+        let d = encode_key(&Value::Decimal(7, 2)).unwrap();
+        assert_eq!(d[0], 0x08);
+        for other in [
+            encode_key(&Value::Int(7)).unwrap(),
+            encode_key(&Value::Double(7.0)).unwrap(),
+            encode_key(&Value::Date(7)).unwrap(),
+            encode_key(&Value::DateTime(7)).unwrap(),
+            encode_key(&Value::Str("7".into())).unwrap(),
+        ] {
+            assert_ne!(d, other);
+        }
+        // Typed form is distinct from every other tag too.
+        assert_eq!(encode_typed(&Value::Decimal(7, 2))[0], 0x08);
+        // Type-mismatched decodes are rejected both ways.
+        let ty = SqlType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        assert!(decode_key(&d, SqlType::Int).is_err());
+        assert!(decode_key(&encode_key(&Value::Int(7)).unwrap(), ty).is_err());
+        assert!(decode_key(&encode_key(&Value::Date(7)).unwrap(), ty).is_err());
     }
 }

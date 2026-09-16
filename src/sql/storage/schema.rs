@@ -3,10 +3,15 @@
 //! Pure data types only; loading/persisting lives in `catalog.rs`, physical
 //! row encoding in `row.rs`. Types are deliberately narrowed for v1: the
 //! temporal domain is DATE/DATETIME (TIMESTAMP parses as DATETIME) via
-//! `temporal`, while DECIMAL/TIME are still rejected at parse time with a
-//! clear unsupported error instead of mis-storing them.
+//! `temporal`, and DECIMAL stores exact fixed-point `i128` mantissas (the
+//! exact-arithmetic executor paths land in a follow-up batch); TIME is
+//! still rejected at parse time with a clear unsupported error instead of
+//! mis-storing it.
 
 use serde::{Deserialize, Serialize};
+
+/// Max scale of a DECIMAL value (mantissa stays inside `i128`).
+pub const MAX_DECIMAL_SCALE: u8 = 38;
 
 /// Column value domain of the SQL engine (v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +20,14 @@ pub enum SqlType {
     Bool,
     Int,
     Double,
+    /// Exact fixed-point decimal. `scale` digits live behind the point;
+    /// `precision` is the declared column width (1..=38, validated at
+    /// DDL time) and is metadata only -- stored values are bounded by
+    /// the `i128` mantissa, not by precision.
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
     Date,
     DateTime,
     VarChar,
@@ -28,6 +41,9 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Double(f64),
+    /// Fixed-point decimal: mantissa already scaled by `10^scale`
+    /// (`1.23` at scale 2 is `123`). `scale <= MAX_DECIMAL_SCALE`.
+    Decimal(i128, u8),
     /// Days since 1970-01-01 (see `temporal`).
     Date(i64),
     /// Microseconds since the epoch (see `temporal`).
@@ -36,19 +52,109 @@ pub enum Value {
     Bytes(Vec<u8>),
 }
 
+/// Render one fixed-point decimal in canonical SQL form: integer digits,
+/// a `.` and exactly `scale` fraction digits (zero-padded). `scale 0`
+/// has no point, and `-0` never appears (the mantissa carries the
+/// sign). Pure formatting, shared by result rendering, literal display
+/// and the MySQL wire layer.
+pub fn format_decimal(mantissa: i128, scale: u8) -> String {
+    if scale == 0 {
+        return mantissa.to_string();
+    }
+    let neg = mantissa < 0;
+    let digits = mantissa.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let int_len = digits.len().saturating_sub(scale);
+    let mut out = String::with_capacity(digits.len() + 3);
+    if neg {
+        out.push('-');
+    }
+    if int_len == 0 {
+        out.push('0');
+    } else {
+        out.push_str(&digits[..int_len]);
+    }
+    out.push('.');
+    for _ in digits.len()..scale {
+        out.push('0');
+    }
+    out.push_str(&digits[int_len..]);
+    out
+}
+
 impl Value {
     /// SQL type of a non-null value (Null has none; callers decide).
+    /// Decimal reports the nominal maximum precision: a value carries
+    /// only its scale, and precision is column metadata (see
+    /// [`SqlType::Decimal`]).
     pub fn sql_type(&self) -> Option<SqlType> {
         match self {
             Value::Null => None,
             Value::Bool(_) => Some(SqlType::Bool),
             Value::Int(_) => Some(SqlType::Int),
             Value::Double(_) => Some(SqlType::Double),
+            Value::Decimal(_, scale) => Some(SqlType::Decimal {
+                precision: MAX_DECIMAL_SCALE,
+                scale: *scale,
+            }),
             Value::Date(_) => Some(SqlType::Date),
             Value::DateTime(_) => Some(SqlType::DateTime),
             Value::Str(_) => Some(SqlType::VarChar),
             Value::Bytes(_) => Some(SqlType::Blob),
         }
+    }
+
+    /// Parse a fixed-point decimal string (`[-]digits[.digits]`) into a
+    /// [`Value::Decimal`]: the scale is the fraction digit count and the
+    /// mantissa is the digits scaled by `10^scale`. Pure function, shared
+    /// by literal coercion and the MySQL wire layer. Errors name the
+    /// offender; scale beyond [`MAX_DECIMAL_SCALE`] is rejected.
+    pub fn parse_decimal(s: &str) -> Result<Value, String> {
+        let body = s
+            .strip_prefix('+')
+            .or_else(|| s.strip_prefix('-'))
+            .unwrap_or(s);
+        let neg = s.starts_with('-');
+        let (int_part, frac_part) = match body.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (body, ""),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(format!("truncated DECIMAL value: '{s}'"));
+        }
+        if !int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .all(|b| b.is_ascii_digit())
+        {
+            return Err(format!("incorrect DECIMAL value: '{s}'"));
+        }
+        let scale = frac_part.len() as u64;
+        if scale > MAX_DECIMAL_SCALE as u64 {
+            return Err(format!(
+                "DECIMAL scale {} exceeds maximum {}",
+                scale, MAX_DECIMAL_SCALE
+            ));
+        }
+        // The digit fold over int+frac parts is already scaled: "12.345"
+        // folds to 12345 at scale 3.
+        let mantissa: u128 = int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .fold(0u128, |acc, b| acc * 10 + u128::from(b - b'0'));
+        let signed = if neg {
+            // `1u128 << 127` has no positive i128 representation; the
+            // unsigned fold still reaches it, so map it to i128::MIN.
+            if mantissa == 1u128 << 127 {
+                Some(i128::MIN)
+            } else {
+                i128::try_from(mantissa).ok().and_then(|m| m.checked_neg())
+            }
+        } else {
+            i128::try_from(mantissa).ok()
+        };
+        let mantissa = signed.ok_or_else(|| format!("DECIMAL value out of range: '{s}'"))?;
+        Ok(Value::Decimal(mantissa, scale as u8))
     }
 }
 
@@ -193,6 +299,7 @@ impl TableSchema {
             SqlType::Bool => T::MYSQL_TYPE_TINY,
             SqlType::Int => T::MYSQL_TYPE_LONGLONG,
             SqlType::Double => T::MYSQL_TYPE_DOUBLE,
+            SqlType::Decimal { .. } => T::MYSQL_TYPE_NEWDECIMAL,
             SqlType::Date => T::MYSQL_TYPE_DATE,
             SqlType::DateTime => T::MYSQL_TYPE_DATETIME,
             SqlType::VarChar => T::MYSQL_TYPE_VAR_STRING,
@@ -204,6 +311,36 @@ impl TableSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DECIMAL columns/values must round trip through catalog JSON and
+    /// keep old (decimal-free) JSON loading: mixed-version clusters
+    /// replicate the same payload.
+    #[test]
+    fn decimal_type_and_value_serde_round_trip() {
+        let ty = SqlType::Decimal {
+            precision: 12,
+            scale: 3,
+        };
+        let js = serde_json::to_string(&ty).expect("ser");
+        assert_eq!(js, r#"{"decimal":{"precision":12,"scale":3}}"#);
+        assert_eq!(serde_json::from_str::<SqlType>(&js).unwrap(), ty);
+        let v = serde_json::to_value(Value::Decimal(-12345, 3)).expect("ser");
+        assert_eq!(
+            serde_json::from_value::<Value>(v).unwrap(),
+            Value::Decimal(-12345, 3)
+        );
+
+        let mut s = demo();
+        s.columns.push(ColumnDef {
+            name: "amount".into(),
+            sql_type: ty,
+            nullable: true,
+        });
+        let js = serde_json::to_string(&s).expect("ser");
+        assert!(js.contains(r#""type":{"decimal""#));
+        let back: TableSchema = serde_json::from_str(&js).expect("de");
+        assert_eq!(back, s);
+    }
 
     fn demo() -> TableSchema {
         TableSchema {
@@ -288,5 +425,89 @@ mod tests {
         // Name lookup stays case-insensitive for the AI column too.
         assert_eq!(back.auto_increment_index(), Some(0));
         assert_eq!(demo().auto_increment_index(), None);
+    }
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_parse_covers_signs_and_scales() {
+        assert_eq!(Value::parse_decimal("0").unwrap(), Value::Decimal(0, 0));
+        assert_eq!(
+            Value::parse_decimal("-1.23").unwrap(),
+            Value::Decimal(-123, 2)
+        );
+        assert_eq!(
+            Value::parse_decimal("+0007.050").unwrap(),
+            Value::Decimal(7050, 3)
+        );
+        assert_eq!(Value::parse_decimal(".5").unwrap(), Value::Decimal(5, 1));
+        assert_eq!(Value::parse_decimal("-.5").unwrap(), Value::Decimal(-5, 1));
+        assert_eq!(Value::parse_decimal("42.").unwrap(), Value::Decimal(42, 0));
+    }
+
+    #[test]
+    fn decimal_parse_rejects_malformed() {
+        for bad in ["", "+", "-", "1.2.3", "abc", "1e5", " 1", "1 ", "0x10"] {
+            assert!(Value::parse_decimal(bad).is_err(), "{bad}");
+        }
+        // i128::MIN mantissa is in range at scale 0.
+        assert_eq!(
+            Value::parse_decimal("-170141183460469231731687303715884105728").unwrap(),
+            Value::Decimal(i128::MIN, 0)
+        );
+        // One digit beyond i128 range overflows.
+        assert!(Value::parse_decimal("-170141183460469231731687303715884105729").is_err());
+        assert!(Value::parse_decimal("170141183460469231731687303715884105728").is_err());
+        // Scale cap.
+        let deep = format!("0.{}1", "0".repeat(38));
+        assert!(Value::parse_decimal(&deep).is_err());
+    }
+
+    #[test]
+    fn decimal_format_round_trips_parse() {
+        for (m, s) in [
+            (0i128, 0u8),
+            (0, 2),
+            (-1, 2),
+            (1, 2),
+            (123, 2),
+            (-123, 2),
+            (-5, 9),
+            (5, 9),
+            (1, 38),
+            (-1, 38),
+            (i128::MIN, 0),
+            (i128::MAX, 3),
+        ] {
+            let text = format_decimal(m, s);
+            assert_eq!(
+                Value::parse_decimal(&text).unwrap(),
+                Value::Decimal(m, s),
+                "{text}"
+            );
+        }
+        assert_eq!(format_decimal(123, 2), "1.23");
+        assert_eq!(format_decimal(-123, 2), "-1.23");
+        assert_eq!(format_decimal(5, 2), "0.05");
+        assert_eq!(format_decimal(-5, 2), "-0.05");
+        assert_eq!(format_decimal(120, 2), "1.20");
+        assert_eq!(format_decimal(1230, 3), "1.230");
+        assert_eq!(format_decimal(7, 0), "7");
+        assert_eq!(format_decimal(-7, 0), "-7");
+        assert_eq!(format_decimal(0, 4), "0.0000");
+    }
+
+    #[test]
+    fn decimal_sql_type_reports_nominal_precision() {
+        assert_eq!(
+            Value::Decimal(-123, 4).sql_type(),
+            Some(SqlType::Decimal {
+                precision: 38,
+                scale: 4
+            })
+        );
     }
 }

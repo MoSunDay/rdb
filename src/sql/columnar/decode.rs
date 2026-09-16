@@ -101,6 +101,11 @@ fn read_payload(buf: &mut &[u8], ty: SqlType) -> Result<Value, String> {
         ))),
         SqlType::Date => Value::Date(i64::from_be_bytes(take(buf, 8)?.try_into().unwrap())),
         SqlType::DateTime => Value::DateTime(i64::from_be_bytes(take(buf, 8)?.try_into().unwrap())),
+        // Defensive: DDL rejects DECIMAL columns on columnar tables; a
+        // page claiming to hold one is corrupt-by-construction.
+        SqlType::Decimal { .. } => {
+            return Err("DECIMAL not supported on columnar tables".to_string())
+        }
         SqlType::VarChar => Value::Str(string_from(read_bytes(buf)?)?),
         SqlType::Blob => Value::Bytes(read_bytes(buf)?.to_vec()),
     })
