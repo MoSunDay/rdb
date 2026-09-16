@@ -222,8 +222,16 @@ fn build_commit_batch_assigns_sequential_ts_in_key_order() {
 
     let shared = shared();
     let batch = build_commit_batch(&writes, &schemas, 100..103).unwrap();
-    assert_eq!(batch.len(), 3);
+    assert_eq!(batch.len(), 4, "3 versions + the ts floor key");
+    // The floor key rides the SAME batch, stamped with the range's max
+    // ts: after the write lands, `floor::recover` must report it.
+    assert_eq!(
+        crate::sql::tx::floor::recover(&shared.store),
+        0,
+        "floor not persisted yet"
+    );
     ops::batch_write(&shared.store, batch).unwrap();
+    assert_eq!(crate::sql::tx::floor::recover(&shared.store), 102);
 
     // (table_id, pk_key, ts, decoded payload) of every staged version,
     // in (table_id, pk) order -- the same order ts was assigned in.
