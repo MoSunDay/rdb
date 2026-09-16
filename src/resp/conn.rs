@@ -274,7 +274,19 @@ async fn process_command(
     // transaction controls is validated and QUEUED, never executed here
     // (see queue_command for the queue-time rejection rules).
     if conn.in_multi() && !is_tx_control(&first) {
-        queue_command(shared, argv, &first, &raw0, conn, out);
+        // queue_command re-runs lookup/routing OUTSIDE the panic net
+        // command::dispatch wraps its handler in, so it gets its own. On a
+        // panic, mirror dispatch's contract: the connection closes too,
+        // because the queue path may have desynced the framing.
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue_command(shared, argv, &first, &raw0, conn, out)
+        })) {
+            codec::append_error(
+                out,
+                &format!("fatal error: {}", command::panic_payload(&payload)),
+            );
+            *close = true;
+        }
         return;
     }
 

@@ -39,6 +39,12 @@ const ARGS_PREALLOC_CAP: usize = 16;
 /// payload bytes are read. i64 because `parse_int` yields i64.
 pub const MAX_BULK_LEN: i64 = 512 * 1024 * 1024;
 
+/// Upper bound on a single inline (telnet-form) line with no newline
+/// yet, mirroring Redis `PROTO_INLINE_MAX_SIZE` (64KB). Without it an
+/// authenticated client pins connection memory up to the 1GB cumulative
+/// cap with one unterminated line.
+const MAX_INLINE_LEN: usize = 64 * 1024;
+
 /// Parse one command from `buf` (redcon `ReadNextCommand`, Redis-kind).
 pub fn parse_command(buf: &[u8]) -> ParseOutcome {
     if buf.is_empty() {
@@ -157,6 +163,15 @@ fn parse_multibulk(buf: &[u8]) -> ParseOutcome {
 fn parse_telnet(buf: &[u8]) -> ParseOutcome {
     let nl = match buf.iter().position(|&b| b == b'\n') {
         Some(p) => p,
+        // Redis `PROTO_INLINE_MAX_SIZE` parity: an UNTERMINATED line past
+        // 64KB is a protocol error, not an unbounded Incomplete. Strictly
+        // greater, so exactly 64KB still waits; a line with a newline
+        // anywhere parses regardless of length -- the cap only applies
+        // while the line is unterminated. Text mirrors the sibling
+        // cumulative-cap error in `conn.rs` (itself from Redis).
+        None if buf.len() > MAX_INLINE_LEN => {
+            return protocol_error("Protocol error: too big inline request")
+        }
         None => return ParseOutcome::Incomplete,
     };
     let mut line: &[u8] = if nl > 0 && buf[nl - 1] == b'\r' {

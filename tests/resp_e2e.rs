@@ -297,3 +297,26 @@ async fn preauth_garbage_over_64kb_gets_too_big_error_and_close() {
     assert_eq!(read_n(&mut s, expect.len()).await, expect);
     assert_eof(&mut s).await;
 }
+
+#[tokio::test]
+async fn authed_inline_line_over_64kb_gets_too_big_error_and_close() {
+    let shared = Arc::new(test_shared(test_config(), "inline-cap"));
+    let listener = resp::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(resp::serve(listener, shared));
+
+    let mut s = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
+        .await
+        .expect("connect timeout")
+        .expect("connect");
+    rpc(&mut s, &resp_req(&[b"AUTH", b"test-token"]), b"+OK\r\n").await;
+    // AUTHENTICATED (unlike the preauth case above): the 64KB pre-auth
+    // cap no longer applies, but 66KB of newline-free inline junk is a
+    // protocol error in its own right -- Redis `PROTO_INLINE_MAX_SIZE` --
+    // instead of buffering until the 1GB cumulative cap. The 66KB is
+    // fully consumed, so the close is a clean FIN, not an RST.
+    s.write_all(&vec![b'x'; 66 * 1024]).await.expect("write");
+    let expect: &[u8] = b"-ERR Protocol error: too big inline request\r\n";
+    assert_eq!(read_n(&mut s, expect.len()).await, expect);
+    assert_eof(&mut s).await;
+}

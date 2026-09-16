@@ -326,7 +326,14 @@ pub(crate) fn redirect_line(
 ) -> Option<String> {
     // 1. IMPORTING gate (before ownership routing: the importing node may
     // not own the slot in any routing table yet).
-    let importing = shared.importing.read().unwrap();
+    // These routing locks are read on EVERY cross-node command, OUTSIDE the
+    // handler panic net: a poisoned lock (a control-plane writer panicked
+    // while holding it) must not cascade-panic the connection task, and the
+    // guarded data is still structurally valid -- so recover, never unwrap.
+    let importing = shared
+        .importing
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(src) = importing.get(&slot) {
         if !asking {
             return Some(router::moved_error_line(slot, src));
@@ -336,7 +343,10 @@ pub(crate) fn redirect_line(
     drop(importing);
     // 2. ownership routing with per-slot overrides.
     let decision = {
-        let topo = shared.topology.read().unwrap();
+        let topo = shared
+            .topology
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         router::route_with_owners(
             slot,
             &topo.stable_addrs,
@@ -349,7 +359,10 @@ pub(crate) fn redirect_line(
         return Some(router::moved_error_line(slot, &addr));
     }
     // 3. MIGRATING source: missing key -> ASK to the destination.
-    let migrating = shared.migrating.read().unwrap();
+    let migrating = shared
+        .migrating
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(dst) = migrating.get(&slot) {
         if !key_present(shared, slot, key) {
             return Some(format!("ASK {} {}", slot, dst));
@@ -438,7 +451,21 @@ pub(crate) async fn dispatch(
         prefix_key = prefix;
         let asking = conn.asking;
         conn.asking = false; // single-shot: consumed by this routed command
-        if let Some(line) = redirect_line(shared, slot, &argv[key_idx], asking) {
+                             // The routing read runs BEFORE the handler panic net below but can
+                             // panic in principle too (the MIGRATING check does a best-effort
+                             // store read): catch it and reply exactly like a panicked handler,
+                             // closing the connection after the flush.
+        let line = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            redirect_line(shared, slot, &argv[key_idx], asking)
+        })) {
+            Ok(line) => line,
+            Err(payload) => {
+                codec::append_error(out, &format!("fatal error: {}", panic_payload(&payload)));
+                *close = true;
+                return false;
+            }
+        };
+        if let Some(line) = line {
             codec::append_error(out, &line);
             observe(shared, &first, true, start);
             return false;
@@ -487,7 +514,8 @@ pub(crate) async fn dispatch(
 }
 
 /// Panic payload -> human text (Go prints `%v` of the recovered value).
-fn panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
+/// `pub(crate)`: the connection layer reuses it for its queue-path net.
+pub(crate) fn panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -646,6 +674,73 @@ mod tests {
         // Key present locally -> served (still the source owner).
         seed(&shared, b"{b}here", b"1");
         assert_eq!(redirect_line(&shared, slot, b"{b}here", false), None);
+    }
+
+    /// Poison a routing lock the way real poisoning happens: a writer
+    /// panics while holding the guard. (The catch_unwind prints a noisy
+    /// panic backtrace to stderr; that is expected in tests.)
+    fn poison<T>(lock: &std::sync::RwLock<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = lock.write().unwrap();
+            panic!("poison");
+        }));
+        assert!(lock.is_poisoned());
+    }
+
+    #[test]
+    fn redirect_survives_poisoned_routing_locks() {
+        let (_guard, shared) = shared_for("127.0.0.1:32681");
+        *shared.topology.write().unwrap() = topology::refresh(INSTANCES);
+        let (slot, _) = crate::hash::slot_with_prefix(crate::hash::hash_tag(b"{b}here"));
+        shared
+            .migrating
+            .write()
+            .unwrap()
+            .insert(slot, "127.0.0.1:32683".to_string());
+        // Poison all three AFTER the setup writes: redirect_line must read
+        // through the poison (the guarded data is still valid), not panic.
+        poison(&shared.topology);
+        poison(&shared.importing);
+        poison(&shared.migrating);
+        // Local band (slot 100) still served.
+        assert_eq!(redirect_line(&shared, 100, b"k", false), None);
+        // Foreign band still MOVED (7000 lives on the second node).
+        assert_eq!(
+            redirect_line(&shared, 7000, b"k", false),
+            Some("MOVED 7000 127.0.0.1:32683".to_string())
+        );
+        // MIGRATING + absent key still ASK to the destination.
+        assert_eq!(
+            redirect_line(&shared, slot, b"gone", false),
+            Some(format!("ASK {slot} 127.0.0.1:32683"))
+        );
+    }
+
+    /// Same poison, one level up: dispatch routes (redirect_line) and runs
+    /// the GET handler without the poisoned locks cascade-panicking the
+    /// task. `bar` tags to slot 5061, inside the local (0-5461) band, so
+    /// the absent key resolves to a null bulk, not a MOVED.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // TEST_STORE_LOCK guard must outlive Shared
+    async fn dispatch_survives_poisoned_routing_locks() {
+        let (_guard, shared) = shared_for("127.0.0.1:32681");
+        *shared.topology.write().unwrap() = topology::refresh(INSTANCES);
+        poison(&shared.topology);
+        poison(&shared.importing);
+        poison(&shared.migrating);
+        let mut out = Vec::new();
+        let mut close = false;
+        let wrote = dispatch(
+            &shared,
+            vec![b"get".to_vec(), b"bar".to_vec()],
+            &mut ConnState::default(),
+            &mut out,
+            &mut close,
+        )
+        .await;
+        assert_eq!(out, b"$-1\r\n");
+        assert!(!close);
+        assert!(!wrote);
     }
 
     #[test]
