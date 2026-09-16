@@ -141,13 +141,12 @@ pub fn parse_version_key(key: &[u8]) -> Option<(u16, u32, Vec<u8>, u64)> {
     let body = &key[slash + 2..];
     let table_id = u32::from_be_bytes(body[..4].try_into().ok()?);
     let (pk, ts_raw) = body[4..].split_at(body.len() - 4 - TS_SUFFIX_LEN);
-    Some((
+    (ts_raw.len() == TS_SUFFIX_LEN).then_some((
         slot,
         table_id,
         pk.to_vec(),
         ts_from_suffix(&body[body.len() - TS_SUFFIX_LEN..]),
     ))
-    .filter(|_| ts_raw.len() == TS_SUFFIX_LEN)
 }
 
 /// Encode a live row value: header + null bitmap + typed payloads.

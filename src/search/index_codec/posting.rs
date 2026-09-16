@@ -126,8 +126,8 @@ pub fn decode_centroids(value: &[u8]) -> Option<CentroidTable> {
     let mut centroids = Vec::with_capacity(k.min(65536) as usize);
     for _ in 0..k {
         let mut c = Vec::with_capacity(dimusize);
-        for chunk in rest[..dimusize * 4].chunks_exact(4) {
-            c.push(f32::from_le_bytes(chunk.try_into().ok()?));
+        for chunk in rest[..dimusize * 4].as_chunks::<4>().0 {
+            c.push(f32::from_le_bytes(*chunk));
         }
         rest = &rest[dimusize * 4..];
         centroids.push(c);
@@ -137,8 +137,10 @@ pub fn decode_centroids(value: &[u8]) -> Option<CentroidTable> {
             return None;
         }
         let axes = rest[..dimusize * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         Some((axes, &rest[dimusize * 4..]))
     }

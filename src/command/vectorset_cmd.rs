@@ -87,8 +87,10 @@ pub(crate) fn parse_vector(
             return Err(ERR_FP16);
         }
         return Ok(args[0]
-            .chunks_exact(2)
-            .map(|c| vectorset_ds::fp16_to_f64(u16::from_le_bytes([c[0], c[1]])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| vectorset_ds::fp16_to_f64(u16::from_le_bytes(*c)))
             .collect());
     }
     if eq_ignore_case(mode, b"VALUES") {
