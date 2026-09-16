@@ -1,8 +1,24 @@
 # E2E scenario results -- rdb real-client acceptance
 
-Last full green run: **2026-09-14**, git `c74def1`,
+Last full green run: **2026-09-16**, git `5b67c47`,
 binary `target/release/rdb`.
 Runner: `run_all.sh` -> **4 pass, 0 fail**.
+
+2026-09-16: DECIMAL(p,s) + composite-PK assertion coverage (W2.2):
+`scenario_mysql_orders.sh` gains orders_amt (exact 0.1+0.2, half-up
+rounding read-back, SUM/AVG scale, decimal secondary-index point
+lookup, DESCRIBE decimal(10,2), DECIMAL(5,2) 1292 edge) and orders_item
+(composite pk upsert == single-column upsert, tuple point lookup/
+UPDATE, both PRI flags + PRIMARY index rows, AUTO_INCREMENT 1075);
+`scenario_starrocks_analytics.sh` gains sr_mpk (multi-column PK model
+upsert on the full tuple, exact decimal v, SUM + GROUP BY, DESCRIBE)
+plus DOUBLE-in-composite-pk and columnar-DECIMAL rejections. Found &
+fixed a real wire bug while doing so: `result_type` labeled
+SUM(decimal) / AVG(decimal) / decimal arithmetic result columns as
+DOUBLE (or INT), so SDK clients parsed the exact text cells as floats
+(mycli showed 0.6 for "0.60") and the binary protocol rejected the
+decimal cells outright; metadata now mirrors the value shapes
+(src/sql/exec/select.rs, unit + sql e2e suites re-run green).
 
 2026-09-14: re-validated around the ts-authority fail-fast + CLUSTER
 INIT seeding fix (commits `525777c`/`c74def1`). `scenario_mysql_orders.sh`
@@ -48,10 +64,10 @@ Latest results (assertions = `^ok` lines in the per-scenario log):
 | scenario                        | story                       | assertions | result |
 |---------------------------------|-----------------------------|-----------:|--------|
 | scenario_redis_session.sh       | session cache / leaderboard |         39 | PASS   |
-| scenario_mysql_orders.sh        | orders + 2PC transactions   |         64 | PASS   |
-| scenario_starrocks_analytics.sh | DDL compatibility/analytics |         52 | PASS   |
+| scenario_mysql_orders.sh        | orders + 2PC transactions   |        117 | PASS   |
+| scenario_starrocks_analytics.sh | DDL compatibility/analytics |         76 | PASS   |
 | scenario_vector_search.sh       | vector + FT.* search        |         60 | PASS   |
-| **total**                       |                             |  **215**   | **4/4**|
+| **total**                       |                             |  **292**   | **4/4**|
 
 Per-scenario coverage (see each script header for source-verified
 semantics):
@@ -62,10 +78,15 @@ semantics):
 - **mysql_orders**: mysql-wire DDL/DML, prepared-ish flows, BEGIN/
   COMMIT/ROLLBACK, cross-node 2PC commit and abort paths, fail-closed
   conflict behavior (`ts >= conflict_ts`), information_schema/SHOW
-  visibility (incl. `Non_unique=0` for secondary index rows).
+  visibility (incl. `Non_unique=0` for secondary index rows),
+  DECIMAL(p,s) exact arithmetic/rounding/SUM/AVG + secondary index
+  point lookup + 1292 out-of-range edge, composite-PK upsert/lookup/
+  UPDATE + PRI/SHOW INDEX + AUTO_INCREMENT 1075 rejection.
 - **starrocks_analytics**: MySQL-compatible DDL surface used by
   StarRocks-style clients, columnar scan/aggregates, SHOW INDEX /
-  SHOW CREATE TABLE compatibility details.
+  SHOW CREATE TABLE compatibility details, multi-column PRIMARY KEY
+  model (full-tuple upsert, exact decimal values, GROUP BY) and
+  composite-pk / columnar-DECIMAL DDL rejections.
 - **vector_search**: VADD/VSIM (FP16 via stdin, similarity in [0,1]),
   FT.CREATE/ADD/BUILD, BM25 text, exact KNN pre/post FT.BUILD, term
   prefilter + KNN, FT.INFO, then the same KNN query answered
