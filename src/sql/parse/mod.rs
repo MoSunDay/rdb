@@ -11,6 +11,7 @@ pub(crate) mod session;
 pub mod starrocks;
 pub(crate) mod table;
 pub(crate) mod translate;
+pub(crate) mod translate_type;
 
 pub use ast::*;
 pub use error::{ErrorCode, SqlError, SqlResult};
@@ -35,7 +36,7 @@ mod tests {
             panic!("shape");
         };
         assert_eq!(name, "users");
-        assert_eq!(pk, "id");
+        assert_eq!(pk, vec!["id".to_string()]);
         assert_eq!(columns[0].sql_type, SqlType::Int);
         assert!(!columns[0].nullable);
         assert!(columns[1].nullable);
@@ -48,7 +49,7 @@ mod tests {
         let Statement::CreateTable { pk, .. } = s else {
             panic!("shape")
         };
-        assert_eq!(pk, "k");
+        assert_eq!(pk, vec!["k".to_string()]);
     }
 
     #[test]

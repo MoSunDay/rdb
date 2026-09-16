@@ -30,6 +30,7 @@ use rocksdb::WriteBatch;
 
 use crate::sql::dist;
 use crate::sql::exec::scan;
+use crate::sql::exec::show;
 use crate::sql::exec::ExecOutcome;
 use crate::sql::index::{self, IndexOps, IndexRef};
 use crate::sql::parse::ast::{ColumnSpec, Statement};
@@ -179,7 +180,7 @@ async fn create_table(
     name: &str,
     if_not_exists: bool,
     columns: &[ColumnSpec],
-    pk: &str,
+    pk: &[String],
     engine: Engine,
     starrocks: Option<&crate::sql::parse::starrocks::StarRocksModel>,
 ) -> SqlResult<ExecOutcome> {
@@ -363,7 +364,7 @@ async fn backfill_index(shared: &Shared, schema: &TableSchema, index: &IndexRef)
     };
     let mut ops: IndexOps = Vec::with_capacity(rows.len());
     for r in &rows {
-        let pk_key = row::pk_encode(&r[schema.pk_index()]).map_err(SqlError::from)?;
+        let pk_key = row::pk_encode_row(schema, r).map_err(SqlError::from)?;
         ops.extend(index::entries_for_live_row(schema, index, &pk_key, r).map_err(SqlError::from)?);
     }
     if ops.is_empty() {
@@ -517,7 +518,7 @@ pub fn build_schema(
     id: u32,
     name: &str,
     columns: &[ColumnSpec],
-    pk: &str,
+    pk: &[String],
     engine: Engine,
     starrocks: Option<&crate::sql::parse::starrocks::StarRocksModel>,
 ) -> SqlResult<TableSchema> {
@@ -554,22 +555,47 @@ pub fn build_schema(
             }
         }
     }
-    let pk_idx = columns
+    let pk_indices: Vec<usize> = pk
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(pk))
-        .ok_or_else(|| {
-            SqlError::new(
-                ErrorCode::Parse,
-                format!("primary key column '{pk}' not found"),
-            )
-        })?;
+        .map(|p| {
+            columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(p))
+                .ok_or_else(|| {
+                    SqlError::new(
+                        ErrorCode::Parse,
+                        format!("primary key column '{p}' not found"),
+                    )
+                })
+        })
+        .collect::<SqlResult<Vec<_>>>()?;
     // DECIMAL storage/encoding exists (W2.0 batch 1), but the key
     // encodings are not decimal-aware yet, so a DECIMAL pk is a loud
     // 1235 rejection rather than a mis-ordered keyspace.
-    if matches!(columns[pk_idx].sql_type, SqlType::Decimal { .. }) {
+    if pk_indices.len() == 1 && matches!(columns[pk_indices[0]].sql_type, SqlType::Decimal { .. }) {
         return Err(SqlError::unsupported(
             "DECIMAL primary key is not supported (use an integer pk)",
         ));
+    }
+    // Composite pk column types are narrowed to the fixed-width and
+    // varlen key components that concatenate unambiguously: Bool and
+    // Double have no composite key support, Decimal is rejected above
+    // for single pks too, and Blob is rejected outright.
+    if pk_indices.len() > 1 {
+        for &i in &pk_indices {
+            let c = &columns[i];
+            if !matches!(
+                c.sql_type,
+                SqlType::Int | SqlType::Date | SqlType::DateTime | SqlType::VarChar
+            ) {
+                return Err(SqlError::unsupported(format!(
+                    "composite PRIMARY KEY column '{}' has type {}; allowed types: \
+                     TINYINT/SMALLINT/INT/BIGINT, VARCHAR, DATE, DATETIME",
+                    c.name,
+                    show::type_name(c.sql_type)
+                )));
+            }
+        }
     }
     // Same guard for the append-only columnar engine: its segment
     // pages have no decimal encoding (see `columnar::encode`).
@@ -585,9 +611,10 @@ pub fn build_schema(
     // AUTO_INCREMENT validation (MySQL 1075/1063): at most one auto
     // column, integer type (TINYINT/SMALLINT/INT/BIGINT all translate
     // to SqlType::Int; BOOL is a distinct engine type and rejected),
-    // and the column must be the primary key -- the only key the
-    // engine supports, so MySQL's "must be defined as a key" narrows
-    // to "must be THE pk".
+    // and the column must be the entire primary key -- the only key
+    // the engine supports, so MySQL's "must be defined as a key"
+    // narrows to "must be THE pk" (a composite pk containing the auto
+    // column therefore rejects).
     let auto_cols: Vec<&ColumnSpec> = columns.iter().filter(|c| c.auto_increment).collect();
     let auto_increment = match auto_cols.as_slice() {
         [] => None,
@@ -602,7 +629,7 @@ pub fn build_schema(
                     ),
                 ));
             }
-            if !one.name.eq_ignore_ascii_case(pk) {
+            if pk.len() != 1 || !one.name.eq_ignore_ascii_case(&pk[0]) {
                 return Err(SqlError::new(
                     ErrorCode::WrongAutoKey,
                     "Incorrect table definition; there can be only one auto column \
@@ -633,22 +660,28 @@ pub fn build_schema(
                 format!("duplicate column '{}'", c.name),
             ));
         }
-        // A primary key is implicitly NOT NULL (MySQL semantics), even
-        // if the body said NULL. DUPLICATE-model tables keep the
-        // declared nullability: their "pk" is recorded metadata of the
-        // first dup-key column, not a dedup key.
-        let pk_not_null = i == pk_idx && key_model != KeyModel::Duplicate;
+        // Every primary-key column is implicitly NOT NULL (MySQL
+        // semantics), even if the body said NULL. DUPLICATE-model
+        // tables keep the declared nullability: their "pk" is recorded
+        // metadata of the first dup-key column, not a dedup key.
+        let pk_not_null = key_model != KeyModel::Duplicate && pk_indices.contains(&i);
         defs.push(ColumnDef {
             name: c.name.clone(),
             sql_type: c.sql_type,
             nullable: c.nullable && !pk_not_null,
         });
     }
+    // Canonical pk names (the column list's casing, not the
+    // constraint's) keep catalog lookups and SHOW output stable.
+    let pk = pk_indices
+        .into_iter()
+        .map(|i| columns[i].name.clone())
+        .collect();
     Ok(TableSchema {
         id,
         name: name.to_string(),
         columns: defs,
-        pk: columns[pk_idx].name.clone(),
+        pk,
         auto_increment,
         engine,
         indexes: Vec::new(),

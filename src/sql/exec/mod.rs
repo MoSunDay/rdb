@@ -18,6 +18,7 @@ pub mod set_ops;
 pub mod show;
 pub mod subquery;
 pub mod write;
+mod write_probe;
 
 use crate::sql::parse::ast::Statement;
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};

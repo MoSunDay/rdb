@@ -34,7 +34,7 @@ fn columnar_schema() -> TableSchema {
                 nullable: true,
             },
         ],
-        pk: "id".into(),
+        pk: vec!["id".to_string()],
         auto_increment: None,
         engine: Engine::Columnar,
         indexes: vec![],

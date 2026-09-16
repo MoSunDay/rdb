@@ -13,7 +13,7 @@ fn scope(t: SqlType) -> FromScope {
             columns: vec!["v".into()],
             types: vec![t],
             nullable: vec![true],
-            key_pos: None,
+            key_pos: Vec::new(),
             offset: 0,
         }],
     }

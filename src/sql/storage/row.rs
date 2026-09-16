@@ -73,17 +73,50 @@ pub fn slot_of(table_id: u32, pk_key: &[u8]) -> u16 {
     crc16(&hashed) % crate::topology::SLOT_NUMBER as u16
 }
 
-/// Order-preserving encoding of a PK value (schema-driven decode).
+/// Order-preserving encoding of one PK value (schema-driven decode).
+/// Single-component form; multi-column pks use [`pk_encode_row`].
 pub fn pk_encode(pk: &Value) -> Result<Vec<u8>, String> {
     encode_key(pk)
 }
 
+/// Decode one single-column pk of a known type. Panics-free callers
+/// only; multi-column keys use [`pk_decode_row`].
 pub fn pk_decode(bytes: &[u8], ty: SqlType) -> Result<Value, String> {
     let (v, rest) = decode_key(bytes, ty)?;
     if !rest.is_empty() {
         return Err("trailing bytes after primary key".into());
     }
     Ok(v)
+}
+
+/// Encoded primary key of a full-width row: every pk column's
+/// order-preserving key encoding concatenated in pk-declaration order
+/// (one component for single-column pks -- byte-identical to the
+/// classic `pk_encode` output, so existing physical keys never move).
+pub fn pk_encode_row(schema: &TableSchema, values: &[Value]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    for i in schema.pk_indices() {
+        out.extend_from_slice(&encode_key(&values[i])?);
+    }
+    Ok(out)
+}
+
+/// Decode a full pk byte string back into its column values, in pk
+/// order: each component decodes with its schema type and the input
+/// must be consumed exactly (no trailing bytes, no truncation).
+pub fn pk_decode_row(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Value>, String> {
+    let mut rest = bytes;
+    let mut out = Vec::with_capacity(schema.pk.len());
+    for (i, ty) in schema.pk_types().into_iter().enumerate() {
+        let (v, r) =
+            decode_key(rest, ty).map_err(|e| format!("pk column {}: {e}", schema.pk[i]))?;
+        out.push(v);
+        rest = r;
+    }
+    if !rest.is_empty() {
+        return Err("trailing bytes after primary key".into());
+    }
+    Ok(out)
 }
 
 /// Inverted commit timestamp: ascending bytes = descending ts (newest
@@ -124,9 +157,10 @@ pub fn version_prefix(table_id: u32, pk_key: &[u8]) -> Vec<u8> {
     k
 }
 
-/// Decode the pk tail of a physical row key (input starts at the pk bytes).
-pub fn pk_from_key_tail(tail: &[u8], schema: &TableSchema) -> Result<Value, String> {
-    pk_decode(tail, schema.pk_type())
+/// Decode the pk tail of a physical row key into the pk column values
+/// (input starts at the pk bytes; all components must consume exactly).
+pub fn pk_from_key_tail(tail: &[u8], schema: &TableSchema) -> Result<Vec<Value>, String> {
+    pk_decode_row(tail, schema)
 }
 
 /// Decompose a store key into `(slot, table_id, pk_key, ts)` when it is a
@@ -373,7 +407,7 @@ mod tests {
                     nullable: true,
                 },
             ],
-            pk: "id".into(),
+            pk: vec!["id".into()],
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
@@ -418,7 +452,7 @@ mod tests {
                     nullable: true,
                 },
             ],
-            pk: "id".into(),
+            pk: vec!["id".into()],
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
@@ -491,7 +525,7 @@ mod tests {
                     nullable: true,
                 },
             ],
-            pk: "id".into(),
+            pk: vec!["id".into()],
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
@@ -555,7 +589,7 @@ mod tests {
         assert!(key.starts_with(&prefix));
         // the tail is pk bytes followed by the 8-byte ts suffix
         let tail = &key[prefix.len()..key.len() - TS_SUFFIX_LEN];
-        assert_eq!(pk_from_key_tail(tail, &s).expect("dec"), pk);
+        assert_eq!(pk_from_key_tail(tail, &s).expect("dec"), vec![pk]);
     }
 
     #[test]
@@ -678,3 +712,9 @@ mod prepared_tests {
         );
     }
 }
+
+/// Composite-pk encoding tests live beside the row codec (kept here so
+/// `row.rs` stays under the file-size budget).
+#[cfg(test)]
+#[path = "row_pk_tests.rs"]
+mod pk_tests;

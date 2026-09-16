@@ -117,7 +117,7 @@ pub fn parse_index_key(key: &[u8]) -> Option<(u8, u32, u32, Vec<u8>)> {
 
 /// Split an entry-key tail into its encoded column value and the pk
 /// suffix. Fixed-width types split by length; var-length values end at
-/// their 0x00 terminator (`codec::key_bytes`).
+/// their 0x00 terminator, skipping escaped NUL pairs (`codec::key_bytes`).
 pub fn split_tail(tail: &[u8], ty: SqlType) -> Option<(&[u8], &[u8])> {
     let fixed = match ty {
         SqlType::Bool => 2,
@@ -126,9 +126,26 @@ pub fn split_tail(tail: &[u8], ty: SqlType) -> Option<(&[u8], &[u8])> {
         // Decimal keys are tag + 16B mantissa: fixed width, so the
         // split is deterministic without a terminator.
         SqlType::Decimal { .. } => 17,
-        SqlType::VarChar | SqlType::Blob => tail[1..].iter().position(|&b| b == 0x00)? + 2,
+        SqlType::VarChar | SqlType::Blob => terminator_len(tail)?,
     };
     tail.split_at_checked(fixed)
+}
+
+/// Byte length of a var-length key component at the head of `tail`
+/// (tag + escaped content + terminator): a 0x00 followed by 0xFF is an
+/// escaped literal NUL, any other successor of a 0x00 ends the value.
+fn terminator_len(tail: &[u8]) -> Option<usize> {
+    let mut i = 1; // skip the tag byte
+    while i < tail.len() {
+        if tail[i] != 0x00 {
+            i += 1;
+        } else if tail.get(i + 1) == Some(&0xFF) {
+            i += 2;
+        } else {
+            return Some(i + 1);
+        }
+    }
+    None // unterminated
 }
 
 /// Decode the column value of an entry tail (best effort; used by tests

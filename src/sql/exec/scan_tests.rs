@@ -22,7 +22,7 @@ fn schema(id: u32, name: &str) -> TableSchema {
                 nullable: true,
             },
         ],
-        pk: "id".into(),
+        pk: vec!["id".to_string()],
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
@@ -159,7 +159,7 @@ async fn materialize_nested_loop_join_with_on() {
             sql_type: SqlType::Int,
             nullable: false,
         }],
-        pk: "uid".into(),
+        pk: vec!["uid".to_string()],
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
@@ -214,7 +214,7 @@ fn resolve_reports_ambiguity() {
         id: 2,
         name: "t2".into(),
         columns: s.columns.clone(),
-        pk: "id".into(),
+        pk: vec!["id".to_string()],
         auto_increment: None,
         engine: Engine::Row,
         indexes: vec![],
@@ -331,10 +331,10 @@ async fn outer_join_widens_nullability_of_the_extended_side() {
     };
     // Left side keeps its declared flags (id is the NOT NULL pk).
     assert_eq!(l.nullable, vec![false, true]);
-    assert_eq!(l.key_pos, Some(0));
+    assert_eq!(l.key_pos, vec![0]);
     // Null-extended right side: everything may be NULL, no key.
     assert_eq!(r.nullable, vec![true, true]);
-    assert_eq!(r.key_pos, None);
+    assert!(r.key_pos.is_empty());
 }
 
 #[tokio::test]

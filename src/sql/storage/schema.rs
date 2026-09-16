@@ -221,6 +221,26 @@ pub struct Distribution {
     pub buckets: u32,
 }
 
+/// Deserialize `pk`: new catalogs write an array (`["a","b"]`), old
+/// catalogs wrote the single-column name as a bare string. Both load;
+/// mixed-version rollout depends on exactly this widening (see
+/// COMPAT.md).
+fn de_string_or_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+    match StringOrVec::deserialize(d)? {
+        StringOrVec::One(s) => Ok(vec![s]),
+        StringOrVec::Many(v) => Ok(v),
+    }
+}
+
 /// A table schema, stored as JSON under `sql_catalog/<table>` (see
 /// `catalog.rs`). `id` is stable across renames (there are none in v1) and
 /// namespaces physical row keys, so a dropped+recreated table never reads
@@ -230,8 +250,13 @@ pub struct TableSchema {
     pub id: u32,
     pub name: String,
     pub columns: Vec<ColumnDef>,
-    /// Exactly one primary-key column in v1 (enforced at DDL time).
-    pub pk: String,
+    /// Primary-key columns in declaration order (one for the classic
+    /// single-column pk, more for `PRIMARY KEY(a,b)`; enforced at DDL
+    /// time). Serialized as an array; old catalog JSON that carried a
+    /// bare string decodes as the one-element vector.
+    #[serde(deserialize_with = "de_string_or_vec")]
+    pub pk: Vec<String>,
+
     /// AUTO_INCREMENT column name, when the table has one (MySQL
     /// server-side id allocation on INSERT; see `exec/sequence.rs`).
     /// Old catalog JSON without the field decodes as `None`.
@@ -262,9 +287,20 @@ impl TableSchema {
         &self.columns[idx]
     }
 
-    pub fn pk_index(&self) -> usize {
-        self.column_index(&self.pk)
-            .expect("schema validated at DDL: pk exists")
+    /// Primary-key column positions in declaration order.
+    pub fn pk_indices(&self) -> Vec<usize> {
+        self.pk
+            .iter()
+            .map(|p| {
+                self.column_index(p)
+                    .expect("schema validated at DDL: every pk column exists")
+            })
+            .collect()
+    }
+
+    /// True for a multi-column `PRIMARY KEY(a,b)`.
+    pub fn is_composite_pk(&self) -> bool {
+        self.pk.len() > 1
     }
 
     /// Position of the AUTO_INCREMENT column, if any (the name is
@@ -275,9 +311,24 @@ impl TableSchema {
             .and_then(|c| self.column_index(c))
     }
 
-    /// Storage type of the primary-key column.
+    /// Storage type of the single primary-key column. Panics on a
+    /// composite pk -- callers that must handle both use
+    /// [`TableSchema::pk_types`]; a silent first-column pick would
+    /// mis-decode every physical key.
     pub fn pk_type(&self) -> SqlType {
-        self.columns[self.pk_index()].sql_type
+        assert!(
+            self.pk.len() == 1,
+            "pk_type() on a composite pk: use pk_types()"
+        );
+        self.columns[self.pk_indices()[0]].sql_type
+    }
+
+    /// Storage types of all pk columns, in pk order.
+    pub fn pk_types(&self) -> Vec<SqlType> {
+        self.pk_indices()
+            .iter()
+            .map(|&i| self.columns[i].sql_type)
+            .collect()
     }
 
     pub fn index(&self, name: &str) -> Option<&IndexDef> {
@@ -358,7 +409,7 @@ mod tests {
                     nullable: true,
                 },
             ],
-            pk: "id".into(),
+            pk: vec!["id".into()],
             auto_increment: None,
             engine: Engine::Row,
             indexes: vec![],
@@ -378,7 +429,7 @@ mod tests {
     fn lookup_is_case_insensitive() {
         let s = demo();
         assert_eq!(s.column_index("V"), Some(1));
-        assert_eq!(s.pk_index(), 0);
+        assert_eq!(s.pk_indices(), vec![0]);
         assert_eq!(s.column_index("nope"), None);
     }
 
@@ -413,6 +464,39 @@ mod tests {
         let back: TableSchema = serde_json::from_str(&old).expect("de old json");
         assert_eq!(back.key_model, KeyModel::MySql);
         assert_eq!(back.distribution, None);
+    }
+
+    /// Old catalog JSON wrote the pk as a bare string; new JSON writes
+    /// an array. The string form must keep decoding as the one-element
+    /// pk -- persisted catalogs on live clusters carry it.
+    #[test]
+    fn old_catalog_string_pk_loads_as_single_column_vec() {
+        let js = serde_json::to_string(&demo()).expect("ser");
+        assert!(js.contains(r#""pk":["id"]"#));
+        let old = js.replace(r#""pk":["id"]"#, r#""pk":"id""#);
+        let back: TableSchema = serde_json::from_str(&old).expect("de old json");
+        assert_eq!(back.pk, vec!["id".to_string()]);
+        assert_eq!(back, demo());
+    }
+
+    /// Multi-column pk round trips through catalog JSON unchanged
+    /// (order is significant: it is the physical key column order).
+    #[test]
+    fn composite_pk_json_round_trip() {
+        let mut s = demo();
+        s.columns.push(ColumnDef {
+            name: "day".into(),
+            sql_type: SqlType::Date,
+            nullable: false,
+        });
+        s.pk = vec!["day".into(), "id".into()];
+        let js = serde_json::to_string(&s).expect("ser");
+        assert!(js.contains(r#""pk":["day","id"]"#));
+        let back: TableSchema = serde_json::from_str(&js).expect("de");
+        assert_eq!(back, s);
+        assert_eq!(back.pk_indices(), vec![2, 0]);
+        assert!(back.is_composite_pk());
+        assert_eq!(back.pk_types(), vec![SqlType::Date, SqlType::Int]);
     }
 
     #[test]
