@@ -408,8 +408,7 @@ fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
                 },
                 Some(SqlType::Decimal { scale, .. }) => SqlType::Decimal {
                     precision: crate::sql::storage::schema::MAX_DECIMAL_SCALE,
-                    scale: (scale + 4)
-                        .min(crate::sql::storage::schema::MAX_DECIMAL_SCALE),
+                    scale: (scale + 4).min(crate::sql::storage::schema::MAX_DECIMAL_SCALE),
                 },
                 _ => SqlType::Double,
             },
