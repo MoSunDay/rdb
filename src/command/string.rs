@@ -298,7 +298,7 @@ pub async fn mset(ctx: &mut Ctx<'_>) {
     }
     let _guards = guards;
     let mut batch = WriteBatch::default();
-    for pair in pairs.chunks_exact(2) {
+    for pair in pairs.as_chunks::<2>().0 {
         let state = keys_core::resolve(&ctx.shared.store, &ctx.prefix_key, &pair[0], now);
         clear_key_family(&mut batch, &ctx.prefix_key, &pair[0], &state);
         write_string_record(&mut batch, &ctx.prefix_key, &pair[0], &pair[1], 0);

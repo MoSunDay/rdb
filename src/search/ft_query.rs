@@ -166,8 +166,10 @@ pub(super) fn knn_vector(knn: &KnnOpts, dim: u64) -> Result<Vec<f64>, &'static s
         }
         return Ok(knn
             .blob
-            .chunks_exact(2)
-            .map(|c| vectorset_ds::fp16_to_f64(u16::from_le_bytes([c[0], c[1]])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| vectorset_ds::fp16_to_f64(u16::from_le_bytes(*c)))
             .collect());
     }
     if knn.values.len() != dim as usize {

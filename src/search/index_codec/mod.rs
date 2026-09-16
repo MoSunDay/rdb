@@ -185,8 +185,8 @@ pub fn decode_doc(value: &[u8]) -> Option<DocRecord> {
     let mut vector = Vec::with_capacity(vlen.min(65536) as usize);
     let raw = rest.get(..vlen as usize * 8)?;
     let rest = &rest[vlen as usize * 8..];
-    for chunk in raw.chunks_exact(8) {
-        vector.push(f64::from_le_bytes(chunk.try_into().ok()?));
+    for chunk in raw.as_chunks::<8>().0 {
+        vector.push(f64::from_le_bytes(*chunk));
     }
     Some(DocRecord {
         doclen,

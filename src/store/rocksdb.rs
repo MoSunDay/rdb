@@ -179,7 +179,7 @@ pub fn mset(store: &Store, prefix: &[u8], pairs: &[Vec<u8>]) -> Result<(), Strin
         return Err("mset: odd number of elements, expected key/value pairs".to_string());
     }
     let mut batch = WriteBatch::default();
-    for pair in pairs.chunks_exact(2) {
+    for pair in pairs.as_chunks::<2>().0 {
         batch.put(physical_key(prefix, &pair[0]), &pair[1]);
     }
     store
@@ -233,7 +233,7 @@ pub async fn mset_async(
     }
     tokio::task::spawn_blocking(move || {
         let mut batch = WriteBatch::default();
-        for pair in pairs.chunks_exact(2) {
+        for pair in pairs.as_chunks::<2>().0 {
             batch.put(physical_key(&prefix, &pair[0]), &pair[1]);
         }
         store

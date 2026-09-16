@@ -169,8 +169,8 @@ pub fn decode_elem_value(value: &[u8], dim: u64) -> Option<ElemValue> {
     let vec_len = dim.checked_mul(8)? as usize;
     let raw = value.get(..vec_len)?;
     let mut vector = Vec::with_capacity(dim as usize);
-    for chunk in raw.chunks_exact(8) {
-        vector.push(f64::from_le_bytes(chunk.try_into().ok()?));
+    for chunk in raw.as_chunks::<8>().0 {
+        vector.push(f64::from_le_bytes(*chunk));
     }
     let (attr_len, rest) = decode_leb128(value.get(vec_len..)?)?;
     if rest.len() != attr_len as usize {
