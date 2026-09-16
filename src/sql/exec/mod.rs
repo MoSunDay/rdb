@@ -8,6 +8,7 @@
 pub mod agg;
 pub mod ddl;
 pub mod expr;
+mod expr_decimal;
 pub mod relation;
 pub mod render;
 pub mod scan;

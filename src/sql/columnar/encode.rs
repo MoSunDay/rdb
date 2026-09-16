@@ -48,12 +48,28 @@ fn cmp_vals(a: &Value, b: &Value) -> Option<Ordering> {
         // a DATETIME never share a column, so cross-type is None).
         (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
         (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
+        // Decimals align to the coarser scale exactly; a headroom
+        // overflow has no total order, so it falls back to None.
+        (Value::Decimal(x, sx), Value::Decimal(y, sy)) => align_decimal(*x, *sx, *y, *sy),
         (Value::Str(x), Value::Str(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
         (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Bytes(y)) => Some(x.as_bytes().cmp(y.as_slice())),
         (Value::Bytes(x), Value::Str(y)) => Some(x.as_slice().cmp(y.as_bytes())),
         _ => None,
     }
+}
+
+/// Exact cross-scale decimal alignment: lift the coarser mantissa by
+/// `10^(hi-lo)` and compare. `None` when the lift overflows i128.
+pub(crate) fn align_decimal(a: i128, sa: u8, b: i128, sb: u8) -> Option<Ordering> {
+    let (lo, hi) = if sa <= sb { (a, b) } else { (b, a) };
+    let lift = 10i128.checked_pow(u32::from(sb.abs_diff(sa)))?;
+    let lifted = lo.checked_mul(lift)?;
+    Some(if sa <= sb {
+        lifted.cmp(&hi)
+    } else {
+        hi.cmp(&lifted)
+    })
 }
 
 fn fold_min(acc: &mut Option<Value>, v: &Value) {
@@ -92,7 +108,7 @@ fn set_null_bit(bitmap: &mut [u8], i: usize) {
     bitmap[i / 8] |= 1 << (i % 8);
 }
 
-fn push_payload(out: &mut Vec<u8>, v: &Value) {
+fn push_payload(out: &mut Vec<u8>, v: &Value) -> Result<(), String> {
     match v {
         Value::Null => unreachable!("nulls live in the bitmap"),
         Value::Bool(b) => out.push(*b as u8),
@@ -109,11 +125,16 @@ fn push_payload(out: &mut Vec<u8>, v: &Value) {
             out.extend_from_slice(&(b.len() as u32).to_be_bytes());
             out.extend_from_slice(b);
         }
+        // Defensive: DDL rejects DECIMAL columns on columnar tables, so
+        // one reaching here means a schema/payload mismatch, never a
+        // supported path.
+        Value::Decimal(..) => return Err("DECIMAL not supported on columnar tables".into()),
     }
+    Ok(())
 }
 
 /// `[u32 BE num_values][null bitmap][payloads of the NON-NULL values]`.
-fn encode_plain(values: &[Value]) -> Vec<u8> {
+fn encode_plain(values: &[Value]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     out.extend_from_slice(&(values.len() as u32).to_be_bytes());
     let bm_off = out.len();
@@ -122,10 +143,10 @@ fn encode_plain(values: &[Value]) -> Vec<u8> {
         if matches!(v, Value::Null) {
             set_null_bit(&mut out[bm_off..], i);
         } else {
-            push_payload(&mut out, v);
+            push_payload(&mut out, v)?;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Distinct string/bytes entries in first-appearance order; None when a
@@ -200,7 +221,7 @@ fn encode_dict(values: &[Value], entries: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-fn encode_page(ty: SqlType, values: &[Value]) -> EncodedPage {
+fn encode_page(ty: SqlType, values: &[Value]) -> Result<EncodedPage, String> {
     let mut null_count = 0u32;
     let mut min = None;
     let mut max = None;
@@ -222,22 +243,22 @@ fn encode_page(ty: SqlType, values: &[Value]) -> EncodedPage {
             encode_dict(values, entries.as_ref().unwrap()),
         )
     } else {
-        (ENC_PLAIN.to_string(), encode_plain(values))
+        (ENC_PLAIN.to_string(), encode_plain(values)?)
     };
-    EncodedPage {
+    Ok(EncodedPage {
         encoding,
         bytes,
         num_values: values.len() as u32,
         null_count,
         min: min.unwrap_or(Value::Null),
         max: max.unwrap_or(Value::Null),
-    }
+    })
 }
 
 /// Chunk one column's values into pages (<= MAX_PAGE_VALUES each) and
 /// encode them. `values.len()` may be 0 (no pages). Type comes from the
 /// schema; values are trusted to match it (the write path coerced them).
-pub fn encode_column_pages(ty: SqlType, values: &[Value]) -> Vec<EncodedPage> {
+pub fn encode_column_pages(ty: SqlType, values: &[Value]) -> Result<Vec<EncodedPage>, String> {
     values
         .chunks(MAX_PAGE_VALUES)
         .map(|chunk| encode_page(ty, chunk))
@@ -263,7 +284,7 @@ pub fn build_segment(
     let mut zones = Vec::with_capacity(width);
     for (ci, col) in schema.columns.iter().enumerate() {
         let values: Vec<Value> = rows.iter().map(|r| r[ci].clone()).collect();
-        let pages = encode_column_pages(col.sql_type, &values);
+        let pages = encode_column_pages(col.sql_type, &values)?;
         let mut footers = Vec::with_capacity(pages.len());
         let (mut ordinal, mut null_count) = (0u32, 0u64);
         let (mut min, mut max) = (None, None);

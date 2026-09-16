@@ -74,9 +74,62 @@ mod tests {
 
     #[test]
     fn unsupported_types_rejected() {
-        assert!(parse_statement("CREATE TABLE t (d DECIMAL(10,2), id INT PRIMARY KEY)").is_err());
+        assert!(parse_statement("CREATE TABLE t (d UUID, id INT PRIMARY KEY)").is_err());
         // DATE used to live here; it parses now (see
         // temporal_column_types_translate).
+    }
+
+    /// DECIMAL/DEC/NUMERIC share the fixed-point type; widths follow
+    /// MySQL (bare = (10,0), (p) = scale 0) and stay inside the i128
+    /// mantissa budget (precision <= 38, scale <= precision).
+    #[test]
+    fn decimal_column_types_translate() {
+        let Statement::CreateTable { columns, .. } = stmt(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY,\
+             a DECIMAL, b DEC(12,5), c NUMERIC(38), d DECIMAL(38,38))",
+        ) else {
+            panic!("shape");
+        };
+        let ty = |i: usize| columns[i].sql_type;
+        assert_eq!(
+            ty(1),
+            SqlType::Decimal {
+                precision: 10,
+                scale: 0
+            }
+        );
+        assert_eq!(
+            ty(2),
+            SqlType::Decimal {
+                precision: 12,
+                scale: 5
+            }
+        );
+        assert_eq!(
+            ty(3),
+            SqlType::Decimal {
+                precision: 38,
+                scale: 0
+            }
+        );
+        assert_eq!(
+            ty(4),
+            SqlType::Decimal {
+                precision: 38,
+                scale: 38
+            }
+        );
+        for (bad, needle) in [
+            ("DECIMAL(0)", "precision"),
+            ("DECIMAL(39)", "precision"),
+            ("DECIMAL(10,11)", "scale"),
+            ("DECIMAL(5,-1)", "scale"),
+        ] {
+            let e = parse_statement(&format!("CREATE TABLE t (id BIGINT PRIMARY KEY, c {bad})"))
+                .expect_err(bad);
+            assert_eq!(e.code, ErrorCode::NotSupported, "{bad}: {e}");
+            assert!(e.msg.contains(needle), "{bad}: {e}");
+        }
     }
 
     #[test]
@@ -145,16 +198,11 @@ mod tests {
         for c in &columns[2..] {
             assert_eq!(c.sql_type, SqlType::DateTime, "{c:?}");
         }
-        // TIME / DECIMAL (and the wider temporal family) stay loud
-        // unsupported (1235), never mis-stored. Note: MySQL dialect
-        // maps `TIMESTAMP WITHOUT TIME ZONE` onto plain TIMESTAMP.
-        for bad in [
-            "TIME",
-            "TIME(3)",
-            "DATE32",
-            "DATETIME64(3, 'UTC')",
-            "DECIMAL(10,2)",
-        ] {
+        // TIME (and the wider temporal family) stays loud unsupported
+        // (1235), never mis-stored; DECIMAL now translates (see
+        // `decimal_column_types_translate`). Note: MySQL dialect maps
+        // `TIMESTAMP WITHOUT TIME ZONE` onto plain TIMESTAMP.
+        for bad in ["TIME", "TIME(3)", "DATE32", "DATETIME64(3, 'UTC')"] {
             let e = parse_statement(&format!("CREATE TABLE t (id BIGINT PRIMARY KEY, c {bad})"))
                 .expect_err(bad);
             assert_eq!(e.code, ErrorCode::NotSupported, "{bad}: {e}");
@@ -358,5 +406,43 @@ mod tests {
             parse_statement("SELECT * FROM t UNION SELECT * FROM t2"),
             Ok(Statement::SelectCompound(_))
         ));
+    }
+
+    // Plain int.frac literals translate to exact Decimals (i128 based,
+    // no f64 on the path); exponents and >38-digit spellings stay Doubles.
+    #[test]
+    fn decimal_literals_translate_exactly() {
+        let Statement::Select(q) = stmt("SELECT 0.1, -1.5, 1.50, 2.5e0, 12") else {
+            panic!("shape");
+        };
+        let lits: Vec<Expr> = q
+            .items
+            .into_iter()
+            .map(|i| match i {
+                SelectItem::Expr { expr, .. } => expr,
+                SelectItem::Wildcard => panic!("wildcard"),
+            })
+            .collect();
+        assert_eq!(lits[0], Expr::Lit(Value::Decimal(1, 1)));
+        assert_eq!(
+            lits[1],
+            Expr::Neg(Box::new(Expr::Lit(Value::Decimal(15, 1))))
+        );
+        assert_eq!(lits[2], Expr::Lit(Value::Decimal(150, 2)));
+        assert_eq!(lits[3], Expr::Lit(Value::Double(2.5)));
+        assert_eq!(lits[4], Expr::Lit(Value::Int(12)));
+        // 39 significant digits fall back to Double instead of losing digits.
+        let wide = format!("SELECT 1{}.5", "2".repeat(38));
+        let Statement::Select(q) = stmt(&wide) else {
+            panic!("shape");
+        };
+        let expected: f64 = format!("1{}.5", "2".repeat(38)).parse().unwrap();
+        assert_eq!(
+            q.items[0],
+            SelectItem::Expr {
+                expr: Expr::Lit(Value::Double(expected)),
+                alias: None
+            }
+        );
     }
 }

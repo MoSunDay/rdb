@@ -563,6 +563,25 @@ pub fn build_schema(
                 format!("primary key column '{pk}' not found"),
             )
         })?;
+    // DECIMAL storage/encoding exists (W2.0 batch 1), but the key
+    // encodings are not decimal-aware yet, so a DECIMAL pk is a loud
+    // 1235 rejection rather than a mis-ordered keyspace.
+    if matches!(columns[pk_idx].sql_type, SqlType::Decimal { .. }) {
+        return Err(SqlError::unsupported(
+            "DECIMAL primary key is not supported (use an integer pk)",
+        ));
+    }
+    // Same guard for the append-only columnar engine: its segment
+    // pages have no decimal encoding (see `columnar::encode`).
+    if engine.is_columnar()
+        && columns
+            .iter()
+            .any(|c| matches!(c.sql_type, SqlType::Decimal { .. }))
+    {
+        return Err(SqlError::unsupported(
+            "DECIMAL columns are not supported on columnar tables",
+        ));
+    }
     // AUTO_INCREMENT validation (MySQL 1075/1063): at most one auto
     // column, integer type (TINYINT/SMALLINT/INT/BIGINT all translate
     // to SqlType::Int; BOOL is a distinct engine type and rejected),

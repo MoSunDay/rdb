@@ -300,3 +300,100 @@ async fn table_ids_stay_monotone_across_drop_recreate() {
     // because 2 now bounds allocation. Only u's tombstone survives.
     assert_eq!(catalog::dropped_ids(&shared), vec![3]);
 }
+
+/// DECIMAL columns land on the row engine (storage/encoding batch);
+/// a DECIMAL pk and any DECIMAL column of a columnar table are loud
+/// 1235 rejections, never mis-stored keys or pages.
+#[test]
+fn build_schema_guards_decimal_pk_and_columnar() {
+    use crate::sql::storage::schema::SqlType;
+    // DECIMAL pk: rejected even though the column itself is fine.
+    let cols = [
+        spec(
+            "id",
+            SqlType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+            false,
+        ),
+        int_spec("v"),
+    ];
+    let err = build_schema(0, "t", &cols, "id", Engine::Row, None).unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotSupported);
+    assert!(err.msg.contains("DECIMAL primary key"), "{err}");
+    // Columnar engine + DECIMAL column: rejected.
+    let cols = [
+        int_spec("id"),
+        spec(
+            "amount",
+            SqlType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            true,
+        ),
+    ];
+    let err = build_schema(0, "t", &cols, "id", Engine::Columnar, None).unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotSupported);
+    assert!(err.msg.contains("columnar"), "{err}");
+    // Row engine + DECIMAL non-pk column: accepted.
+    let s = build_schema(9, "t", &cols, "id", Engine::Row, None).unwrap();
+    assert_eq!(s.columns[1].sql_type, cols[1].sql_type);
+}
+
+#[tokio::test]
+async fn create_table_with_decimal_column_round_trip() {
+    let shared = testutil::shared_with(testutil::test_config());
+    run(
+        &shared,
+        parse_statement(
+            "CREATE TABLE ledgers (id BIGINT PRIMARY KEY,\
+             amount DECIMAL(18,4) NULL, rate NUMERIC(5,2) NOT NULL)",
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let s = catalog::lookup(&shared, "ledgers")
+        .unwrap()
+        .expect("created");
+    assert_eq!(s.pk, "id");
+    assert_eq!(
+        s.columns[1].sql_type,
+        SqlType::Decimal {
+            precision: 18,
+            scale: 4
+        }
+    );
+    assert!(s.columns[1].nullable);
+    assert_eq!(
+        s.columns[2].sql_type,
+        SqlType::Decimal {
+            precision: 5,
+            scale: 2
+        }
+    );
+    assert!(!s.columns[2].nullable);
+
+    // The guards also fire end-to-end through the parser.
+    let e = run(
+        &shared,
+        parse_statement("CREATE TABLE bad (d DECIMAL(10,2) PRIMARY KEY, v INT)").unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotSupported);
+    assert!(e.msg.contains("DECIMAL primary key"), "{e}");
+    let e = run(
+        &shared,
+        parse_statement(
+            "CREATE TABLE bad2 (id BIGINT PRIMARY KEY, d DECIMAL(10,2)) ENGINE=columnar",
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotSupported);
+    assert!(e.msg.contains("columnar"), "{e}");
+}

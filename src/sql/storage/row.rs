@@ -242,6 +242,17 @@ fn encode_payload(out: &mut Vec<u8>, ty: SqlType, v: &Value) -> Result<(), Strin
         (SqlType::Bool, Value::Bool(b)) => out.push(*b as u8),
         (SqlType::Int, Value::Int(i)) => out.extend_from_slice(&i.to_be_bytes()),
         (SqlType::Double, Value::Double(d)) => out.extend_from_slice(&d.to_bits().to_be_bytes()),
+        // Fixed-point payload: scale byte + 16B BE mantissa. The scale
+        // is stored AND checked against the schema: a catalog that
+        // drifted (same table, different scale) must fail loudly here
+        // rather than silently misreading every stored value.
+        (SqlType::Decimal { scale, .. }, Value::Decimal(m, s)) => {
+            if *s != scale {
+                return Err("decimal scale mismatch".to_string());
+            }
+            out.push(*s);
+            out.extend_from_slice(&m.to_be_bytes());
+        }
         // Temporal payloads are 8B BE integers (days / micros).
         (SqlType::Date, Value::Date(i)) => out.extend_from_slice(&i.to_be_bytes()),
         (SqlType::DateTime, Value::DateTime(i)) => out.extend_from_slice(&i.to_be_bytes()),
@@ -276,6 +287,17 @@ fn decode_payload(mut rest: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String
             let (raw, r) = split8(rest, "double")?;
             rest = r;
             Value::Double(f64::from_bits(u64::from_be_bytes(raw.try_into().unwrap())))
+        }
+        // Fixed-width 1 + 16 bytes; the stored scale must equal the
+        // schema's (see `encode_payload`).
+        SqlType::Decimal { scale, .. } => {
+            let (s, r) = rest.split_first().ok_or("decimal payload truncated")?;
+            if *s != scale {
+                return Err("decimal scale mismatch".to_string());
+            }
+            let (raw, r) = r.split_at_checked(16).ok_or("decimal payload truncated")?;
+            rest = r;
+            Value::Decimal(i128::from_be_bytes(raw.try_into().unwrap()), *s)
         }
         SqlType::Date => {
             let (raw, r) = split8(rest, "date")?;
@@ -374,6 +396,77 @@ mod tests {
         let (header, dec) = decode_version(&s, &enc).expect("decode");
         assert_eq!(header, HEADER_LIVE);
         assert_eq!(dec, row);
+    }
+
+    #[test]
+    fn decimal_row_round_trip_and_scale_drift_rejected() {
+        let s = TableSchema {
+            id: 45,
+            name: "ledgers".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    sql_type: SqlType::Int,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "amount".into(),
+                    sql_type: SqlType::Decimal {
+                        precision: 18,
+                        scale: 4,
+                    },
+                    nullable: true,
+                },
+            ],
+            pk: "id".into(),
+            auto_increment: None,
+            engine: Engine::Row,
+            indexes: vec![],
+            key_model: KeyModel::MySql,
+            distribution: None,
+        };
+        for v in [
+            Value::Decimal(0, 4),
+            Value::Decimal(-123_456_789, 4),
+            Value::Decimal(i128::MIN, 4),
+            Value::Decimal(i128::MAX, 4),
+            Value::Null,
+        ] {
+            let row = vec![Value::Int(1), v];
+            let enc = encode_row(&s, &row).expect("encode");
+            let (_, dec) = decode_version(&s, &enc).expect("decode");
+            assert_eq!(dec, row);
+        }
+        // A value whose scale differs from the schema's is refused at
+        // encode time...
+        let bad = vec![Value::Int(1), Value::Decimal(123, 2)];
+        let err = encode_row(&s, &bad).unwrap_err();
+        assert_eq!(err, "decimal scale mismatch");
+        // ...and a payload decoded under a drifted schema scale fails
+        // the same way (catalog drift guard).
+        let enc = encode_row(&s, &[Value::Int(1), Value::Decimal(123, 4)]).unwrap();
+        let drifted = TableSchema {
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    sql_type: SqlType::Int,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "amount".into(),
+                    sql_type: SqlType::Decimal {
+                        precision: 18,
+                        scale: 2,
+                    },
+                    nullable: true,
+                },
+            ],
+            ..s
+        };
+        assert_eq!(
+            decode_version(&drifted, &enc).unwrap_err(),
+            "decimal scale mismatch"
+        );
     }
 
     #[test]

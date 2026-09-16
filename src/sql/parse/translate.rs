@@ -5,9 +5,9 @@
 //! executor only ever sees runnable shapes.
 
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, CreateTableOptions, DataType, Expr as SqlExpr,
-    FromTable, ObjectName, ObjectNamePart, SetExpr, SqlOption, Statement as SqlStatement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins,
+    ColumnDef as SqlColumnDef, ColumnOption, CreateTableOptions, DataType, ExactNumberInfo,
+    Expr as SqlExpr, FromTable, ObjectName, ObjectNamePart, SetExpr, SqlOption,
+    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -20,8 +20,7 @@ use crate::sql::parse::starrocks::StarRocksModel;
 use crate::sql::storage::schema::{Engine, KeyModel, SqlType, Value};
 
 /// Parse one SQL string; exactly one statement expected (clients send one).
-/// StarRocks table-model clauses are lifted out first (see
-/// `parse::starrocks`); everything else reaches sqlparser untouched.
+/// StarRocks table-model clauses lift out first (see `parse::starrocks`).
 pub fn parse_statement(sql: &str) -> SqlResult<Statement> {
     let (text, model) = crate::sql::parse::starrocks::preparse(sql)?;
     let stmts =
@@ -328,6 +327,10 @@ fn translate(stmt: SqlStatement, sr: Option<&StarRocksModel>) -> SqlResult<State
         SqlStatement::Explain { statement, .. } => {
             Ok(Statement::Explain(Box::new(translate(*statement, sr)?)))
         }
+        // DESCRIBE/DESC <table> is MySQL's SHOW COLUMNS spelling.
+        SqlStatement::ExplainTable { table_name, .. } => {
+            Ok(Statement::ShowColumns(object_name(&table_name)?))
+        }
         SqlStatement::StartTransaction { .. } => Ok(Statement::Begin),
         SqlStatement::Commit { .. } => Ok(Statement::Commit),
         SqlStatement::Rollback { chain, savepoint } => {
@@ -360,8 +363,7 @@ fn translate(stmt: SqlStatement, sr: Option<&StarRocksModel>) -> SqlResult<State
                 .ok_or_else(|| SqlError::parse("SHOW COLUMNS FROM <table> required"))?;
             Ok(Statement::ShowColumns(object_name(&name)?))
         }
-        // sqlparser has no dedicated SHOW INDEX parse: it surfaces as a
-        // ShowVariable whose identifiers are [index, from, <table>].
+        // No dedicated SHOW INDEX parse: a ShowVariable [index, from, <table>].
         SqlStatement::ShowVariable { variable } if variable.len() == 3 => {
             let is_show_index = variable[0].value.eq_ignore_ascii_case("index")
                 && variable[1].value.eq_ignore_ascii_case("from");
@@ -616,11 +618,38 @@ fn translate_type(t: &DataType) -> SqlResult<SqlType> {
         // is ignored -- storage is always microsecond precision.
         Date => SqlType::Date,
         Datetime(_) | Timestamp(_, _) => SqlType::DateTime,
+        // DECIMAL/DEC/NUMERIC share one exact fixed-point type. A bare
+        // DECIMAL is MySQL's DECIMAL(10,0); precision must fit the i128
+        // mantissa (<= 38 digits) and scale must not exceed precision.
+        Decimal(info) | Dec(info) | Numeric(info) => decimal_type(info)?,
         other => {
             return Err(SqlError::unsupported(format!(
-                "column type {other} (v1: BOOL/INT/DOUBLE/VARCHAR/BLOB/DATE/DATETIME/TIMESTAMP)"
+                "column type {other} (v1: BOOL/INT/DOUBLE/DECIMAL/VARCHAR/BLOB/DATE/DATETIME/TIMESTAMP)"
             )))
         }
+    })
+}
+
+/// DECIMAL width/scale: bare = (10,0); precision 1..=38, scale 0..=precision.
+fn decimal_type(info: &ExactNumberInfo) -> SqlResult<SqlType> {
+    let (precision, scale) = match info {
+        ExactNumberInfo::None => (10i64, 0i64),
+        ExactNumberInfo::Precision(p) => (*p as i64, 0),
+        ExactNumberInfo::PrecisionAndScale(p, s) => (*p as i64, *s),
+    };
+    if !(1..=38).contains(&precision) {
+        return Err(SqlError::unsupported(format!(
+            "DECIMAL precision {precision} out of range 1..=38"
+        )));
+    }
+    if !(0..=precision).contains(&scale) {
+        return Err(SqlError::unsupported(format!(
+            "DECIMAL scale {scale} out of range 0..={precision}"
+        )));
+    }
+    Ok(SqlType::Decimal {
+        precision: precision as u8,
+        scale: scale as u8,
     })
 }
 

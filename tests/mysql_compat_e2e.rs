@@ -328,3 +328,52 @@ async fn not_and_in_are_three_valued() {
     }
     node.kill_now();
 }
+
+/// DECIMAL on the wire: NEWDECIMAL column metadata for literals and
+/// table columns, and prepared-statement parameters in and out without
+/// losing the declared scale.
+#[tokio::test]
+async fn decimal_wire_metadata_and_params() {
+    let dir = std::env::temp_dir().join(format!("rdb-compat-dec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut node = spawn_node_mysql(&dir, 0, true, None);
+    wait_resp_ready(&mut node, 15).await;
+    wait_mysql_ready(&node, 15).await;
+    let mut c = connect(&node).await;
+
+    ddl(
+        &mut c,
+        "CREATE TABLE acc (id BIGINT PRIMARY KEY, bal DECIMAL(12,2) NOT NULL)",
+    )
+    .await;
+
+    // Prepared INSERT binds a text decimal; the stored value keeps the
+    // column scale (0.1 + 0.2 is exact, no binary-float residue).
+    c.exec_drop("INSERT INTO acc (id, bal) VALUES (?, ?)", (1, "0.3004"))
+        .await
+        .expect("insert");
+    assert_eq!(
+        rows(&mut c, "SELECT bal FROM acc WHERE id = 1").await,
+        vec![vec![s("0.30")]]
+    );
+
+    // Params flow out through a comparison too.
+    let got: Vec<mysql_async::Row> = c
+        .exec("SELECT id, bal FROM acc WHERE bal >= ?", ("0.1",))
+        .await
+        .expect("select");
+    assert_eq!(got.len(), 1);
+
+    // Column metadata announces NEWDECIMAL for both a literal and the
+    // table column; the literal path is decimal since it carries scale.
+    for sql in ["SELECT 1.5", "SELECT bal FROM acc"] {
+        let rs: Vec<mysql_async::Row> = c.query(sql).await.expect(sql);
+        assert_eq!(
+            rs[0].columns_ref()[0].column_type(),
+            mysql_async::consts::ColumnType::MYSQL_TYPE_NEWDECIMAL,
+            "{sql}"
+        );
+    }
+    node.kill_now();
+}

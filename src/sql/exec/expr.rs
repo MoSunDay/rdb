@@ -5,8 +5,10 @@
 
 use crate::sql::parse::ast::{BinOp, Expr};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
-use crate::sql::storage::schema::{SqlType, Value};
+use crate::sql::storage::schema::{format_decimal, SqlType, Value};
 use crate::sql::temporal::{self, MICROS_PER_DAY};
+
+use super::expr_decimal::{arith_decimal, decimal_out_of_range, decimal_to_f64, fit_column, pow10};
 
 /// Resolve `table.name` -> column index; tables must be unambiguous.
 pub trait ColumnScope {
@@ -70,6 +72,7 @@ pub fn eval<S: ColumnScope>(e: &Expr, scope: &S, row: &[Value]) -> SqlResult<Val
             match v {
                 Value::Int(i) => Ok(Value::Int(i.wrapping_neg())),
                 Value::Double(d) => Ok(Value::Double(-d)),
+                Value::Decimal(m, s) => Ok(Value::Decimal(m.wrapping_neg(), s)),
                 Value::Null => Ok(Value::Null),
                 other => Err(SqlError::new(
                     ErrorCode::NotSupported,
@@ -164,6 +167,7 @@ pub fn truthy(v: &Value) -> SqlResult<bool> {
         Value::Bool(b) => Ok(*b),
         Value::Int(i) => Ok(*i != 0),
         Value::Double(d) => Ok(*d != 0.0),
+        Value::Decimal(m, _) => Ok(*m != 0),
         other => Err(SqlError::new(
             ErrorCode::NotSupported,
             format!("{other:?} is not a boolean"),
@@ -236,6 +240,16 @@ fn arith(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
             "DATE/DATETIME values do not support arithmetic".to_string(),
         ));
     }
+    // Decimal arithmetic stays exact: operands align to the coarser
+    // scale, add/sub/mul ride checked i128 ops (mul adds the scales),
+    // and div carries scale+4 with half-away rounding (expr_decimal).
+    // A Double operand still wins (coarsened double mode below).
+    let decimal_mode = (matches!(l, Value::Decimal(..)) || matches!(r, Value::Decimal(..)))
+        && !matches!(l, Value::Double(_))
+        && !matches!(r, Value::Double(_));
+    if decimal_mode {
+        return arith_decimal(op, l, r);
+    }
     // Integer arithmetic stays integer unless an operand is a double.
     let double_mode = matches!(l, Value::Double(_)) || matches!(r, Value::Double(_));
     if double_mode {
@@ -292,6 +306,7 @@ fn as_double(v: &Value) -> SqlResult<f64> {
     match v {
         Value::Int(i) => Ok(*i as f64),
         Value::Double(d) => Ok(*d),
+        Value::Decimal(m, s) => Ok(decimal_to_f64(*m, *s)),
         other => Err(SqlError::new(
             ErrorCode::NotSupported,
             format!("{other:?} is not numeric"),
@@ -299,7 +314,6 @@ fn as_double(v: &Value) -> SqlResult<f64> {
     }
 }
 
-/// Total ordering across same-typed values (NULLs handled by callers).
 pub fn cmp_values(l: &Value, r: &Value) -> SqlResult<std::cmp::Ordering> {
     use std::cmp::Ordering;
     use Value::*;
@@ -308,6 +322,61 @@ pub fn cmp_values(l: &Value, r: &Value) -> SqlResult<std::cmp::Ordering> {
         (Double(a), Double(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
         (Int(a), Double(b)) => (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal),
         (Double(a), Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
+        // Decimal comparison: same-scale mantissae compare directly;
+        // cross-scale and Decimal-vs-Int align exactly in i128 (an
+        // alignment overflow is a loud error, never a wrong answer).
+        (Decimal(a, sa), Decimal(b, sb)) => {
+            let (lo, hi) = if sa <= sb { (*a, *b) } else { (*b, *a) };
+            let lift = 10i128
+                .checked_pow(u32::from(sa.abs_diff(*sb)))
+                .ok_or_else(|| cmp_unsupported(l, r))?;
+            let lifted = lo.checked_mul(lift).ok_or_else(|| cmp_unsupported(l, r))?;
+            if sa <= sb {
+                lifted.cmp(&hi)
+            } else {
+                hi.cmp(&lifted)
+            }
+        }
+        // Decimal vs Int is exact: the integer lifts to the decimal's
+        // scale (an i64 never overflows a x10^38 lift only at the very
+        // extremes -- loud error there).
+        (Decimal(a, sa), Int(b)) => match i128::from(*b).checked_mul(pow10(*sa)) {
+            Some(lifted) => a.cmp(&lifted),
+            None => return Err(cmp_unsupported(l, r)),
+        },
+        (Int(a), Decimal(b, sb)) => match i128::from(*a).checked_mul(pow10(*sb)) {
+            Some(lifted) => lifted.cmp(b),
+            None => return Err(cmp_unsupported(l, r)),
+        },
+        // Decimal vs Double/Str goes through f64 / a string parse:
+        // coarsened beyond 2^53 significands.
+        // TODO(W2.0-exec): exact decimal path for Double/Str operands.
+        (Decimal(a, sa), Double(b)) => decimal_to_f64(*a, *sa)
+            .partial_cmp(b)
+            .ok_or_else(|| cmp_unsupported(l, r))?,
+        (Double(a), Decimal(b, sb)) => a
+            .partial_cmp(&decimal_to_f64(*b, *sb))
+            .ok_or_else(|| cmp_unsupported(l, r))?,
+        (Decimal(a, sa), Str(b)) => match Value::parse_decimal(b) {
+            Ok(v @ Value::Decimal(..)) => cmp_values(&Decimal(*a, *sa), &v)?,
+            Ok(_) => unreachable!("parse_decimal only yields Decimal"),
+            Err(_) => {
+                return Err(SqlError::new(
+                    ErrorCode::NotSupported,
+                    format!("Incorrect DECIMAL value: '{b}'"),
+                ))
+            }
+        },
+        (Str(a), Decimal(b, sb)) => match Value::parse_decimal(a) {
+            Ok(v @ Value::Decimal(..)) => cmp_values(&v, &Decimal(*b, *sb))?,
+            Ok(_) => unreachable!("parse_decimal only yields Decimal"),
+            Err(_) => {
+                return Err(SqlError::new(
+                    ErrorCode::NotSupported,
+                    format!("Incorrect DECIMAL value: '{a}'"),
+                ))
+            }
+        },
         (Bool(a), Bool(b)) => a.cmp(b),
         (Str(a), Str(b)) => a.cmp(b),
         (Bytes(a), Bytes(b)) => a.cmp(b),
@@ -419,6 +488,15 @@ pub fn cmp_values(l: &Value, r: &Value) -> SqlResult<std::cmp::Ordering> {
     })
 }
 
+/// Shared "no total order here" error of `cmp_values` (used by the
+/// decimal alignment fallbacks).
+fn cmp_unsupported(l: &Value, r: &Value) -> SqlError {
+    SqlError::new(
+        ErrorCode::NotSupported,
+        format!("cannot compare {l:?} with {r:?}"),
+    )
+}
+
 fn eq_values(l: &Value, r: &Value) -> SqlResult<bool> {
     Ok(cmp_values(l, r)?.is_eq())
 }
@@ -489,6 +567,12 @@ fn eval_func(name: &str, args: &[Value]) -> SqlResult<Value> {
         ("abs", [v]) => match v {
             Value::Int(i) => Ok(Value::Int(i.wrapping_abs())),
             Value::Double(d) => Ok(Value::Double(d.abs())),
+            // i128::MIN has no positive peer: loud, never wrapped.
+            Value::Decimal(m, s) => Ok(Value::Decimal(
+                m.checked_abs()
+                    .ok_or_else(|| decimal_out_of_range(&format_decimal(*m, *s), *s))?,
+                *s,
+            )),
             Value::Null => Ok(Value::Null),
             other => Err(SqlError::new(
                 ErrorCode::NotSupported,
@@ -525,6 +609,46 @@ pub fn coerce(v: Value, ty: SqlType) -> SqlResult<Value> {
         (Value::Int(i), SqlType::Double) => Value::Double(i as f64),
         (Value::Int(i), SqlType::Bool) => Value::Bool(i != 0),
         (Value::Str(s), SqlType::Blob) => Value::Bytes(s.into_bytes()),
+        // Decimal column coercion: every source first becomes an exact
+        // (mantissa, scale) pair -- Ints scale up, decimals rescale,
+        // strings parse, doubles go through their shortest round-trip
+        // text (never the lossy f64 product) -- and the column width
+        // then bounds the stored mantissa (see fit_column).
+        (Value::Int(i), SqlType::Decimal { precision, scale }) => {
+            fit_column(i128::from(i), 0, precision, scale, &i.to_string())?
+        }
+        (Value::Double(d), SqlType::Decimal { precision, scale }) => {
+            if !d.is_finite() {
+                return Err(decimal_out_of_range(&format!("{d}"), scale));
+            }
+            // Rust's f64 Display is the shortest round-tripping
+            // decimal spelling; parsing it back is exact.
+            let text = format!("{d}");
+            match Value::parse_decimal(&text)
+                .map_err(|e| SqlError::new(ErrorCode::WrongValue, e))?
+            {
+                Value::Decimal(m, s) => fit_column(m, s, precision, scale, &text)?,
+                _ => unreachable!("parse_decimal yields Decimal"),
+            }
+        }
+        (Value::Str(s), SqlType::Decimal { precision, scale }) => {
+            match Value::parse_decimal(&s).map_err(|e| SqlError::new(ErrorCode::WrongValue, e))? {
+                Value::Decimal(m, from) => fit_column(m, from, precision, scale, &s)?,
+                _ => unreachable!("parse_decimal yields Decimal"),
+            }
+        }
+        (Value::Decimal(m, s), SqlType::Decimal { precision, scale }) => {
+            fit_column(m, s, precision, scale, &format_decimal(m, s))?
+        }
+        (Value::Decimal(m, s), SqlType::Int) => {
+            let whole = m / pow10(s);
+            i64::try_from(whole)
+                .map(Value::Int)
+                .map_err(|_| decimal_out_of_range(&format_decimal(m, s), 0))?
+        }
+        (Value::Decimal(m, s), SqlType::Double) => Value::Double(decimal_to_f64(m, s)),
+        (Value::Decimal(m, s), SqlType::VarChar) => Value::Str(format_decimal(m, s)),
+        (Value::Decimal(m, _), SqlType::Bool) => Value::Bool(m != 0),
         // Temporal coercion: strings via the canonical spellings, ints
         // via the compact YYYYMMDD[HHMMSS] forms; anything unparsable is
         // an incorrect value, not a silent NULL (MySQL 1292 style).
