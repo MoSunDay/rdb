@@ -4,6 +4,32 @@ Last full green run: **2026-09-16**, git `5b67c47`,
 binary `target/release/rdb`.
 Runner: `run_all.sh` -> **4 pass, 0 fail**.
 
+2026-09-17: `upgrade_rehearsal.sh` added -- W2.2 catalog co-upgrade
+rehearsal (standalone drill, NOT part of `run_all.sh`; ~3 min cold,
+builds both binaries itself). Proves the stop-the-world same-batch
+swap across this iteration's catalog-shape change (`TableSchema.pk`
+string -> column array + DECIMAL `SqlType` variant; COMPAT.md gates
+ROLLING as unsafe there): old binary `c22ff37` (detached worktree
+`.upgrade-old`, auto-built/removed) seeds the old feature surface
+(single-col BIGINT pk + unique/secondary index, StarRocks single-col
+PRIMARY KEY model, AUTO_INCREMENT, UPDATE/DELETE for multi-versions +
+tombstones) and snapshots rows/COLUMNS/INDEX; SIGTERM-all; the NEW
+binary (`8372d90`) restarts the same data dirs and must match every
+snapshot, run the one-time boot floor scan exactly once, carry the
+AUTO_INCREMENT counter across (65 -> 129), keep 1062/txn semantics,
+and unlock the new surface (DECIMAL(10,2) + index, composite pk,
+StarRocks multi-column PRIMARY KEY); then kill -9 all + restart: no
+second floor scan, snapshot stable again, counter at 193. Result:
+**94 assertions, PASS** -- twice consecutively with full cold builds
+and automatic scratch/worktree cleanup; no upgrade bug found (the
+`de_string_or_vec` compat + boot floor scan held). Semantics notes:
+AUTO_INCREMENT allocation is leader-only at BOTH versions (auto
+inserts route via the raft leader; followers still refuse), and
+follower-coordinated PK-model upserts can 1213 fail-fast on tight
+timing (pre-existing M2 ts-ordering caveat, not upgrade-related).
+Env: `RDB_UPGRADE_OLD_COMMIT`, port band 32900, `RDB_E2E_KEEP_WORKDIR=1`
+keeps scratch for iteration.
+
 2026-09-16: DECIMAL(p,s) + composite-PK assertion coverage (W2.2):
 `scenario_mysql_orders.sh` gains orders_amt (exact 0.1+0.2, half-up
 rounding read-back, SUM/AVG scale, decimal secondary-index point
