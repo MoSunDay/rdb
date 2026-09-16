@@ -41,6 +41,7 @@ use crate::sql::parse::ast::{Expr, LockRead};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog;
 use crate::sql::storage::row;
+use crate::sql::storage::schema::Value;
 use crate::state::Shared;
 
 /// One latched row identity: `(table_id, encoded primary key)` -- the
@@ -162,16 +163,25 @@ pub fn lock_matched(
         if schema.engine.is_columnar() {
             continue;
         }
-        let Some(pos) = side
-            .columns
+        // Latches key the row's physical pk (all pk columns of a
+        // composite key, in pk order). Sides that cannot resolve every
+        // pk column (derived relations) carry no row-store key.
+        let pk_offsets: Vec<usize> = schema
+            .pk
             .iter()
-            .position(|c| c.eq_ignore_ascii_case(&schema.pk))
-        else {
+            .filter_map(|p| {
+                side.columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(p))
+                    .map(|pos| side.offset + pos)
+            })
+            .collect();
+        if pk_offsets.len() != schema.pk.len() {
             continue;
-        };
-        let offset = side.offset + pos;
+        }
         for row in &matched {
-            let pk = row::pk_encode(&row[offset]).map_err(SqlError::from)?;
+            let values: Vec<Value> = pk_offsets.iter().map(|&i| row[i].clone()).collect();
+            let pk = row::pk_encode_row(&schema, &values).map_err(SqlError::from)?;
             keys.insert((schema.id, pk));
         }
     }

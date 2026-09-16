@@ -171,8 +171,7 @@ pub fn assert_no_duplicates(
             continue; // NULLs never conflict
         }
         let ck = super::keys::col_key_of(v).map_err(SqlError::from)?;
-        let pk =
-            crate::sql::storage::row::pk_encode(&row[schema.pk_index()]).map_err(SqlError::from)?;
+        let pk = crate::sql::storage::row::pk_encode_row(schema, row).map_err(SqlError::from)?;
         if let Some(other) = owners.get(&ck) {
             if other != &pk {
                 return Err(dup_entry(v, &index.name));

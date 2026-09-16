@@ -183,17 +183,24 @@ pub fn encode_key(value: &Value) -> Result<Vec<u8>, String> {
     })
 }
 
-/// Var-length key component: tag + bytes + 0x00 terminator. Embedded NUL
-/// bytes are REJECTED -- the terminator is the only self-delimiter, so an
-/// embedded one would silently truncate on decode. (v1 restriction:
-/// indexed/PK strings may not contain NUL.)
+/// Var-length key component: tag + escaped bytes + 0x00 terminator.
+/// Embedded NULs are ESCAPED order-preservingly (0x00 -> 0x00 0xFF, the
+/// FoundationDB tuple trick): every 0x00 in the stream is then either an
+/// escape-pair head or the terminator, so concatenated key components
+/// (multi-column pks, index value+pk tails) split without ambiguity.
+/// Terminators sort below every continuation, so byte order still
+/// equals value order across the escape.
 fn key_bytes(tag: u8, bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if bytes.contains(&0x00) {
-        return Err("NUL byte not allowed in string/blob key values".into());
-    }
     let mut v = Vec::with_capacity(bytes.len() + 2);
     v.push(tag);
-    v.extend_from_slice(bytes);
+    for &b in bytes {
+        if b == 0x00 {
+            v.push(0x00);
+            v.push(0xFF);
+        } else {
+            v.push(b);
+        }
+    }
     v.push(0x00);
     Ok(v)
 }
@@ -272,22 +279,35 @@ pub fn decode_key(bytes: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String> {
             (Value::Double(f64::from_bits(bits)), r)
         }
         (0x04, SqlType::VarChar) | (0x05, SqlType::Blob) => {
-            // Terminator is required: encoded keys of these types always
-            // carry one, so position 0 would mean an empty string key
-            // followed by nothing -- malformed for a chained key.
-            let end = rest
-                .iter()
-                .position(|&b| b == 0x00)
-                .ok_or("varlen key unterminated")?;
-            let (raw, r_with_term) = rest.split_at(end);
-            let (_, r) = r_with_term
-                .split_first()
+            // Scan for the terminator: a 0x00 followed by 0xFF opens an
+            // escaped literal NUL, any other successor ends the value
+            // (see `key_bytes`). A missing terminator is malformed for
+            // a chained key.
+            let mut raw: Vec<u8> = Vec::with_capacity(rest.len());
+            let mut i = 0;
+            while i < rest.len() {
+                if rest[i] != 0x00 {
+                    raw.push(rest[i]);
+                    i += 1;
+                    continue;
+                }
+                let next = rest.get(i + 1).copied();
+                if next == Some(0xFF) {
+                    raw.push(0x00); // escaped literal NUL
+                    i += 2;
+                } else {
+                    break; // terminator (or end of input)
+                }
+            }
+            let (_, r) = rest
+                .split_at_checked(i)
                 .ok_or("varlen key missing terminator")?;
+            let (_, r) = r.split_first().ok_or("varlen key missing terminator")?;
             (
                 if *tag == 0x04 {
-                    Value::Str(String::from_utf8(raw.to_vec()).map_err(|_| "invalid utf8 key")?)
+                    Value::Str(String::from_utf8(raw).map_err(|_| "invalid utf8 key")?)
                 } else {
-                    Value::Bytes(raw.to_vec())
+                    Value::Bytes(raw)
                 },
                 r,
             )

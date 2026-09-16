@@ -115,7 +115,7 @@ pub fn stage_append(txn: &mut Txn, table_name: &str, values: Vec<Value>) -> SqlR
 pub fn stage_upsert(txn: &mut Txn, schema: &TableSchema, values: Vec<Value>) -> SqlResult<()> {
     check_engine(txn, Engine::Row)?;
     txn.mode = Some(Engine::Row);
-    let pk = row::pk_encode(pk_value(schema, &values)).map_err(SqlError::from)?;
+    let pk = row::pk_encode_row(schema, &values).map_err(SqlError::from)?;
     txn.writes.insert((schema.id, pk), TxnWrite::Row(values));
     Ok(())
 }
@@ -231,7 +231,7 @@ pub fn merge_rows(
 ) -> SqlResult<Vec<Vec<Value>>> {
     let mut merged: BTreeMap<Vec<u8>, Vec<Value>> = BTreeMap::new();
     for r in store_rows {
-        let pk = row::pk_encode(pk_value(schema, &r)).map_err(SqlError::from)?;
+        let pk = row::pk_encode_row(schema, &r).map_err(SqlError::from)?;
         merged.insert(pk, r);
     }
     for ((table_id, pk), w) in &txn.writes {
@@ -479,10 +479,6 @@ pub fn rollback(oracle: &Oracle, txn: Txn) {
     oracle.unregister_snapshot(txn.read_ts);
     // Savepoints and row latches die with the txn.
     crate::sql::tx::latch::release_owner(txn.id);
-}
-
-fn pk_value<'a>(schema: &TableSchema, values: &'a [Value]) -> &'a Value {
-    &values[schema.pk_index()]
 }
 
 fn hex(bytes: &[u8]) -> String {

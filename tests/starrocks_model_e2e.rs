@@ -184,6 +184,37 @@ async fn starrocks_models_single_node() {
         .await
         .expect_err("'blue' is taken");
 
+    // ---- PRIMARY KEY model with a COMPOSITE pk: upsert dedups on the
+    // full key tuple, not on any single column ----
+    ddl(
+        &mut c,
+        "CREATE TABLE cpk_t (a INT, b VARCHAR(16), v INT NULL) \
+         PRIMARY KEY(a, b) DISTRIBUTED BY HASH(a)",
+    )
+    .await;
+    c.query_drop("INSERT INTO cpk_t (a, b, v) VALUES (1, 'x', 10), (1, 'y', 20), (2, 'x', 30)")
+        .await
+        .expect("composite insert");
+    c.query_drop("INSERT INTO cpk_t (a, b, v) VALUES (1, 'x', 99), (2, 'x', 98)")
+        .await
+        .expect("composite upsert: (1,'x') and (2,'x') are distinct keys");
+    assert_eq!(
+        grid(&mut c, "SELECT a, b, v FROM cpk_t ORDER BY a, b").await,
+        vec![
+            vec!["1", "x", "99"],
+            vec!["1", "y", "20"],
+            vec!["2", "x", "98"],
+        ],
+        "same value in either single column is not a conflict; only the full tuple dedups"
+    );
+    c.query_drop("UPDATE cpk_t SET v = 0 WHERE a = 1 AND b = 'y'")
+        .await
+        .expect("update matches on both pk columns");
+    assert_eq!(
+        col(&mut c, "SELECT v FROM cpk_t WHERE a = 1 AND b = 'y'").await,
+        vec!["0"]
+    );
+
     // ---- DUPLICATE KEY model: columnar append-only ----
     ddl(
         &mut c,
@@ -216,8 +247,6 @@ async fn starrocks_models_single_node() {
         "CREATE TABLE bad (k INT PRIMARY KEY) ORDER BY(k)",
         "CREATE TABLE bad (k INT PRIMARY KEY) UNIQUE KEY(k)",
         "CREATE TABLE bad (k INT PRIMARY KEY) DISTRIBUTED BY RANDOM",
-        // multi-column PK model is Phase 4 (composite pk unsupported yet)
-        "CREATE TABLE bad (a INT, b INT) PRIMARY KEY(a, b) DISTRIBUTED BY HASH(a)",
         // model/engine matrix violations
         "CREATE TABLE bad (k INT NOT NULL) PRIMARY KEY(k) ENGINE=columnar",
         "CREATE TABLE bad (k INT, v VARCHAR(8)) DUPLICATE KEY(k) ENGINE=row",
