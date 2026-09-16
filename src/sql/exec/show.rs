@@ -69,11 +69,12 @@ fn show_columns(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
     })
 }
 
-/// MySQL `Key` flag: PRI for the primary key, UNI/MUL for indexed
-/// columns (MUL marks a column whose index is non-unique or shared
-/// with the pk -- single-column indexes make them the same thing).
+/// MySQL `Key` flag: PRI for every primary-key column (composite pks
+/// mark all their columns), UNI/MUL for indexed columns (MUL marks a
+/// column whose index is non-unique or shared with the pk --
+/// single-column indexes make them the same thing).
 fn key_flag(schema: &TableSchema, column: &str) -> &'static str {
-    if column.eq_ignore_ascii_case(&schema.pk) {
+    if schema.pk.iter().any(|p| p.eq_ignore_ascii_case(column)) {
         return "PRI";
     }
     match schema
@@ -95,14 +96,20 @@ fn show_indexes(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
         .ok_or_else(|| SqlError::no_such_table(table))?;
     let str_col = |name: &str| ColMeta::computed("", name, SqlType::VarChar);
     let int_col = |name: &str| ColMeta::computed("", name, SqlType::Int);
-    let mut rows = vec![vec![
-        Value::Str(schema.name.clone()),
-        Value::Int(0),
-        Value::Str("PRIMARY".to_string()),
-        Value::Int(1),
-        Value::Str(schema.pk.clone()),
-        Value::Str("BTREE".to_string()),
-    ]];
+    let mut rows = Vec::new();
+    // PRIMARY: one row per pk column in pk order (MySQL numbers the
+    // columns of one index from 1 with Seq_in_index). Names come from
+    // the column list so the emitted case is canonical.
+    for (seq, idx) in schema.pk_indices().into_iter().enumerate() {
+        rows.push(vec![
+            Value::Str(schema.name.clone()),
+            Value::Int(0),
+            Value::Str("PRIMARY".to_string()),
+            Value::Int(seq as i64 + 1),
+            Value::Str(schema.columns[idx].name.clone()),
+            Value::Str("BTREE".to_string()),
+        ]);
+    }
     for i in &schema.indexes {
         rows.push(vec![
             Value::Str(schema.name.clone()),
@@ -130,7 +137,10 @@ fn show_indexes(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
 
 /// MySQL-ish type names (narrow v1 domain). DECIMAL spells its full
 /// `decimal(p,s)` form (the pair is the type).
-fn type_name(t: SqlType) -> String {
+/// One row per indexed column, MySQL `SHOW INDEX` shape; used by
+/// `show_indexes` (PRIMARY = one row per pk column, `Seq_in_index`
+/// counting from 1) and re-used for DDL error messages.
+pub(crate) fn type_name(t: SqlType) -> String {
     match t {
         SqlType::Bool => "bool".to_string(),
         SqlType::Int => "bigint".to_string(),

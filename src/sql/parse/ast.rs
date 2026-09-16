@@ -11,7 +11,9 @@ pub enum Statement {
         name: String,
         if_not_exists: bool,
         columns: Vec<ColumnSpec>,
-        pk: String,
+        /// Primary-key columns in declaration order: one element for
+        /// the classic single-column pk, more for `PRIMARY KEY(a,b)`.
+        pk: Vec<String>,
         engine: crate::sql::storage::schema::Engine,
         /// StarRocks table model lifted by the pre-parser (`None` for
         /// plain MySQL DDL; see `parse::starrocks`).

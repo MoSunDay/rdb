@@ -29,7 +29,7 @@ fn indexed_schema(id: u32, name: &str) -> TableSchema {
                 nullable: true,
             },
         ],
-        pk: "id".into(),
+        pk: vec!["id".to_string()],
         auto_increment: None,
         engine: Engine::Row,
         key_model: KeyModel::MySql,

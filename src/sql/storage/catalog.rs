@@ -302,7 +302,7 @@ mod tests {
                 sql_type: SqlType::Int,
                 nullable: false,
             }],
-            pk: "id".to_string(),
+            pk: vec!["id".to_string()],
             auto_increment: None,
             engine: Engine::Row,
             indexes: Vec::new(),

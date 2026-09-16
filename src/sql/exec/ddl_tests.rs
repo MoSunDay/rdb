@@ -26,17 +26,17 @@ fn build_schema_validates_body() {
         spec("d", SqlType::Double, false),
     ];
     // missing pk column
-    let err = build_schema(0, "t", &cols, "nope", Engine::Row, None).unwrap_err();
+    let err = build_schema(0, "t", &cols, &["nope".to_string()], Engine::Row, None).unwrap_err();
     assert_eq!(err.code, ErrorCode::Parse);
     assert!(err.msg.contains("primary key column 'nope'"));
     // duplicate column
     let dup = [int_spec("id"), int_spec("ID")];
-    let err = build_schema(0, "t", &dup, "id", Engine::Row, None).unwrap_err();
+    let err = build_schema(0, "t", &dup, &["id".to_string()], Engine::Row, None).unwrap_err();
     assert!(err.msg.contains("duplicate column"));
     // pk is implicitly NOT NULL even when declared NULL
-    let s = build_schema(7, "t", &cols, "id", Engine::Row, None).unwrap();
+    let s = build_schema(7, "t", &cols, &["id".to_string()], Engine::Row, None).unwrap();
     assert_eq!(s.id, 7);
-    assert_eq!(s.pk, "id");
+    assert_eq!(s.pk, vec!["id".to_string()]);
     assert!(!s.columns[0].nullable, "pk coerced NOT NULL");
     assert!(s.columns[1].nullable);
     assert!(!s.columns[2].nullable, "declared NOT NULL stays");
@@ -59,7 +59,7 @@ fn build_schema_validates_auto_increment() {
         ai_spec("id", SqlType::Int),
         spec("v", SqlType::VarChar, true),
     ];
-    let s = build_schema(1, "t", &cols, "id", Engine::Row, None).unwrap();
+    let s = build_schema(1, "t", &cols, &["id".to_string()], Engine::Row, None).unwrap();
     assert_eq!(s.auto_increment.as_deref(), Some("id"));
     assert_eq!(s.auto_increment_index(), Some(0));
 
@@ -69,7 +69,7 @@ fn build_schema_validates_auto_increment() {
         ai_spec("seq", SqlType::Int),
         spec("v", SqlType::VarChar, true),
     ];
-    let err = build_schema(0, "t", &dup, "id", Engine::Row, None).unwrap_err();
+    let err = build_schema(0, "t", &dup, &["id".to_string()], Engine::Row, None).unwrap_err();
     assert_eq!(err.code, ErrorCode::WrongAutoKey);
     assert!(err.msg.contains("only one auto column"));
 
@@ -78,7 +78,7 @@ fn build_schema_validates_auto_increment() {
         ai_spec("id", SqlType::VarChar),
         spec("v", SqlType::Int, true),
     ];
-    let err = build_schema(0, "t", &varchar, "id", Engine::Row, None).unwrap_err();
+    let err = build_schema(0, "t", &varchar, &["id".to_string()], Engine::Row, None).unwrap_err();
     assert_eq!(err.code, ErrorCode::WrongAutoKey);
     assert!(err.msg.contains("Incorrect column specifier"));
 
@@ -87,7 +87,7 @@ fn build_schema_validates_auto_increment() {
         spec("id", SqlType::Int, false),
         ai_spec("seq", SqlType::Int),
     ];
-    let err = build_schema(0, "t", &not_pk, "id", Engine::Row, None).unwrap_err();
+    let err = build_schema(0, "t", &not_pk, &["id".to_string()], Engine::Row, None).unwrap_err();
     assert_eq!(err.code, ErrorCode::WrongAutoKey);
     assert!(err.msg.contains("must be defined as a key"));
 }
@@ -129,7 +129,7 @@ async fn create_lookup_drop_round_trip() {
         parse_statement("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)").unwrap();
     run(&shared, stmt).await.unwrap();
     let s = catalog::lookup(&shared, "t").unwrap().expect("created");
-    assert_eq!(s.pk, "id");
+    assert_eq!(s.pk, vec!["id".to_string()]);
     assert_eq!(s.id, 1, "first table id");
 
     // second table allocates a fresh id (max+1 over the stub kv)
@@ -319,7 +319,7 @@ fn build_schema_guards_decimal_pk_and_columnar() {
         ),
         int_spec("v"),
     ];
-    let err = build_schema(0, "t", &cols, "id", Engine::Row, None).unwrap_err();
+    let err = build_schema(0, "t", &cols, &["id".to_string()], Engine::Row, None).unwrap_err();
     assert_eq!(err.code, ErrorCode::NotSupported);
     assert!(err.msg.contains("DECIMAL primary key"), "{err}");
     // Columnar engine + DECIMAL column: rejected.
@@ -334,11 +334,11 @@ fn build_schema_guards_decimal_pk_and_columnar() {
             true,
         ),
     ];
-    let err = build_schema(0, "t", &cols, "id", Engine::Columnar, None).unwrap_err();
+    let err = build_schema(0, "t", &cols, &["id".to_string()], Engine::Columnar, None).unwrap_err();
     assert_eq!(err.code, ErrorCode::NotSupported);
     assert!(err.msg.contains("columnar"), "{err}");
     // Row engine + DECIMAL non-pk column: accepted.
-    let s = build_schema(9, "t", &cols, "id", Engine::Row, None).unwrap();
+    let s = build_schema(9, "t", &cols, &["id".to_string()], Engine::Row, None).unwrap();
     assert_eq!(s.columns[1].sql_type, cols[1].sql_type);
 }
 
@@ -358,7 +358,7 @@ async fn create_table_with_decimal_column_round_trip() {
     let s = catalog::lookup(&shared, "ledgers")
         .unwrap()
         .expect("created");
-    assert_eq!(s.pk, "id");
+    assert_eq!(s.pk, vec!["id".to_string()]);
     assert_eq!(
         s.columns[1].sql_type,
         SqlType::Decimal {
@@ -396,4 +396,133 @@ async fn create_table_with_decimal_column_round_trip() {
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::NotSupported);
     assert!(e.msg.contains("columnar"), "{e}");
+}
+
+#[test]
+fn build_schema_composite_pk_type_guards() {
+    use crate::sql::storage::schema::SqlType;
+    // legal composite: Int + VarChar + Date (+ DateTime below)
+    let cols = [
+        int_spec("a"),
+        spec("b", SqlType::VarChar, true),
+        spec("d", SqlType::Date, true),
+    ];
+    let s = build_schema(
+        11,
+        "t",
+        &cols,
+        &["a".to_string(), "b".to_string(), "d".to_string()],
+        Engine::Row,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        s.pk,
+        vec!["a".to_string(), "b".to_string(), "d".to_string()]
+    );
+    assert_eq!(s.pk_indices(), vec![0, 1, 2]);
+    assert!(s.is_composite_pk());
+    assert!(
+        s.columns.iter().take(3).all(|c| !c.nullable),
+        "pk coerced NOT NULL"
+    );
+
+    // DateTime is fine too.
+    let cols = [int_spec("a"), spec("ts", SqlType::DateTime, true)];
+    let s = build_schema(
+        12,
+        "t",
+        &cols,
+        &["a".to_string(), "ts".to_string()],
+        Engine::Row,
+        None,
+    )
+    .unwrap();
+    assert_eq!(s.pk_types(), vec![SqlType::Int, SqlType::DateTime]);
+
+    // Bool / Double / Decimal / Blob in a composite pk: 1235.
+    for (name, ty) in [
+        ("f", SqlType::Double),
+        ("ok", SqlType::Bool),
+        (
+            "dec",
+            SqlType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        ),
+        ("bl", SqlType::Blob),
+    ] {
+        let cols = [int_spec("a"), spec(name, ty, true)];
+        let err = build_schema(
+            0,
+            "t",
+            &cols,
+            &["a".to_string(), name.to_string()],
+            Engine::Row,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotSupported, "{name}: {err}");
+        assert!(
+            err.msg.contains("composite PRIMARY KEY column"),
+            "{name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn build_schema_composite_pk_rejects_auto_increment() {
+    let cols = [
+        ai_spec("id", crate::sql::storage::schema::SqlType::Int),
+        int_spec("b"),
+    ];
+    let err = build_schema(
+        0,
+        "t",
+        &cols,
+        &["id".to_string(), "b".to_string()],
+        Engine::Row,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::WrongAutoKey);
+    assert!(err.msg.contains("only one auto column"), "{err}");
+}
+
+#[tokio::test]
+async fn composite_pk_table_round_trip_and_parse_guards() {
+    let shared = testutil::shared_with(testutil::test_config());
+    run(
+        &shared,
+        parse_statement("CREATE TABLE ck (a INT, b VARCHAR(32), v DATE NULL) PRIMARY KEY(a, b)")
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let s = catalog::lookup(&shared, "ck").unwrap().expect("created");
+    assert_eq!(s.pk, vec!["a".to_string(), "b".to_string()]);
+    assert!(s.columns.iter().take(2).all(|c| !c.nullable));
+    assert!(s.columns[2].nullable);
+
+    // pk column not in the body
+    let e = parse_statement("CREATE TABLE t (a INT) PRIMARY KEY(a, z)").unwrap_err();
+    assert!(e.msg.contains("'z' not defined"), "{}", e.msg);
+    // same column twice
+    let e = parse_statement("CREATE TABLE t (a INT) PRIMARY KEY(a, A)").unwrap_err();
+    assert!(e.msg.contains("duplicate column"), "{}", e.msg);
+    // inline + constraint
+    let e =
+        parse_statement("CREATE TABLE t (a INT PRIMARY KEY, b INT) PRIMARY KEY(a, b)").unwrap_err();
+    assert!(e.msg.contains("multiple PRIMARY KEY"), "{}", e.msg);
+    // two constraints (the StarRocks preparse flags the repeated model
+    // clause before the MySQL path sees two constraints -- either way
+    // the statement rejects)
+    let e =
+        parse_statement("CREATE TABLE t (a INT, b INT) PRIMARY KEY(a) PRIMARY KEY(b)").unwrap_err();
+    assert!(
+        e.msg.contains("multiple PRIMARY KEY") || e.msg.contains("table models"),
+        "{}",
+        e.msg
+    );
 }
