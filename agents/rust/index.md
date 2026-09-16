@@ -16,6 +16,7 @@ Commit: 98e17a5
 ## 构建要求（关键）
 - `.cargo/config.toml` 设置 `rustflags = ["--cfg", "tokio_unstable"]`，使 `main.rs` 中 `Builder::disable_lifo_slot()` 编译生效：tokio multi_thread 默认 LIFO slot 在本负载下丢唤醒，导致整个 runtime 冻结（6s+ 停顿）。
 - 在仓库根目录外构建需显式 `RUSTFLAGS='--cfg tokio_unstable'`；缺该 cfg 时回退为带 LIFO slot 的 multi_thread runtime（冻结复现）。
+- clippy 门槛跟随 CI 的最新 stable（本地旧 toolchain 会漏新 lint：1.98 起 `chunks_exact`→`as_chunks`、`then_some` 类已收敛，收口记录见 changelog 2026-09-16）；tokio `test-util` 仅在 `[dev-dependencies]`（state.rs paused-clock 测试用），生产依赖图不含。
 - 环境变量：`RDB_CURRENT_THREAD=1` 改用 current_thread runtime（应急逃生，单线程）；`RDB_WORKER_THREADS=N` 设置 worker 数（默认对齐 Go NumCPU）；`RDB_BEACON=1` 开启诊断心跳（默认关闭）。
 - 详见 `COMPAT.md`。
 
@@ -62,7 +63,7 @@ Commit: 98e17a5
 - `store/`：RocksDB 封装（`rocksdb.rs`），物理 key = `<slot>/` + key（`slot_prefix`），全部同步写；库路径 `store_path/bind`（`data_path`）。
 - `ds/`：数据结构基座（七类结构共用，纯函数式）。
   - `codec.rs`：typed 物理编码——`<slot>/<kind:u8><u32 BE key_len><key><suffix>`；kind 0x00 为 raw string（无信封，零开销）；其余 value = LEB128 `expire_ms` 信封 + payload；`0xFD` 过期索引键；`family_delete_ranges` 整键族删除（测试外置 `codec_tests.rs`）；
-  - `expire.rs`：全类型统一 TTL——读路径惰性判定 + `spawn_active_expire` 后台采样清理（`main.rs` 装配）；
+  - `expire/`：全类型统一 TTL——`mod.rs` 公共谓词/时间/batch 维护与再导出，`lazy.rs` 读路径惰性判定（Arc 场景脱离 worker 的 revalidate 清除），`active.rs` `spawn_active_expire` 后台旋转游标采样（`main.rs` 装配）；测试按 lazy/active 分置 `tests/`；
   - `latch.rs`：用户键分片读写锁（读改写串行化）；`wait.rs`：阻塞命令 WaitHub（BLPOP 族备用）；
   - `hash_ds.rs`/`set_ds.rs`/`setops.rs`：Hash/Set 的派生键读写与集合代数；`json_ds.rs`：JSON 单记录存取（kind 0x10，整文档 envelope+compact body，preserve_order 保序）。`vectorset_ds.rs`：向量集双记录存取（meta=kind 0x11 存 LEB128 dim/count，elem=kind 0x12 存 dim×f64 LE 向量+LEB128 长度前缀属性）与手写 FP16→f64 解码。`search` 家族 kind 0x13–0x18（meta/doc/posting/termstat/ann_centroid/ann_posting，单键族整删）。
 - `sql/`：SQL 数据面（MySQL 接入、MVCC 快照事务、二级/唯一索引与计划器、raft 全局时间戳、跨节点 2PC 写与 scatter-gather 读）——模块地图见 [sql.md](./sql.md)。
