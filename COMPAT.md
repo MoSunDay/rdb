@@ -469,7 +469,9 @@ contract; module map lives in `agents/rust/sql.md`.
   col_pos)` so one index is contiguous in one slot band. NULLs unindexed. Unique is
   enforced at write/commit (1062); `CREATE UNIQUE INDEX` pre-checks existing rows (a race
   window vs concurrent writers is accepted and documented in-code). Single-column only.
-- **AUTO_INCREMENT**: one integer pk column per table (MySQL 1075 otherwise). The counter is
+- **AUTO_INCREMENT**: one integer pk column per table, and that column must be the
+  entire (single-column) pk — a composite pk containing the auto column rejects with
+  MySQL 1075. The counter is
   raft-replicated catalog state (`sql_sequence/<table>` = decimal next value; seeded at 1
   by CREATE, cleared by DROP), so ids survive restarts and leadership changes. Allocation
   is a serialized leader-only read-modify-write (same raft write guard as DDL — a
@@ -498,11 +500,64 @@ contract; module map lives in `agents/rust/sql.md`.
   arithmetic; SUM/AVG over temporal is NULL. `NOW()`/`CURRENT_TIMESTAMP()`/`CURDATE()`
   are typed functions. Wire: text results are canonical strings; the binary protocol
   emits MYSQL_TYPE_DATE (4-byte) and MYSQL_TYPE_DATETIME (7/11-byte) cells and accepts
-  string or binary date/datetime statement parameters (TIME and DECIMAL stay 1235).
+  string or binary date/datetime statement parameters (TIME stays 1235).
   Storage codec tags `0x06` (Date) / `0x07` (DateTime) appear in payloads and index
   keys. Rollout gate: SqlType travels in the catalog JSON, columnar segment
   footers/meta, and the ColumnarRows RPC — mixed-version clusters cannot decode a new
   catalog/segment/RPC, so nodes upgrade together.
+- **Decimal type**: `DECIMAL(p,s)` / `NUMERIC(p,s)`, p 1..=38, s <= p, i128 fixed-point
+  mantissa (effective digits are bounded by i128, not p). Literals and prepared
+  parameters parse exactly — never through double. Arithmetic is exact: `+`/`-` align to
+  the coarser scale, `*` multiplies mantissae and adds scales, `%` aligns, all checked
+  (overflow is loud); `/` is MySQL-style long division — quotient at dividend
+  scale+4 (`div_precision_increment=4`), remainder rounded half away from zero; any
+  DOUBLE operand coarsens the whole expression to double. Decimal/Decimal (cross-scale)
+  and Decimal/Int comparisons are exact in i128; comparisons against DOUBLE/strings go
+  through f64/parse (explicit downgrade). `SUM(decimal)` stays DECIMAL at the column
+  scale; `AVG` divides the exact sum at scale+4 — `AVG(int)` types as DECIMAL(38,4),
+  `AVG(decimal)` as DECIMAL(38, scale+4); result-column metadata for decimal
+  arithmetic/aggregates is MYSQL_TYPE_NEWDECIMAL (mislabeling them DOUBLE once made SDKs
+  read the exact cell "0.60" as 0.6 and the binary encoder reject the cells — fixed).
+  Writes coerce to the column scale (half away from zero); an integer part wider than
+  p-s rejects the statement with MySQL 1292. Wire type is MYSQL_TYPE_NEWDECIMAL (text
+  cells are canonical fixed-point strings). Storage codec tag `0x08` (payload and
+  order-preserving fixed-width key encoding — byte order equals value order, negatives
+  included — so DECIMAL columns take secondary/unique indexes and ORDER BY). Trims
+  (1235, loud): a DECIMAL column cannot be a primary key (single-column pks too), and
+  DECIMAL columns are rejected on columnar tables (segment pages have no decimal
+  encoding).
+- **Composite primary keys**: `PRIMARY KEY(a,b,...)` is accepted. Column types are
+  narrowed to what concatenates unambiguously in an order-preserving key: TINYINT/
+  SMALLINT/INT/BIGINT (all engine-internal Int), VARCHAR, DATE, DATETIME — BOOL,
+  DOUBLE, BLOB and DECIMAL reject with 1235. Multi-column pks encode as the
+  declaration-ordered concatenation of per-column key codecs (var-length components
+  NUL-escape 0x00 -> 0x00 0xFF and terminate with 0x00, so the split is unique and byte
+  order equals tuple order); secondary/unique index entries, 2PC write sets, locking-read
+  latches and row probes all carry the full pk tuple. AUTO_INCREMENT must still be the
+  ENTIRE single-column pk: a composite pk containing the auto column rejects with MySQL
+  1075. Catalog shape: `TableSchema.pk` widened String -> Vec<String>, serialized as an
+  array; old catalog JSON that carried the bare string `"pk":"id"` deserializes as the
+  one-element vector (`de_string_or_vec`), and the new DECIMAL `SqlType` variant is
+  additive — old binaries simply never see either (they cannot decode the new shape),
+  which is exactly the co-upgrade gate above: mixed-version clusters are unsupported,
+  nodes upgrade together in one batch. Rehearsal evidence:
+  `scrtips/e2e_scenarios/upgrade_rehearsal.sh` (stop-the-world c22ff37 -> HEAD swap,
+  94 assertions, run twice) — see `scrtips/e2e_scenarios/RESULTS.md`.
+- **Local ts floor (single-node durability)**: every durable batch that stamps MVCC
+  records also stamps ONE store-reserved key `\x00sql_ts_floor` (the batch's highest ts,
+  riding the batch's existing fsync — no extra write); boot replays it into the oracle
+  (`advance_to`, on both the normal and backup listener paths), so a kill -9 restart can
+  never run the clock backwards (a backwards clock makes every previously committed row
+  invisible and shadows same-pk rewrites with stale higher-ts versions). The key has no
+  `"N/"` slot prefix and classifies as Foreign: FLUSHDB preserves it and DBSIZE/INFO
+  never count it. In-place upgrade from a pre-floor binary: when the key is ABSENT, the
+  first boot runs ONE full-keyspace scan (row-version keys with a crc16 slot
+  cross-check, plus columnar segment commit_ts from the 0x23 metas), takes the max ts
+  and stamps the key immediately — no later boot ever scans again (fresh stores return
+  instantly). A mid-scan iterator error keeps the partial max (still a floor) and logs.
+  Cluster mode is fenced by the raft-replicated `sql_ts_cursor` either way; the floor
+  is the single-machine equivalent and also covers a cluster node's local writes before
+  the cluster forms.
 - **Planner**: sargable `=`/`IN`/`BETWEEN` on an indexed column -> pk lookup (>1000 pks or
   no index -> SeqScan). In cluster mode the index path is disabled (v1) and EXPLAIN shows
   `Gather(bands=N)` over `SeqScan`.
@@ -600,7 +655,8 @@ storage engines. No new engine: the mapping is syntax-level; placement stays the
 slot sharding (see deviations).
 
 - **Accepted headers**:
-  `PRIMARY KEY(col) [DISTRIBUTED BY HASH(col) [BUCKETS n]]` -> row store, INSERT-as-UPSERT.
+  `PRIMARY KEY(col[, col...]) [DISTRIBUTED BY HASH(col) [BUCKETS n]]` -> row store,
+  INSERT-as-UPSERT (single- or multi-column pk, engine composite-pk rules apply).
   `DUPLICATE KEY(cols...) [DISTRIBUTED BY HASH(col) [BUCKETS n]]` -> columnar, append-only.
   Distribution is optional (`BUCKETS` defaults to StarRocks' 10). A MySQL-level pk may be
   written inline (`col INT PRIMARY KEY`) or as a constraint; for DUPLICATE tables a MySQL
@@ -611,8 +667,10 @@ slot sharding (see deviations).
   `sql::parse::starrocks`). Unrecognized clauses — `PARTITION BY`, `PROPERTIES`,
   `ORDER BY`, `UNIQUE KEY(...)`, `DISTRIBUTED BY RANDOM`, `ENGINE=row`/`innodb` on a
   model table, `PRIMARY KEY` + `ENGINE=columnar`, and `AGGREGATE KEY` — reject loudly
-  with MySQL 1235 instead of being dropped silently. Multi-column `PRIMARY KEY(...)` still rejects with the
-  single-pk message (composite pk is Phase 4).
+  with MySQL 1235 instead of being dropped silently. The PK model's key list is injected
+  back as a MySQL `PRIMARY KEY(...)` constraint, so multi-column `PRIMARY KEY(col1,col2)`
+  flows into the composite-pk path (same column-type narrowing; see the SQL data plane
+  bullets above) — the Phase-4 single-pk restriction is gone.
 - **Schema metadata**: `TableSchema.key_model` (`MySql` | `PrimaryKey` | `Duplicate`) and
   `TableSchema.distribution` (`{columns, buckets}`) persist in the raft catalog JSON,
   both `#[serde(default)]`: old catalog JSON decodes as `MySql`/none. Because old nodes
@@ -632,7 +690,8 @@ slot sharding (see deviations).
     Row correctness holds everywhere (one version per pk wins by ts); whether the new value
     shadows older seeds on every reader follows cluster-wide timestamp ordering — the same
     M2-era caveat ordinary cross-node UPDATEs already carry, so secondaries/unique entries
-    plus cross-coordinator replace recency stay follow-up work alongside composite keys.
+    plus cross-coordinator replace recency stay follow-up work (composite keys themselves
+    landed in the W2 batch; multi-column tuples ride the same caveat, not a new one).
 
 ## Runtime verification (this tree)
 
