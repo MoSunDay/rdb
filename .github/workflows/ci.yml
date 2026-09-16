@@ -46,7 +46,20 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test
-        run: cargo test --workspace
+        # Anonymous API users cannot download run logs, so surface the
+        # per-test verdicts as check-run annotations (readable without
+        # auth). `timeout-minutes` turns any future hang into a fast
+        # red instead of burning the 360-min job cap.
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee /tmp/test-out.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            names=$(grep '^---- ' /tmp/test-out.log | sed 's/^---- //; s/ stdout ----$//' | head -10 | paste -sd, -)
+            echo "::error title=test-failures::${names:-no-test-names-detected}"
+          fi
+          exit "$rc"
 
       - name: release build
         run: cargo build --release --workspace
