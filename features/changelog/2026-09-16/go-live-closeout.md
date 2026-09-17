@@ -132,3 +132,7 @@ burning the 360-min job cap.
 Outstanding: the B-side failover flake (one failure in a 2x10
 concurrent-binary stress loop, heavier than CI load, not reproducible
 4/4 serial) — revisit only if CI annotations name it.
+
+Closeout: run 35164744900 on fc5de4c (main) is the first full-green
+CI since fca9112 (2026-08-20) — fmt/clippy/test/release/guards all
+success, test step ~9m45s across three consecutive runs.
