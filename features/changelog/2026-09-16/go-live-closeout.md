@@ -136,3 +136,28 @@ concurrent-binary stress loop, heavier than CI load, not reproducible
 Closeout: run 35164744900 on fc5de4c (main) is the first full-green
 CI since fca9112 (2026-08-20) — fmt/clippy/test/release/guards all
 success, test step ~9m45s across three consecutive runs.
+
+## J. Nightly soak first runs: soak green, e2e provisioning gap (fixed)
+
+First two nightly runs (35201176027, 35323730055; GitHub delayed the
+03:17 cron by ~5h both times): the 900s kill -9 soak step passed BOTH
+nights — durability zero-loss and the p99 ≤1000ms gate healthy. The
+"full e2e scenario suite" step failed all 4 scenarios both nights.
+
+Root cause (environment, not product): the runner image only
+installed redis-tools, but the scenarios drive real clients —
+mysql + mycli (orders, starrocks), iredis (session), redis-py
+(vector). Each scenario FATALs on a missing client, hence 4/4. The
+suite passes 4/4 locally and in an ubuntu:24.04 container with the
+runner provisioning script + pinned client matrix
+(mysql 8.0 line, iredis 1.16.1, mycli 1.31.2, redis-py 7.4.1).
+
+Fix: soak.yml installs default-mysql-client + python3-pip and
+pip-installs the pinned iredis/redis/mycli trio; run_all.sh now also
+emits per-scenario failure tails as ::error annotations (anonymous
+check-runs readable — same channel as the ci.yml test step).
+
+One non-blocker spotted locally (1-in-~10 runs, not seen in the
+nightlies since they never got past provisioning): vector_search
+KNN docid compare can read [] before the index settles — needs an
+eventual-retry wrapper; follow-up if the nightly names it.

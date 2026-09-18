@@ -59,5 +59,16 @@ for s in "${scenarios[@]}"; do
 done
 
 echo "== summary: $pass pass, $fail fail =="
-[ "$fail" -eq 0 ] || printf 'failed: %s\n' "${failed_names[@]}"
+if [ "$fail" -ne 0 ]; then
+    printf 'failed: %s\n' "${failed_names[@]}"
+    # GitHub annotations are readable via the anonymous check-runs API
+    # even when log downloads are not; surface each failure's tail there.
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        for name in "${failed_names[@]}"; do
+            short="${name#scenario_}"; short="${short%.sh}"
+            tail_txt="$(tail -n 8 "/tmp/rdb_e2e_${name%.sh}.out" 2>/dev/null | tr '\n' '|' | tail -c 300)"
+            printf '::error title=e2e-%s::%s\n' "$short" "${tail_txt:-no-log}"
+        done
+    fi
+fi
 exit "$fail"

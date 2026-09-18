@@ -43,9 +43,15 @@ jobs:
       # ci.yml). redis-tools: the e2e harness drives redis-cli (with
       # REDISCLI_AUTH exported by env.sh). curl: /metrics probes.
       - name: Install rocksdb build + e2e deps
+        # The scenario suite drives REAL clients: mysql + mycli (orders /
+        # starrocks), iredis (session), redis-py (vector). Versions pinned
+        # to the locally-validated matrix (mysql 8.0 line, iredis 1.16.1,
+        # mycli 1.31.2, redis-py 7.4.1). PEP 668 runner python needs
+        # --break-system-packages.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev redis-tools curl
+          sudo apt-get install -y --no-install-recommends clang libclang-dev redis-tools curl default-mysql-client python3-pip
+          python3 -m pip install --break-system-packages "iredis==1.16.1" "redis==7.4.1" "mycli==1.31.2"
 
       - uses: dtolnay/rust-toolchain@stable
 
