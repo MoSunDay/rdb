@@ -35,12 +35,15 @@ Commit: 98e17a5
   `expr_decimal.rs`（i128 精确十进制算术：`/` 长除 scale+4 half-away-from-zero、
   列 scale 舍入 fit_column/1292）、
   `show.rs`、`render.rs`（EXPLAIN，含复合计划）、`ddl.rs`（`catalog_txn`/
-  `catalog_apply`：进程级 `DDL_MUX` 串行整个 DDL（decide→queue→commit-await），
+  `catalog_apply`：进程级 `CATALOG_MUX`（pub(crate)）串行整个 DDL（decide→queue→commit-await），
+  并同时串行 `sequence::allocate` 的 floor RMW 全程（读 floor→queue→commit-await），
   raft 写锁只在 decide+queue 瞬间持有，commit 一律锁外 await——锁跨 await 会饿死
   leader 的 raft/HTTP 服务与 ts refill（4 核 CI 实证挂死）；
   `DdlPlan{mutations, schema, changed}`：table-id 分配与目录变更在同一 raft 写守卫
   窗口内单决策生效，索引回填 mutations 随决策落盘）、`sequence.rs`
-  （AUTO_INCREMENT 分配：leader 串行 RMW + 批量预留 64、`LAST_INSERT_ID()`）。
+  （AUTO_INCREMENT 分配：串行由 `CATALOG_MUX` 提供——floor 读→queue→commit-await
+  全程持 mux，FSM 只见已 apply 的 bump，queued-but-unapplied 期间重读旧 floor 即重号；
+  raft 写锁仍只在 queue 前瞬间持有、批量预留 64、`LAST_INSERT_ID()`）。
 - `storage/`：`row.rs`（版本键 `<slot>/ 0x20 table_id pk !ts`、header 0x01/0x00/0x02）、
   `codec.rs`（typed 编解码 + kind 常量 0x20/0x21/0x22；payload/key 标签 0x06=Date
   天数、0x07=DateTime 微秒）、`schema.rs`、`catalog.rs`
