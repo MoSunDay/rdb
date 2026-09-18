@@ -338,3 +338,50 @@ async fn cluster_allocates_unique_ids_through_raft() {
         "follower error should mention the leader: {err}"
     );
 }
+
+/// Real-process sentinel for the CATALOG_MUX serialization of
+/// `sequence::allocate`: the race window is queue->raft-apply on the
+/// leader, where a concurrent INSERT can re-read a not-yet-applied
+/// floor and hand out overlapping ids (the row store's PK upsert then
+/// silently overwrites a row). Four independent connections x 10
+/// single-row INSERTs must land 40 pairwise-distinct ids; the
+/// deterministic repro (50ms-delayed apply loop) lives in the
+/// sequence.rs unit tests.
+#[tokio::test]
+async fn concurrent_inserts_hand_out_unique_ids() {
+    let (mut node, mut c) = world("conc").await;
+    run(
+        &mut c,
+        "CREATE TABLE ai_conc (id BIGINT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64))",
+    )
+    .await;
+
+    let mut futs = Vec::new();
+    for t in 0..4u8 {
+        let mut conn = connect(&node).await;
+        futs.push(async move {
+            for i in 0..10 {
+                run(
+                    &mut conn,
+                    &format!("INSERT INTO ai_conc (v) VALUES ('t{t}-i{i}')"),
+                )
+                .await;
+            }
+        });
+    }
+    futures::future::join_all(futs).await;
+
+    let mut got: Vec<i64> = rows(&mut c, "SELECT id FROM ai_conc")
+        .await
+        .into_iter()
+        .map(|r| match &r[0] {
+            MVal::Bytes(b) => String::from_utf8_lossy(b).parse().unwrap(),
+            v => panic!("non-bytes id {v:?}"),
+        })
+        .collect();
+    assert_eq!(got.len(), 40, "one row per INSERTed row: {got:?}");
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(got.len(), 40, "ids must be pairwise distinct: {got:?}");
+    node.kill_now();
+}

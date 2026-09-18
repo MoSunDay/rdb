@@ -120,8 +120,12 @@ impl DdlPlan {
 /// visible in the FSM's `live_kv` (the original design got this
 /// ordering by blocking on the raft guard through the commit; that
 /// guard-across-await starved the leader's raft/HTTP serve paths and
-/// ts refill -- a proven 4-core hang, see `catalog_txn`).
-static DDL_MUX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+/// ts refill -- a proven 4-core hang, see `catalog_txn`). It also
+/// serializes `exec::sequence::allocate`'s floor read-modify-write
+/// (read floor -> queue bump -> commit-await) so two concurrent
+/// INSERTs can never observe the same floor while a bump is
+/// queued-but-unapplied.
+pub(crate) static CATALOG_MUX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Run `begin` + queue the single mutation inside ONE raft write-guard
@@ -132,7 +136,7 @@ static DDL_MUX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 /// for single-mutation follow-ups that need no decision (the
 /// AUTO_INCREMENT counter lifecycle).
 async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<()> {
-    let _ddl = DDL_MUX.lock().await;
+    let _catalog = CATALOG_MUX.lock().await;
     let raft = Arc::clone(&shared.raft);
     let queued = tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();
@@ -170,7 +174,7 @@ async fn catalog_txn<F>(shared: &Shared, decide: F) -> SqlResult<DdlPlan>
 where
     F: FnOnce(&RaftState) -> SqlResult<DdlPlan> + Send + 'static,
 {
-    let _ddl = DDL_MUX.lock().await;
+    let _catalog = CATALOG_MUX.lock().await;
     let raft = Arc::clone(&shared.raft);
     let (plan, queued) = tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();

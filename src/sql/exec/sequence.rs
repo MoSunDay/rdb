@@ -89,17 +89,26 @@ pub fn persist_target(floor: i64, walk: &Walk) -> i64 {
 }
 
 /// Read the floor, assign ids and persist the raised counter as ONE
-/// serialized read-modify-write: the control-plane write guard spans
-/// read + assign + raft apply, exactly like the DDL serialization in
-/// `exec/ddl.rs`, so two concurrent INSERTs on the leader can never
-/// hand out the same floor. Returns the rewritten rows plus the first
-/// auto-generated id of the statement (for `LAST_INSERT_ID()`).
+/// serialized read-modify-write: the floor RMW is serialized by
+/// `exec::ddl::CATALOG_MUX`, held across floor read -> queue ->
+/// commit-await. The raft WRITE guard still only spans
+/// read + assign + queue and never crosses an await (deadlock rule,
+/// see `exec::ddl::catalog_apply`); the mux -- not the guard -- is
+/// what guarantees two concurrent INSERTs never hand out the same
+/// floor, because the floor read observes only FSM-APPLIED bumps and a
+/// queued-but-unapplied bump stays invisible until its commit lands.
+/// Returns the rewritten rows plus the first auto-generated id of the
+/// statement (for `LAST_INSERT_ID()`).
 pub async fn allocate(
     shared: &Shared,
     table: &str,
     mut rows: Vec<Vec<Value>>,
     ai: usize,
 ) -> SqlResult<(Vec<Vec<Value>>, Option<i64>)> {
+    // Serialize the whole floor RMW (the plain tokio mutex is MADE to
+    // be held across awaits); the raft write guard below stays
+    // short-lived.
+    let _catalog = crate::sql::exec::ddl::CATALOG_MUX.lock().await;
     let raft = Arc::clone(&shared.raft);
     let table = table.to_string();
     // Queue the counter bump under the raft write guard, await the
@@ -370,6 +379,90 @@ mod tests {
             insert(&shared, &mut sess, "INSERT INTO ai (v) VALUES ('b')").await;
             assert_eq!(ids(&shared).await, vec![1, 65]);
             assert_eq!(sess.last_insert_id, 65);
+        }
+
+        /// Stub raft with a REAL queue->apply window: entries sent on
+        /// `apply_tx` park for 50ms in a background loop before landing
+        /// in the FSM view, so a floor read in `allocate` observes only
+        /// FSM-APPLIED bumps -- exactly the production shape, where the
+        /// bump becomes visible only after the queued entry commits.
+        async fn world_with_delayed_apply() -> crate::state::Shared {
+            let shared = testutil::shared_with(testutil::test_config());
+            let raft = Arc::clone(&shared.raft);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::state::ApplyReq>(64);
+            tokio::spawn(async move {
+                while let Some(req) = rx.recv().await {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    {
+                        let mut guard = raft.write().unwrap();
+                        guard
+                            .kv
+                            .insert(req.entry.key.clone(), req.entry.value.clone());
+                        guard.apply_count += 1;
+                    }
+                    let _ = req.reply.send(Ok(()));
+                }
+            });
+            shared.raft.write().unwrap().apply_tx = Some(tx);
+            shared
+        }
+
+        /// Deterministic repro of the queue->apply window race: the
+        /// floor read in `allocate` sees only FSM-APPLIED bumps, so a
+        /// concurrent INSERT racing a queued-but-unapplied bump re-reads
+        /// the OLD floor and hands out overlapping ids -- the row
+        /// store's PK upsert then silently overwrites the earlier row
+        /// (data corruption, not a visible error). The 50ms apply delay
+        /// widens the window to certainty: 4 tasks x (3 single-row + 2
+        /// two-row INSERTs) = 28 ids must all stay distinct. Sentinel
+        /// for the CATALOG_MUX serialization fix.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn concurrent_inserts_never_share_ids_when_apply_lags() {
+            let shared = Arc::new(world_with_delayed_apply().await);
+            ddl::run(
+                &shared,
+                parse_statement(
+                    "CREATE TABLE ai \
+                     (id BIGINT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64) NULL)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let mut tasks = Vec::new();
+            for t in 0..4u8 {
+                let shared = Arc::clone(&shared);
+                tasks.push(tokio::spawn(async move {
+                    let mut sess = SqlSession::default();
+                    for i in 0..3 {
+                        insert(
+                            &shared,
+                            &mut sess,
+                            &format!("INSERT INTO ai (v) VALUES ('{t}-{i}')"),
+                        )
+                        .await;
+                    }
+                    for _ in 0..2 {
+                        insert(
+                            &shared,
+                            &mut sess,
+                            &format!("INSERT INTO ai (v) VALUES ('{t}-a'), ('{t}-b')"),
+                        )
+                        .await;
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let got = ids(&shared).await;
+            assert_eq!(got.len(), 28, "one visible row per INSERTed row: {got:?}");
+            let distinct: std::collections::HashSet<_> = got.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                28,
+                "duplicate ids mean the PK upsert silently overwrote a row: {got:?}"
+            );
         }
     }
 }
