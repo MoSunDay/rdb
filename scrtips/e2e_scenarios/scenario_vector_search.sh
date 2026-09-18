@@ -295,10 +295,11 @@ assert_eq "iredis KNN docids identical to redis-cli" "$(doc_seq "$knn_post")" "$
 # direct Redis() client is exercised: RedisCluster() additionally runs
 # COMMAND during its handshake (not implemented server-side), while the
 # topology call CLUSTER SLOTS already returns the expected slot ranges.
-py_out="$(
-    PY_HOST="$E2E_HOST" PY_PORT="$RDB_PORT" PY_TOKEN="$RDB_E2E_TOKEN" \
-    PY_IDX="$IDX" PY_QV="$QV" \
-    python3 - <<'PYEOF'
+# A transient socket blip inside the SDK script aborts it mid-way and
+# every later py_val assert reads "" (one blip -> 6 red asserts); retry
+# the whole SDK probe when the final "docs" line is missing.
+_py_sdk="$E2E_WORKDIR/py_sdk.py"
+cat > "$_py_sdk" <<'PYEOF'
 import os
 import redis
 
@@ -331,7 +332,14 @@ if ok:
     print("total", res[0])
     print("docs", b" ".join(res[1:-1:2]).decode())
 PYEOF
-)"
+py_out=""
+for _try in 1 2 3; do
+    py_out="$(PY_HOST="$E2E_HOST" PY_PORT="$RDB_PORT" PY_TOKEN="$RDB_E2E_TOKEN" \
+        PY_IDX="$IDX" PY_QV="$QV" python3 "$_py_sdk" 2>&1)"
+    [ -n "$(printf '%s\n' "$py_out" | sed -n 's/^docs //p')" ] && break
+    echo "-- python SDK attempt $_try incomplete; retrying --"
+    sleep 2
+done
 py_val() { printf '%s\n' "$py_out" | sed -n "s/^$1 //p" | head -n1; }
 assert_eq "redis-py PING over AUTH answers True" "1" "$(py_val ping)"
 assert_eq "redis-py SET/GET roundtrip preserves raw bytes" "1" "$(py_val roundtrip)"
