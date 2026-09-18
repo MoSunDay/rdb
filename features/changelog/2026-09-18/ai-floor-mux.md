@@ -1,6 +1,6 @@
 # AUTO_INCREMENT floor RMW 丢原子性：CATALOG_MUX 全程串行 + 死 API 清理
 
-Commit: e159ccd
+Commit: 99e1f4e
 
 ## 背景
 
