@@ -58,10 +58,6 @@ pub fn sequence_next(shared: &Shared, table: &str) -> i64 {
 /// both observe max_id and pick the same new id).
 pub struct CatalogTxn<'a> {
     raft: &'a mut RaftState,
-    /// Every replicated entry this txn landed, in order: the
-    /// replication barrier replays these to the peers so a DDL ack
-    /// implies follower visibility (see [`super::replicate`]).
-    applied: Vec<(String, String)>,
 }
 
 /// One catalog mutation handed to raft: the (key, value) pair plus the
@@ -83,13 +79,9 @@ impl CatalogTxn<'_> {
         self.raft
     }
 
-    /// Entries applied so far (key -> value as written through raft).
-    pub fn applied(&self) -> &[(String, String)] {
-        &self.applied
-    }
-
     /// Queue a schema upsert. Commit by awaiting the ticket AFTER the
-    /// guard is released, then [`record`](Self::record) the pair.
+    /// guard is released (callers then rebuild their own applied list
+    /// for the replication barrier, see `exec::ddl`).
     pub fn queue_put(&mut self, schema: &TableSchema) -> Result<QueuedApply, String> {
         let value = serde_json::to_string(schema).map_err(|e| e.to_string())?;
         self.queue_entry(&catalog_key(&schema.name), value)
@@ -111,7 +103,8 @@ impl CatalogTxn<'_> {
 
     /// Queue one replicated entry: `raft_apply_start` only, so the
     /// raft write guard is never held across an await. Callers await
-    /// the ticket after dropping the guard, then `record` the pair.
+    /// the ticket after dropping the guard and rebuild their own
+    /// applied list for the replication barrier (see `exec::ddl`).
     fn queue_entry(&mut self, key: &str, value: String) -> Result<QueuedApply, String> {
         let entry = RaftLogEntryData {
             key: key.to_string(),
@@ -123,12 +116,6 @@ impl CatalogTxn<'_> {
             value,
             ticket,
         })
-    }
-
-    /// Record a committed apply so the replication barrier (see
-    /// [`super::replicate`]) can replay it to the peers.
-    pub fn record(&mut self, queued: QueuedApply) {
-        self.applied.push((queued.key, queued.value));
     }
 }
 
@@ -144,10 +131,7 @@ pub fn begin<'a>(raft: &'a mut RaftState, what: &str) -> Result<CatalogTxn<'a>, 
         };
         return Err(format!("{what} requires the raft leader{hint}"));
     }
-    Ok(CatalogTxn {
-        raft,
-        applied: Vec::new(),
-    })
+    Ok(CatalogTxn { raft })
 }
 
 /// Read one table's schema from the FSM view (leader and followers alike).
