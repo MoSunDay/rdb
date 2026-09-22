@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use rdb::rcache::fsm::KvMap;
 use rdb::rcache::RdbRaft;
-use rdb::{conf, ds, es, kafka, monitor, rcache, resp, rocksmq, sql, state, store, topology};
+use rdb::{conf, ds, es, kafka, monitor, rcache, resp, rocksmq, s3, sql, state, store, topology};
 
 const TOPOLOGY_KEY: &str = "cluster_slots_stable_instances";
 
@@ -642,6 +642,21 @@ async fn do_main() {
         };
         tokio::spawn(rocksmq::serve(listener, Arc::clone(&shared)));
     }
+    // S3-compatible object-storage front (empty s3_bind = disabled;
+    // s3_token gates Bearer auth) plus the periodic RocksDB checkpoint
+    // publisher, which no-ops on its own when the front or the
+    // interval is off.
+    if !conf.s3_bind.is_empty() {
+        let listener = match s3::http::bind(&conf.s3_bind) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::spawn(s3::http::serve(listener, Arc::clone(&shared)));
+    }
+    s3::checkpoint::spawn_publisher(Arc::clone(&shared));
     // M3: node-to-node 2PC transport (empty sql_rpc_bind = disabled)
     // and the in-doubt marker recovery sweep.
     if !conf.sql_rpc_bind.is_empty() {

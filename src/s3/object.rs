@@ -165,14 +165,14 @@ fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// point at a missing file -- the crash-ordering argument of
 /// `rcache/store_snapshot.rs::write_durably`, applied to (object
 /// bytes, metadata) instead of (data file, meta record).
-pub fn commit(final: &Path, tmp: &Path, etag: &str, content_type: &str) -> io::Result<()> {
+pub fn commit(dst: &Path, tmp: &Path, etag: &str, content_type: &str) -> io::Result<()> {
     File::open(tmp)?.sync_all()?;
-    fs::rename(tmp, final)?;
-    if let Some(dir) = final.parent() {
+    fs::rename(tmp, dst)?;
+    if let Some(dir) = dst.parent() {
         File::open(dir)?.sync_all()?;
     }
     let meta = serde_json::json!({"etag": etag, "content_type": content_type});
-    write_durably(&sidecar_path(final), &serde_json::to_vec(&meta).unwrap_or_default())
+    write_durably(&sidecar_path(dst), &serde_json::to_vec(&meta).unwrap_or_default())
 }
 
 /// Copy `src` into `(bucket, key)` streaming through a 64 KiB buffer
@@ -215,7 +215,7 @@ pub fn head(store: &ObjectStore, bucket: &str, key: &str) -> Option<ObjectMeta> 
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)?;
-    let fallback = || (format!("\"{size}-{}\"", mtime_ms / 1000), "application/octet-stream");
+    let fallback = || (format!("\"{size}-{}\"", mtime_ms / 1000), "application/octet-stream".to_string());
     let (etag, content_type) = fs::read(sidecar_path(&path))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -279,7 +279,7 @@ pub fn list(store: &ObjectStore, bucket: &str, prefix: &str, delimiter: &str, ma
             break;
         }
         let tail = &key[prefix.len()..];
-        if !delimiter.is_empty() && let Some(i) = tail.find(delimiter) {
+        if let Some(i) = (!delimiter.is_empty()).then(|| tail.find(delimiter)).flatten() {
             let cp = format!("{}{}{}", &key[..prefix.len()], &tail[..i], delimiter);
             if last_prefix.as_deref() != Some(cp.as_str()) {
                 last_prefix = Some(cp.clone());
@@ -358,7 +358,8 @@ mod tests {
         assert_eq!(keys, ["a.txt", "z.txt"]);
         assert_eq!(page.common_prefixes, ["dir/", "dirx/"]);
         assert!(!page.truncated);
-        assert_eq!(page.next_after.as_deref(), Some("dirx/"));
+        // next_after = the LAST entry; z.txt sorts after the prefixes.
+        assert_eq!(page.next_after.as_deref(), Some("z.txt"));
         let p1 = list(&s, "b", "", "/", 1).expect("list");
         assert_eq!(p1.objects[0].key, "a.txt");
         assert!(p1.truncated);
