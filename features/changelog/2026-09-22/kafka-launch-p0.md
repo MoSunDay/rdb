@@ -1,6 +1,6 @@
 # Kafka 订阅/消费上线 P0 修复：重启世代死区 + 广告地址 + 连接配额 + 指标失真
 
-Commit: HEAD（与 kafka/es/rocksmq/s3 前置批次同批入库）
+Commit: e2d4fad（与 kafka/es/rocksmq/s3 前置批次同批入库）
 
 ## 背景
 上线评估确认功能面就绪（组协议/消费/持久化 e2e 全绿），但有 1 个已确认 bug +
