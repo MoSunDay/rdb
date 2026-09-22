@@ -4,7 +4,8 @@
 - rdb 的消息队列能力保持**单一产品线**：RocketMQ 5.5 Lite Mode 风格的语义模型
   （父主题 + 动态队列 + 消费组水位 + PEL），经 Redis Streams 动词面暴露——即
   [agents/rust](../agents/rust/index.md) 的 `lite/` 模块族（"A 路线"）。
-- Kafka 线协议兼容**现阶段明确拒绝**，仅保留为远期可选的协议前置适配层。
+- Kafka 线协议兼容改为**分阶段落地**（P0 已开始）：可选的 `kafka front` 协议前置
+  适配层，规范见 [kafka-front.md](./kafka-front.md)。
 - 本文档两部分：上半部分为路线决策记录（**final，不再复议**）；下半部分为正在落地的
   Lite MQ 面**规范（living spec）**，与实现同步演进。
 
@@ -13,8 +14,11 @@
 ### 决策陈述
 - A 路线是唯一在维护的 MQ 线路：全部能力经 Redis Streams 动词访问
   （XADD/XREADGROUP/XACK/XPENDING/XCLAIM/XAUTOCLAIM/XGROUP/...），Redis SDK 即用。
-- Kafka wire 兼容：**rejected for now**。若远期重启，形态是一个可选的 `kafka front`
-  协议前置（parent/child → topic/partition 静态映射），不是引擎分叉。
+- Kafka wire 兼容：原判 "rejected for now"，**2026-09 起改为分阶段落地**——形态维持
+  当年预留的样子：可选的 `kafka front` 协议前置（parent/child → topic/partition
+  静态映射），不是引擎分叉。规范与阶段表见 [kafka-front.md](./kafka-front.md)
+  （P0：骨架 + ApiVersions/Metadata，已落地）。单节点持久性风险显式接受，
+  "先数据面复制、再谈协议"的结论对 P3+（组协调、acks=all 承诺）依然有效。
 
 ### 差距盘点：引擎级 vs 协议级
 对齐"一个可用的 MQ"所缺的能力，**全部是引擎级缺口，没有一个能靠换协议解决**：

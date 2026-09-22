@@ -283,6 +283,80 @@ async fn for_update_conflict_between_two_sessions() {
     node.kill_now();
 }
 
+/// Composite pk that is neither leading nor in table order
+/// (`PRIMARY KEY(c, a)` on columns (a, b, c)): the locking read must
+/// encode the pk by SCHEMA COLUMN position, so both sessions derive
+/// the same physical key for the same row -- a declaration-order
+/// pairing would latch a key nothing else ever computes (lock
+/// silently ineffective), and a non-leading pk used to overflow the
+/// compact pk-values vector outright.
+#[tokio::test]
+async fn for_update_composite_pk_non_leading_columns() {
+    let (mut node, mut a) = world("latch-cp").await;
+    ddl(
+        &mut a,
+        "CREATE TABLE latch_cp (a INT, b VARCHAR(16), c INT, PRIMARY KEY (c, a))",
+    )
+    .await;
+    a.query_drop(
+        "INSERT INTO latch_cp (a, b, c) VALUES (1, 'one', 7), (2, 'two', 8), (3, 'three', 7)",
+    )
+    .await
+    .expect("seed");
+    let mut b = connect(&node).await;
+
+    // A's locking read on a composite-pk row must answer, not error.
+    a.query_drop("BEGIN").await.expect("A begin");
+    assert_eq!(
+        one_col(
+            &mut a,
+            "SELECT b FROM latch_cp WHERE c = 7 AND a = 1 FOR UPDATE"
+        )
+        .await,
+        vec!["one"]
+    );
+
+    // B's locking read of the SAME row fails fast (1205): both sides
+    // computed the same encoded key from (c, a).
+    b.query_drop("BEGIN").await.expect("B begin");
+    let err = b
+        .query_drop("SELECT b FROM latch_cp WHERE c = 7 AND a = 1 FOR UPDATE")
+        .await
+        .expect_err("latch conflict on the latched row");
+    assert!(
+        err.to_string().contains("Lock wait timeout exceeded"),
+        "expected 1205-style error, got: {err}"
+    );
+
+    // A different composite-pk row stays free for B: lockable and
+    // writable inside its txn.
+    assert_eq!(
+        one_col(
+            &mut b,
+            "SELECT b FROM latch_cp WHERE c = 8 AND a = 2 FOR UPDATE"
+        )
+        .await,
+        vec!["two"]
+    );
+    b.query_drop("UPDATE latch_cp SET b = 'deux' WHERE c = 8 AND a = 2")
+        .await
+        .expect("B updates an unlatched row");
+
+    // COMMIT releases A's latch: B's retry now succeeds.
+    a.query_drop("COMMIT").await.expect("A commit");
+    assert_eq!(
+        one_col(
+            &mut b,
+            "SELECT b FROM latch_cp WHERE c = 7 AND a = 1 FOR UPDATE"
+        )
+        .await,
+        vec!["one"],
+        "composite-pk latch released at COMMIT"
+    );
+    b.query_drop("ROLLBACK").await.expect("B rollback");
+    node.kill_now();
+}
+
 #[tokio::test]
 async fn for_update_locks_release_on_rollback_to_savepoint() {
     let (mut node, mut a) = world("rbto-latch").await;

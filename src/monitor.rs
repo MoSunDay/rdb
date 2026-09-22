@@ -37,6 +37,8 @@ pub struct Collector {
     pub tx_events: CounterVec,
     /// Redis MULTI/EXEC: wall-clock commit (replay) latency, ms.
     pub tx_commit_latency: Histogram,
+    /// Kafka wire front: per-api request latency (labels: api).
+    pub kafka_api_latency: HistogramVec,
     registry: Registry,
 }
 
@@ -89,7 +91,7 @@ pub fn new_collector() -> Collector {
             "rdb_sql_query_latency",
             "sql statement latency(millisecond)",
         )
-        .buckets(sql_buckets),
+        .buckets(sql_buckets.clone()),
         &["kind"],
     )
     .expect("sql histogram");
@@ -100,6 +102,17 @@ pub fn new_collector() -> Collector {
         &["outcome"],
     )
     .expect("counter");
+    // Kafka front: same bucket shape as the SQL histogram keeps
+    // dashboards uniform.
+    let kafka_api_latency = HistogramVec::new(
+        HistogramOpts::new(
+            "rdb_kafka_api_latency",
+            "kafka front api latency(millisecond)",
+        )
+        .buckets(sql_buckets.clone()),
+        &["api"],
+    )
+    .expect("kafka histogram");
     let registry = Registry::new();
     registry
         .register(Box::new(latency.clone()))
@@ -125,6 +138,9 @@ pub fn new_collector() -> Collector {
     registry
         .register(Box::new(tx_commit_latency.clone()))
         .expect("reg tx_commit_latency");
+    registry
+        .register(Box::new(kafka_api_latency.clone()))
+        .expect("reg kafka_api_latency");
     for event in ["queued", "commits", "aborts", "conflicts"] {
         tx_events.with_label_values(&[event]).inc_by(0.0);
     }
@@ -155,6 +171,7 @@ pub fn new_collector() -> Collector {
         sql_query_latency,
         sql_tx_active,
         sql_tx_total,
+        kafka_api_latency,
         registry,
     }
 }
@@ -172,6 +189,11 @@ pub fn tx_event(c: &Collector, event: &str) {
 /// Redis MULTI/EXEC: observe one commit's replay latency.
 pub fn tx_commit_latency(c: &Collector, ms: f64) {
     c.tx_commit_latency.observe(ms);
+}
+
+/// Kafka wire front: observe one api's latency by name label.
+pub fn observe_kafka_latency(c: &Collector, api: &str, ms: f64) {
+    c.kafka_api_latency.with_label_values(&[api]).observe(ms);
 }
 
 /// SQL data plane: +1 / -1 in-flight transaction.

@@ -2,7 +2,9 @@
 
 /// Workload selector; `mixed` alternates set/get by op index parity, the
 /// `x*` trio drives Lite streams (`xadd` produces entries, `xreadgroup`
-/// delivers them, `xack` delivers + acks each one).
+/// delivers them, `xack` delivers + acks each one), and the `kafka-*`
+/// pair drives the kafka front (`--host`): `kafka-prod` sends Produce v2
+/// batches, `kafka-fetch` tails Fetch v4 (ops count records on both).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Workload {
     Ping,
@@ -12,6 +14,8 @@ pub enum Workload {
     Xadd,
     XReadGroup,
     Xack,
+    KafkaProd,
+    KafkaFetch,
 }
 
 impl Workload {
@@ -25,6 +29,8 @@ impl Workload {
             "xadd" => Some(Workload::Xadd),
             "xreadgroup" => Some(Workload::XReadGroup),
             "xack" => Some(Workload::Xack),
+            "kafka-prod" => Some(Workload::KafkaProd),
+            "kafka-fetch" => Some(Workload::KafkaFetch),
             _ => None,
         }
     }
@@ -38,7 +44,14 @@ impl Workload {
             Workload::Xadd => "xadd",
             Workload::XReadGroup => "xreadgroup",
             Workload::Xack => "xack",
+            Workload::KafkaProd => "kafka-prod",
+            Workload::KafkaFetch => "kafka-fetch",
         }
+    }
+
+    /// Whether the workload runs against the kafka front (`--host`).
+    pub fn is_kafka(self) -> bool {
+        matches!(self, Workload::KafkaProd | Workload::KafkaFetch)
     }
 }
 
@@ -51,6 +64,12 @@ pub struct Config {
     pub duration: u64,
     pub pipeline: usize,
     pub workload: Workload,
+    /// Kafka front address (kafka-* workloads only; empty otherwise).
+    pub host: String,
+    /// Kafka topic; `<topic>/q0` is pre-created via RESP XADD.
+    pub topic: String,
+    /// Records per Produce request (kafka-prod).
+    pub batch: usize,
 }
 
 /// Help text; latency semantics (per batch, not per command) spelled out.
@@ -67,11 +86,21 @@ pub fn usage() -> String {
         "                      sampled once per batch RTT, so with pipeline > 1",
         "                      rtt_ms stats are per batch, not per command",
         "  --workload <w>       ping | set | get | mixed | xadd | xreadgroup |",
-        "                      xack (default mixed); mixed alternates set/get",
-        "                      by op index parity; the x* workloads drive Lite",
-        "                      streams bench_<client>/c as producer (xadd) and",
-        "                      consumers (xreadgroup deliver-only, xack pairs a",
-        "                      deliver with an ack, counting 2 ops per pair)",
+        "                      xack | kafka-prod | kafka-fetch (default mixed);",
+        "                      mixed alternates set/get by op index parity; the",
+        "                      x* workloads drive Lite streams bench_<client>/c",
+        "                      as producer (xadd) and consumers (xreadgroup",
+        "                      deliver-only, xack pairs a deliver with an ack,",
+        "                      counting 2 ops per pair); the kafka-* workloads",
+        "                      drive the kafka front on --host (kafka-prod sends",
+        "                      Produce v2 batches, kafka-fetch tails Fetch v4;",
+        "                      ops count records on both)",
+        "  --host <host:port>   kafka front address (required for kafka-*)",
+        "  --topic <name>       kafka topic, pre-created as <topic>/q0 via a",
+        "                      RESP XADD seed before kafka-* runs (default",
+        "                      bench1)",
+        "  --batch <n>          records per Produce request (kafka-prod only,",
+        "                      default 100)",
         "",
         "exit codes: 0 = ok, 1 = server error replies (e.g. -MOVED), 2 = bad usage",
     ]
@@ -107,18 +136,18 @@ fn parse_count(raw: &str, name: &str) -> Result<usize, String> {
 }
 
 /// Light `host:port` shape check (connect failures surface later anyway).
-fn validate_addr(addr: &str) -> Result<(), String> {
-    let (host, port) = addr
+fn validate_hostport(value: &str, flag: &str) -> Result<(), String> {
+    let (host, port) = value
         .rsplit_once(':')
-        .ok_or_else(|| format!("--addr must be host:port, got '{addr}'"))?;
+        .ok_or_else(|| format!("{flag} must be host:port, got '{value}'"))?;
     if host.is_empty() {
-        return Err(format!("empty host in --addr '{addr}'"));
+        return Err(format!("empty host in {flag} '{value}'"));
     }
     let port: u16 = port
         .parse()
-        .map_err(|_| format!("bad port in --addr '{addr}'"))?;
+        .map_err(|_| format!("bad port in {flag} '{value}'"))?;
     if port == 0 {
-        return Err(format!("port 0 not allowed in --addr '{addr}'"));
+        return Err(format!("port 0 not allowed in {flag} '{value}'"));
     }
     Ok(())
 }
@@ -132,6 +161,9 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut duration: Option<usize> = None;
     let mut pipeline: Option<usize> = None;
     let mut workload: Option<Workload> = None;
+    let mut host: Option<String> = None;
+    let mut topic: Option<String> = None;
+    let mut batch: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -152,10 +184,17 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
             "--pipeline" => {
                 pipeline = Some(parse_count(&flag_value(args, &mut i, name, inline)?, name)?)
             }
+            "--host" => host = Some(flag_value(args, &mut i, name, inline)?),
+            "--topic" => topic = Some(flag_value(args, &mut i, name, inline)?),
+            "--batch" => {
+                batch = Some(parse_count(&flag_value(args, &mut i, name, inline)?, name)?)
+            }
             "--workload" => {
                 let raw = flag_value(args, &mut i, name, inline)?;
                 workload = Some(Workload::parse(&raw).ok_or_else(|| {
-                    format!("unknown workload '{raw}' (ping|set|get|mixed|xadd|xreadgroup|xack)")
+                    format!(
+                        "unknown workload '{raw}' (ping|set|get|mixed|xadd|xreadgroup|xack|kafka-prod|kafka-fetch)"
+                    )
                 })?);
             }
             other => return Err(format!("unknown argument '{other}'")),
@@ -164,10 +203,27 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
     }
 
     let addr = addr.ok_or("missing required --addr")?;
-    validate_addr(&addr)?;
+    validate_hostport(&addr, "--addr")?;
     let token = token.ok_or("missing required --token")?;
     if token.is_empty() {
         return Err("--token must not be empty".to_string());
+    }
+    let workload = workload.unwrap_or(Workload::Mixed);
+    // Kafka flags exist only for the kafka-* workloads; the workload
+    // itself exists only with --host (the kafka front address).
+    let host = if workload.is_kafka() {
+        let host = host.ok_or("kafka-* workloads need --host <kafka host:port>")?;
+        validate_hostport(&host, "--host")?;
+        host
+    } else {
+        if host.is_some() || topic.is_some() || batch.is_some() {
+            return Err("--host/--topic/--batch only apply to kafka-* workloads".to_string());
+        }
+        String::new()
+    };
+    let topic = topic.unwrap_or_else(|| "bench1".to_string());
+    if topic.is_empty() {
+        return Err("--topic must not be empty".to_string());
     }
     Ok(Config {
         addr,
@@ -175,7 +231,10 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
         clients: clients.unwrap_or(16),
         duration: duration.unwrap_or(10) as u64,
         pipeline: pipeline.unwrap_or(1),
-        workload: workload.unwrap_or(Workload::Mixed),
+        workload,
+        host,
+        topic,
+        batch: batch.unwrap_or(100),
     })
 }
 
@@ -223,6 +282,55 @@ mod tests {
             Ok(_) => panic!("expected unknown-workload error"),
         };
         assert!(err.contains("xadd|xreadgroup|xack"), "{err}");
+    }
+
+    #[test]
+    fn parses_kafka_workloads_and_flags() {
+        let cfg = parse_args(&argv(&[
+            "--addr",
+            "h:1",
+            "--token",
+            "t",
+            "--host",
+            "k:9092",
+            "--workload",
+            "kafka-prod",
+            "--topic",
+            "tp",
+            "--batch",
+            "7",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.workload, Workload::KafkaProd);
+        assert!(cfg.workload.is_kafka());
+        assert_eq!((cfg.host.as_str(), cfg.topic.as_str(), cfg.batch), ("k:9092", "tp", 7));
+        // Defaults: topic bench1, batch 100 records per request.
+        let cfg = parse_args(&argv(&[
+            "--addr=h:1",
+            "--token=t",
+            "--host=k:2",
+            "--workload=kafka-fetch",
+        ]))
+        .expect("parse");
+        assert_eq!(cfg.workload.as_str(), "kafka-fetch");
+        assert_eq!((cfg.topic.as_str(), cfg.batch), ("bench1", 100));
+        assert!(!Workload::Mixed.is_kafka());
+    }
+
+    #[test]
+    fn kafka_flags_are_gated() {
+        for bad in [
+            // kafka workload without --host
+            argv(&["--addr", "h:1", "--token", "t", "--workload", "kafka-prod"]),
+            // kafka workload with a malformed --host
+            argv(&["--addr", "h:1", "--token", "t", "--host", "nohost", "--workload", "kafka-fetch"]),
+            // kafka flags on a RESP workload
+            argv(&["--addr", "h:1", "--token", "t", "--host", "k:2"]),
+            argv(&["--addr", "h:1", "--token", "t", "--topic", "t1"]),
+            argv(&["--addr", "h:1", "--token", "t", "--batch", "10"]),
+        ] {
+            assert!(parse_args(&bad).is_err(), "expected failure: {bad:?}");
+        }
     }
 
     #[test]

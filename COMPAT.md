@@ -207,14 +207,24 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     auto-picks a queue.
   - Physical slot prefix is derived from the PARENT topic name (CRC16), so all queues of a
     topic family co-locate and any node serves the family (all Lite verbs route-local).
-  - Kafka wire-protocol compatibility was evaluated and explicitly rejected for now: every
-    current MQ gap is engine-level (a protocol swap solves none), a full compat surface is
-    11 wire APIs + an embedded group coordinator + RecordBatch v2 + 4 codecs (months of
-    work), and half-compat would be a trust trap — Kafka clients expect acks=all/ISR/
-    idempotence/transactions over a data plane that is node-local and non-replicated
-    (plain KV included). Engine first; a future optional `kafka front` adapter could map
-    parent/child to topic/partition the way a sql/front would for MySQL. Decision record
-    and living Lite-MQ spec: [features/mq-lite.md](../features/mq-lite.md).
+  - Kafka wire-protocol compatibility was evaluated and rejected in the first pass (every
+    current MQ gap is engine-level, and half-compat is a trust trap — Kafka clients expect
+    acks=all/ISR/idempotence/transactions over a data plane that is node-local and
+    non-replicated, plain KV included). Decision reversed 2026-09: the front landed in
+    stages as a protocol adapter mapping parent/child to topic/partition exactly the way
+    a sql/front does for MySQL — see the next bullet. Decision record and living Lite-MQ
+    spec: [features/mq-lite.md](../features/mq-lite.md).
+- **Kafka wire frontend (`kafka_bind`, rdb extension)**: 13 wire APIs over the same Lite
+  engine — topic=parent stream, partition=child `p<N>`/`q<N>` queue, offset=ACTIVE-entry
+  ordinal (not a physical offset), committed offsets in a separate kind-0x20 ledger.
+  Single broker: Metadata always returns one node; acks=all = one synchronous fsync (no
+  ISR/replicas). Compression is rejected by default (error 76); the optional
+  `kafka-codecs` feature enables produce-side gzip/snappy/lz4 (fetch is never compressed;
+  zstd unsupported). The group coordinator is in-memory (restart = clients rejoin,
+  committed offsets persist); assignment comes from the consumer leader (standard broker
+  behavior). `kafka_advertised_host/port` override the advertised listener (wildcard
+  binds would otherwise advertise localhost); `kafka_max_connections` caps front
+  connections (0 = 4096). Spec: [features/kafka-front.md](../features/kafka-front.md).
 - **JSON (P3, json.* verbs)**: single-record storage — one kind-0x10 record per key holds the
   whole document (LEB128 expire envelope + compact serde_json body, `preserve_order` keeps
   object key insertion order like Redis). Every mutation deserializes, mutates and re-serializes
@@ -511,7 +521,9 @@ contract; module map lives in `agents/rust/sql.md`.
   the coarser scale, `*` multiplies mantissae and adds scales, `%` aligns, all checked
   (overflow is loud); `/` is MySQL-style long division — quotient at dividend
   scale+4 (`div_precision_increment=4`), remainder rounded half away from zero; any
-  DOUBLE operand coarsens the whole expression to double. Decimal/Decimal (cross-scale)
+  DOUBLE operand coarsens the whole expression to double. `Int / Int` stays INTEGER
+  division — MySQL's `/` returns a decimal quotient (known divergence, listed with the
+  SQL dataplane limitations); a decimal quotient needs a DECIMAL operand on either side. Decimal/Decimal (cross-scale)
   and Decimal/Int comparisons are exact in i128; comparisons against DOUBLE/strings go
   through f64/parse (explicit downgrade). `SUM(decimal)` stays DECIMAL at the column
   scale; `AVG` divides the exact sum at scale+4 — `AVG(int)` types as DECIMAL(38,4),
@@ -692,6 +704,68 @@ slot sharding (see deviations).
     M2-era caveat ordinary cross-node UPDATEs already carry, so secondaries/unique entries
     plus cross-coordinator replace recency stay follow-up work (composite keys themselves
     landed in the W2 batch; multi-column tuples ride the same caveat, not a new one).
+
+## Elasticsearch-compatible frontend (Rust-only)
+
+An ES-style HTTP/JSON frontend (`es_bind`, optional `es_token` Bearer auth) exposes the SAME
+search kernel as the FT.* commands (see "Full-text + vector search" above). It is a protocol
+adapter, not an ES clone; the deviations below are the contract.
+
+- **Indexing model**: one index = one user key = one slot — the index NAME is the storage key,
+  so hash-tag it (`{books}`) to colocate an index with its docs on one node. No shards,
+  replicas, settings, aliases or index templates exist. A request naming a slot this node does
+  not own is NOT proxied or redirected: it fails with HTTP 400 `routing_exception` naming the
+  owning node (the HTTP analogue of RESP's MOVED; cross-cluster access is client fan-out).
+- **Concurrency/versioning**: `_version` is always 1 and `_seq_no`/`_primary_term` always
+  0/1 — there is no optimistic concurrency control (`?if_seq_no` etc. ignored; `op_type=create`
+  on an existing id still 409s).
+- **Refresh semantics**: `_refresh` is a no-op returning success (reads are realtime); the
+  `?refresh` query parameter is ignored.
+- **`match` operator default is `or`**: multi-term `match` unions the per-term postings and
+  sums BM25, whereas FT.SEARCH query strings AND their terms. `match` with an empty or
+  whitespace-only query matches nothing.
+- **Term semantics**: keyword `term`/`terms` compare exact bytes (case-sensitive, no
+  analyzer — `Redis` != `redis`). Numeric fields accept exactly one scalar number (arrays are
+  rejected with 400). `term`/`range` on an unknown or non-numeric field match nothing (0 hits)
+  instead of erroring.
+- **knn**: exact L2 distance over the filtered candidate set, SPANN probe otherwise; score is
+  `1/(1+L2)`. `num_candidates` maps to the SPANN `nprobe = clamp(n/16, 1, 64)`. At most one
+  VECTOR field per index.
+- **Not implemented**: aggs, highlight, scroll, script_score, `minimum_should_match`, custom
+  analyzers, index templates, aliases. An unsupported `_bulk` `update` action yields a
+  per-item error inside the 200 `_bulk` envelope.
+- **sort by field** reads `_source` per hit (no doc-values); documents missing the sort field
+  sort last; `from + size` is capped at 10000 (400 beyond).
+- **Transport**: HTTP/1.1 only, one request per connection (`Connection: close`, no
+  keep-alive), Content-Length bodies only (`Transfer-Encoding: chunked` -> 501). Optional
+  `Authorization: Bearer <es_token>` when `es_token` is non-empty.
+
+## RocksMQ-compatible HTTP frontend (Rust-only)
+
+A minimal RocksMQ-style HTTP/1.1 message frontend (`rocksmq_bind`, unauthenticated, reuses
+the hand-rolled HTTP of the ES front) over the same Lite engine as the Kafka front — three
+POST endpoints: `/produce` (XADD; replies the Lite `<ms>-<seq>` id), `/consume` (grouped
+XREADGROUP `>`; group-less tail pull via XREVRANGE keeps no cursor — duplicates/skips are
+documented), `/ack` (XACK, idempotent 200; unknown group 404). A bare channel name maps to
+`NAME/q0`; the body is the `v` field pair, byte-identical with the Kafka front's
+keyless/headerless records, so the two fronts read each other's messages. Remaining
+deviations vs real RocksMQ (`<ms>-<seq>` ids not integer offsets, no topic create/delete/
+seek): [features/rocksmq-http.md](../features/rocksmq-http.md).
+
+## S3-compatible object-storage frontend (Rust-only)
+
+An S3-protocol frontend (`s3_bind`, optional `s3_token` Bearer auth — NOT SigV4) serves
+objects from the local filesystem (`s3_store_path`, empty falls back to `<store_path>/s3`):
+one object = one real file plus a `.s3meta.json` sidecar, written atomically (tmp + fsync +
+rename). Buckets, ListObjectsV2 (prefix/delimiter/common-prefixes, max-keys capped at 1000,
+continuation-token or v1 marker, encoding-type=url), single-range GET (206/416), always-204
+DELETE, one request per connection (chunked -> 501, 1 GiB body cap); no multipart, no
+versioning, directory-marker keys (trailing `/`) fail with InvalidArgument. RocksDB
+checkpoints are periodically published StarRocks-tablet style under
+`<bucket>/rocksdb/<node-bind>/ckpt_<unix_ms>/` (file set + a final `meta.json`, the rowset-
+meta analogue), retaining the newest `s3_checkpoint_retention` (default 2) so a backup
+instance can pull a self-consistent DB directory with any S3 client. The Go archive has no
+such frontend. Spec: [features/s3-object-storage.md](../features/s3-object-storage.md).
 
 ## Runtime verification (this tree)
 

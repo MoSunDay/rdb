@@ -42,9 +42,9 @@ pub(crate) fn index_state(store: &crate::store::Store, prefix: &[u8], index: &[u
     }
 }
 
-/// `FT.CREATE <index> SCHEMA <field> TEXT | <field> VECTOR DIM <n> ...`
-/// (SCHEMA keyword required, options case-insensitive, at least one
-/// field, one VECTOR field max at v1).
+/// `FT.CREATE <index> SCHEMA <field> TEXT | KEYWORD | NUMERIC |
+/// <field> VECTOR DIM <n> ...` (SCHEMA keyword required, options
+/// case-insensitive, at least one field, one VECTOR field max at v1).
 pub async fn ft_create(ctx: &mut Ctx<'_>) {
     if ctx.args.len() < 3 || !eq_ignore_case(&ctx.args[1], b"SCHEMA") {
         arity(ctx.out, "ft.create");
@@ -65,6 +65,16 @@ pub async fn ft_create(ctx: &mut Ctx<'_>) {
             IndexField {
                 name,
                 ftype: FieldType::Text,
+            }
+        } else if eq_ignore_case(ty, b"KEYWORD") {
+            IndexField {
+                name,
+                ftype: FieldType::Keyword,
+            }
+        } else if eq_ignore_case(ty, b"NUMERIC") {
+            IndexField {
+                name,
+                ftype: FieldType::Numeric,
             }
         } else if eq_ignore_case(ty, b"VECTOR") {
             let (Some(kw), Some(dim)) = (ctx.args.get(i), ctx.args.get(i + 1)) else {
@@ -92,7 +102,10 @@ pub async fn ft_create(ctx: &mut Ctx<'_>) {
                 ftype: FieldType::Vector { dim },
             }
         } else {
-            append_error(ctx.out, "ERR unknown field type (use TEXT or VECTOR DIM n)");
+            append_error(
+                ctx.out,
+                "ERR unknown field type (use TEXT, KEYWORD, NUMERIC or VECTOR DIM n)",
+            );
             return;
         };
         if fields.iter().any(|f| f.name == field.name) {
@@ -142,7 +155,7 @@ pub async fn ft_create(ctx: &mut Ctx<'_>) {
 
 /// Stringify one JSON value for a TEXT field: strings verbatim,
 /// numbers/bools via serde_json, everything else is a type error.
-fn text_of(v: &Value) -> Option<String> {
+pub(crate) fn text_of(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
@@ -151,8 +164,13 @@ fn text_of(v: &Value) -> Option<String> {
     }
 }
 
-/// Build the DocRecord (terms + doclen + vector) from the JSON body.
-fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> Result<DocRecord, &'static str> {
+/// Build the DocRecord (terms + doclen + vector) from the JSON body,
+/// plus the (field, value) pairs of NUMERIC fields for the kind 0x19
+/// doc-value records (written by `build_add_batch`).
+pub(crate) fn doc_record_of(
+    meta: &IndexMeta,
+    body: &[u8],
+) -> Result<(DocRecord, Vec<(Vec<u8>, f64)>), &'static str> {
     let json: Value = serde_json::from_slice(body).map_err(|_| "ERR invalid JSON document")?;
     let Value::Object(map) = json else {
         return Err("ERR document must be a JSON object");
@@ -164,6 +182,7 @@ fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> Result<DocRecord, &'static st
         vector: Vec::new(),
         doc: body.to_vec(),
     };
+    let mut numvals = Vec::new();
     for f in &meta.fields {
         let name = String::from_utf8_lossy(&f.name);
         let Some(v) = map.get(name.as_ref()) else {
@@ -175,6 +194,42 @@ fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> Result<DocRecord, &'static st
                 let toks = tokenize(&text);
                 rec.doclen += toks.len() as u64;
                 bump_terms(&mut rec.terms, &f.name, toks);
+            }
+            FieldType::Keyword => {
+                // exact bytes, NO tokenize/lowercase: one term per value
+                let toks = match v {
+                    Value::String(s) => vec![s.clone()],
+                    Value::Number(n) => vec![n.to_string()],
+                    Value::Bool(b) => vec![b.to_string()],
+                    Value::Array(items) => {
+                        let mut vals = Vec::with_capacity(items.len());
+                        for it in items {
+                            let s = match it {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                _ => {
+                                    return Err(
+                                        "ERR keyword field must be a string or array of strings"
+                                    )
+                                }
+                            };
+                            vals.push(s);
+                        }
+                        vals
+                    }
+                    _ => return Err("ERR keyword field must be a string or array of strings"),
+                };
+                bump_terms(&mut rec.terms, &f.name, toks);
+            }
+            FieldType::Numeric => {
+                let v = v
+                    .as_f64()
+                    .ok_or("ERR numeric field must be a JSON number")?;
+                if !v.is_finite() {
+                    return Err("ERR numeric field must be a JSON number");
+                }
+                numvals.push((f.name.clone(), v));
             }
             FieldType::Vector { dim } => {
                 let Value::Array(items) = v else {
@@ -192,7 +247,7 @@ fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> Result<DocRecord, &'static st
             }
         }
     }
-    Ok(rec)
+    Ok((rec, numvals))
 }
 
 /// Fold tokens into the (field, term, tf) list (order-preserving merge
@@ -241,7 +296,7 @@ pub async fn ft_add(ctx: &mut Ctx<'_>) {
         }
         IndexState::Present(m) => m,
     };
-    let rec = match doc_record_of(&meta, &body) {
+    let (rec, numvals) = match doc_record_of(&meta, &body) {
         Ok(r) => r,
         Err(e) => {
             append_error(ctx.out, e);
@@ -255,6 +310,7 @@ pub async fn ft_add(ctx: &mut Ctx<'_>) {
         &meta,
         &docid,
         rec,
+        &numvals,
     ) {
         Ok(batch) => match ctx.commit(batch).await {
             Ok(()) => append_int(ctx.out, 1),

@@ -218,7 +218,7 @@ fn run_knn(
 ) -> Result<Vec<Hit>, String> {
     let Some((vfield, dim)) = meta.fields.iter().find_map(|f| match &f.ftype {
         FieldType::Vector { dim } => Some((f.name.clone(), dim)),
-        FieldType::Text => None,
+        FieldType::Text | FieldType::Keyword | FieldType::Numeric => None,
     }) else {
         return Err("ERR index has no VECTOR field".to_string());
     };
@@ -284,6 +284,14 @@ pub(super) fn reply_info(
                 append_bulk_string(out, "TEXT");
                 append_int(out, 0);
             }
+            FieldType::Keyword => {
+                append_bulk_string(out, "KEYWORD");
+                append_int(out, 0);
+            }
+            FieldType::Numeric => {
+                append_bulk_string(out, "NUMERIC");
+                append_int(out, 0);
+            }
             FieldType::Vector { dim } => {
                 append_bulk_string(out, "VECTOR");
                 append_int(out, *dim as i64);
@@ -302,7 +310,7 @@ pub(super) fn reply_info(
 fn ann_built(store: &Store, prefix: &[u8], index: &[u8], meta: &IndexMeta) -> (i64, i64) {
     let Some((field, _)) = meta.fields.iter().find_map(|f| match &f.ftype {
         FieldType::Vector { dim } => Some((f.name.clone(), dim)),
-        FieldType::Text => None,
+        FieldType::Text | FieldType::Keyword | FieldType::Numeric => None,
     }) else {
         return (0, 0);
     };

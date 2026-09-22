@@ -18,7 +18,7 @@ const MAX_SAMPLES_PER_CLIENT: usize = 500_000;
 
 /// 64-byte SET value: a 16-hex-digit op counter plus filler, so the payload
 /// differs on every op while staying fixed size.
-fn set_value(op_index: u64, out: &mut String) {
+pub(crate) fn set_value(op_index: u64, out: &mut String) {
     out.clear();
     out.push_str(&format!("{:0width$x}", op_index, width = VALUE_COUNTER_LEN));
     for _ in 0..(VALUE_LEN - VALUE_COUNTER_LEN) {
@@ -83,6 +83,10 @@ fn append_op(
         // The ack id only exists in the deliver reply, so xack runs its
         // own dependent round trip (see `xack_round`), never a batch.
         Workload::Xack => unreachable!("xack is never batched"),
+        // The kafka workloads have their own client loops (kafka.rs).
+        Workload::KafkaProd | Workload::KafkaFetch => {
+            unreachable!("kafka workloads use the kafka client")
+        }
         Workload::Mixed => unreachable!("op_kind never returns Mixed"),
     }
 }
@@ -92,9 +96,13 @@ pub struct ClientStats {
     /// Batch RTT samples in ms (subsampled once the cap is hit).
     pub samples: Vec<f64>,
     /// Completed commands (every reply read counts, errors included).
+    /// The kafka-* workloads count RECORDS, not requests.
     pub ops: u64,
-    /// Replies that started with `-` (e.g. -MOVED / -ERR).
+    /// Replies that started with `-` (e.g. -MOVED / -ERR) or carried a
+    /// nonzero kafka error code.
     pub errors: u64,
+    /// Record payload bytes produced/fetched (kafka-* workloads).
+    pub bytes: u64,
     /// First error reply text, kept for the stderr diagnostic.
     pub first_error: Option<String>,
 }
@@ -104,7 +112,7 @@ pub struct ClientStats {
 /// every `(len/CAP + 1)`-th sample is kept (the stride grows with the
 /// stored length, bounding memory; percentile accuracy degrades slightly
 /// while ops/errors counters stay exact).
-fn push_sample(samples: &mut Vec<f64>, seq: &mut u64, ms: f64) {
+pub(crate) fn push_sample(samples: &mut Vec<f64>, seq: &mut u64, ms: f64) {
     let len = samples.len();
     if len < MAX_SAMPLES_PER_CLIENT {
         samples.push(ms);
@@ -139,6 +147,7 @@ pub async fn run_client(
         samples: Vec::with_capacity(4096),
         ops: 0,
         errors: 0,
+        bytes: 0,
         first_error: None,
     };
     let mut seq: u64 = 0;

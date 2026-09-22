@@ -166,6 +166,11 @@ pub fn lock_matched(
         // Latches key the row's physical pk (all pk columns of a
         // composite key, in pk order). Sides that cannot resolve every
         // pk column (derived relations) carry no row-store key.
+        // `pk_idx` and `pk_offsets` walk `schema.pk` in the same
+        // declaration order: the k-th pk column is `pk_idx[k]` in the
+        // schema's column order and `pk_offsets[k]` in the compact
+        // row's layout.
+        let pk_idx = schema.pk_indices();
         let pk_offsets: Vec<usize> = schema
             .pk
             .iter()
@@ -180,8 +185,17 @@ pub fn lock_matched(
             continue;
         }
         for row in &matched {
-            let values: Vec<Value> = pk_offsets.iter().map(|&i| row[i].clone()).collect();
-            let pk = row::pk_encode_row(&schema, &values).map_err(SqlError::from)?;
+            // `pk_encode_row` indexes `values` by SCHEMA COLUMN
+            // position (`pk_indices`), so the pk values gathered in
+            // pk-declaration order must be scattered into a
+            // full-width, schema-column-indexed vector first.
+            // Non-pk slots stay `Null` placeholders that
+            // `pk_encode_row` never reads.
+            let mut by_col = vec![Value::Null; schema.columns.len()];
+            for (k, &off) in pk_offsets.iter().enumerate() {
+                by_col[pk_idx[k]] = row[off].clone();
+            }
+            let pk = row::pk_encode_row(&schema, &by_col).map_err(SqlError::from)?;
             keys.insert((schema.id, pk));
         }
     }
