@@ -62,18 +62,24 @@ fn contents(meta: &ObjectMeta, enc: bool) -> String {
     )
 }
 
+/// Inputs of one `GET /{bucket}` list reply (data carrier, not a
+/// positional 10-arg call).
+pub struct ListArgs<'a> {
+    pub bucket: &'a str,
+    pub prefix: &'a str,
+    pub delimiter: &'a str,
+    pub max_keys: usize,
+    pub is_truncated: bool,
+    pub objects: &'a [ObjectMeta],
+    pub common_prefixes: &'a [String],
+    pub next_token: Option<&'a str>,
+    pub encoded: bool,
+    pub v1: bool,
+}
+
 /// GET /<bucket> (ListObjectsV2 / v1 list) response.
-pub fn list_bucket_result(
-    bucket: &str,
-    prefix: &str,
-    delimiter: &str,
-    max_keys: usize,
-    is_truncated: bool,
-    objects: &[ObjectMeta],
-    common_prefixes: &[String],
-    next_token: Option<&str>,
-    encoded: bool,
-) -> String {
+pub fn list_bucket_result(a: &ListArgs) -> String {
+    let ListArgs { bucket, prefix, delimiter, max_keys, is_truncated, objects, common_prefixes, next_token, encoded, v1 } = *a;
     let enc = |s: &str| if encoded { percent_encode_component(s) } else { escape(s) };
     let mut out = format!("{XML_DECL}<ListBucketResult xmlns=\"{NS}\">");
     out.push_str(&format!("<Name>{}</Name>", escape(bucket)));
@@ -85,15 +91,20 @@ pub fn list_bucket_result(
         out.push_str("<EncodingType>url</EncodingType>");
     }
     out.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    // KeyCount = keys + folded prefixes returned on THIS page.
+    out.push_str(&format!("<KeyCount>{}</KeyCount>", objects.len() + common_prefixes.len()));
     out.push_str(&format!(
         "<IsTruncated>{}</IsTruncated>",
         if is_truncated { "true" } else { "false" }
     ));
     if let (Some(tok), true) = (next_token, is_truncated) {
-        out.push_str(&format!(
-            "<NextContinuationToken>{}</NextContinuationToken>",
-            percent_encode_component(tok)
-        ));
+        let enc_tok = percent_encode_component(tok);
+        if v1 {
+            // v1 pages with marker/NextMarker instead of a token.
+            out.push_str(&format!("<NextMarker>{enc_tok}</NextMarker>"));
+        } else {
+            out.push_str(&format!("<NextContinuationToken>{enc_tok}</NextContinuationToken>"));
+        }
     }
     for meta in objects {
         out.push_str(&contents(meta, encoded));
@@ -145,20 +156,22 @@ mod tests {
             last_modified_ms: 1_789_450_496_789,
             content_type: "text/plain".to_string(),
         }];
-        let doc = list_bucket_result(
-            "bkt",
-            "dir/",
-            "/",
-            100,
-            true,
-            &objects,
-            &["dirx/".to_string()],
-            Some("dirx/"),
-            false,
-        );
+        let doc = list_bucket_result(&ListArgs {
+            bucket: "bkt",
+            prefix: "dir/",
+            delimiter: "/",
+            max_keys: 100,
+            is_truncated: true,
+            objects: &objects,
+            common_prefixes: &["dirx/".to_string()],
+            next_token: Some("dirx/"),
+            encoded: false,
+            v1: false,
+        });
         assert!(doc.contains("<Name>bkt</Name><Prefix>dir/</Prefix><Delimiter>/</Delimiter>"));
-        assert!(doc.contains("<MaxKeys>100</MaxKeys><IsTruncated>true</IsTruncated>"));
+        assert!(doc.contains("<MaxKeys>100</MaxKeys><KeyCount>2</KeyCount><IsTruncated>true</IsTruncated>"));
         assert!(doc.contains("<NextContinuationToken>dirx/</NextContinuationToken>"));
+        assert!(!doc.contains("<NextMarker>"));
         assert!(doc.contains("<Contents><Key>dir/1.txt</Key>"));
         assert!(doc.contains("<LastModified>2026-09-15T05:34:56.789Z</LastModified>"));
         assert!(doc.contains("<ETag>&quot;abc&quot;</ETag><Size>3</Size>"));
@@ -166,19 +179,39 @@ mod tests {
         assert!(doc.contains("<CommonPrefixes><Prefix>dirx/</Prefix></CommonPrefixes>"));
         assert!(!doc.contains("<EncodingType>"));
         // encoding-type=url percent-encodes keys/prefixes
-        let enc = list_bucket_result(
-            "bkt",
-            "a b/",
-            "",
-            10,
-            false,
-            &[],
-            &[],
-            None,
-            true,
-        );
+        let enc = list_bucket_result(&ListArgs {
+            bucket: "bkt",
+            prefix: "a b/",
+            delimiter: "",
+            max_keys: 10,
+            is_truncated: false,
+            objects: &[],
+            common_prefixes: &[],
+            next_token: None,
+            encoded: true,
+            v1: true,
+        });
         assert!(enc.contains("<EncodingType>url</EncodingType>"));
         assert!(enc.contains("<Prefix>a%20b/</Prefix>"));
+    }
+
+    #[test]
+    fn v1_pages_with_next_marker() {
+        let doc = list_bucket_result(&ListArgs {
+            bucket: "bkt",
+            prefix: "",
+            delimiter: "/",
+            max_keys: 1,
+            is_truncated: true,
+            objects: &[],
+            common_prefixes: &["d/".to_string()],
+            next_token: Some("d/"),
+            encoded: false,
+            v1: true,
+        });
+        assert!(doc.contains("<KeyCount>1</KeyCount>"));
+        assert!(doc.contains("<NextMarker>d/</NextMarker>"));
+        assert!(!doc.contains("<NextContinuationToken>"));
     }
 
     #[test]

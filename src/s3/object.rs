@@ -102,11 +102,20 @@ pub fn bucket_exists(store: &ObjectStore, bucket: &str) -> bool {
     bucket_path(store, bucket).is_some_and(|p| p.is_dir())
 }
 
-/// Delete a bucket; only an EMPTY one (the caller checks first --
-/// `remove_dir` refusing a non-empty dir is the second line of
-/// defense).
+/// Delete a bucket. Refuses with `InvalidInput` while any object
+/// remains (the router 409s first; this is the second line of
+/// defense), then sweeps the whole tree: leftover EMPTY directories
+/// (nested-key deletes prune those, but a crash mid-PUT can leave
+/// them), stray sidecars and staging files go with it -- an
+/// object-free bucket is always deletable, never a 500 ENOTEMPTY.
 pub fn delete_bucket(store: &ObjectStore, bucket: &str) -> io::Result<()> {
-    fs::remove_dir(bucket_path(store, bucket).ok_or_else(|| invalid("invalid bucket name"))?)
+    let root = bucket_path(store, bucket).ok_or_else(|| invalid("invalid bucket name"))?;
+    let mut keys = Vec::new();
+    walk(&root, "", &mut keys)?;
+    if !keys.is_empty() {
+        return Err(invalid("bucket not empty"));
+    }
+    fs::remove_dir_all(&root)
 }
 
 /// All bucket names (first-level directories, `.`-prefixed skipped).
@@ -227,13 +236,31 @@ pub fn head(store: &ObjectStore, bucket: &str, key: &str) -> Option<ObjectMeta> 
 }
 
 /// Delete an object and its sidecar; `true` when the object existed.
+/// Directories left empty by the delete are pruned back to (but never
+/// including) the bucket root, so an emptied bucket stays deletable.
 pub fn delete(store: &ObjectStore, bucket: &str, key: &str) -> bool {
     let Some(path) = object_path(store, bucket, key) else {
         return false;
     };
     let existed = fs::remove_file(&path).is_ok();
     let _ = fs::remove_file(sidecar_path(&path)); // best-effort
+    if existed {
+        prune_empty_dirs(&store.root.join(bucket), &path);
+    }
     existed
+}
+
+/// Remove `file`'s now-empty ancestor directories up to `root`
+/// (`remove_dir` only succeeds on an empty dir, so this can never
+/// drop a directory that still holds an object).
+fn prune_empty_dirs(root: &Path, file: &Path) {
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        if d == root || fs::remove_dir(d).is_err() {
+            return;
+        }
+        dir = d.parent();
+    }
 }
 
 /// Recursively collect relative keys: skip `.`-prefixed entries and
@@ -396,5 +423,27 @@ mod tests {
         let meta = head(&s, "b", "raw.bin").expect("fallback head");
         assert_eq!(meta.content_type, "application/octet-stream");
         assert!(meta.etag.starts_with("\"3-"));
+    }
+
+    #[test]
+    fn emptied_bucket_deletes_despite_dir_leftovers() {
+        let (dir, s) = store();
+        create_bucket(&s, "b").expect("create");
+        put(&s, "b", "x/y/z.bin", b"v");
+        assert!(delete(&s, "b", "x/y/z.bin"));
+        // empty parents were pruned: only the bucket dir remains
+        assert!(!dir.path().join("b/x").exists());
+        delete_bucket(&s, "b").expect("emptied bucket deletes");
+        assert!(!dir.path().join("b").exists());
+        // crash-style leftovers (empty dir tree + stray sidecar, no
+        // objects) are swept away with the tree
+        create_bucket(&s, "b").expect("recreate");
+        fs::create_dir_all(dir.path().join("b/orphan/dir")).expect("orphan dirs");
+        fs::write(dir.path().join("b/stray.s3meta.json"), "{}").expect("stray sidecar");
+        delete_bucket(&s, "b").expect("leftovers swept");
+        // a real object still refuses the delete
+        create_bucket(&s, "b").expect("recreate");
+        put(&s, "b", "keep.bin", b"v");
+        assert_eq!(delete_bucket(&s, "b").unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 }

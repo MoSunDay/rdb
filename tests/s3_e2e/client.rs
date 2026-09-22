@@ -25,7 +25,11 @@ pub(super) fn split_response(buf: &[u8]) -> (u16, String, Vec<u8>) {
 }
 
 pub(super) async fn s3(addr: &str, method: &str, target: &str, extra: &[(&str, &str)], body: &[u8]) -> (u16, String, Vec<u8>) {
-    let mut heads = format!("Authorization: Bearer {TOKEN}\r\n");
+    let mut heads = String::new();
+    // extra may carry its own Authorization (auth-focused tests)
+    if !extra.iter().any(|(n, _)| n.eq_ignore_ascii_case("authorization")) {
+        heads.push_str(&format!("Authorization: Bearer {TOKEN}\r\n"));
+    }
     for (n, v) in extra {
         heads.push_str(&format!("{n}: {v}\r\n"));
     }

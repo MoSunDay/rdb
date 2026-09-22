@@ -32,7 +32,10 @@ pub(super) fn free_addr() -> String {
     l.local_addr().expect("local_addr").to_string()
 }
 
-pub(super) fn spawn_once(dir: &str) -> Node {
+pub(super) fn spawn_once(dir: &str, s3_token: &str) -> Node {
+    // (Re)create the node dir: a failed spawn's `Node::drop` removes it,
+    // and the retry loop below comes straight back here.
+    std::fs::create_dir_all(dir).expect("create node dir");
     let (bind, raft, raft_http, monitor, http) =
         (free_addr(), free_addr(), free_addr(), free_addr(), free_addr());
     let s3root = PathBuf::from(dir).join("s3data");
@@ -40,7 +43,7 @@ pub(super) fn spawn_once(dir: &str) -> Node {
         "bind: \"{bind}\"\nstore_path: \"{dir}\"\nraft_bind_address: \"{raft}\"\n\
          raft_http_bind_address: \"{raft_http}\"\nmonitor_addr: \"{monitor}\"\n\
          raft_token: \"{TOKEN}\"\ns3_bind: \"{http}\"\ns3_store_path: \"{}\"\n\
-         s3_bucket: \"rdb\"\ns3_token: \"{TOKEN}\"\ns3_checkpoint_interval_ms: 500\n",
+         s3_bucket: \"rdb\"\ns3_token: \"{s3_token}\"\ns3_checkpoint_interval_ms: 500\n",
         s3root.display(),
     );
     let config_path = PathBuf::from(dir).join("conf.yaml");
@@ -61,18 +64,26 @@ pub(super) fn spawn_once(dir: &str) -> Node {
 }
 
 pub(super) fn spawn_s3_node(dir: &str) -> Node {
-    std::fs::create_dir_all(dir).expect("create node dir");
+    spawn_s3_node_retry(dir, TOKEN)
+}
+
+/// Same, with a caller-chosen `s3_token` (auth-edge-case tests).
+pub(super) fn spawn_s3_node_with_token(dir: &str, s3_token: &str) -> Node {
+    spawn_s3_node_retry(dir, s3_token)
+}
+
+fn spawn_s3_node_retry(dir: &str, s3_token: &str) -> Node {
     // A freed probe port can be grabbed between free_addr() and the child's
     // bind(); retry with a fresh address set when the binary exits early.
     for _ in 0..3 {
-        let mut node = spawn_once(dir);
+        let mut node = spawn_once(dir, s3_token);
         std::thread::sleep(Duration::from_millis(250));
         match node.child.try_wait() {
             Ok(Some(_)) => continue,
             _ => return node,
         }
     }
-    let mut node = spawn_once(dir);
+    let mut node = spawn_once(dir, s3_token);
     node.child.wait().expect("rdb run");
     panic!("rdb kept failing to bind; see {}", node.stderr_path.display());
 }
