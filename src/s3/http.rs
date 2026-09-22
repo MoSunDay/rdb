@@ -267,6 +267,7 @@ async fn read_head(sock: &mut TcpStream) -> Result<Option<(Head, Vec<u8>)>, Resp
     };
     let leftover = buf[end + 4..].to_vec();
     parse_head(&buf[..end]).map(|head| Some((head, leftover)))
+        .map_err(|e| error_reply(400, "BadRequest", &e, "/"))
 }
 
 /// Parsed head section (headers lowercased, content-length pre-parsed:
@@ -351,8 +352,8 @@ fn percent_decode(s: &str) -> Result<String, String> {
     while i < bytes.len() {
         match bytes[i] {
             b'%' => {
-                let hi = hex_digit(bytes.get(i + 1).copied()).ok_or("bad percent-escape")?;
-                let lo = hex_digit(bytes.get(i + 2).copied()).ok_or("bad percent-escape")?;
+                let hi = bytes.get(i + 1).copied().and_then(hex_digit).ok_or("bad percent-escape")?;
+                let lo = bytes.get(i + 2).copied().and_then(hex_digit).ok_or("bad percent-escape")?;
                 out.push(hi * 16 + lo);
                 i += 3;
             }

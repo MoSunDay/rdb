@@ -41,6 +41,8 @@ pub mod router;
 #[cfg(feature = "full")]
 pub mod rtypes;
 #[cfg(feature = "full")]
+pub mod s3;
+#[cfg(feature = "full")]
 pub mod search;
 #[cfg(feature = "full")]
 pub mod sql;

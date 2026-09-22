@@ -74,6 +74,24 @@ pub struct Config {
     /// Bearer token for the ES frontend (empty = no auth).
     #[serde(default, rename = "es_token")]
     pub es_token: String,
+    /// S3-compatible object storage HTTP front (empty = disabled).
+    #[serde(default, rename = "s3_bind")]
+    pub s3_bind: String,
+    /// Object-store root directory (empty = `<store_path>/s3`).
+    #[serde(default, rename = "s3_store_path")]
+    pub s3_store_path: String,
+    /// Published/default bucket name (empty = "rdb").
+    #[serde(default, rename = "s3_bucket")]
+    pub s3_bucket: String,
+    /// Bearer token for the S3 frontend (empty = no auth).
+    #[serde(default, rename = "s3_token")]
+    pub s3_token: String,
+    /// RocksDB checkpoint publish period in ms (0 = never publish).
+    #[serde(default, rename = "s3_checkpoint_interval_ms")]
+    pub s3_checkpoint_interval_ms: u64,
+    /// Keep the newest N checkpoints (0 = built-in default 2).
+    #[serde(default, rename = "s3_checkpoint_retention")]
+    pub s3_checkpoint_retention: u32,
     /// Node-to-node SQL RPC (sub-plans, 2PC); empty = disabled.
     #[serde(default, rename = "sql_rpc_bind")]
     pub sql_rpc_bind: String,

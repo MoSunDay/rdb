@@ -26,6 +26,7 @@
 pub mod checkpoint;
 pub mod http;
 pub mod object;
+pub mod router;
 pub mod xml;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,6 +106,45 @@ pub(crate) fn request_id() -> String {
     format!("s3-{}", &hex::encode(hasher.finalize())[..16])
 }
 
+/// Outcome of parsing one `Range` request header.
+pub(crate) enum Range {
+    /// Malformed / multi-range / non-bytes spec: serve the full object.
+    Full,
+    Part(u64, u64),
+    Unsatisfiable,
+}
+
+/// Single-span `bytes=first[-last]` / `bytes=-suffix` parsing (the
+/// only range grammar this front implements): `last` saturates to
+/// the object end, a start at/past the size is `Unsatisfiable`,
+/// anything unparsable, multi-span or inverted degrades to `Full`.
+pub(crate) fn parse_range(spec: &str, size: u64) -> Range {
+    let Some(rest) = spec.trim().strip_prefix("bytes=") else { return Range::Full };
+    if rest.contains(',') {
+        return Range::Full; // multi-range is outside the subset
+    }
+    let Some((first, last)) = rest.split_once('-') else { return Range::Full };
+    if first.is_empty() { // suffix form: the final N bytes
+        return match last.parse::<u64>() {
+            Ok(n) if n > 0 && size > 0 => Range::Part(size - n.min(size), size - 1),
+            _ => Range::Unsatisfiable,
+        };
+    }
+    let Ok(start) = first.parse::<u64>() else { return Range::Full };
+    if start >= size {
+        return Range::Unsatisfiable;
+    }
+    let end = match last.parse::<u64>() {
+        Ok(l) if !last.is_empty() => l.min(size - 1),
+        _ if last.is_empty() => size - 1,
+        _ => return Range::Full,
+    };
+    if start > end {
+        return Range::Full; // inverted span: ignore, like a malformed spec
+    }
+    Range::Part(start, end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +162,19 @@ mod tests {
         assert_eq!(iso8601_millis(1_789_450_496_789), "2026-09-15T05:34:56.789Z");
         assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
         assert_eq!(http_date(1_789_450_496), "Tue, 15 Sep 2026 05:34:56 GMT");
+    }
+
+    #[test]
+    fn range_header_single_span() {
+        assert!(matches!(parse_range("bytes=0-2", 10), Range::Part(0, 2)));
+        assert!(matches!(parse_range("bytes=5-", 10), Range::Part(5, 9)));
+        assert!(matches!(parse_range("bytes=5-99", 10), Range::Part(5, 9))); // saturate
+        assert!(matches!(parse_range("bytes=-3", 10), Range::Part(7, 9)));
+        assert!(matches!(parse_range("bytes=-99", 10), Range::Part(0, 9)));
+        assert!(matches!(parse_range("bytes=10-", 10), Range::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=0-", 0), Range::Unsatisfiable));
+        for spec in ["bytes=0-1,3-4", "items=0-2", "bytes=x-2", "bytes=5-2", "bytes"] {
+            assert!(matches!(parse_range(spec, 10), Range::Full), "{spec}");
+        }
     }
 }
