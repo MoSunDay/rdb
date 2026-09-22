@@ -1,6 +1,6 @@
 # S3 兼容对象存储前置：`src/s3/` + RocksDB checkpoint 发布（接口冻结）
 
-Commit: HEAD（规范/文档先行落地；`src/s3/` 实现与本条同批合入）
+Commit: 8823f40（规范/文档先行于 e2d4fad，实现与本条同批合入）
 
 ## 内容
 - 规范：[features/s3-object-storage.md](../../s3-object-storage.md)——本地文件

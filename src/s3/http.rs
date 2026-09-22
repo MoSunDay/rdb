@@ -146,6 +146,7 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        411 => "Length Required",
         413 => "Payload Too Large",
         416 => "Range Not Satisfiable",
         431 => "Request Header Fields Too Large",
@@ -153,6 +154,30 @@ fn reason(status: u16) -> &'static str {
         501 => "Not Implemented",
         _ => "Error",
     }
+}
+
+/// Bearer check; BOTH sides are lowercased (the scheme is
+/// case-insensitive and a mixed-case configured token must still
+/// match) -- same posture as `es/http.rs::authorized`.
+pub(crate) fn authorized(headers: &[(String, String)], token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    let expected = format!("bearer {}", token.to_ascii_lowercase());
+    headers.iter().any(|(n, v)| n == "authorization" && v.trim().to_ascii_lowercase() == expected)
+}
+
+/// Header values we are willing to store and echo back: no control
+/// bytes -- a bare CR/LF inside a stored Content-Type would split the
+/// response head on GET (response-header injection).
+pub(crate) fn valid_header_value(v: &str) -> bool {
+    !v.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+/// Strip CR/LF/NUL before a value enters the response head (defense
+/// in depth behind `valid_header_value`).
+fn sanitize_header_value(v: &str) -> String {
+    v.chars().filter(|c| *c != '\r' && *c != '\n' && *c != '\0').collect()
 }
 
 async fn handle_conn(mut sock: TcpStream, ctx: Arc<Ctx>) {
@@ -165,7 +190,23 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<Ctx>) {
     if head.headers.iter().any(|(n, _)| n == "transfer-encoding") {
         return reply_and_close(&mut sock, error_reply(501, "NotImplemented", "chunked transfer encoding is not supported", "/")).await;
     }
-    let len = if head.method == "PUT" { head.content_length.unwrap_or(0) } else { 0 };
+    // PUT is the only method with a body here and MUST carry
+    // Content-Length (chunked is refused above) -- without it we
+    // would silently store an empty object.
+    let len = if head.method == "PUT" {
+        match head.content_length {
+            Some(n) => n,
+            None => {
+                return reply_and_close(
+                    &mut sock,
+                    error_reply(411, "MissingContentLength", "PUT requires a Content-Length header", "/"),
+                )
+                .await
+            }
+        }
+    } else {
+        0
+    };
     if len > MAX_BODY_BYTES {
         return reply_and_close(&mut sock, error_reply(413, "EntityTooLarge", "request body exceeds the 1 GiB limit", "/")).await;
     }
@@ -176,18 +217,10 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<Ctx>) {
     if expects_continue && len > 0 {
         let _ = sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
     }
-    // ---- auth: non-empty token requires `Bearer <token>` (scheme
-    // case-insensitive, token verbatim; not timing-hardened, like the
-    // RESP AUTH path) ----
-    if !ctx.token.is_empty() {
-        let expected = format!("bearer {}", ctx.token);
-        let ok = head
-            .headers
-            .iter()
-            .any(|(n, v)| n == "authorization" && v.trim().to_ascii_lowercase() == expected);
-        if !ok {
-            return reply_and_close(&mut sock, error_reply(401, "AccessDenied", "missing or invalid bearer credentials", "/")).await;
-        }
+    // ---- auth: non-empty token requires `Bearer <token>` (see
+    // `authorized`; not timing-hardened, like the RESP AUTH path) ----
+    if !authorized(&head.headers, &ctx.token) {
+        return reply_and_close(&mut sock, error_reply(401, "AccessDenied", "missing or invalid bearer credentials", "/")).await;
     }
     // ---- route ----
     let rep = match build_req(&head) {
@@ -215,10 +248,14 @@ async fn write_response(sock: &mut TcpStream, rep: &Response, is_head: bool) -> 
         request_id()
     );
     if rep.status != 204 {
-        head.push_str(&format!("Content-Type: {}\r\nContent-Length: {}\r\n", rep.content_type, rep.len()));
+        head.push_str(&format!(
+            "Content-Type: {}\r\nContent-Length: {}\r\n",
+            sanitize_header_value(&rep.content_type),
+            rep.len()
+        ));
     }
     for (n, v) in &rep.headers {
-        head.push_str(&format!("{n}: {v}\r\n"));
+        head.push_str(&format!("{}: {}\r\n", sanitize_header_value(n), sanitize_header_value(v)));
     }
     head.push_str("Connection: close\r\n\r\n");
     sock.write_all(head.as_bytes()).await?;
@@ -396,5 +433,45 @@ fn hex_digit(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_matches_regardless_of_case() {
+        let hdrs = |v: &str| vec![("authorization".to_string(), v.to_string())];
+        // mixed-case configured token, client sends it verbatim
+        assert!(authorized(&hdrs("Bearer Sec-ABC-123"), "Sec-ABC-123"));
+        // client lowercases it, still fine: both sides compare lowercase
+        assert!(authorized(&hdrs("bearer sec-abc-123"), "Sec-ABC-123"));
+        assert!(authorized(&hdrs("  BEARER SEC-abc-123  "), "Sec-ABC-123"));
+        assert!(!authorized(&hdrs("Bearer nope"), "Sec-ABC-123"));
+        assert!(!authorized(&[], "Sec-ABC-123"));
+        // empty configured token = front is open
+        assert!(authorized(&[], ""));
+        assert!(authorized(&hdrs("Bearer whatever"), ""));
+    }
+
+    #[test]
+    fn header_values_with_control_bytes_are_rejected() {
+        for bad in ["a\nb", "a\rb", "a\rb\nx", "a\0b", "a\tb", "a\u{7f}b"] {
+            assert!(!valid_header_value(bad), "{bad:?}");
+        }
+        assert!(valid_header_value("text/plain; charset=utf-8"));
+        // the wire-side guard never lets a CR/LF reach the raw head
+        assert_eq!(sanitize_header_value("evil\nX-Injected: 1"), "evilX-Injected: 1");
+        assert_eq!(sanitize_header_value("clean"), "clean");
+    }
+
+    #[test]
+    fn head_parsing_carries_content_length() {
+        let head = parse_head(b"PUT /b/k HTTP/1.1\r\nHost: x\r\n\r\n").expect("parse");
+        assert!(head.content_length.is_none());
+        let head = parse_head(b"PUT /b/k HTTP/1.1\r\nContent-Length: 5\r\n\r\n").expect("parse");
+        assert_eq!(head.content_length, Some(5));
+        assert_eq!(head.headers[0], ("content-length".to_string(), "5".to_string()));
     }
 }

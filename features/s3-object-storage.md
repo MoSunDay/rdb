@@ -18,8 +18,8 @@
 ## 对象物理布局
 - 根目录 = `s3_store_path`（空回退 `<store_path>/s3`）；bucket = 根下一级真实
   目录（`s3_bucket` 空 = `rdb`）；对象 key = bucket 目录下的相对文件路径。
-- 对象 = 真实文件 `<bucket>/<key>` + 旁车 `<bucket>/<key>.s3meta.json`（大小、
-  修改时间、ETag 等）。原子写：同目录 tmp + fsync + rename，rename 落地后才对
+- 对象 = 真实文件 `<bucket>/<key>` + 旁车 `<bucket>/<key>.s3meta.json`（ETag、
+  Content-Type；大小/修改时间直接取文件 stat）。原子写：同目录 tmp + fsync + rename，rename 落地后才对
   协议面可见（对象与旁车各一段）。
 - ListObjects 遍历真实目录树（`.s3meta.json` 旁车不出现在结果里），字典序。
 
@@ -43,11 +43,11 @@ HTTP PUT（不受 1 GiB body 上限约束）。
 | 操作 | 请求 | 成功 | 语义 / 错误 |
 |---|---|---|---|
 | ListAllMyBuckets | `GET /` | 200 `ListAllMyBucketsResult` | 列根一级目录为 bucket |
-| CreateBucket | `PUT /{bucket}` | 200 | 已存在 409 `BucketAlreadyOwnedByYou`；非法名 400 |
+| CreateBucket | `PUT /{bucket}` | 200 | 已存在 409 `BucketAlreadyOwnedByYou`；非法名 400 `InvalidBucketName`（GET/HEAD/DELETE 同） |
 | HeadBucket | `HEAD /{bucket}` | 200 / 404 | 无 body |
 | DeleteBucket | `DELETE /{bucket}` | 204 | 非空 409 `BucketNotEmpty` |
 | ListObjectsV2 | `GET /{bucket}?list-type=2...` | 200 `ListBucketResult` | 参数见下；v1（无 `list-type`）走 `marker` 同语义 |
-| PutObject | `PUT /{bucket}/{key...}` | 200（带 `ETag` 头） | Content-Length 必填（chunked 501）；>1 GiB 413；key 以 `/` 结尾 400 `InvalidArgument` |
+| PutObject | `PUT /{bucket}/{key...}` | 200（带 `ETag` 头） | Content-Length 必填（缺失 411 `MissingContentLength`、chunked 501）；>1 GiB 413；key 以 `/` 结尾 400 `InvalidArgument`；Content-Type 含控制字节（CR/LF/NUL 等）400 `InvalidArgument` |
 | GetObject | `GET /{bucket}/{key...}` | 200 / 206 | `Range: bytes=a-b` 单区间 → 206 + `Content-Range`；不可满足 416 `InvalidRange` |
 | HeadObject | `HEAD /{bucket}/{key...}` | 200（`Content-Length`/`ETag`）/ 404 | 无 body |
 | DeleteObject | `DELETE /{bucket}/{key...}` | **恒 204** | 幂等：不存在也 204，无 404 分支 |
@@ -57,6 +57,8 @@ ListObjectsV2 参数（v1 `marker` 与 v2 `continuation-token` 等价，翻页�
 - `prefix`：key 前缀过滤；
 - `delimiter`：公共前缀聚合为 `CommonPrefixes`（目录视图），可与 prefix 组合；
 - `max-keys`：默认 1000，>1000 钳到 1000；
+- 回包含 `<KeyCount>`（本页 key + 公共前缀数）；v1 截断时回 `<NextMarker>`，
+  v2 回 `<NextContinuationToken>`；
 - `encoding-type=url`：key / 公共前缀值做 URL 编码回传（`<node-bind>` 含 `:`，
   外部消费建议始终带上）；
 - versioning 参数（`versionId`/`key-marker` 等）不在子集。
@@ -70,7 +72,7 @@ key 校验：不允许以 `/` 结尾（目录 marker → 400 `InvalidArgument`�
 ## 偏差清单（vs AWS S3）
 - **无 SigV4**：鉴权 = `Authorization: Bearer <s3_token>`（同 `es_token` 姿态）；
   原生签名客户端（aws-cli / SDK 默认路径）不能直连——用 curl/自定客户端，或经
-  反向代理注入 Bearer 头。
+  反向代理注入 Bearer 头。token 比较双侧小写（配置含大写字母可用）。
 - **无 multipart upload**：`POST ?uploads` / `UploadPart` /
   `CompleteMultipartUpload` 不在子集；>1 GiB 的对象无法经协议面写入（413）。
 - **无版本化**：无 version id、无 delete marker；DELETE 即删文件 + 旁车。

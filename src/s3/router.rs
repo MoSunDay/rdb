@@ -11,7 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::http::{
-    error_reply, method_not_allowed, xml_reply, Body, Ctx, Req, Response, BODY_TIMEOUT, CHUNK,
+    error_reply, method_not_allowed, valid_header_value, xml_reply, Body, Ctx, Req, Response,
+    BODY_TIMEOUT, CHUNK,
 };
 use super::object::{self, ObjectMeta};
 use super::{http_date, parse_range, xml, Range};
@@ -36,6 +37,11 @@ fn bucket_route(ctx: &Ctx, req: &Req) -> Response {
             return xml_reply(200, xml::list_all_my_buckets(&object::list_buckets(&ctx.store)));
         }
         return method_not_allowed(&resource);
+    }
+    // Malformed bucket names never reach the filesystem layer (which
+    // would surface as a 500): 400 `InvalidBucketName`, like S3.
+    if !object::valid_bucket_name(&req.bucket) {
+        return error_reply(400, "InvalidBucketName", "the specified bucket name is ill-formed", &resource);
     }
     match req.method.as_str() {
         "GET" => list_objects(ctx, req, &resource),
@@ -77,6 +83,10 @@ fn delete_bucket(ctx: &Ctx, req: &Req, resource: &str) -> Response {
     }
     match object::delete_bucket(&ctx.store, &req.bucket) {
         Ok(()) => empty_reply(204),
+        // raced with a PUT between the check and the delete: same 409
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            error_reply(409, "BucketNotEmpty", "the bucket contains objects", resource)
+        }
         Err(e) => internal(&e, resource),
     }
 }
@@ -97,6 +107,8 @@ fn list_objects(ctx: &Ctx, req: &Req, resource: &str) -> Response {
     // "first entry strictly after this key".
     let after = req.q("continuation-token").or_else(|| req.q("start-after")).or_else(|| req.q("marker")).unwrap_or("").to_string();
     let encoded = req.q("encoding-type").is_some_and(|v| v == "url");
+    // v1 flavor (no `list-type=2`) pages with `marker`/`NextMarker`.
+    let v1 = req.q("list-type") != Some("2");
     // object::list has no after-token, so page here over the FULL
     // folded listing (fine at this store's scale; keys+prefixes are
     // already byte-sorted by the walker).
@@ -120,10 +132,18 @@ fn list_objects(ctx: &Ctx, req: &Req, resource: &str) -> Response {
     }
     xml_reply(
         200,
-        xml::list_bucket_result(
-            &req.bucket, &prefix, &delimiter, max_keys, truncated, &objects, &prefixes,
-            next_after.as_deref(), encoded,
-        ),
+        xml::list_bucket_result(&xml::ListArgs {
+            bucket: &req.bucket,
+            prefix: &prefix,
+            delimiter: &delimiter,
+            max_keys,
+            is_truncated: truncated,
+            objects: &objects,
+            common_prefixes: &prefixes,
+            next_token: next_after.as_deref(),
+            encoded,
+            v1,
+        }),
     )
 }
 
@@ -187,10 +207,16 @@ async fn put_object(ctx: &Ctx, req: &Req, key: &str, sock: &mut TcpStream, lefto
         Ok(pair) => pair,
         Err(e) => return internal(&e, resource),
     };
+    // Reject control bytes up front: the stored Content-Type is
+    // echoed verbatim in GET/HEAD heads, and a bare CR/LF there would
+    // split the response (header injection).
+    let content_type = req.header("content-type").unwrap_or("application/octet-stream").to_string();
+    if !valid_header_value(&content_type) {
+        let _ = std::fs::remove_file(&tmp);
+        return error_reply(400, "InvalidArgument", "content-type must not contain control characters", resource);
+    }
     match read_body_to_file(sock, leftover, len, &tmp).await {
         Ok(etag) => {
-            let content_type =
-                req.header("content-type").unwrap_or("application/octet-stream").to_string();
             match object::commit(&final_path, &tmp, &etag, &content_type) {
                 Ok(()) => Response {
                     status: 200,

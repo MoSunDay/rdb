@@ -4,7 +4,7 @@ mod client;
 mod fixture;
 
 use client::{all_tags, put, s3, split_response, xml_text};
-use fixture::{dir_for, spawn_s3_node, wait_accepting};
+use fixture::{dir_for, spawn_s3_node, spawn_s3_node_with_token, wait_accepting};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -226,4 +226,106 @@ async fn list_buckets_root() {
     assert_eq!(s, 200, "{doc}");
     assert!(doc.contains("<ListAllMyBucketsResult"), "{doc}");
     assert!(doc.contains("<Name>rdb</Name>"), "buckets: {doc}");
+}
+
+#[tokio::test]
+async fn mixed_case_token_authenticates() {
+    let mut node = spawn_s3_node_with_token(&dir_for("authcase"), "Sec-ABC-xyz-Mixed-Case");
+    let http = node.http.clone();
+    wait_accepting(&mut node, &http, "s3 http").await;
+    // verbatim mixed-case credential: the pre-fix code 401'd this forever
+    let (s, _, _) = s3(&http, "GET", "/", &[("Authorization", "Bearer Sec-ABC-xyz-Mixed-Case")], b"").await;
+    assert_eq!(s, 200, "verbatim mixed-case token must authenticate");
+    // client lowercases the same credential: still fine
+    let (s, _, _) = s3(&http, "GET", "/", &[("Authorization", "Bearer sec-abc-xyz-mixed-case")], b"").await;
+    assert_eq!(s, 200, "lowercased token must authenticate");
+    // near-miss token stays rejected
+    let (s, _, _) = s3(&http, "GET", "/", &[("Authorization", "Bearer sec-abc-xyz-mixed-caseX")], b"").await;
+    assert_eq!(s, 401);
+}
+
+#[tokio::test]
+async fn invalid_bucket_name_maps_to_400() {
+    let mut node = spawn_s3_node(&dir_for("badbucket"));
+    let http = node.http.clone();
+    wait_accepting(&mut node, &http, "s3 http").await;
+    for method in ["PUT", "DELETE", "GET", "HEAD"] {
+        let (s, _, body) = s3(&http, method, "/Bad_Name", &[], b"").await;
+        assert_eq!(s, 400, "{method} on an ill-formed bucket name");
+        // HEAD suppresses the body (headers only); the status carries the verdict
+        if method != "HEAD" {
+            assert!(body.windows(17).any(|w| w == b"InvalidBucketName"), "{}", String::from_utf8_lossy(&body));
+        }
+    }
+}
+
+#[tokio::test]
+async fn emptied_bucket_deletes_after_nested_keys() {
+    let mut node = spawn_s3_node(&dir_for("bucketdel"));
+    let http = node.http.clone();
+    wait_accepting(&mut node, &http, "s3 http").await;
+    for k in ["deep/nested/a.bin", "deep/nested/b.bin"] {
+        let (s, head, _) = put(&node, k, b"v").await;
+        assert_eq!(s, 200, "{head:?}");
+    }
+    // objects still present -> 409
+    let (s, _, _) = s3(&http, "DELETE", "/rdb", &[], b"").await;
+    assert_eq!(s, 409);
+    for k in ["deep/nested/a.bin", "deep/nested/b.bin"] {
+        let (s, _, _) = s3(&http, "DELETE", &format!("/rdb/{k}"), &[], b"").await;
+        assert_eq!(s, 204);
+    }
+    // all objects gone: the empty-dir leftover must NOT 500 anymore
+    let (s, head, _) = s3(&http, "DELETE", "/rdb", &[], b"").await;
+    assert_eq!(s, 204, "{head:?}");
+    let (s, _, _) = s3(&http, "HEAD", "/rdb", &[], b"").await;
+    assert_eq!(s, 404);
+}
+
+#[tokio::test]
+async fn list_and_put_hardening() {
+    let mut node = spawn_s3_node(&dir_for("keycount"));
+    let http = node.http.clone();
+    wait_accepting(&mut node, &http, "s3 http").await;
+    for k in ["d/1", "d/2", "e"] {
+        let (s, _, _) = put(&node, k, b"x").await;
+        assert_eq!(s, 200);
+    }
+    // v2: KeyCount counts folded entries; no NextMarker in v2 replies
+    let (s, _, body) = s3(&http, "GET", "/rdb?list-type=2&delimiter=/&max-keys=1", &[], b"").await;
+    let doc = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(s, 200, "{doc}");
+    assert!(doc.contains("<KeyCount>1</KeyCount>"), "{doc}");
+    assert!(doc.contains("<IsTruncated>true</IsTruncated>"), "{doc}");
+    assert!(!doc.contains("<NextMarker>"), "{doc}");
+    // v1: NextMarker instead of a continuation token, and it pages
+    let (s, _, body) = s3(&http, "GET", "/rdb?delimiter=/&max-keys=1", &[], b"").await;
+    let doc = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(s, 200, "{doc}");
+    assert_eq!(xml_text(&doc, "NextMarker"), Some("d/"), "{doc}");
+    assert!(!doc.contains("<NextContinuationToken>"), "{doc}");
+    let (s, _, body) = s3(&http, "GET", "/rdb?delimiter=/&marker=d/", &[], b"").await;
+    let doc = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(s, 200, "{doc}");
+    assert!(doc.contains("<KeyCount>1</KeyCount>") && doc.contains("<IsTruncated>false</IsTruncated>"), "{doc}");
+    // Content-Type with a bare LF is refused, never stored (response
+    // head injection), and PUT without Content-Length is 411.
+    let (s, _, _) = s3(&http, "PUT", "/rdb/evil", &[("Content-Type", "text/plain\nX-Injected: 1")], b"x").await;
+    assert_eq!(s, 400);
+    let (s, _, _) = s3(&http, "GET", "/rdb/evil", &[], b"").await;
+    assert_eq!(s, 404, "poisoned object must not exist");
+    let mut sock = TcpStream::connect(&http).await.expect("connect");
+    sock.write_all(b"PUT /rdb/nolen HTTP/1.1\r\nHost: x\r\n\r\n").await.expect("write");
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(n) = sock.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let (s, head, _) = split_response(&buf);
+    assert_eq!(s, 411, "{head}");
+    let (s, _, _) = s3(&http, "GET", "/rdb/nolen", &[], b"").await;
+    assert_eq!(s, 404, "no silent empty object without Content-Length");
 }
