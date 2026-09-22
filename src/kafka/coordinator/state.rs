@@ -137,14 +137,12 @@ pub fn new_group(protocol_type: &str) -> GroupState {
     new_group_seeded(protocol_type, 0)
 }
 
-/// Fresh group whose generation resumes at `generation` -- the
-/// restart path: the first join after a restart seeds the runtime
-/// counter from the durable ledger's high-water generation (see
-/// `join::join_group`), so the group's FIRST runtime generation is
-/// already above every pre-restart ledger row and a legitimate new
-/// member can never be fenced by the cross-restart check in
-/// `offsets_commit::commit_one` (the pre-fix death zone: ledger gen
-/// N >= 2 vs a fresh runtime gen 1 rejected every commit).
+/// Fresh group whose generation resumes at `generation` -- the restart
+/// path: the first join after a restart seeds the runtime counter from
+/// the durable ledger's high-water generation (`join::join_group`), so
+/// the first runtime generation already tops every pre-restart ledger
+/// row and the cross-restart fencing check in `offsets_commit::commit_one`
+/// never rejects a legitimate new member (the pre-fix death zone).
 pub fn new_group_seeded(protocol_type: &str, generation: i32) -> GroupState {
     GroupState {
         stage: GroupStage::Empty,

@@ -30,6 +30,6 @@ Commit: e2d4fad（与 kafka/es/rocksmq/s3 前置批次同批入库）
    （`fetch::handle_fetch` 返回 parked_ms，conn 侧扣除）；acks=0 无响应帧路径补打点。
 
 ## 验证
-`cargo test --lib "kafka::"` 70 过；kafka 全套 e2e（wire/produce/fetch/offsets/
-group/group_failover）14 过 + rocksmq_http 3 过 + lite 全套 41 过；
-`scenario_kafka_sdk.sh`（真实 librdkafka）回归通过。
+`cargo test --lib "kafka::"` 69 过（启用 `kafka-codecs` 特性 76 过）；kafka 全套
+e2e（wire/produce/fetch/offsets/group/group_failover）13 过 + rocksmq_http 3 过
++ lite 全套 41 过；`scenario_kafka_sdk.sh`（真实 librdkafka）回归通过。
