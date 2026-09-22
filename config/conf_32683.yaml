@@ -9,3 +9,7 @@ monitor_addr: 127.0.0.1:42683
 # Redis MULTI/EXEC transactions (set enabled: false to reject MULTI)
 tx:
   enabled: true
+
+# Elasticsearch-compatible HTTP frontend on the search kernel (empty = disabled; e.g. es_bind: "127.0.0.1:9200")
+es_bind: ""
+es_token: ""

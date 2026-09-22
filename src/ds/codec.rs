@@ -53,6 +53,15 @@ pub const KIND_SEARCH_POSTING: u8 = 0x15;
 pub const KIND_SEARCH_TERMSTAT: u8 = 0x16;
 pub const KIND_ANN_CENTROID: u8 = 0x17;
 pub const KIND_ANN_POSTING: u8 = 0x18;
+pub const KIND_SEARCH_NUMVAL: u8 = 0x19;
+/// Kafka committed-offset ledger row (`kafka::ledger`, P2): one record
+/// per (partition stream, consumer group) carrying the JSON payload
+/// {"committed_ordinal","generation","leader"}. Its own single-kind
+/// family -- it must NOT join STREAM_FAMILY's span 0x0C..=0x0F, a range
+/// delete across 0x0C..=0x20 would swallow JSON/vectorset/search kinds;
+/// instead the stream-reclaim paths fold the ledger window in
+/// explicitly (see `ds::expire::family_delete_entries`).
+pub const KIND_STREAM_OFFSET: u8 = 0x20;
 /// Never a user-visible type: the active-expiration index record.
 pub const KIND_EXPIRE_INDEX: u8 = 0xFD;
 
@@ -65,9 +74,12 @@ pub const LIST_FAMILY: CodecFamily = (KIND_LIST_META, KIND_LIST_R);
 pub const SET_FAMILY: CodecFamily = (KIND_SET_META, KIND_SET_MEMBER);
 pub const ZSET_FAMILY: CodecFamily = (KIND_ZSET_META, KIND_ZSET_SCORE);
 pub const STREAM_FAMILY: CodecFamily = (KIND_STREAM_META, KIND_STREAM_PEND);
+/// Committed-offset ledger (kafka front): single-kind family so its
+/// window deletes/reclaims exactly like the other families.
+pub const OFFSET_FAMILY: CodecFamily = (KIND_STREAM_OFFSET, KIND_STREAM_OFFSET);
 pub const JSON_FAMILY: CodecFamily = (KIND_JSON, KIND_JSON);
 pub const VECTORSET_FAMILY: CodecFamily = (KIND_VECTORSET_META, KIND_VECTORSET_ELEM);
-pub const SEARCH_FAMILY: CodecFamily = (KIND_SEARCH_META, KIND_ANN_POSTING);
+pub const SEARCH_FAMILY: CodecFamily = (KIND_SEARCH_META, KIND_SEARCH_NUMVAL);
 
 /// Meta/root kinds a user key can exist under (one record = key "exists").
 pub const META_KINDS: [u8; 9] = [
@@ -103,10 +115,11 @@ pub fn family_of(kind: u8) -> Option<CodecFamily> {
         KIND_STREAM_META | KIND_STREAM_ENTRY | KIND_STREAM_GROUP | KIND_STREAM_PEND => {
             STREAM_FAMILY
         }
+        KIND_STREAM_OFFSET => OFFSET_FAMILY,
         KIND_JSON => JSON_FAMILY,
         KIND_VECTORSET_META | KIND_VECTORSET_ELEM => VECTORSET_FAMILY,
         KIND_SEARCH_META | KIND_SEARCH_DOC | KIND_SEARCH_POSTING | KIND_SEARCH_TERMSTAT
-        | KIND_ANN_CENTROID | KIND_ANN_POSTING => SEARCH_FAMILY,
+        | KIND_ANN_CENTROID | KIND_ANN_POSTING | KIND_SEARCH_NUMVAL => SEARCH_FAMILY,
         _ => return None,
     };
     Some(family)
@@ -258,14 +271,18 @@ pub fn decode_count(payload: &[u8]) -> u64 {
 
 /// How a physical key (after the slot prefix) reads during iteration.
 ///
-/// Rule: bytes `<= 0x18` or `== 0xFD` are typed records (kind header);
-/// anything else is a raw string whose user key is the whole remainder.
+/// Rule: bytes `<= 0x19`, `== 0x20` (stream-offset ledger) or `== 0xFD`
+/// are typed records (kind header); anything else is a raw string whose
+/// user key is the whole remainder.
 ///
 /// COLLISION CAVEAT (accepted breaking change, documented for COMPAT.md):
-/// a legacy raw string whose first byte is `<= 0x12` (e.g. a control byte)
-/// is misread as a typed record. Raw strings written after this change
-/// simply start with an ordinary byte in practice; 0xFD is included so
-/// expire-index entries classify as typed and can be skipped by scanners.
+/// a legacy raw string whose first byte is `<= 0x12` (e.g. a control
+/// byte) is misread as a typed record. Raw strings written after this
+/// change simply start with an ordinary byte in practice; 0xFD is
+/// included so expire-index entries classify as typed and can be
+/// skipped by scanners; 0x20 (space, the ledger kind) joins the typed
+/// set since P2 -- a raw string beginning with a space is misread the
+/// same way.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Classification {
     Raw,
@@ -274,7 +291,9 @@ pub enum Classification {
 
 pub fn classify(after_prefix: &[u8]) -> Classification {
     match after_prefix.first() {
-        Some(&b) if b <= KIND_ANN_POSTING || b == KIND_EXPIRE_INDEX => Classification::Typed(b),
+        Some(&b) if b <= KIND_SEARCH_NUMVAL || b == KIND_EXPIRE_INDEX || b == KIND_STREAM_OFFSET => {
+            Classification::Typed(b)
+        }
         _ => Classification::Raw,
     }
 }

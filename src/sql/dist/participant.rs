@@ -302,10 +302,15 @@ pub fn decide(
             for key in &m.keys {
                 if crate::sql::columnar::meta::parse_meta_key(key).is_some() {
                     // Segment meta: flip Prepared -> Live in the same
-                    // batch; the segment commit_ts already lives in the
-                    // marker's ts range, so `hi` needs no update.
+                    // batch. `hi` must cover EVERY ts this decision
+                    // makes visible -- row versions AND columnar
+                    // segment tails: a mixed slice (remote rows plus a
+                    // locally staged segment) can stage a segment whose
+                    // commit_ts sits ABOVE the marker's commit_ts, so
+                    // the marker alone is no upper bound for `hi`.
                     if let Some(v) = ops::get_physical(store, key)? {
                         if let Ok(mut meta) = crate::sql::columnar::meta::decode_meta(&v) {
+                            hi = hi.max(meta.commit_ts);
                             if meta.state == crate::sql::columnar::meta::SegmentState::Prepared {
                                 meta.state = crate::sql::columnar::meta::SegmentState::Live;
                                 if let Ok(enc) = crate::sql::columnar::meta::encode_meta(&meta) {
@@ -455,7 +460,66 @@ pub fn outcomes(store: &Store) -> Vec<(String, OutcomeRecord)> {
 
 #[cfg(test)]
 mod tests {
-    use super::conflict_ts;
+    use super::{conflict_ts, decide, marker_key, Marker};
+    use crate::sql::columnar::meta::{self, SegmentMeta, SegmentState};
+    use crate::sql::columnar::Registry;
+    use crate::sql::tx::floor;
+    use crate::store::ops;
+
+    use rocksdb::WriteBatch;
+
+    /// Lightest faithful scaffolding (same shape as the `floor` tests):
+    /// a real RocksDB `Store` on a tempdir, no raft/catalog around it.
+    fn open_store() -> (tempfile::TempDir, crate::store::Store) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::store::open(
+            crate::store::data_path(dir.path().to_str().unwrap(), "t")
+                .to_str()
+                .expect("utf8 path"),
+        )
+        .expect("open store");
+        (dir, store)
+    }
+
+    fn staged_segment(table_id: u32, segment_id: u64, commit_ts: u64) -> SegmentMeta {
+        SegmentMeta {
+            table_id,
+            table_name: format!("t{table_id}"),
+            segment_id,
+            commit_ts,
+            state: SegmentState::Prepared,
+            num_rows: 1,
+            file: format!("{table_id}_{segment_id}.bin"),
+            columns: vec![],
+        }
+    }
+
+    /// Stage one segment meta (Prepared) plus its in-doubt marker in a
+    /// single atomic batch -- the same `(meta_key, encode_meta)` /
+    /// `marker_key` + serde_json write paths `vote` uses.
+    fn stage_marker_with_segment(
+        store: &crate::store::Store,
+        txn_id: &str,
+        seg: &SegmentMeta,
+        commit_ts: u64,
+    ) -> Vec<u8> {
+        let key = meta::meta_key(seg.table_id, seg.segment_id);
+        let mut batch = WriteBatch::default();
+        batch.put(&key, meta::encode_meta(seg).expect("encode meta"));
+        batch.put(
+            marker_key(txn_id),
+            serde_json::to_vec(&Marker {
+                coordinator: "http://127.0.0.1:9".into(),
+                read_ts: commit_ts.saturating_sub(1),
+                commit_ts,
+                started_at: 0,
+                keys: vec![key.clone()],
+            })
+            .expect("marker json"),
+        );
+        ops::batch_write(store, batch).expect("stage prepare batch");
+        key
+    }
 
     #[test]
     fn conflict_ts_extracts_committed_ts_from_veto_reason() {
@@ -478,5 +542,96 @@ mod tests {
             None
         );
         assert_eq!(conflict_ts(""), None);
+    }
+
+    /// Mixed-slice regression: a locally staged columnar segment can
+    /// carry commit_ts ABOVE the coordinator's commit point (90 here,
+    /// segment 100). decide(commit) makes that segment Live, so both
+    /// the returned `hi` and the persisted floor must cover 100 --
+    /// otherwise a kill -9 reboot starts the oracle under the segment
+    /// and it is briefly invisible (floor must be >= any Live ts).
+    #[test]
+    fn decide_commit_hi_covers_segment_ts_above_marker_commit_ts() {
+        let (dir, store) = open_store();
+        let seg = staged_segment(7, 11, 100);
+        let key = stage_marker_with_segment(&store, "t-mixed", &seg, 90);
+
+        let registry = Registry::default();
+        let hi = decide(
+            &store,
+            dir.path(),
+            &registry,
+            "t-mixed",
+            "127.0.0.1:1",
+            /* commit */ true,
+            &[],
+        )
+        .expect("decide");
+
+        assert_eq!(
+            hi, 100,
+            "hi must reach the segment's commit_ts, not stop at the marker's 90"
+        );
+        // Persisted floor: decoded from FLOOR_KEY via the boot path.
+        assert!(
+            floor::recover(&store) >= 100,
+            "floor {} must not sit below a segment this decision made Live",
+            floor::recover(&store)
+        );
+        // The flip itself is unchanged: Prepared -> Live on disk and in
+        // the registry.
+        let raw = ops::get_physical(&store, &key)
+            .expect("get meta")
+            .expect("meta present");
+        assert_eq!(
+            meta::decode_meta(&raw).expect("decode meta").state,
+            SegmentState::Live
+        );
+        assert_eq!(
+            registry.segments(7).as_slice(),
+            &[{
+                let mut m = seg.clone();
+                m.state = SegmentState::Live;
+                m
+            }]
+        );
+        drop(store);
+        drop(dir);
+    }
+
+    /// The raise is a max, never a regression: a segment staged BELOW
+    /// the marker's commit_ts leaves `hi` at the marker's ts.
+    #[test]
+    fn decide_commit_hi_stays_at_marker_ts_when_segment_is_lower() {
+        let (dir, store) = open_store();
+        let seg = staged_segment(8, 21, 50);
+        let key = stage_marker_with_segment(&store, "t-low", &seg, 90);
+
+        let registry = Registry::default();
+        let hi = decide(
+            &store,
+            dir.path(),
+            &registry,
+            "t-low",
+            "127.0.0.1:1",
+            /* commit */ true,
+            &[],
+        )
+        .expect("decide");
+
+        assert_eq!(hi, 90);
+        assert_eq!(floor::recover(&store), 90);
+        assert_eq!(
+            meta::decode_meta(
+                &ops::get_physical(&store, &key)
+                    .expect("get meta")
+                    .expect("meta present")
+            )
+            .expect("decode meta")
+            .state,
+            SegmentState::Live
+        );
+        drop(store);
+        drop(dir);
     }
 }

@@ -1,5 +1,5 @@
 //! Physical codecs for the search-engine record family (kinds
-//! 0x13..=0x18, `codec::SEARCH_FAMILY`). One family on purpose: the
+//! 0x13..=0x19, `codec::SEARCH_FAMILY`). One family on purpose: the
 //! index meta's TTL envelope drives a lazy purge that must wipe text
 //! AND vector side-records together.
 //!
@@ -7,6 +7,8 @@
 //! ```text
 //! meta value     = n_docs ++ sum_doclen ++ nfields
 //!                  ++ per field [ name_len++name ++ type:u8 ++ dim? ]
+//!                  (type bytes: 1 TEXT, 2 VECTOR(+dim), 3 KEYWORD,
+//!                   4 NUMERIC -- keyword/numeric carry no payload)
 //! doc suffix     = docid_len ++ docid
 //! doc value      = doclen ++ nentries
 //!                  ++ per entry [ field++term++tf ]      (postings undo log)
@@ -21,6 +23,8 @@
 //!                  ++ k member counts                    (SQ8 calibration)
 //! annpost sfx    = field_len++field ++ centroid_id
 //! annpost value  = dim ++ entries sorted by docid [ docid ++ dim SQ8 bytes ]
+//! numval sfx     = field_len++field ++ docid            (kind 0x19)
+//! numval value   = f64 LE                                (NUMERIC doc value)
 //! ```
 //! SQ8 calibration (per-dimension min/scale) is GLOBAL per field and
 //! rides in the centroid record, so one quantized entry costs ~1 byte
@@ -32,8 +36,10 @@ use crate::ds::codec::{
 };
 use crate::store::key_upper_bound;
 
+pub mod numval;
 pub mod posting;
 
+pub use numval::{decode_numval, encode_numval, numval_key, numval_range};
 pub use posting::{
     decode_centroids, decode_posting, decode_termstat, encode_centroids, encode_posting,
     encode_termstat, remove_posting, upsert_posting, CentroidTable, PostEntry, TermStat,
@@ -46,11 +52,18 @@ pub const NO_CENTROID: u64 = u64::MAX;
 /// Field type byte in the meta schema.
 pub const FIELD_TEXT: u8 = 1;
 pub const FIELD_VECTOR: u8 = 2;
+pub const FIELD_KEYWORD: u8 = 3;
+pub const FIELD_NUMERIC: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     Text,
     Vector { dim: u64 },
+    /// Exact-match, untokenized single terms (one posting entry each,
+    /// tf folds duplicates).
+    Keyword,
+    /// Columnar f64 doc value in a kind 0x19 record (no postings).
+    Numeric,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +116,8 @@ pub fn encode_meta(meta: &IndexMeta) -> Vec<u8> {
                 out.push(FIELD_VECTOR);
                 out.extend_from_slice(&encode_count(dim));
             }
+            FieldType::Keyword => out.push(FIELD_KEYWORD),
+            FieldType::Numeric => out.push(FIELD_NUMERIC),
         }
     }
     out
@@ -127,6 +142,8 @@ pub fn decode_meta(payload: &[u8]) -> Option<IndexMeta> {
                 rest = r;
                 FieldType::Vector { dim }
             }
+            FIELD_KEYWORD => FieldType::Keyword,
+            FIELD_NUMERIC => FieldType::Numeric,
             _ => return None,
         };
         fields.push(IndexField { name, ftype });
@@ -268,7 +285,7 @@ fn kind_range(prefix: &[u8], kind: u8, index: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (lower, upper)
 }
 
-/// Batch entries wiping the whole search family (all six kinds) and
+/// Batch entries wiping the whole search family (all seven kinds) and
 /// the TTL index entry; used by FT.DROP and lazy purge.
 pub fn delete_family_entries(
     batch: &mut rocksdb::WriteBatch,

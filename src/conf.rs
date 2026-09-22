@@ -47,6 +47,33 @@ pub struct Config {
     pub mysql_user: String,
     #[serde(default, rename = "mysql_password")]
     pub mysql_password: String,
+    /// Kafka wire front (P0: ApiVersions/Metadata; empty = disabled).
+    #[serde(default, rename = "kafka_bind")]
+    pub kafka_bind: String,
+    /// Advertised broker host for Metadata/FindCoordinator replies.
+    /// Empty = derive from kafka_bind (wildcard binds advertise
+    /// "localhost" -- fine for loopback, useless remotely). Set this
+    /// (and the port) when binding 0.0.0.0/:: for remote clients.
+    #[serde(default, rename = "kafka_advertised_host")]
+    pub kafka_advertised_host: String,
+    /// Advertised broker port (0 = the kafka_bind port).
+    #[serde(default, rename = "kafka_advertised_port")]
+    pub kafka_advertised_port: i32,
+    /// Kafka front connection cap; 0 = built-in default 4096. New
+    /// connections beyond the cap are closed immediately.
+    #[serde(default, rename = "kafka_max_connections")]
+    pub kafka_max_connections: i64,
+    /// RocksMQ-style HTTP front (P4; empty = disabled), see
+    /// `src/rocksmq/` + features/rocksmq-http.md.
+    #[serde(default, rename = "rocksmq_bind")]
+    pub rocksmq_bind: String,
+    /// Elasticsearch-compatible HTTP frontend on the search kernel
+    /// (empty = disabled).
+    #[serde(default, rename = "es_bind")]
+    pub es_bind: String,
+    /// Bearer token for the ES frontend (empty = no auth).
+    #[serde(default, rename = "es_token")]
+    pub es_token: String,
     /// Node-to-node SQL RPC (sub-plans, 2PC); empty = disabled.
     #[serde(default, rename = "sql_rpc_bind")]
     pub sql_rpc_bind: String,

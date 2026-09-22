@@ -66,6 +66,25 @@ pub fn dump_key(store: &Arc<Store>, prefix: &[u8], key: &[u8], now: u64) -> Opti
                 })
                 .ok()?;
             }
+            // Stream dumps carry the Kafka committed-offset ledger rows
+            // too (they belong to the partition stream being migrated);
+            // the ledger kind sits in its own family, so its window is
+            // appended explicitly.
+            if family == codec::STREAM_FAMILY {
+                let lower = codec::data_key(prefix, codec::KIND_STREAM_OFFSET, key);
+                let upper = key_upper_bound(&lower).unwrap_or_default();
+                ops::for_each_from(store, &lower, false, &mut |pk, v| {
+                    if pk >= upper.as_slice() {
+                        return false; // left this (kind, key) window
+                    }
+                    records.push(Record {
+                        body: pk[prefix.len()..].to_vec(),
+                        value: v.to_vec(),
+                    });
+                    true
+                })
+                .ok()?;
+            }
             if records.is_empty() {
                 // Envelope read raced a purge: ship the resolved payload.
                 records.push(Record {
@@ -170,7 +189,14 @@ pub fn restore_key(
     for (i, r) in records.iter().enumerate() {
         let (k, rest) = take(&r.body, 1).ok_or_else(bad_payload)?;
         let (olen, rest) = be32(rest).ok_or_else(bad_payload)?;
-        if (i == 0 && k[0] != kind) || codec::family_of(k[0]) != Some(fam) || rest.len() < olen {
+        // Stream dumps also carry Kafka ledger rows: their kind lives in
+        // OFFSET_FAMILY (a deliberate outlier -- see KIND_STREAM_OFFSET),
+        // accepted here for stream restores.
+        let ledger_row = fam == codec::STREAM_FAMILY && k[0] == codec::KIND_STREAM_OFFSET;
+        if (i == 0 && k[0] != kind)
+            || (codec::family_of(k[0]) != Some(fam) && !ledger_row)
+            || rest.len() < olen
+        {
             return Err(bad_payload());
         }
         let suffix = &rest[olen..];

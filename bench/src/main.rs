@@ -8,10 +8,15 @@
 //! RTT; with larger pipelines every reported stat is a per-batch RTT.
 //!
 //! Modules: `cli` (argument parsing), `resp` (client-side RESP codec),
-//! `client` (the per-connection load loop) and `stats` (pure aggregation).
+//! `client` (the per-connection load loop), `stats` (pure aggregation)
+//! and `kafka`/`kafka_wire`/`kafka_reply` (the hand-rolled Produce v2 /
+//! Fetch v4 client for the kafka front).
 
 mod cli;
 mod client;
+mod kafka;
+mod kafka_reply;
+mod kafka_wire;
 mod resp;
 mod stats;
 
@@ -32,6 +37,16 @@ async fn main() {
         }
     };
 
+    // Kafka workloads need the topic partition to exist before any
+    // client connects (the kafka front never auto-creates topics), so
+    // seed `<topic>/q0` over RESP once, up front.
+    if cfg.workload.is_kafka() {
+        if let Err(msg) = kafka::ensure_topic(&cfg).await {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
+    }
+
     // Shared deadline: tasks stop issuing batches after it and only drain
     // the replies of the batch already in flight.
     let deadline = Instant::now() + Duration::from_secs(cfg.duration);
@@ -40,7 +55,11 @@ async fn main() {
     for client_id in 0..cfg.clients {
         let task_cfg = cfg.clone();
         handles.push(tokio::spawn(async move {
-            client::run_client(&task_cfg, client_id, deadline).await
+            if task_cfg.workload.is_kafka() {
+                kafka::run_kafka_client(&task_cfg, client_id, deadline).await
+            } else {
+                client::run_client(&task_cfg, client_id, deadline).await
+            }
         }));
     }
 

@@ -23,3 +23,16 @@ backup_target_map:
 # Redis MULTI/EXEC transactions (set enabled: false to reject MULTI)
 tx:
   enabled: true
+
+# Elasticsearch-compatible HTTP frontend on the search kernel (empty = disabled; e.g. es_bind: "127.0.0.1:9200")
+es_bind: ""
+es_token: ""
+
+# S3-compatible object-storage frontend on the local filesystem
+# (empty = disabled; e.g. s3_bind: "127.0.0.1:9000")
+#s3_bind: ""            # S3 HTTP 监听地址（空 = 禁用；backup 监听器不含）
+#s3_store_path: ""      # 对象根目录（空 = 回退 <store_path>/s3）
+#s3_bucket: ""          # 发布/默认 bucket 名（空 = rdb）
+#s3_token: ""           # Bearer 鉴权 token（空 = 无鉴权；非 SigV4）
+#s3_checkpoint_interval_ms: 0  # RocksDB checkpoint 发布周期毫秒（0 = 不发布）
+#s3_checkpoint_retention: 0    # 保留最近 N 份 checkpoint（0 = 内建默认 2）

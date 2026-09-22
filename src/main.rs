@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use rdb::rcache::fsm::KvMap;
 use rdb::rcache::RdbRaft;
-use rdb::{conf, ds, monitor, rcache, resp, sql, state, store, topology};
+use rdb::{conf, ds, es, kafka, monitor, rcache, resp, rocksmq, sql, state, store, topology};
 
 const TOPOLOGY_KEY: &str = "cluster_slots_stable_instances";
 
@@ -603,6 +603,44 @@ async fn do_main() {
             }
         };
         tokio::spawn(sql::front::serve(listener, Arc::clone(&shared)));
+    }
+    // ES-compatible HTTP frontend on the search kernel (empty es_bind =
+    // disabled; es_token gates Bearer auth when non-empty).
+    if !conf.es_bind.is_empty() {
+        let listener = match es::http::bind(&conf.es_bind) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        let token = conf.es_token.clone();
+        tokio::spawn(es::http::serve(listener, Arc::clone(&shared), token));
+    }
+    // P0: Kafka wire front on the same Lite storage (empty kafka_bind =
+    // disabled; the backup listener never wires it).
+    if !conf.kafka_bind.is_empty() {
+        let listener = match kafka::bind(&conf.kafka_bind) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::spawn(kafka::serve(listener, Arc::clone(&shared)));
+    }
+    // P4: RocksMQ-style minimal HTTP API on the same Lite storage
+    // (empty rocksmq_bind = disabled; the backup listener never wires
+    // it).
+    if !conf.rocksmq_bind.is_empty() {
+        let listener = match rocksmq::bind(&conf.rocksmq_bind) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::spawn(rocksmq::serve(listener, Arc::clone(&shared)));
     }
     // M3: node-to-node 2PC transport (empty sql_rpc_bind = disabled)
     // and the in-doubt marker recovery sweep.

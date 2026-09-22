@@ -118,9 +118,16 @@ pub(super) fn div_decimal(ma: i128, mb: i128, sa: u8, sb: u8) -> SqlResult<Value
             let (q, r) = (d.checked_div(mb), d.checked_rem(mb));
             if let (Some(q), Some(r)) = (q, r) {
                 // |r| >= half the divisor -> one unit away from zero.
+                // The direction follows the EXACT quotient's sign,
+                // `(d < 0) != (mb < 0)`: the divisor here is signed, so
+                // unlike rescale_decimal (positive pow10 divisor, where
+                // the dividend's sign suffices) a truncated q of 0
+                // carries no sign and `q.is_negative()` would bump the
+                // wrong way.
+                let negative = (d < 0) != (mb < 0);
                 let bump = r != 0 && r.unsigned_abs() * 2 >= mb.unsigned_abs();
                 let q = if bump {
-                    q.checked_add(if q.is_negative() { -1 } else { 1 })
+                    q.checked_add(if negative { -1 } else { 1 })
                 } else {
                     Some(q)
                 };
@@ -195,5 +202,36 @@ pub(super) fn rescale_decimal(m: i128, from: u8, to: u8) -> SqlResult<i128> {
                 Ok(q)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::div_decimal;
+    use crate::sql::storage::schema::Value;
+
+    // Half-away-from-zero rounding must follow the EXACT quotient's
+    // sign, not the truncated q's: when truncation yields q == 0 the
+    // quotient carries no sign of its own.
+    #[test]
+    fn div_rounds_away_from_zero_by_exact_quotient_sign() {
+        // The reported bug: -0.00001 / 15000 -> -0.000000001 (not +1).
+        assert_eq!(div_decimal(-1, 15000, 5, 0), Ok(Value::Decimal(-1, 9)));
+        // Positive mirror: 0.00001 / 15000 -> +0.000000001.
+        assert_eq!(div_decimal(1, 15000, 5, 0), Ok(Value::Decimal(1, 9)));
+        // Negative divisor with q == 0: 0.00001 / -15000 -> -1e-9.
+        assert_eq!(div_decimal(1, -15000, 5, 0), Ok(Value::Decimal(-1, 9)));
+        // Both negative: -0.00001 / -15000 -> +0.000000001.
+        assert_eq!(div_decimal(-1, -15000, 5, 0), Ok(Value::Decimal(1, 9)));
+    }
+
+    // Non-zero quotients keep truncation-toward-zero + bump (the
+    // exact-sign rule agrees with sign(q) here); exact ties round away.
+    #[test]
+    fn div_rounds_exact_ties_away_from_zero() {
+        // -5 / 20000 = -0.00025 exactly -> away from zero to -0.0003.
+        assert_eq!(div_decimal(-5, 20000, 0, 0), Ok(Value::Decimal(-3, 4)));
+        // 5 / 20000 = 0.00025 exactly -> away from zero to 0.0003.
+        assert_eq!(div_decimal(5, 20000, 0, 0), Ok(Value::Decimal(3, 4)));
     }
 }

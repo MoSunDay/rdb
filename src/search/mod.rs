@@ -5,7 +5,7 @@
 //!
 //! Layers (all pure functions + data carriers, no classes):
 //! - `index_codec`: physical record codecs (meta/doc/posting/termstat/
-//!   centroids/ANN partitions, kinds 0x13..=0x18)
+//!   centroids/ANN partitions/numeric doc-values, kinds 0x13..=0x19)
 //! - `tokenize`: jieba + Unicode hybrid CJK/Latin tokenizer (index and
 //!   query side share it), bigram fallback for unknown Han runs
 //! - `bm25`: Okapi BM25 scoring + bounded top-k collector

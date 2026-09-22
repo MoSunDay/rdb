@@ -126,8 +126,11 @@ fn family_delete_ranges_upper_is_never_empty_for_typed_roots() {
 fn classify_raw_vs_typed() {
     assert_eq!(classify(b"abc"), Classification::Raw);
     assert_eq!(classify(b""), Classification::Raw);
-    assert_eq!(classify(&[0x19]), Classification::Raw); // unassigned, > KIND_ANN_POSTING
-    assert_eq!(classify(&[0x20]), Classification::Raw);
+    assert_eq!(classify(&[0x1A]), Classification::Raw); // unassigned, > KIND_SEARCH_NUMVAL
+    assert_eq!(
+        classify(&[0x20]),
+        Classification::Typed(0x20)
+    ); // KIND_STREAM_OFFSET (space byte; documented misread)
     assert_eq!(
         classify(&[KIND_HASH_META, 0, 0, 0, 1]),
         Classification::Typed(KIND_HASH_META)
@@ -172,6 +175,7 @@ fn family_of_spans() {
     assert_eq!(family_of(KIND_EXPIRE_INDEX), None);
     assert_eq!(family_of(KIND_HASH_FLD), Some(HASH_FAMILY));
     assert_eq!(family_of(KIND_STREAM_PEND), Some(STREAM_FAMILY));
+    assert_eq!(family_of(KIND_STREAM_OFFSET), Some(OFFSET_FAMILY));
     for kind in meta_kinds() {
         let (first, last) = family_of(*kind).unwrap();
         assert!(first <= *kind && *kind <= last);

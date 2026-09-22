@@ -34,6 +34,16 @@ full = [
     "dep:tracing-subscriber",
 ]
 store = []
+# Produce-side decompression of compressed RecordBatches (gzip/snappy/
+# lz4). Pure-Rust backends only (flate2=miniz_oxide, snap, lz4_flex);
+# zstd stays out (C dependency). Deliberately NOT in `default`/`full`:
+# the stock build keeps a zero-new-dependency tree and rejects
+# compressed batches with error 76 (UNSUPPORTED_COMPRESSION_TYPE).
+kafka-codecs = [
+    "dep:flate2",
+    "dep:snap",
+    "dep:lz4_flex",
+]
 
 [dependencies]
 rocksdb = "0.24"
@@ -58,6 +68,11 @@ async-trait = { version = "0.1", optional = true }
 # Chinese word segmentation for the FT.* search tokenizer (embedded dict).
 jieba-rs = { version = "0.10", optional = true }
 serde_yaml = { version = "0.9", optional = true }
+# Kafka produce-side compression codecs (feature `kafka-codecs`): all
+# pure-Rust backends so the optional feature adds no C-toolchain needs.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+snap = { version = "1", optional = true }
+lz4_flex = { version = "0.11", optional = true }
 
 [dev-dependencies]
 # start_paused clock-control for the state.rs advance-tick tests; a

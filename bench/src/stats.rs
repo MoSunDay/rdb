@@ -27,21 +27,36 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 pub fn report(cfg: &Config, wall_secs: f64, all: &[ClientStats]) -> i32 {
     let ops: u64 = all.iter().map(|s| s.ops).sum();
     let errors: u64 = all.iter().map(|s| s.errors).sum();
+    let bytes: u64 = all.iter().map(|s| s.bytes).sum();
     let first_error = all.iter().find_map(|s| s.first_error.clone());
 
     let mut samples: Vec<f64> = all.iter().flat_map(|s| s.samples.iter().copied()).collect();
     samples.sort_by(f64::total_cmp);
 
+    // Kafka workloads point at the kafka front and report the record
+    // batch size instead of the RESP pipeline depth; the RESP line
+    // format is unchanged byte for byte.
+    let (addr, tail) = if cfg.workload.is_kafka() {
+        (cfg.host.as_str(), format!("topic={} batch={}", cfg.topic, cfg.batch))
+    } else {
+        (cfg.addr.as_str(), format!("pipeline={}", cfg.pipeline))
+    };
     println!(
-        "workload={} addr={} clients={} pipeline={} duration={}s",
+        "workload={} addr={} clients={} {tail} duration={}s",
         cfg.workload.as_str(),
-        cfg.addr,
+        addr,
         cfg.clients,
-        cfg.pipeline,
         cfg.duration
     );
     println!("ops={} errors={} wall={:.3}", ops, errors, wall_secs);
     println!("ops/s={:.1}", ops as f64 / wall_secs.max(1e-9));
+    if bytes > 0 {
+        println!(
+            "records_bytes={} records_bytes/s={:.1}",
+            bytes,
+            bytes as f64 / wall_secs.max(1e-9)
+        );
+    }
     println!(
         "rtt_ms avg={:.3} p50={:.3} p99={:.3} max={:.3}",
         mean(&samples),

@@ -4,6 +4,47 @@ Last full green run: **2026-09-16**, git `5b67c47`,
 binary `target/release/rdb`.
 Runner: `run_all.sh` -> **4 pass, 0 fail**.
 
+2026-09-18: `scenario_kafka_sdk.sh` grew step 7 (compression, P5b) --
+gzip/snappy/lz4 x 30 msgs each via the real SDK (`batch.num.messages=10`
++ `linger.ms=200` so librdkafka actually forms compressed batches),
+then a key+value consume roundtrip. Build-feature aware: on a default
+binary every delivery callback comes back 76 UNSUPPORTED_COMPRESSION_
+TYPE -> the step self-SKIPs (6/6, exit 0); on
+`cargo build --release --features kafka-codecs` it runs and passes
+(7/7: gzip@11..40 snappy@41..70 lz4@71..100). zstd is not probed via
+the SDK (this build ships zstd produce uncompressed, attributes=0);
+its 76 rejection is pinned by `tests/kafka_codec_e2e.rs`.
+
+2026-09-18: kafka bench workloads added (P5c) --
+`scenario_kafka_bench.sh` drives the kafka front with the repo's own
+load generator instead of a client library: rdb-bench grew
+`kafka-prod` (Produce v2, acks=1, 100 records/request, 2 clients) and
+`kafka-fetch` (Fetch v4, 1 client, 500ms long-poll tail) workloads
+from a hand-rolled client in `bench/src/kafka_wire.rs` /
+`kafka_reply.rs` / `kafka.rs` (no rdb-lib link). Standalone, NOT part
+of `run_all.sh` (~55s). Result: **PASS** -- produce 1,159,800 records
+@ ~77k/s zero error replies, then the fetcher reads 1,159,802
+(= produced + the 2 XADD topic-seed entries) inside its 30s window;
+base_offset monotonicity asserted client-side. Usage of the two
+workloads against a live node (kafka front needs `kafka_bind`; the
+bench pre-creates `bench1/q0` over RESP itself):
+
+    # produce: 2 clients, 15s, 100 records per request
+    ./target/release/rdb-bench --addr 127.0.0.1:6379 --token <raft_token> \
+        --host 127.0.0.1:9092 --workload kafka-prod \
+        --clients 2 --duration 15 --batch 100
+    # fetch: 1 client tails topic bench1 partition 0 from offset 0
+    ./target/release/rdb-bench --addr 127.0.0.1:6379 --token <raft_token> \
+        --host 127.0.0.1:9092 --workload kafka-fetch \
+        --clients 1 --duration 30
+
+On the kafka workloads `ops` counts RECORDS (so ops/s = records/s) and
+a `records_bytes=` line carries payload volume; kafka-only flags
+(`--host/--topic/--batch`) are rejected on RESP workloads.
+Reference-box numbers: produce ~72-77k rec/s (acks=1, one fsync per
+request), tail ~61-84k rec/s; the scenario's 2x fetch window covers
+the gap.
+
 2026-09-17: `upgrade_rehearsal.sh` added -- W2.2 catalog co-upgrade
 rehearsal (standalone drill, NOT part of `run_all.sh`; ~3 min cold,
 builds both binaries itself). Proves the stop-the-world same-batch

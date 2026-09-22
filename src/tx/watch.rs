@@ -19,13 +19,14 @@ use crate::store::Store;
 /// the callback returns `false` to stop early (unused by the hasher,
 /// which always drains the range).
 ///
-/// User-data kind range: KIND_STRING_TTL (0x01) ..= KIND_ANN_POSTING
-/// (0x18), i.e. every family including the SEARCH kinds (0x13..=0x18;
+/// User-data kind range: KIND_STRING_TTL (0x01) ..= KIND_SEARCH_NUMVAL
+/// (0x19), i.e. every family including the SEARCH kinds (0x13..=0x19;
 /// next registered kind is the expire index at 0xFD). The raw-string
 /// layout (0x00) is hashed separately below; the expire index is
 /// derived state (its contents follow the data records) and is covered
 /// transitively.
-const USER_KINDS: std::ops::RangeInclusive<u8> = codec::KIND_STRING_TTL..=codec::KIND_ANN_POSTING;
+const USER_KINDS: std::ops::RangeInclusive<u8> =
+    codec::KIND_STRING_TTL..=codec::KIND_SEARCH_NUMVAL;
 
 /// Hash every physical byte stored for `key` under `prefix`.
 ///
@@ -143,9 +144,8 @@ mod tests {
         let h0 = value_hash(&sh.store, p, k);
 
         // SEARCH family records (FT.* data) are user data too: an ANN
-        // posting element under the key -- the top boundary kind, 0x18 --
-        // must move the fingerprint, or FT.* writes cannot dirty a
-        // MULTI/EXEC transaction.
+        // posting element under the key must move the fingerprint, or
+        // FT.* writes cannot dirty a MULTI/EXEC transaction.
         sh.store
             .db
             .put(codec::elem_key(p, codec::KIND_ANN_POSTING, k, b"d1"), b"q")

@@ -19,7 +19,11 @@ pub mod conf;
 #[cfg(feature = "full")]
 pub mod ds;
 #[cfg(feature = "full")]
+pub mod es;
+#[cfg(feature = "full")]
 pub mod hash;
+#[cfg(feature = "full")]
+pub mod kafka;
 #[cfg(feature = "full")]
 pub mod lite;
 #[cfg(feature = "full")]
@@ -30,6 +34,8 @@ pub mod park;
 pub mod rcache;
 #[cfg(feature = "full")]
 pub mod resp;
+#[cfg(feature = "full")]
+pub mod rocksmq;
 #[cfg(feature = "full")]
 pub mod router;
 #[cfg(feature = "full")]

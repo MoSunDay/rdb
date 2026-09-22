@@ -26,10 +26,10 @@ pub use codec::{
     KIND_ANN_CENTROID, KIND_ANN_POSTING, KIND_EXPIRE_INDEX, KIND_HASH_FLD, KIND_HASH_META,
     KIND_JSON, KIND_LIST_L, KIND_LIST_META, KIND_LIST_R, KIND_SEARCH_DOC, KIND_SEARCH_META,
     KIND_SEARCH_POSTING, KIND_SEARCH_TERMSTAT, KIND_SET_MEMBER, KIND_SET_META, KIND_STREAM_ENTRY,
-    KIND_STREAM_GROUP, KIND_STREAM_META, KIND_STREAM_PEND, KIND_STRING, KIND_STRING_TTL,
-    KIND_VECTORSET_ELEM, KIND_VECTORSET_META, KIND_ZSET_MEMBER, KIND_ZSET_META, KIND_ZSET_SCORE,
-    LIST_FAMILY, SEARCH_FAMILY, SET_FAMILY, STREAM_FAMILY, STRING_FAMILY, VECTORSET_FAMILY,
-    ZSET_FAMILY,
+    KIND_STREAM_GROUP, KIND_STREAM_META, KIND_STREAM_OFFSET, KIND_STREAM_PEND, KIND_STRING,
+    KIND_STRING_TTL, KIND_VECTORSET_ELEM, KIND_VECTORSET_META, KIND_ZSET_MEMBER, KIND_ZSET_META,
+    KIND_ZSET_SCORE, LIST_FAMILY, OFFSET_FAMILY, SEARCH_FAMILY, SET_FAMILY, STREAM_FAMILY,
+    STRING_FAMILY, VECTORSET_FAMILY, ZSET_FAMILY,
 };
 
 /// Redis `TYPE` reply for a kind byte. Raw/typed strings answer "string";
@@ -45,7 +45,8 @@ pub fn type_name(kind: u8) -> &'static str {
         codec::KIND_STREAM_META
         | codec::KIND_STREAM_ENTRY
         | codec::KIND_STREAM_GROUP
-        | codec::KIND_STREAM_PEND => "stream",
+        | codec::KIND_STREAM_PEND
+        | codec::KIND_STREAM_OFFSET => "stream",
         codec::KIND_JSON => "ReJSON-RL",
         codec::KIND_VECTORSET_META | codec::KIND_VECTORSET_ELEM => "vectorset",
         codec::KIND_SEARCH_META
@@ -53,7 +54,8 @@ pub fn type_name(kind: u8) -> &'static str {
         | codec::KIND_SEARCH_POSTING
         | codec::KIND_SEARCH_TERMSTAT
         | codec::KIND_ANN_CENTROID
-        | codec::KIND_ANN_POSTING => "search",
+        | codec::KIND_ANN_POSTING
+        | codec::KIND_SEARCH_NUMVAL => "search",
         _ => "none",
     }
 }
@@ -81,6 +83,7 @@ mod tests {
             (codec::KIND_STREAM_ENTRY, "stream"),
             (codec::KIND_STREAM_GROUP, "stream"),
             (codec::KIND_STREAM_PEND, "stream"),
+            (codec::KIND_STREAM_OFFSET, "stream"),
             (codec::KIND_JSON, "ReJSON-RL"),
             (codec::KIND_VECTORSET_META, "vectorset"),
             (codec::KIND_VECTORSET_ELEM, "vectorset"),
@@ -90,6 +93,7 @@ mod tests {
             (codec::KIND_SEARCH_TERMSTAT, "search"),
             (codec::KIND_ANN_CENTROID, "search"),
             (codec::KIND_ANN_POSTING, "search"),
+            (codec::KIND_SEARCH_NUMVAL, "search"),
             (codec::KIND_EXPIRE_INDEX, "none"),
             (0xEE, "none"),
         ];

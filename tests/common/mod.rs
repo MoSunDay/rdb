@@ -57,6 +57,8 @@ pub struct ProcNode {
     pub mysql: String,
     /// M3 2PC node-to-node bind address ("" when disabled).
     pub sql_rpc: String,
+    /// ES-compatible HTTP bind address ("" when disabled).
+    pub es: String,
 }
 
 impl ProcNode {
@@ -215,6 +217,7 @@ pub fn spawn_node(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str
                 monitor,
                 mysql: String::new(),
                 sql_rpc: String::new(),
+                es: String::new(),
             };
         }
     }
@@ -263,6 +266,7 @@ pub fn spawn_node_mysql(
                 monitor,
                 mysql,
                 sql_rpc: String::new(),
+                es: String::new(),
             };
         }
     }
@@ -318,6 +322,54 @@ pub fn spawn_node_sql(dir: &Path, id: usize, bootstrap: bool, join_http: Option<
                 monitor,
                 mysql,
                 sql_rpc,
+                es: String::new(),
+            };
+        }
+    }
+    panic!("rdb kept dying at startup; see stderr.log in {node_dir:?}");
+}
+
+/// Spawn a node with the Elasticsearch-compatible HTTP frontend
+/// enabled on a fresh port (no Bearer auth: es_token stays empty).
+/// Base yaml from `write_config` (unchanged signature); `es_bind` +
+/// `es_token` are appended as extra top-level keys after the fact,
+/// exactly like `spawn_node_sql` appends `sql_rpc_bind`.
+pub fn spawn_node_es(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str>) -> ProcNode {
+    let node_dir = dir.join(format!("node{id}"));
+    std::fs::create_dir_all(&node_dir).expect("create node dir");
+    for _ in 0..SPAWN_ATTEMPTS {
+        let (resp, raft, http, monitor, es) = (
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+            free_addr(),
+        );
+        let config_path = node_dir.join("conf.yaml");
+        write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor, "");
+        std::fs::write(
+            &config_path,
+            format!(
+                "{}es_bind: \"{es}\"\nes_token: \"\"\n",
+                std::fs::read_to_string(&config_path).expect("read back conf.yaml")
+            ),
+        )
+        .expect("append es_bind");
+        let stderr_path = node_dir.join("stderr.log");
+        let mut child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
+        if !matches!(early_exit_kind(&mut child, &stderr_path), Some(true)) {
+            return ProcNode {
+                dir: node_dir,
+                config_path,
+                stderr_path,
+                child,
+                resp,
+                raft,
+                http,
+                monitor,
+                mysql: String::new(),
+                sql_rpc: String::new(),
+                es,
             };
         }
     }
@@ -372,6 +424,7 @@ pub fn spawn_node_backup(
                     monitor,
                     mysql: String::new(),
                     sql_rpc: String::new(),
+                    es: String::new(),
                 },
                 backup,
             );

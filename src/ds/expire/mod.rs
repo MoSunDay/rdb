@@ -78,6 +78,15 @@ pub fn family_delete_entries(
     for (lower, upper) in codec::family_delete_ranges(prefix, family, key) {
         batch.delete_range(lower, upper);
     }
+    // Stream deletes also drop the Kafka committed-offset ledger rows
+    // (KIND_STREAM_OFFSET sits in its own family far above the stream
+    // span -- a single 0x0C..=0x20 range would swallow JSON/vectorset/
+    // search records -- so the window is folded in explicitly here).
+    if family == codec::STREAM_FAMILY {
+        for (lower, upper) in codec::family_delete_ranges(prefix, codec::OFFSET_FAMILY, key) {
+            batch.delete_range(lower, upper);
+        }
+    }
     if expire > 0 {
         let root = codec::data_key(prefix, family.0, key);
         batch.delete(codec::expire_index_key(prefix, expire, &root));

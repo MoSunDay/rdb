@@ -16,8 +16,8 @@ use crate::store::{ops, Store};
 use super::ann;
 use super::index_codec::{
     decode_doc, decode_meta, decode_posting, decode_termstat, encode_doc, encode_meta,
-    encode_posting, encode_termstat, meta_key, posting_key, remove_posting, termstat_key,
-    upsert_posting, DocRecord, PostEntry, TermStat,
+    encode_numval, encode_posting, encode_termstat, meta_key, numval_key, posting_key,
+    remove_posting, termstat_key, upsert_posting, DocRecord, PostEntry, TermStat,
 };
 
 pub use super::index_codec::{FieldType, IndexField, IndexMeta};
@@ -91,6 +91,9 @@ pub fn read_termstat(
 /// Build the single batch that adds-or-replaces `docid` with `rec`
 /// (terms + optional vector + raw doc bytes). `meta` is the CURRENT
 /// meta (counters/statistics are mutated into the returned batch).
+/// `numvals` carries the (field, value) pairs for NUMERIC fields --
+/// a field absent from the list clears its stored value, so the
+/// replace path rewrites stale numbers too.
 /// Vector partitioning consults the ANN centroid table when the schema
 /// has a VECTOR field and a table exists (see `ann`).
 pub fn build_add_batch(
@@ -100,6 +103,7 @@ pub fn build_add_batch(
     meta: &IndexMeta,
     docid: &[u8],
     mut rec: DocRecord,
+    numvals: &[(Vec<u8>, f64)],
 ) -> Result<WriteBatch, String> {
     let old = read_doc(store, prefix, index, docid)?;
     let mut batch = WriteBatch::default();
@@ -195,6 +199,20 @@ pub fn build_add_batch(
         }
     }
 
+    // -- numeric doc values: put-or-clear per schema field (adds and
+    //    replacements alike -- an absent value must wipe the old one) --
+    for field in numeric_fields(meta) {
+        let v = numvals
+            .iter()
+            .find(|(name, _)| *name == field)
+            .map(|(_, v)| *v);
+        let key = numval_key(prefix, index, &field, docid);
+        match v {
+            Some(v) => batch.put(key, encode_numval(v)),
+            None => batch.delete(key),
+        }
+    }
+
     // -- meta counters + the doc record itself --
     let mut new_meta = meta.clone();
     if old.is_none() {
@@ -261,6 +279,11 @@ pub fn build_del_batch(
             )?;
         }
     }
+    // numeric doc values are schema-addressed, not term-addressed:
+    // clear them per field regardless of what the old doc carried
+    for field in numeric_fields(meta) {
+        batch.delete(numval_key(prefix, index, &field, docid));
+    }
     let mut new_meta = meta.clone();
     new_meta.num_docs = new_meta.num_docs.saturating_sub(1);
     new_meta.sum_doclen = new_meta.sum_doclen.saturating_sub(old.doclen);
@@ -274,8 +297,27 @@ pub fn build_del_batch(
 pub fn vector_field(meta: &IndexMeta) -> Option<(Vec<u8>, u64)> {
     meta.fields.iter().find_map(|f| match &f.ftype {
         FieldType::Vector { dim } => Some((f.name.clone(), *dim)),
-        FieldType::Text => None,
+        FieldType::Text | FieldType::Keyword | FieldType::Numeric => None,
     })
+}
+
+/// NUMERIC field names (columnar doc-value records, kind 0x19).
+pub fn numeric_fields(meta: &IndexMeta) -> Vec<Vec<u8>> {
+    meta.fields
+        .iter()
+        .filter(|f| matches!(f.ftype, FieldType::Numeric))
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// KEYWORD field names (exact-match terms, postings via the doc
+/// record's undo log like TEXT).
+pub fn keyword_fields(meta: &IndexMeta) -> Vec<Vec<u8>> {
+    meta.fields
+        .iter()
+        .filter(|f| matches!(f.ftype, FieldType::Keyword))
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 /// TEXT field names (query-side scope defaults).
