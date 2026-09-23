@@ -44,7 +44,11 @@ pub async fn handle_join_group(
     let bad = || "malformed joingroup request".to_string();
     let group = body.string().ok_or_else(bad)?;
     let session_ms = body.i32().ok_or_else(bad)? as i64;
-    let rebalance_ms = if version >= 1 { body.i32().ok_or_else(bad)? as i64 } else { session_ms };
+    let rebalance_ms = if version >= 1 {
+        body.i32().ok_or_else(bad)? as i64
+    } else {
+        session_ms
+    };
     let mut member_id = body.string().ok_or_else(bad)?;
     // Canonical gate: group_instance_id arrives at v5 (v4 only added
     // the two-phase member-id flow) -- librdkafka omits it on v4.
@@ -182,7 +186,11 @@ fn parse_assignments_compact(body: &mut Reader<'_>) -> Result<Vec<(String, Vec<u
     let mut list = Vec::new();
     for _ in 0..count {
         let id = body.compact_string().ok_or_else(bad)?;
-        let a = body.compact_bytes().ok_or_else(bad)?.unwrap_or(&[]).to_vec();
+        let a = body
+            .compact_bytes()
+            .ok_or_else(bad)?
+            .unwrap_or(&[])
+            .to_vec();
         list.push((id, a));
     }
     Ok(list)

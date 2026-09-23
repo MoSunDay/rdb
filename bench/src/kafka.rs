@@ -70,8 +70,13 @@ pub async fn ensure_topic(cfg: &Config) -> Result<(), String> {
     stream.set_nodelay(true).ok();
     let (mut rd, mut wr) = stream.into_split();
     let mut inbox = Vec::with_capacity(512);
-    if let resp::Reply::Error(text) =
-        resp::roundtrip(&mut wr, &mut rd, &mut inbox, &[b"AUTH", cfg.token.as_bytes()]).await?
+    if let resp::Reply::Error(text) = resp::roundtrip(
+        &mut wr,
+        &mut rd,
+        &mut inbox,
+        &[b"AUTH", cfg.token.as_bytes()],
+    )
+    .await?
     {
         return Err(format!("AUTH rejected: {text}"));
     }
@@ -180,7 +185,8 @@ async fn produce_loop(
             })
             .collect();
         kafka_wire::build_batch(now_ms(), &records, &mut batch);
-        let req = kafka_wire::produce_request(corr, cid, &cfg.topic, ACKS, PRODUCE_TIMEOUT_MS, &batch);
+        let req =
+            kafka_wire::produce_request(corr, cid, &cfg.topic, ACKS, PRODUCE_TIMEOUT_MS, &batch);
         let sent = Instant::now();
         write_frame(sock, &req).await?;
         let payload = read_frame(sock).await?;
@@ -198,7 +204,10 @@ async fn produce_loop(
         if out.base_offset < last_base {
             note_error(
                 stats,
-                format!("base_offset regression: {} after {last_base}", out.base_offset),
+                format!(
+                    "base_offset regression: {} after {last_base}",
+                    out.base_offset
+                ),
             );
         } else {
             last_base = out.base_offset;

@@ -40,8 +40,13 @@ fn free_addr() -> String {
 
 fn spawn_rocksmq_node(dir: &str) -> Node {
     std::fs::create_dir_all(dir).expect("create node dir");
-    let (resp, raft, raft_http, monitor, http) =
-        (free_addr(), free_addr(), free_addr(), free_addr(), free_addr());
+    let (resp, raft, raft_http, monitor, http) = (
+        free_addr(),
+        free_addr(),
+        free_addr(),
+        free_addr(),
+        free_addr(),
+    );
     let config_path = PathBuf::from(dir).join("conf.yaml");
     let yaml = format!(
         "bind: \"{resp}\"\nstore_path: \"{dir}\"\nraft_bind_address: \"{raft}\"\n\
@@ -106,7 +111,9 @@ async fn post(addr: &str, target: &str, body: &str) -> (u16, String) {
 
 /// Read one full response (head + content-length body) off `sock`.
 async fn round_trip(sock: &mut TcpStream, req: &str) -> (u16, String, String) {
-    sock.write_all(req.as_bytes()).await.expect("write http req");
+    sock.write_all(req.as_bytes())
+        .await
+        .expect("write http req");
     let mut buf = Vec::new();
     let head_end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -273,7 +280,11 @@ async fn interop_resp_xadd_and_back() {
     // RESP XADD lands in ch2/q0; a NEW HTTP group consume sees it
     // (auto-created group starts at the stream head).
     let resp = resp_cmd(&node.resp, &[b"XADD", b"ch2/q0", b"*", b"v", b"world"]).await;
-    assert!(resp.starts_with(b"$"), "xadd id: {:?}", String::from_utf8_lossy(&resp));
+    assert!(
+        resp.starts_with(b"$"),
+        "xadd id: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
     let (s, b) = post(&node.http, "/consume?channel=ch2&group=g9", "").await;
     assert_eq!(s, 200, "{b}");
     let got = msgs_of(&b);
@@ -287,7 +298,10 @@ async fn interop_resp_xadd_and_back() {
     let range = resp_cmd(&node.resp, &[b"XRANGE", b"ch2/q0", b"-", b"+"]).await;
     let text = String::from_utf8_lossy(&range).to_string();
     assert!(text.contains("*2\r\n"), "two entries: {text}");
-    assert!(text.contains("$1\r\nv\r\n$5\r\nworld") && text.contains("http-msg"), "fields: {text}");
+    assert!(
+        text.contains("$1\r\nv\r\n$5\r\nworld") && text.contains("http-msg"),
+        "fields: {text}"
+    );
 
     // Bare channel name == explicit parent/child (both hit q0).
     let (_, b1) = post(&node.http, "/consume?channel=ch2&n=10", "").await;
@@ -372,7 +386,10 @@ async fn no_group_pull_and_error_paths() {
         }
     }
     let head = String::from_utf8_lossy(&got).to_string();
-    assert!(head.starts_with("HTTP/1.1 413"), "oversized body reply: {head}");
+    assert!(
+        head.starts_with("HTTP/1.1 413"),
+        "oversized body reply: {head}"
+    );
 
     // Keep-alive: two rounds on ONE socket; Connection: close honored.
     let mut sock = TcpStream::connect(&node.http).await.expect("connect");
@@ -383,7 +400,10 @@ async fn no_group_pull_and_error_paths() {
         );
         let (s, head, id) = round_trip(&mut sock, &req).await;
         assert_eq!(s, 200, "{head}");
-        assert!(head.to_ascii_lowercase().contains("connection: keep-alive"), "{head}");
+        assert!(
+            head.to_ascii_lowercase().contains("connection: keep-alive"),
+            "{head}"
+        );
         assert!(id.contains('-'), "{id}");
     }
     let (s, head, _) = round_trip(
@@ -392,7 +412,10 @@ async fn no_group_pull_and_error_paths() {
     )
     .await;
     assert_eq!(s, 200, "{head}");
-    assert!(head.to_ascii_lowercase().contains("connection: close"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
     // the server must now have closed the socket: next read is EOF
     let mut chunk = [0u8; 16];
     let n = sock.read(&mut chunk).await.expect("read after close");

@@ -23,15 +23,18 @@ impl<'a> Reader<'a> {
     }
 
     fn i16(&mut self) -> Option<i16> {
-        self.take(2).map(|b| i16::from_be_bytes(b.try_into().unwrap()))
+        self.take(2)
+            .map(|b| i16::from_be_bytes(b.try_into().unwrap()))
     }
 
     fn i32(&mut self) -> Option<i32> {
-        self.take(4).map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+        self.take(4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
     }
 
     fn i64(&mut self) -> Option<i64> {
-        self.take(8).map(|b| i64::from_be_bytes(b.try_into().unwrap()))
+        self.take(8)
+            .map(|b| i64::from_be_bytes(b.try_into().unwrap()))
     }
 
     fn string(&mut self) -> Option<String> {
@@ -39,7 +42,7 @@ impl<'a> Reader<'a> {
         if len < 0 {
             return None;
         }
-        Some(String::from_utf8(self.take(len as usize)?.to_vec()).ok()?)
+        String::from_utf8(self.take(len as usize)?.to_vec()).ok()
     }
 
     /// Classic array count; `Some(None)` = null array (-1).
@@ -85,7 +88,8 @@ fn single_partition(r: &mut Reader<'_>, api: &str) -> Result<(), String> {
     if n_topics != 1 {
         return Err(format!("{api} reply: {n_topics} topics, expected 1"));
     }
-    r.string().ok_or_else(|| format!("malformed {api} topic echo"))?;
+    r.string()
+        .ok_or_else(|| format!("malformed {api} topic echo"))?;
     let n_parts = r
         .array_len()
         .ok_or_else(|| format!("malformed {api} reply"))?
@@ -93,7 +97,8 @@ fn single_partition(r: &mut Reader<'_>, api: &str) -> Result<(), String> {
     if n_parts != 1 {
         return Err(format!("{api} reply: {n_parts} partitions, expected 1"));
     }
-    r.i32().ok_or_else(|| format!("malformed {api} partition"))?;
+    r.i32()
+        .ok_or_else(|| format!("malformed {api} partition"))?;
     Ok(())
 }
 
@@ -139,7 +144,10 @@ pub fn parse_fetch(payload: &[u8], expected_corr: i32) -> Result<FetchOut, Strin
         r.i64().ok_or("malformed aborted transaction")?;
         r.i64().ok_or("malformed aborted transaction")?;
     }
-    let records = r.bytes().ok_or("malformed fetch records")?.map(|b| b.to_vec());
+    let records = r
+        .bytes()
+        .ok_or("malformed fetch records")?
+        .map(|b| b.to_vec());
     Ok(FetchOut {
         error,
         hwm,

@@ -68,7 +68,11 @@ async fn handle_conn(mut sock: TcpStream, shared: Arc<Shared>, token: String) {
     let rep = match read_request(&mut sock).await {
         Ok(Some(req)) => {
             if !authorized(&req, &token) {
-                reply::error(401, "security_exception", "missing or invalid bearer credentials")
+                reply::error(
+                    401,
+                    "security_exception",
+                    "missing or invalid bearer credentials",
+                )
             } else {
                 router::route(&shared, &req).await
             }
@@ -104,9 +108,7 @@ async fn read_request(sock: &mut TcpStream) -> Result<Option<Request>, Reply> {
         };
         buf.extend_from_slice(&chunk[..n]);
     };
-    let head = parse_head(&buf[..head_end]).map_err(|e| {
-        reply::error(400, "bad_request", e)
-    })?;
+    let head = parse_head(&buf[..head_end]).map_err(|e| reply::error(400, "bad_request", e))?;
     if head.header("transfer-encoding").is_some() {
         return Err(reply::error(
             501,
@@ -160,9 +162,9 @@ fn authorized(req: &Request, token: &str) -> bool {
         return true;
     }
     let expected = format!("bearer {}", token.to_ascii_lowercase());
-    req.headers.iter().any(|(n, v)| {
-        n == "authorization" && v.trim().to_ascii_lowercase() == expected
-    })
+    req.headers
+        .iter()
+        .any(|(n, v)| n == "authorization" && v.trim().to_ascii_lowercase() == expected)
 }
 
 async fn write_reply(sock: &mut TcpStream, rep: &Reply) -> std::io::Result<()> {
@@ -222,9 +224,13 @@ fn parse_head(bytes: &[u8]) -> Result<Head, &'static str> {
     let method = parts.next().ok_or("malformed request line")?;
     let target = parts.next().ok_or("malformed request line")?;
     let version = parts.next().ok_or("malformed request line")?;
-    if parts.next().is_some() || method.is_empty() || !target.starts_with('/')
+    if parts.next().is_some()
+        || method.is_empty()
+        || !target.starts_with('/')
         || !version.starts_with("HTTP/1.")
-        || !method.bytes().all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
+        || !method
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
     {
         return Err("malformed request line");
     }
@@ -304,7 +310,7 @@ mod http_tests;
 fn path_segments(path: &str) -> Option<Vec<String>> {
     path.split('/')
         .filter(|s| !s.is_empty())
-        .map(|s| percent_decode(s))
+        .map(percent_decode)
         .collect()
 }
 
@@ -362,7 +368,10 @@ mod tests {
         assert_eq!(split_target("/a?z#frag"), ("/a", "z"));
         let req = build_request(head_of("GET /i%20x//_doc/a%2Fb?q HTTP/1.1\r\n\r\n"), vec![])
             .expect("request");
-        assert_eq!(req.path, vec!["i x".to_string(), "_doc".to_string(), "a/b".to_string()]);
+        assert_eq!(
+            req.path,
+            vec!["i x".to_string(), "_doc".to_string(), "a/b".to_string()]
+        );
         assert_eq!(req.query, "q");
         assert!(build_request(head_of("GET /a%zz HTTP/1.1\r\n\r\n"), vec![]).is_err());
         assert!(build_request(head_of("GET /a%2 HTTP/1.1\r\n\r\n"), vec![]).is_err());

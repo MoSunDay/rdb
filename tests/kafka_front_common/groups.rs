@@ -6,8 +6,13 @@
 //! FindCoordinator v1, OffsetCommit v2 / OffsetFetch v0 reused from
 //! the P2 surface for the fencing assertions).
 
-use rdb::kafka::frame::{put_array_len, put_bytes, put_i32, put_i64, put_nullable_string, put_string};
+// Each e2e binary mounts only the helpers its scenarios drive.
+#![allow(dead_code)]
+
 use rdb::kafka::frame::Reader;
+use rdb::kafka::frame::{
+    put_array_len, put_bytes, put_i32, put_i64, put_nullable_string, put_string,
+};
 use tokio::net::TcpStream;
 
 use super::{kafka_req, kafka_round};
@@ -99,7 +104,13 @@ pub async fn sync_v1(
 }
 
 /// Heartbeat v0 round: the error code.
-pub async fn heartbeat_v0(sock: &mut TcpStream, corr: i32, group: &str, generation: i32, member: &str) -> i16 {
+pub async fn heartbeat_v0(
+    sock: &mut TcpStream,
+    corr: i32,
+    group: &str,
+    generation: i32,
+    member: &str,
+) -> i16 {
     let mut b = Vec::new();
     put_string(&mut b, group);
     put_i32(&mut b, generation);
@@ -150,8 +161,8 @@ pub async fn describe_v0(sock: &mut TcpStream, corr: i32, group: &str) -> Descri
                 let id = r.string().unwrap();
                 r.string(); // client_id
                 r.string(); // client_host
-                r.bytes();  // metadata
-                r.bytes();  // assignment
+                r.bytes(); // metadata
+                r.bytes(); // assignment
                 id
             })
             .collect(),
@@ -161,6 +172,7 @@ pub async fn describe_v0(sock: &mut TcpStream, corr: i32, group: &str) -> Descri
 }
 
 /// OffsetCommit v2 round: the first partition's error code.
+#[allow(clippy::too_many_arguments)] // one arg per OffsetCommit v2 wire field
 pub async fn commit_v2(
     sock: &mut TcpStream,
     corr: i32,

@@ -58,7 +58,9 @@ pub const FIELD_NUMERIC: u8 = 4;
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     Text,
-    Vector { dim: u64 },
+    Vector {
+        dim: u64,
+    },
     /// Exact-match, untokenized single terms (one posting entry each,
     /// tf folds duplicates).
     Keyword,

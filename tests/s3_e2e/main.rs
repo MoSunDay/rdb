@@ -16,20 +16,34 @@ async fn bearer_token_gates_the_front() {
     wait_accepting(&mut node, &http, "s3 http").await;
     // No Authorization -> 401 AccessDenied.
     let mut sock = TcpStream::connect(&http).await.expect("connect");
-    sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.expect("write");
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .expect("write");
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     while let Ok(n) = sock.read(&mut chunk).await {
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         buf.extend_from_slice(&chunk[..n]);
     }
     let (s, head, body) = split_response(&buf);
     assert_eq!(s, 401, "{head}");
-    assert!(body.windows(b"AccessDenied".len()).any(|w| w == b"AccessDenied"), "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.windows(b"AccessDenied".len())
+            .any(|w| w == b"AccessDenied"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
     // Right token -> 200 ListBuckets.
     let (s, _, body) = s3(&http, "GET", "/", &[], b"").await;
     assert_eq!(s, 200, "authed ListBuckets");
-    assert!(body.windows(b"<ListAllMy".len()).any(|w| w == b"<ListAllMy"), "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.windows(b"<ListAllMy".len())
+            .any(|w| w == b"<ListAllMy"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 #[tokio::test]
@@ -40,7 +54,10 @@ async fn put_get_head_roundtrip() {
     let body = b"hello s3 e2e bytes";
     let (s, head, _) = put(&node, "obj/a", body).await;
     assert_eq!(s, 200, "{head:?}");
-    assert!(head.contains("etag:"), "PUT must return an ETag header: {head:?}");
+    assert!(
+        head.contains("etag:"),
+        "PUT must return an ETag header: {head:?}"
+    );
     // GET returns the same bytes.
     let (s, _, got) = s3(&node.http, "GET", "/rdb/obj/a", &[], b"").await;
     assert_eq!(s, 200);
@@ -48,7 +65,11 @@ async fn put_get_head_roundtrip() {
     // HEAD carries the size in Content-Length and no body.
     let (s, head, got) = s3(&node.http, "HEAD", "/rdb/obj/a", &[], b"").await;
     assert_eq!(s, 200);
-    assert!(head.to_ascii_lowercase().contains(&format!("content-length: {}", body.len())), "{head:?}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains(&format!("content-length: {}", body.len())),
+        "{head:?}"
+    );
     assert!(got.is_empty(), "HEAD must not carry a body");
 }
 
@@ -60,14 +81,35 @@ async fn ranged_get() {
     let body = b"0123456789";
     let (s, head, _) = put(&node, "obj/r", body).await;
     assert_eq!(s, 200, "{head:?}");
-    let (s, head, got) = s3(&node.http, "GET", "/rdb/obj/r", &[("Range", "bytes=0-2")], b"").await;
+    let (s, head, got) = s3(
+        &node.http,
+        "GET",
+        "/rdb/obj/r",
+        &[("Range", "bytes=0-2")],
+        b"",
+    )
+    .await;
     assert_eq!(s, 206, "{head:?}");
-    assert!(head.contains(&format!("Content-Range: bytes 0-2/{}", body.len())), "{head:?}");
+    assert!(
+        head.contains(&format!("Content-Range: bytes 0-2/{}", body.len())),
+        "{head:?}"
+    );
     assert_eq!(got, b"012");
     // Start past EOF is unsatisfiable.
-    let (s, _, got) = s3(&node.http, "GET", "/rdb/obj/r", &[("Range", "bytes=20-")], b"").await;
+    let (s, _, got) = s3(
+        &node.http,
+        "GET",
+        "/rdb/obj/r",
+        &[("Range", "bytes=20-")],
+        b"",
+    )
+    .await;
     assert_eq!(s, 416);
-    assert!(got.windows(12).any(|w| w == b"InvalidRange"), "{}", String::from_utf8_lossy(&got));
+    assert!(
+        got.windows(12).any(|w| w == b"InvalidRange"),
+        "{}",
+        String::from_utf8_lossy(&got)
+    );
 }
 
 #[tokio::test]
@@ -83,10 +125,19 @@ async fn list_objects_v2_folding_and_paging() {
     let (s, _, body) = s3(&node.http, "GET", "/rdb?list-type=2&delimiter=/", &[], b"").await;
     let doc = String::from_utf8_lossy(&body).to_string();
     assert_eq!(s, 200, "{doc}");
-    assert!(doc.contains("<CommonPrefixes>") && doc.contains("<Prefix>d/</Prefix>"), "{doc}");
+    assert!(
+        doc.contains("<CommonPrefixes>") && doc.contains("<Prefix>d/</Prefix>"),
+        "{doc}"
+    );
     // prefix view: exactly the two objects under d/.
-    let (s, _, body) =
-        s3(&node.http, "GET", "/rdb?list-type=2&prefix=d/&delimiter=/", &[], b"").await;
+    let (s, _, body) = s3(
+        &node.http,
+        "GET",
+        "/rdb?list-type=2&prefix=d/&delimiter=/",
+        &[],
+        b"",
+    )
+    .await;
     let doc = String::from_utf8_lossy(&body).to_string();
     assert_eq!(s, 200, "{doc}");
     assert_eq!(doc.matches("<Contents>").count(), 2, "{doc}");
@@ -103,14 +154,18 @@ async fn list_objects_v2_folding_and_paging() {
         let doc = String::from_utf8_lossy(&body).to_string();
         assert_eq!(s, 200, "{doc}");
         entries.extend(all_tags(&doc, "Key")); // Contents objects
-        if let Some(cpb) =
-            doc.split("<CommonPrefixes>").nth(1).and_then(|r| r.split("</CommonPrefixes>").next())
+        if let Some(cpb) = doc
+            .split("<CommonPrefixes>")
+            .nth(1)
+            .and_then(|r| r.split("</CommonPrefixes>").next())
         {
             entries.extend(all_tags(cpb, "Prefix")); // folded prefixes
         }
         match xml_text(&doc, "IsTruncated") {
             Some("true") => {
-                token = xml_text(&doc, "NextContinuationToken").expect("next token").to_string();
+                token = xml_text(&doc, "NextContinuationToken")
+                    .expect("next token")
+                    .to_string();
             }
             _ => break,
         }
@@ -134,7 +189,9 @@ async fn list_objects_v2_folding_and_paging() {
         entries.extend(all_tags(&doc, "Key"));
         match xml_text(&doc, "IsTruncated") {
             Some("true") => {
-                token = xml_text(&doc, "NextContinuationToken").expect("next token").to_string();
+                token = xml_text(&doc, "NextContinuationToken")
+                    .expect("next token")
+                    .to_string();
             }
             _ => break,
         }
@@ -156,14 +213,22 @@ async fn delete_semantics() {
     assert_eq!(s, 204, "{head:?}");
     let (s, _, body) = s3(&node.http, "GET", "/rdb/obj/a", &[], b"").await;
     assert_eq!(s, 404);
-    assert!(body.windows(9).any(|w| w == b"NoSuchKey"), "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.windows(9).any(|w| w == b"NoSuchKey"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
     // deleting the same key again is still 204 (idempotent)
     let (s, _, _) = s3(&node.http, "DELETE", "/rdb/obj/a", &[], b"").await;
     assert_eq!(s, 204);
     // non-empty bucket refuses to delete
     let (s, _, body) = s3(&node.http, "DELETE", "/rdb", &[], b"").await;
     assert_eq!(s, 409);
-    assert!(body.windows(14).any(|w| w == b"BucketNotEmpty"), "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.windows(14).any(|w| w == b"BucketNotEmpty"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 #[tokio::test]
@@ -186,20 +251,45 @@ async fn checkpoint_publisher_lands_real_files() {
         if let Some(id) = found {
             break id;
         }
-        assert!(Instant::now() < deadline, "no checkpoint in 20s; stderr:\n{}", std::fs::read_to_string(&node.stderr_path).unwrap_or_default());
+        assert!(
+            Instant::now() < deadline,
+            "no checkpoint in 20s; stderr:\n{}",
+            std::fs::read_to_string(&node.stderr_path).unwrap_or_default()
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     // The same set is listable over the protocol face.
-    let (s, _, body) = s3(&node.http, "GET", "/rdb?list-type=2&prefix=rocksdb/&delimiter=/", &[], b"").await;
+    let (s, _, body) = s3(
+        &node.http,
+        "GET",
+        "/rdb?list-type=2&prefix=rocksdb/&delimiter=/",
+        &[],
+        b"",
+    )
+    .await;
     let doc = String::from_utf8_lossy(&body).to_string();
     assert_eq!(s, 200, "{doc}");
-    assert!(doc.contains(&format!("<Prefix>rocksdb/{}/</Prefix>", node.bind)), "{doc}");
+    assert!(
+        doc.contains(&format!("<Prefix>rocksdb/{}/</Prefix>", node.bind)),
+        "{doc}"
+    );
     // meta.json decodes and points at files that really exist.
-    let (s, _, body) =
-        s3(&node.http, "GET", &format!("/rdb/rocksdb/{}/{}/meta.json", node.bind, id), &[], b"").await;
+    let (s, _, body) = s3(
+        &node.http,
+        "GET",
+        &format!("/rdb/rocksdb/{}/{}/meta.json", node.bind, id),
+        &[],
+        b"",
+    )
+    .await;
     assert_eq!(s, 200, "GET meta.json");
     let meta: serde_json::Value = serde_json::from_slice(&body).expect("meta.json json");
-    assert_eq!(meta["node"].as_str(), Some(node.bind.as_str()), "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        meta["node"].as_str(),
+        Some(node.bind.as_str()),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
     let files = meta["files"].as_array().expect("files array");
     assert!(!files.is_empty());
     // A listed data file (skip zero-byte ones like LOCK) really carries bytes.
@@ -234,13 +324,34 @@ async fn mixed_case_token_authenticates() {
     let http = node.http.clone();
     wait_accepting(&mut node, &http, "s3 http").await;
     // verbatim mixed-case credential: the pre-fix code 401'd this forever
-    let (s, _, _) = s3(&http, "GET", "/", &[("Authorization", "Bearer Sec-ABC-xyz-Mixed-Case")], b"").await;
+    let (s, _, _) = s3(
+        &http,
+        "GET",
+        "/",
+        &[("Authorization", "Bearer Sec-ABC-xyz-Mixed-Case")],
+        b"",
+    )
+    .await;
     assert_eq!(s, 200, "verbatim mixed-case token must authenticate");
     // client lowercases the same credential: still fine
-    let (s, _, _) = s3(&http, "GET", "/", &[("Authorization", "Bearer sec-abc-xyz-mixed-case")], b"").await;
+    let (s, _, _) = s3(
+        &http,
+        "GET",
+        "/",
+        &[("Authorization", "Bearer sec-abc-xyz-mixed-case")],
+        b"",
+    )
+    .await;
     assert_eq!(s, 200, "lowercased token must authenticate");
     // near-miss token stays rejected
-    let (s, _, _) = s3(&http, "GET", "/", &[("Authorization", "Bearer sec-abc-xyz-mixed-caseX")], b"").await;
+    let (s, _, _) = s3(
+        &http,
+        "GET",
+        "/",
+        &[("Authorization", "Bearer sec-abc-xyz-mixed-caseX")],
+        b"",
+    )
+    .await;
     assert_eq!(s, 401);
 }
 
@@ -254,7 +365,11 @@ async fn invalid_bucket_name_maps_to_400() {
         assert_eq!(s, 400, "{method} on an ill-formed bucket name");
         // HEAD suppresses the body (headers only); the status carries the verdict
         if method != "HEAD" {
-            assert!(body.windows(17).any(|w| w == b"InvalidBucketName"), "{}", String::from_utf8_lossy(&body));
+            assert!(
+                body.windows(17).any(|w| w == b"InvalidBucketName"),
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
         }
     }
 }
@@ -292,7 +407,14 @@ async fn list_and_put_hardening() {
         assert_eq!(s, 200);
     }
     // v2: KeyCount counts folded entries; no NextMarker in v2 replies
-    let (s, _, body) = s3(&http, "GET", "/rdb?list-type=2&delimiter=/&max-keys=1", &[], b"").await;
+    let (s, _, body) = s3(
+        &http,
+        "GET",
+        "/rdb?list-type=2&delimiter=/&max-keys=1",
+        &[],
+        b"",
+    )
+    .await;
     let doc = String::from_utf8_lossy(&body).to_string();
     assert_eq!(s, 200, "{doc}");
     assert!(doc.contains("<KeyCount>1</KeyCount>"), "{doc}");
@@ -307,15 +429,27 @@ async fn list_and_put_hardening() {
     let (s, _, body) = s3(&http, "GET", "/rdb?delimiter=/&marker=d/", &[], b"").await;
     let doc = String::from_utf8_lossy(&body).to_string();
     assert_eq!(s, 200, "{doc}");
-    assert!(doc.contains("<KeyCount>1</KeyCount>") && doc.contains("<IsTruncated>false</IsTruncated>"), "{doc}");
+    assert!(
+        doc.contains("<KeyCount>1</KeyCount>") && doc.contains("<IsTruncated>false</IsTruncated>"),
+        "{doc}"
+    );
     // Content-Type with a bare LF is refused, never stored (response
     // head injection), and PUT without Content-Length is 411.
-    let (s, _, _) = s3(&http, "PUT", "/rdb/evil", &[("Content-Type", "text/plain\nX-Injected: 1")], b"x").await;
+    let (s, _, _) = s3(
+        &http,
+        "PUT",
+        "/rdb/evil",
+        &[("Content-Type", "text/plain\nX-Injected: 1")],
+        b"x",
+    )
+    .await;
     assert_eq!(s, 400);
     let (s, _, _) = s3(&http, "GET", "/rdb/evil", &[], b"").await;
     assert_eq!(s, 404, "poisoned object must not exist");
     let mut sock = TcpStream::connect(&http).await.expect("connect");
-    sock.write_all(b"PUT /rdb/nolen HTTP/1.1\r\nHost: x\r\n\r\n").await.expect("write");
+    sock.write_all(b"PUT /rdb/nolen HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .expect("write");
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     while let Ok(n) = sock.read(&mut chunk).await {

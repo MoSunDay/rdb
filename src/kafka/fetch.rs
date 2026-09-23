@@ -34,10 +34,10 @@ use std::time::{Duration, Instant};
 
 use crate::hash;
 use crate::kafka::errors;
+use crate::kafka::fetch_records::collect_records;
 use crate::kafka::frame::{
     put_array_len, put_bytes, put_i16, put_i32, put_i64, put_null_array_len, put_string, Reader,
 };
-use crate::kafka::fetch_records::collect_records;
 use crate::kafka::mapping;
 use crate::lite::model;
 use crate::state::Shared;
@@ -144,7 +144,14 @@ pub async fn handle_fetch(
                     },
                     Some((prefix, stream)) => {
                         live = true;
-                        read_partition(shared, prefix, stream, g.partition, g.fetch_offset, g.budget)?
+                        read_partition(
+                            shared,
+                            prefix,
+                            stream,
+                            g.partition,
+                            g.fetch_offset,
+                            g.budget,
+                        )?
                     }
                 };
                 total += out.records.len();
@@ -180,7 +187,9 @@ fn parse_fetch(body: &mut Reader<'_>, version: i16) -> Result<FetchReq, String> 
     let _replica_id = body.i32().ok_or_else(bad)?;
     let max_wait_time = body.i32().ok_or_else(bad)?;
     let min_bytes = body.i32().ok_or_else(bad)?;
-    let max_bytes = (version >= 3).then(|| body.i32().ok_or_else(bad)).transpose()?;
+    let max_bytes = (version >= 3)
+        .then(|| body.i32().ok_or_else(bad))
+        .transpose()?;
     if version >= 4 {
         let _isolation_level = body.i8().ok_or_else(bad)?;
     }
@@ -274,11 +283,7 @@ fn resolve_targets(
 }
 
 /// `(prefix, stream)` of a known topic-partition; `None` = unknown.
-fn resolve_stream(
-    shared: &Shared,
-    topic: &str,
-    partition: i32,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+fn resolve_stream(shared: &Shared, topic: &str, partition: i32) -> Option<(Vec<u8>, Vec<u8>)> {
     mapping::validate_topic(topic.as_bytes()).ok()?;
     let parent = topic.as_bytes().to_vec();
     let prefix = hash::slot_with_prefix(&parent).1;
@@ -322,7 +327,6 @@ fn read_partition(
         records,
     })
 }
-
 
 /// Response body v0-v10 (official FetchResponse field order:
 /// throttle v1+, error_code v7+ BEFORE session_id v7+, and

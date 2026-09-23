@@ -16,7 +16,9 @@ use serde_json::Value;
 
 use crate::search::ann;
 use crate::search::bm25::{term_score, TopK};
-use crate::search::ft_index::{read_doc, read_posting, read_termstat, vector_field, FieldType, IndexMeta};
+use crate::search::ft_index::{
+    read_doc, read_posting, read_termstat, vector_field, FieldType, IndexMeta,
+};
 use crate::search::index_codec::{decode_numval, doc_range, numval_range};
 use crate::search::tokenize::tokenize;
 use crate::search::vecmath;
@@ -43,7 +45,12 @@ pub(super) struct EvalCtx<'a> {
     doclens: HashMap<Vec<u8>, u64>,
 }
 
-pub(super) fn new_ctx<'a>(store: &'a Store, prefix: &'a [u8], index: &'a [u8], meta: &'a IndexMeta) -> EvalCtx<'a> {
+pub(super) fn new_ctx<'a>(
+    store: &'a Store,
+    prefix: &'a [u8],
+    index: &'a [u8],
+    meta: &'a IndexMeta,
+) -> EvalCtx<'a> {
     let n = meta.num_docs.max(1);
     EvalCtx {
         store,
@@ -71,7 +78,11 @@ fn retain_common(a: &mut HashMap<Vec<u8>, f64>, b: &HashMap<Vec<u8>, f64>) {
 pub(super) fn eval(ctx: &mut EvalCtx, plan: &Plan) -> Result<Scored, String> {
     match plan {
         Plan::MatchAll => eval_match_all(ctx),
-        Plan::Match { field, terms, operator } => eval_match(ctx, field, terms, operator),
+        Plan::Match {
+            field,
+            terms,
+            operator,
+        } => eval_match(ctx, field, terms, operator),
         Plan::Term { field, value } => eval_term(ctx, field, value),
         Plan::Terms { field, values } => {
             let mut docs = HashMap::new();
@@ -80,12 +91,19 @@ pub(super) fn eval(ctx: &mut EvalCtx, plan: &Plan) -> Result<Scored, String> {
             }
             Ok(Scored { docs })
         }
-        Plan::Range { field, gte, gt, lte, lt } => {
-            eval_range(ctx, field, *gte, *gt, *lte, *lt)
-        }
-        Plan::Bool { must, filter, should, must_not } => {
-            eval_bool(ctx, must, filter, should, must_not)
-        }
+        Plan::Range {
+            field,
+            gte,
+            gt,
+            lte,
+            lt,
+        } => eval_range(ctx, field, *gte, *gt, *lte, *lt),
+        Plan::Bool {
+            must,
+            filter,
+            should,
+            must_not,
+        } => eval_bool(ctx, must, filter, should, must_not),
     }
 }
 
@@ -165,8 +183,7 @@ fn eval_match(
         for (df, tfm) in &per_term {
             for (d, tf) in tfm {
                 let dl = doclen_of(ctx, d);
-                *docs.entry(d.clone()).or_insert(0.0) +=
-                    term_score(*tf, *df, dl, ctx.avgdl, ctx.n);
+                *docs.entry(d.clone()).or_insert(0.0) += term_score(*tf, *df, dl, ctx.avgdl, ctx.n);
             }
         }
     }
@@ -216,9 +233,7 @@ fn eval_term(ctx: &mut EvalCtx, field: &str, value: &TermValue) -> Result<Scored
             Ok(Scored { docs })
         }
         // NUMERIC: f64 doc-value equality (exact LE roundtrip).
-        (Some(FieldType::Numeric), TermValue::Number(x)) => {
-            scan_numvals(ctx, field, &|v| v == *x)
-        }
+        (Some(FieldType::Numeric), TermValue::Number(x)) => scan_numvals(ctx, field, &|v| v == *x),
         // Unknown field / type mismatch: empty set (ES would 404 the
         // field mapping; v1 documents this as match-nothing).
         _ => Ok(Scored::default()),
@@ -264,10 +279,10 @@ fn eval_range(
         return Ok(Scored::default());
     }
     scan_numvals(ctx, field, &|v| {
-        gte.map_or(true, |b| v >= b)
-            && gt.map_or(true, |b| v > b)
-            && lte.map_or(true, |b| v <= b)
-            && lt.map_or(true, |b| v < b)
+        gte.is_none_or(|b| v >= b)
+            && gt.is_none_or(|b| v > b)
+            && lte.is_none_or(|b| v <= b)
+            && lt.is_none_or(|b| v < b)
     })
 }
 
@@ -304,8 +319,16 @@ fn eval_bool(
         }
         for d in member.unwrap_or_default().into_keys() {
             // must scores sum; filter-only matches keep constant 1.0
-            let parts: Vec<f64> = must_s.iter().filter_map(|s| s.docs.get(&d)).copied().collect();
-            let sc = if parts.is_empty() { 1.0 } else { parts.iter().sum() };
+            let parts: Vec<f64> = must_s
+                .iter()
+                .filter_map(|s| s.docs.get(&d))
+                .copied()
+                .collect();
+            let sc = if parts.is_empty() {
+                1.0
+            } else {
+                parts.iter().sum()
+            };
             docs.insert(d, sc);
         }
         // should beside must/filter only adds score (msm 0 default)
@@ -380,7 +403,11 @@ pub(super) fn run_knn(
                     }
                 }
             }
-            Ok(top.finish().into_iter().map(|h| (h.docid, h.score)).collect())
+            Ok(top
+                .finish()
+                .into_iter()
+                .map(|h| (h.docid, h.score))
+                .collect())
         }
     }
 }
@@ -388,7 +415,9 @@ pub(super) fn run_knn(
 /// Parsed source of a doc record; invalid JSON -> None (never fails
 /// the query).
 pub(super) fn load_source(ctx: &EvalCtx, docid: &[u8]) -> Option<Value> {
-    let rec = read_doc(ctx.store, ctx.prefix, ctx.index, docid).ok().flatten()?;
+    let rec = read_doc(ctx.store, ctx.prefix, ctx.index, docid)
+        .ok()
+        .flatten()?;
     serde_json::from_slice(&rec.doc).ok()
 }
 

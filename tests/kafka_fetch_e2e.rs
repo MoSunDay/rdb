@@ -8,13 +8,11 @@ mod kafka_front_common;
 
 use common::contains_bytes;
 use kafka_front_common::{kafka_req, kafka_round, resp_one_shot, spawn_kafka_node, wait_accepting};
-use rdb::kafka::frame::{put_i32, put_i64, put_array_len, put_string, Reader};
+use rdb::kafka::frame::{put_array_len, put_i32, put_i64, put_string, Reader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const API_FETCH: i16 = 1;
-const API_OFFSET_COMMIT: i16 = 8;
-const API_OFFSET_FETCH: i16 = 9;
 
 /// Fetch request body (classic encoding): one topic, one partition.
 #[allow(clippy::too_many_arguments)]
@@ -164,14 +162,8 @@ fn batch_head(records: &[u8]) -> (i64, i32) {
     (base, last_delta + 1)
 }
 
-async fn fetch_round(
-    sock: &mut TcpStream,
-    corr: i32,
-    version: i16,
-    body: &[u8],
-) -> FetchOut {
-    let payload =
-        kafka_round(sock, &kafka_req(API_FETCH, version, corr, false, body)).await;
+async fn fetch_round(sock: &mut TcpStream, corr: i32, version: i16, body: &[u8]) -> FetchOut {
+    let payload = kafka_round(sock, &kafka_req(API_FETCH, version, corr, false, body)).await;
     let mut r = Reader::new(&payload);
     assert_eq!(r.i32(), Some(corr), "correlation id echo");
     let hdr = r.pos();
@@ -184,15 +176,24 @@ fn xadd_id(reply: &[u8]) -> Vec<u8> {
         .split(|&b| b == b'\n')
         .filter(|l| !l.is_empty() && *l.last().unwrap() == b'\r')
         .map(|l| &l[..l.len() - 1])
-        .last()
+        .next_back()
         .unwrap()
         .to_vec()
 }
 
 async fn xadd(resp: &str, stream: &str, key: &str, val: &str) {
-    resp_one_shot(resp, &[b"XADD", stream.as_bytes(), b"*", key.as_bytes(), val.as_bytes()]).await;
+    resp_one_shot(
+        resp,
+        &[
+            b"XADD",
+            stream.as_bytes(),
+            b"*",
+            key.as_bytes(),
+            val.as_bytes(),
+        ],
+    )
+    .await;
 }
-
 
 #[tokio::test]
 async fn fetch_versions_ladder_errors_and_hwm() {
@@ -239,7 +240,10 @@ async fn fetch_versions_ladder_errors_and_hwm() {
         &fetch_body(4, 0, 1, 1 << 20, "f1", 0, 0, 1 << 20),
     )
     .await;
-    assert_eq!((o.throttle, o.error, o.hwm, o.lso, o.aborted_null), (0, 0, 3, 3, true));
+    assert_eq!(
+        (o.throttle, o.error, o.hwm, o.lso, o.aborted_null),
+        (0, 0, 3, 3, true)
+    );
 
     // v10: top-level error 0 + session_id 0 (v7+, error BEFORE session);
     // preferred_read_replica is a v11+ field and must be absent.
@@ -250,7 +254,10 @@ async fn fetch_versions_ladder_errors_and_hwm() {
         &fetch_body(10, 0, 1, 1 << 20, "f1", 0, 0, 1 << 20),
     )
     .await;
-    assert_eq!((o.session_id, o.top_error, o.error, o.preferred_replica), (0, 0, 0, -1));
+    assert_eq!(
+        (o.session_id, o.top_error, o.error, o.preferred_replica),
+        (0, 0, 0, -1)
+    );
     assert_eq!(batch_head(&o.records), (0, 3));
 
     // EOF (offset == hwm): error 0, 0-length record set.
@@ -303,7 +310,11 @@ async fn fetch_budget_truncation() {
     let body = fetch_body(3, 0, 1, 1 << 20, "f2", 0, 0, 70);
     let o = fetch_round(&mut sock, 201, 3, &body).await;
     assert_eq!(o.error, 0);
-    assert_eq!(batch_head(&o.records), (0, 1), "partition_max_bytes truncates");
+    assert_eq!(
+        batch_head(&o.records),
+        (0, 1),
+        "partition_max_bytes truncates"
+    );
 
     // Global budget 200 is SOFT: every live partition still gets 1 record.
     let body = fetch_two_parts(3, "f2", &[(0, 0, 1 << 20), (1, 0, 1 << 20)]);
@@ -331,7 +342,11 @@ async fn fetch_budget_truncation() {
         }
     }
     served.sort_unstable();
-    assert_eq!(served, vec![0, 1], "each partition gets >=1 record under a soft global budget");
+    assert_eq!(
+        served,
+        vec![0, 1],
+        "each partition gets >=1 record under a soft global budget"
+    );
 }
 
 #[tokio::test]
@@ -353,7 +368,10 @@ async fn fetch_long_poll_wakes_and_expires() {
     let req = kafka_req(API_FETCH, 0, 301, false, &body);
     let t0 = std::time::Instant::now();
     let payload = kafka_round(&mut sock, &req).await;
-    assert!(t0.elapsed() >= std::time::Duration::from_millis(450), "waited the slice");
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_millis(450),
+        "waited the slice"
+    );
     let mut r = Reader::new(&payload);
     r.i32();
     let hdr = r.pos();
@@ -380,7 +398,10 @@ async fn fetch_long_poll_wakes_and_expires() {
     })
     .await
     .expect("long poll answered within max_wait");
-    assert!(t0.elapsed() < std::time::Duration::from_secs(7), "woken, not timed out");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(7),
+        "woken, not timed out"
+    );
     waker.await.expect("waker");
     let mut r = Reader::new(&payload);
     assert_eq!(r.i32(), Some(302));

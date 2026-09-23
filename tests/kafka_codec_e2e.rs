@@ -103,8 +103,7 @@ async fn compressed_produce_roundtrips_through_the_real_binary() {
         put_i32(&mut body, 0);
         put_i32(&mut body, batch.len() as i32);
         body.extend_from_slice(&batch);
-        let payload =
-            kafka_round(&mut sock, &kafka_req(API_PRODUCE, 2, corr, false, &body)).await;
+        let payload = kafka_round(&mut sock, &kafka_req(API_PRODUCE, 2, corr, false, &body)).await;
         let mut r = Reader::new(&payload);
         assert_eq!(r.i32(), Some(corr), "corr echo");
         assert_eq!(r.array_len(), Some(Some(1)));
@@ -160,7 +159,11 @@ async fn compressed_produce_roundtrips_through_the_real_binary() {
     r.string();
     r.array_len();
     assert_eq!(r.i32(), Some(0));
-    assert_eq!(r.i16(), Some(ERR_CORRUPT), "garbage gzip -> CORRUPT_MESSAGE");
+    assert_eq!(
+        r.i16(),
+        Some(ERR_CORRUPT),
+        "garbage gzip -> CORRUPT_MESSAGE"
+    );
 
     // All 15 compressed-produced records landed on the Lite queue in
     // order (seed + 5 x 3).
@@ -170,17 +173,19 @@ async fn compressed_produce_roundtrips_through_the_real_binary() {
         for i in 0..5 {
             let key = format!("{tag}-{i}");
             let val = format!("{tag}-value-{i}");
-            let xrange = resp_one_shot(
-                &resp,
-                &[b"XRANGE", b"kc/q0", b"-", b"+"],
-            )
-            .await;
+            let xrange = resp_one_shot(&resp, &[b"XRANGE", b"kc/q0", b"-", b"+"]).await;
             assert!(
-                contains_bytes(&xrange, format!("$1\r\nk\r\n${}\r\n{}\r\n", key.len(), key).as_bytes()),
+                contains_bytes(
+                    &xrange,
+                    format!("$1\r\nk\r\n${}\r\n{}\r\n", key.len(), key).as_bytes()
+                ),
                 "{tag} key {key} missing"
             );
             assert!(
-                contains_bytes(&xrange, format!("$1\r\nv\r\n${}\r\n{}\r\n", val.len(), val).as_bytes()),
+                contains_bytes(
+                    &xrange,
+                    format!("$1\r\nv\r\n${}\r\n{}\r\n", val.len(), val).as_bytes()
+                ),
                 "{tag} value {val} missing"
             );
         }

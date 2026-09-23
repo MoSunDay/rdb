@@ -90,14 +90,17 @@ pub fn load(
     group: &[u8],
 ) -> Result<Option<LedgerRow>, String> {
     let raw = ops::get_physical(store, &ledger_key(prefix, stream, group))?;
-    Ok(raw.as_deref().and_then(decode_value).map(|(ordinal, gen, leader)| LedgerRow {
-        stream: stream.to_vec(),
-        group: group.to_vec(),
-        prefix: prefix.to_vec(),
-        committed_ordinal: ordinal,
-        generation: gen,
-        leader,
-    }))
+    Ok(raw
+        .as_deref()
+        .and_then(decode_value)
+        .map(|(ordinal, gen, leader)| LedgerRow {
+            stream: stream.to_vec(),
+            group: group.to_vec(),
+            prefix: prefix.to_vec(),
+            committed_ordinal: ordinal,
+            generation: gen,
+            leader,
+        }))
 }
 
 fn decode_value(raw: &[u8]) -> Option<(u64, i32, String)> {
@@ -195,7 +198,10 @@ mod tests {
         );
         // stream containing '/' is the normal case.
         let s2 = ledger_key(b"70/", b"orders/eu/p1", b"g");
-        assert_eq!(parse_key(&s2), Some((b"orders/eu/p1".to_vec(), b"g".to_vec())));
+        assert_eq!(
+            parse_key(&s2),
+            Some((b"orders/eu/p1".to_vec(), b"g".to_vec()))
+        );
     }
 
     #[test]

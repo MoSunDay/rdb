@@ -8,11 +8,11 @@
 //!   topic ids) never appears. v8 adds the authorized-ops bitmasks; both
 //!   are emitted as the "unset" sentinel (this front has no ACL model).
 
+use crate::kafka::catalog;
 use crate::kafka::errors;
 use crate::kafka::frame::{
     put_array_len, put_bool, put_i16, put_i32, put_nullable_string, put_string, Reader,
 };
-use crate::kafka::catalog;
 use crate::state::Shared;
 
 /// Single-broker identity (advertised in Metadata; also the leader /
@@ -176,7 +176,7 @@ pub fn metadata_body(version: i16, topics: Vec<TopicMeta>, ad: &(String, i32)) -
         put_nullable_string(&mut out, Some("rdb-lite")); // cluster_id
     }
     put_i32(&mut out, NODE_ID); // controller_id
-    // topics
+                                // topics
     put_array_len(&mut out, topics.len());
     for t in &topics {
         put_i16(&mut out, t.error);
@@ -259,7 +259,10 @@ mod tests {
         assert_eq!(r.i16(), Some(0));
         assert_eq!(r.array_len(), Some(Some(want.len())));
         for (key, lo, hi) in &want {
-            assert_eq!([r.i16(), r.i16(), r.i16()], [Some(*key), Some(*lo), Some(*hi)]);
+            assert_eq!(
+                [r.i16(), r.i16(), r.i16()],
+                [Some(*key), Some(*lo), Some(*hi)]
+            );
         }
         assert_eq!(r.remaining(), 0, "no throttle on v0");
 
@@ -268,7 +271,10 @@ mod tests {
         assert_eq!(r.i16(), Some(0));
         assert_eq!(r.compact_array_len(), Some(Some(want.len())));
         for (key, lo, hi) in &want {
-            assert_eq!([r.i16(), r.i16(), r.i16()], [Some(*key), Some(*lo), Some(*hi)]);
+            assert_eq!(
+                [r.i16(), r.i16(), r.i16()],
+                [Some(*key), Some(*lo), Some(*hi)]
+            );
             assert_eq!(r.skip_tagged_fields(), Some(()));
         }
         assert_eq!(r.i32(), Some(0), "throttle AFTER the array on v3");

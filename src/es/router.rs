@@ -249,5 +249,7 @@ fn check_id(id: &str) -> Option<Reply> {
 /// Bare `?name=value` check (no percent-decoding; the flags this
 /// router reads are plain ASCII).
 fn query_is(query: &str, name: &str, value: &str) -> bool {
-    query.split('&').any(|pair| pair == format!("{name}={value}"))
+    query
+        .split('&')
+        .any(|pair| pair == format!("{name}={value}"))
 }

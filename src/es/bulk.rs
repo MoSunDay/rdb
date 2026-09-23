@@ -26,10 +26,12 @@ pub struct BulkOp {
 const MAX_ID_LEN: usize = 512;
 const MAX_INDEX_LEN: usize = 255;
 
+type BulkParseResult = Result<Vec<(BulkOp, Option<Vec<u8>>)>, String>;
+
 /// Split an NDJSON body into (action, source) pairs. Blank lines are
 /// skipped; `delete` takes no source; every other action must be
 /// followed by one source line. Errors carry the 1-based line number.
-pub fn parse_ndjson(body: &[u8]) -> Result<Vec<(BulkOp, Option<Vec<u8>>)>, String> {
+pub fn parse_ndjson(body: &[u8]) -> BulkParseResult {
     let text = std::str::from_utf8(body).map_err(|_| "bulk body must be UTF-8".to_string())?;
     let mut out = Vec::new();
     let mut pending: Option<BulkOp> = None;
@@ -40,8 +42,8 @@ pub fn parse_ndjson(body: &[u8]) -> Result<Vec<(BulkOp, Option<Vec<u8>>)>, Strin
         }
         match pending.take() {
             None => {
-                let op = parse_action_line(line.trim())
-                    .map_err(|e| format!("line {}: {e}", i + 1))?;
+                let op =
+                    parse_action_line(line.trim()).map_err(|e| format!("line {}: {e}", i + 1))?;
                 if op.action == "delete" {
                     out.push((op, None));
                 } else {
@@ -59,7 +61,8 @@ pub fn parse_ndjson(body: &[u8]) -> Result<Vec<(BulkOp, Option<Vec<u8>>)>, Strin
 
 /// `{"<action>": {"_index"?: s, "_id"?: s}}` -> [`BulkOp`].
 fn parse_action_line(line: &str) -> Result<BulkOp, String> {
-    let v: Value = serde_json::from_str(line).map_err(|_| "malformed JSON action line".to_string())?;
+    let v: Value =
+        serde_json::from_str(line).map_err(|_| "malformed JSON action line".to_string())?;
     let Some(obj) = v.as_object() else {
         return Err("action line must be a JSON object".to_string());
     };
@@ -85,7 +88,11 @@ fn parse_action_line(line: &str) -> Result<BulkOp, String> {
     if id.is_empty() && (action == "delete" || action == "update") {
         return Err(format!("action '{action}' requires an _id"));
     }
-    Ok(BulkOp { action: action.clone(), index, id })
+    Ok(BulkOp {
+        action: action.clone(),
+        index,
+        id,
+    })
 }
 
 /// Run one `_bulk` request against `default_index` (the URL's index;
@@ -107,22 +114,44 @@ pub async fn run_bulk(shared: &Shared, default_index: &str, body: &[u8]) -> Repl
         };
         if !valid_name(&index, MAX_INDEX_LEN) {
             errors = true;
-            items.push(item_err(&op.action, &index, &op.id, "invalid_index_name_exception", "missing or invalid index name"));
+            items.push(item_err(
+                &op.action,
+                &index,
+                &op.id,
+                "invalid_index_name_exception",
+                "missing or invalid index name",
+            ));
             continue;
         }
         match op.action.as_str() {
             "update" => {
                 errors = true;
                 items.push(item_err(
-                    &op.action, &index, &op.id,
+                    &op.action,
+                    &index,
+                    &op.id,
                     "action_request_validation_exception",
                     "update actions are not supported in this ES subset",
                 ));
             }
             "delete" => match write::del_doc(shared, &index, &op.id).await {
-                Ok(Some(())) => items.push(reply::bulk_item(&op.action, &index, &op.id, 200, Some("deleted"), None)),
+                Ok(Some(())) => items.push(reply::bulk_item(
+                    &op.action,
+                    &index,
+                    &op.id,
+                    200,
+                    Some("deleted"),
+                    None,
+                )),
                 // delete-miss: result not_found, NOT an errors:true item
-                Ok(None) => items.push(reply::bulk_item(&op.action, &index, &op.id, 404, Some("not_found"), None)),
+                Ok(None) => items.push(reply::bulk_item(
+                    &op.action,
+                    &index,
+                    &op.id,
+                    404,
+                    Some("not_found"),
+                    None,
+                )),
                 Err(e) => {
                     errors = true;
                     items.push(item_err(&op.action, &index, &op.id, &e.es_type, &e.reason));
@@ -134,7 +163,13 @@ pub async fn run_bulk(shared: &Shared, default_index: &str, body: &[u8]) -> Repl
                 };
                 if !valid_name(&op.id, MAX_ID_LEN) || op.id.contains('/') {
                     errors = true;
-                    items.push(item_err(&op.action, &index, &op.id, "illegal_argument_exception", "invalid document id"));
+                    items.push(item_err(
+                        &op.action,
+                        &index,
+                        &op.id,
+                        "illegal_argument_exception",
+                        "invalid document id",
+                    ));
                     continue;
                 }
                 let (id, create_only) = if op.id.is_empty() {
@@ -143,8 +178,22 @@ pub async fn run_bulk(shared: &Shared, default_index: &str, body: &[u8]) -> Repl
                     (op.id.clone(), act == "create")
                 };
                 match write::put_doc(shared, &index, &id, &src, create_only).await {
-                    Ok(true) => items.push(reply::bulk_item(&op.action, &index, &id, 201, Some("created"), None)),
-                    Ok(false) => items.push(reply::bulk_item(&op.action, &index, &id, 200, Some("updated"), None)),
+                    Ok(true) => items.push(reply::bulk_item(
+                        &op.action,
+                        &index,
+                        &id,
+                        201,
+                        Some("created"),
+                        None,
+                    )),
+                    Ok(false) => items.push(reply::bulk_item(
+                        &op.action,
+                        &index,
+                        &id,
+                        200,
+                        Some("updated"),
+                        None,
+                    )),
                     Err(e) => {
                         errors = true;
                         items.push(item_err(&op.action, &index, &id, &e.es_type, &e.reason));
@@ -206,8 +255,9 @@ mod tests {
     fn bad_json_and_unknown_action_carry_line_numbers() {
         let err = parse_ndjson(b"{\"a\":1,\"b\":2}\n").unwrap_err();
         assert_eq!(err, "line 1: action line must carry exactly one action");
-        let err = parse_ndjson(b"{\"index\":{\"_id\":\"1\"}}\n{}\n{\"frobnicate\":{}}\n{\"x\":1}\n")
-            .unwrap_err();
+        let err =
+            parse_ndjson(b"{\"index\":{\"_id\":\"1\"}}\n{}\n{\"frobnicate\":{}}\n{\"x\":1}\n")
+                .unwrap_err();
         assert_eq!(err, "line 3: unknown bulk action 'frobnicate'");
         let err = parse_ndjson(b"{\"delete\":{\"_index\":\"i\"}}\n").unwrap_err();
         assert!(err.contains("requires an _id"), "{err}");

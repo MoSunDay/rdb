@@ -112,9 +112,15 @@ mod tests {
     #[test]
     fn parses_scalars() {
         assert_eq!(parse(b"+OK\r\n").unwrap(), Value::Simple(b"OK".to_vec()));
-        assert_eq!(parse(b"-NOGROUP x\r\n").unwrap(), Value::Error(b"NOGROUP x".to_vec()));
+        assert_eq!(
+            parse(b"-NOGROUP x\r\n").unwrap(),
+            Value::Error(b"NOGROUP x".to_vec())
+        );
         assert_eq!(parse(b":42\r\n").unwrap(), Value::Int(42));
-        assert_eq!(parse(b"$5\r\nhello\r\n").unwrap(), Value::Bulk(Some(b"hello".to_vec())));
+        assert_eq!(
+            parse(b"$5\r\nhello\r\n").unwrap(),
+            Value::Bulk(Some(b"hello".to_vec()))
+        );
         assert_eq!(parse(b"$-1\r\n").unwrap(), Value::Bulk(None));
     }
 

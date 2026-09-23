@@ -5,8 +5,9 @@
 //! `kafka_produce_e2e.rs` (P1 produce/listoffsets) and
 //! `kafka_fetch_e2e.rs` (P2 fetch/offsets) mount this module.
 
-#[path = "../common/mod.rs"]
-mod common;
+// Helpers are shared across the per-binary e2e crates; each binary uses
+// a different subset, so dead_code fires per-crate (same as common/mod.rs).
+#![allow(dead_code)]
 
 pub mod groups;
 
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use common::TOKEN;
+use crate::common::TOKEN;
 
 /// One rdb process: RESP + kafka listeners and its log paths.
 pub struct KafkaNode {
@@ -80,9 +81,18 @@ pub fn spawn_kafka_node(dir: &Path) -> KafkaNode {
 /// e.g. "kafka_advertised_host: \"broker.example\"\n").
 pub fn spawn_kafka_node_bind(dir: &Path, kafka_bind_override: &str, extra_conf: &str) -> KafkaNode {
     std::fs::create_dir_all(dir).expect("create node dir");
-    let (resp, raft, http, monitor, kafka) =
-        (free_addr(), free_addr(), free_addr(), free_addr(), free_addr());
-    let kafka_bind = if kafka_bind_override.is_empty() { &kafka } else { kafka_bind_override };
+    let (resp, raft, http, monitor, kafka) = (
+        free_addr(),
+        free_addr(),
+        free_addr(),
+        free_addr(),
+        free_addr(),
+    );
+    let kafka_bind = if kafka_bind_override.is_empty() {
+        &kafka
+    } else {
+        kafka_bind_override
+    };
     let config_path = dir.join("conf.yaml");
     let yaml = format!(
         "bind: \"{resp}\"\nstore_path: \"{}\"\nraft_bind_address: \"{raft}\"\n\
@@ -159,7 +169,13 @@ pub async fn resp_one_shot(addr: &str, args: &[&[u8]]) -> Vec<u8> {
 
 /// Kafka request header (classic client_id, optional v2 tagged tail) ++
 /// body; the caller frames it via [`kafka_round`].
-pub fn kafka_req(api_key: i16, api_version: i16, corr: i32, flexible: bool, body: &[u8]) -> Vec<u8> {
+pub fn kafka_req(
+    api_key: i16,
+    api_version: i16,
+    corr: i32,
+    flexible: bool,
+    body: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&api_key.to_be_bytes());
     out.extend_from_slice(&api_version.to_be_bytes());
@@ -182,7 +198,9 @@ pub async fn kafka_round(sock: &mut TcpStream, req: &[u8]) -> Vec<u8> {
     sock.read_exact(&mut lenb).await.expect("read kafka len");
     let len = i32::from_be_bytes(lenb) as usize;
     let mut payload = vec![0u8; len];
-    sock.read_exact(&mut payload).await.expect("read kafka body");
+    sock.read_exact(&mut payload)
+        .await
+        .expect("read kafka body");
     payload
 }
 

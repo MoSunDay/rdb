@@ -40,7 +40,9 @@ pub fn notify_of(rt: &CoordRuntime, group: &str) -> Arc<Notify> {
         .notifies
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.entry(group.to_string()).or_insert_with(|| Arc::new(Notify::new())).clone()
+    map.entry(group.to_string())
+        .or_insert_with(|| Arc::new(Notify::new()))
+        .clone()
 }
 
 /// Wake every waiter parked on this group (waiters re-check state and
@@ -68,9 +70,7 @@ pub fn apply<T>(
         .groups
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(st) = groups.get(group).cloned() else {
-        return None;
-    };
+    let st = groups.get(group).cloned()?;
     let (st2, events, out) = f(st);
     groups.insert(group.to_string(), st2);
     drop(groups);
@@ -153,10 +153,7 @@ mod tests {
         };
         let (st2, _, _) = state::join(st.clone(), &member);
         st = st2;
-        rt.groups
-            .write()
-            .unwrap()
-            .insert("g".into(), st);
+        rt.groups.write().unwrap().insert("g".into(), st);
         // Pin every deadline far out: the sweep finds nothing to do
         // regardless of wall-clock drift (sessions here are 1ms).
         {

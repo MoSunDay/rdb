@@ -24,11 +24,7 @@ async fn api_versions_and_metadata_over_the_wire() {
     wait_accepting(&resp, &mut node, "resp").await;
 
     // Lite stream t1/q0 over RESP (one message) -- the Kafka topic view.
-    let reply = resp_one_shot(
-        &node.resp,
-        &[b"XADD", b"t1/q0", b"*", b"hello", b"world"],
-    )
-    .await;
+    let reply = resp_one_shot(&node.resp, &[b"XADD", b"t1/q0", b"*", b"hello", b"world"]).await;
     assert!(
         reply.starts_with(b"+OK\r\n$"),
         "auth+xadd reply: {:?}",
@@ -40,7 +36,9 @@ async fn api_versions_and_metadata_over_the_wire() {
     );
     wait_accepting(&kafka, &mut node, "kafka").await;
 
-    let mut sock = TcpStream::connect(&node.kafka).await.expect("connect kafka");
+    let mut sock = TcpStream::connect(&node.kafka)
+        .await
+        .expect("connect kafka");
 
     // ---- ApiVersions v0 (classic): the full P0-P3 registry, key-sorted ----
     let payload = kafka_round(&mut sock, &kafka_req(18, 0, 100, false, b"")).await;
@@ -48,19 +46,71 @@ async fn api_versions_and_metadata_over_the_wire() {
     assert_eq!(r.i32(), Some(100), "correlation id echo");
     assert_eq!(r.i16(), Some(0), "error NONE");
     assert_eq!(r.array_len(), Some(Some(13)));
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(0), Some(0), Some(3)], "Produce v0-v3");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(1), Some(0), Some(10)], "Fetch v0-v10");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(2), Some(0), Some(1)], "ListOffsets v0-v1");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(3), Some(0), Some(8)], "Metadata v0-v8");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(8), Some(0), Some(2)], "OffsetCommit v0-v2");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(9), Some(0), Some(7)], "OffsetFetch v0-v7");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(10), Some(0), Some(1)], "FindCoordinator");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(11), Some(0), Some(4)], "JoinGroup v0-v4");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(12), Some(0), Some(4)], "Heartbeat v0-v4");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(13), Some(0), Some(2)], "LeaveGroup v0-v2");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(14), Some(0), Some(4)], "SyncGroup v0-v4");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(15), Some(0), Some(3)], "DescribeGroups");
-    assert_eq!([r.i16(), r.i16(), r.i16()], [Some(18), Some(0), Some(3)], "ApiVersions");
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(0), Some(0), Some(3)],
+        "Produce v0-v3"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(1), Some(0), Some(10)],
+        "Fetch v0-v10"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(2), Some(0), Some(1)],
+        "ListOffsets v0-v1"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(3), Some(0), Some(8)],
+        "Metadata v0-v8"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(8), Some(0), Some(2)],
+        "OffsetCommit v0-v2"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(9), Some(0), Some(7)],
+        "OffsetFetch v0-v7"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(10), Some(0), Some(1)],
+        "FindCoordinator"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(11), Some(0), Some(4)],
+        "JoinGroup v0-v4"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(12), Some(0), Some(4)],
+        "Heartbeat v0-v4"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(13), Some(0), Some(2)],
+        "LeaveGroup v0-v2"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(14), Some(0), Some(4)],
+        "SyncGroup v0-v4"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(15), Some(0), Some(3)],
+        "DescribeGroups"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(18), Some(0), Some(3)],
+        "ApiVersions"
+    );
     assert_eq!(r.remaining(), 0, "v0 has no throttle tail");
 
     // ---- ApiVersions v3 (flexible) ----
@@ -105,11 +155,13 @@ async fn api_versions_and_metadata_over_the_wire() {
     assert_eq!(r.i32(), Some(102));
     assert_eq!(r.i16(), Some(35), "UNSUPPORTED_VERSION");
     assert_eq!(r.array_len(), Some(Some(13)), "v0 body still lists apis");
-    let apis: Vec<[Option<i16>; 3]> =
-        (0..13).map(|_| [r.i16(), r.i16(), r.i16()]).collect();
+    let apis: Vec<[Option<i16>; 3]> = (0..13).map(|_| [r.i16(), r.i16(), r.i16()]).collect();
     // Spot-check the P3 additions made the fallback table too.
     assert!(apis.contains(&[Some(11), Some(0), Some(4)]), "JoinGroup");
-    assert!(apis.contains(&[Some(15), Some(0), Some(3)]), "DescribeGroups");
+    assert!(
+        apis.contains(&[Some(15), Some(0), Some(3)]),
+        "DescribeGroups"
+    );
     assert_eq!(r.remaining(), 0);
 
     // ---- Metadata v0, null topics (list all): sees the Lite stream ----
@@ -122,7 +174,10 @@ async fn api_versions_and_metadata_over_the_wire() {
     assert_eq!(r.i32(), Some(1), "node_id 1");
     let host = r.string().expect("host");
     let port = r.i32().expect("port");
-    assert_eq!((host.as_str(), port), ("127.0.0.1", kafka_port(&node.kafka)));
+    assert_eq!(
+        (host.as_str(), port),
+        ("127.0.0.1", kafka_port(&node.kafka))
+    );
     assert_eq!(r.i32(), Some(1), "controller id 1");
     assert_eq!(r.array_len(), Some(Some(1)), "one topic");
     assert_eq!(r.i16(), Some(0), "topic error NONE");
@@ -186,7 +241,6 @@ async fn api_versions_and_metadata_over_the_wire() {
     assert_eq!(r.string(), Some("nope".into()));
     assert_eq!(r.array_len(), Some(Some(0)), "no partitions");
 }
-
 
 /// Spawn + wait ready with retry: parallel tests race `free_addr`'s
 /// bind-probe/release TOCTOU (a wildcard 0.0.0.0 bind can steal a
@@ -293,12 +347,9 @@ async fn connection_cap_closes_excess_sockets() {
     // server immediately: reads see EOF, not a hang.
     let mut c = TcpStream::connect(&connect).await.expect("conn c connects");
     let mut probe = [0u8; 8];
-    let seen = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        c.read(&mut probe),
-    )
-    .await
-    .expect("server closed within 5s");
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(5), c.read(&mut probe))
+        .await
+        .expect("server closed within 5s");
     assert_eq!(seen.unwrap_or(0), 0, "EOF, no response bytes");
 
     // The survivors are unaffected by the rejection.

@@ -127,10 +127,7 @@ fn classify_raw_vs_typed() {
     assert_eq!(classify(b"abc"), Classification::Raw);
     assert_eq!(classify(b""), Classification::Raw);
     assert_eq!(classify(&[0x1A]), Classification::Raw); // unassigned, > KIND_SEARCH_NUMVAL
-    assert_eq!(
-        classify(&[0x20]),
-        Classification::Typed(0x20)
-    ); // KIND_STREAM_OFFSET (space byte; documented misread)
+    assert_eq!(classify(&[0x20]), Classification::Typed(0x20)); // KIND_STREAM_OFFSET (space byte; documented misread)
     assert_eq!(
         classify(&[KIND_HASH_META, 0, 0, 0, 1]),
         Classification::Typed(KIND_HASH_META)

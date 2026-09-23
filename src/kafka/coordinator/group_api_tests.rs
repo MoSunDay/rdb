@@ -45,7 +45,6 @@ fn join_req(
 struct JoinOut {
     error: i16,
     generation: i32,
-    protocol_type: Option<String>,
     protocol_name: Option<String>,
     leader: String,
     member_id: String,
@@ -59,7 +58,11 @@ fn parse_join(body: &[u8], version: i16) -> JoinOut {
     }
     let error = r.i16().unwrap();
     let generation = r.i32().unwrap();
-    let protocol_type = if version >= 7 { r.nullable_string().unwrap() } else { None };
+    // protocol_type joins the reply at v7 (above this suite's cap);
+    // consumed only to keep the reader aligned, never inspected.
+    if version >= 7 {
+        r.nullable_string().unwrap();
+    }
     let protocol_name = if version >= 1 {
         r.nullable_string().unwrap()
     } else {
@@ -71,12 +74,23 @@ fn parse_join(body: &[u8], version: i16) -> JoinOut {
     let mut members = Vec::new();
     for _ in 0..n {
         let id = r.string().unwrap();
-        let inst = if version >= 5 { r.nullable_string().unwrap() } else { None };
+        let inst = if version >= 5 {
+            r.nullable_string().unwrap()
+        } else {
+            None
+        };
         let md = r.bytes().unwrap().unwrap_or(&[]).to_vec();
         members.push((id, inst, md));
     }
     assert_eq!(r.remaining(), 0, "no trailing bytes");
-    JoinOut { error, generation, protocol_type, protocol_name, leader, member_id, members }
+    JoinOut {
+        error,
+        generation,
+        protocol_name,
+        leader,
+        member_id,
+        members,
+    }
 }
 
 async fn round_join(
@@ -161,7 +175,13 @@ async fn join_instance_id_fencing() {
 }
 
 /// SyncGroup request body: classic (v0-v3) or flexible (v4+).
-fn sync_req(version: i16, group: &str, member: &str, gen: i32, assigns: &[(&str, &[u8])]) -> Vec<u8> {
+fn sync_req(
+    version: i16,
+    group: &str,
+    member: &str,
+    gen: i32,
+    assigns: &[(&str, &[u8])],
+) -> Vec<u8> {
     let mut b = Vec::new();
     if version >= 4 {
         put_compact_string(&mut b, group);
@@ -200,7 +220,9 @@ async fn round_sync(
 ) -> (i16, Vec<u8>) {
     let body = sync_req(version, group, member, gen, assigns);
     let mut r = Reader::new(&body);
-    let out = group_api::handle_sync_group(&mut r, version, rt).await.unwrap();
+    let out = group_api::handle_sync_group(&mut r, version, rt)
+        .await
+        .unwrap();
     let mut r = Reader::new(&out);
     if version >= 1 {
         assert_eq!(r.i32(), Some(0), "throttle first (v1+)");

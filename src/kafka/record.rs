@@ -85,11 +85,7 @@ pub fn parse_batch(buf: &[u8]) -> Result<RecordBatch, String> {
     // batchLength covers everything after itself: header 21B total.
     let total = batch_length as usize + 12;
     if buf.len() < total {
-        return Err(format!(
-            "truncated batch: {}/{} bytes",
-            buf.len(),
-            total
-        ));
+        return Err(format!("truncated batch: {}/{} bytes", buf.len(), total));
     }
     let partition_leader_epoch = r.i32().ok_or("truncated leader epoch")?;
     let magic = r.i8().ok_or("truncated magic")?;
@@ -100,7 +96,9 @@ pub fn parse_batch(buf: &[u8]) -> Result<RecordBatch, String> {
     let crc_start = r.pos();
     let computed = crc32c(&buf[crc_start..total]);
     if computed != crc {
-        return Err(format!("crc mismatch: stored {crc:08x} computed {computed:08x}"));
+        return Err(format!(
+            "crc mismatch: stored {crc:08x} computed {computed:08x}"
+        ));
     }
     let attributes = r.i16().ok_or("truncated attributes")?;
     let last_offset_delta = r.i32().ok_or("truncated last_offset_delta")?;
@@ -232,11 +230,7 @@ pub struct BatchRecord<'a> {
 /// Encode a LEGAL RecordBatch v2: attributes 0 (never compressed), CRC
 /// filled over `attributes..end`, ids -1/-1/-1 (no idempotence). An
 /// empty `records` list is allowed (clients probe with empty batches).
-pub fn build_batch(
-    base_offset: i64,
-    first_timestamp: i64,
-    records: &[BatchRecord<'_>],
-) -> Vec<u8> {
+pub fn build_batch(base_offset: i64, first_timestamp: i64, records: &[BatchRecord<'_>]) -> Vec<u8> {
     use crate::kafka::frame::{put_i16, put_i32, put_i64, put_i8, put_varint};
     let mut body = Vec::new();
     put_i16(&mut body, 0); // attributes: no compression

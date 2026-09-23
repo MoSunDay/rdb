@@ -119,18 +119,25 @@ pub(crate) enum Range {
 /// the object end, a start at/past the size is `Unsatisfiable`,
 /// anything unparsable, multi-span or inverted degrades to `Full`.
 pub(crate) fn parse_range(spec: &str, size: u64) -> Range {
-    let Some(rest) = spec.trim().strip_prefix("bytes=") else { return Range::Full };
+    let Some(rest) = spec.trim().strip_prefix("bytes=") else {
+        return Range::Full;
+    };
     if rest.contains(',') {
         return Range::Full; // multi-range is outside the subset
     }
-    let Some((first, last)) = rest.split_once('-') else { return Range::Full };
-    if first.is_empty() { // suffix form: the final N bytes
+    let Some((first, last)) = rest.split_once('-') else {
+        return Range::Full;
+    };
+    if first.is_empty() {
+        // suffix form: the final N bytes
         return match last.parse::<u64>() {
             Ok(n) if n > 0 && size > 0 => Range::Part(size - n.min(size), size - 1),
             _ => Range::Unsatisfiable,
         };
     }
-    let Ok(start) = first.parse::<u64>() else { return Range::Full };
+    let Ok(start) = first.parse::<u64>() else {
+        return Range::Full;
+    };
     if start >= size {
         return Range::Unsatisfiable;
     }
@@ -159,7 +166,10 @@ mod tests {
     #[test]
     fn date_rendering_anchors() {
         assert_eq!(iso8601_millis(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(iso8601_millis(1_789_450_496_789), "2026-09-15T05:34:56.789Z");
+        assert_eq!(
+            iso8601_millis(1_789_450_496_789),
+            "2026-09-15T05:34:56.789Z"
+        );
         assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
         assert_eq!(http_date(1_789_450_496), "Tue, 15 Sep 2026 05:34:56 GMT");
     }
@@ -173,7 +183,13 @@ mod tests {
         assert!(matches!(parse_range("bytes=-99", 10), Range::Part(0, 9)));
         assert!(matches!(parse_range("bytes=10-", 10), Range::Unsatisfiable));
         assert!(matches!(parse_range("bytes=0-", 0), Range::Unsatisfiable));
-        for spec in ["bytes=0-1,3-4", "items=0-2", "bytes=x-2", "bytes=5-2", "bytes"] {
+        for spec in [
+            "bytes=0-1,3-4",
+            "items=0-2",
+            "bytes=x-2",
+            "bytes=5-2",
+            "bytes",
+        ] {
             assert!(matches!(parse_range(spec, 10), Range::Full), "{spec}");
         }
     }

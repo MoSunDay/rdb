@@ -20,13 +20,13 @@ use crate::kafka::errors;
 use crate::kafka::fetch;
 use crate::kafka::frame::{parse_req_header, put_i32, put_resp_header, Reader};
 use crate::kafka::handshake;
-use crate::kafka::{offsets_commit, offsets_query, produce};
 use crate::kafka::{
     api_flexible, api_name, api_supported, API_KEY_API_VERSIONS, API_KEY_DESCRIBE_GROUPS,
     API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP,
     API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT,
     API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
 };
+use crate::kafka::{offsets_commit, offsets_query, produce};
 use crate::monitor;
 use crate::state::Shared;
 
@@ -159,7 +159,8 @@ async fn process(
     let api_key = probe.i16().ok_or("missing api_key")?;
     let api_version = probe.i16().ok_or("missing api_version")?;
     let flexible = api_flexible(api_key, api_version);
-    let (header, mut body) = parse_req_header(payload, flexible).ok_or("malformed request header")?;
+    let (header, mut body) =
+        parse_req_header(payload, flexible).ok_or("malformed request header")?;
     let api_label = api_name(api_key);
     // Long-poll time the FETCH handler spent parked (0 for every
     // other api): subtracted from the latency observation so the
@@ -179,7 +180,12 @@ async fn process(
             if !api_supported(api_key, api_version) {
                 return Err(format!("{} v{} unsupported", api_label, api_version));
             }
-            Some(handshake::handle_metadata(&mut body, api_version, shared, ad)?)
+            Some(handshake::handle_metadata(
+                &mut body,
+                api_version,
+                shared,
+                ad,
+            )?)
         }
         API_KEY_PRODUCE => {
             if !api_supported(api_key, api_version) {
@@ -192,7 +198,11 @@ async fn process(
             if !api_supported(api_key, api_version) {
                 return Err(format!("{} v{} unsupported", api_label, api_version));
             }
-            Some(offsets_query::handle_list_offsets(&mut body, api_version, shared)?)
+            Some(offsets_query::handle_list_offsets(
+                &mut body,
+                api_version,
+                shared,
+            )?)
         }
         API_KEY_FETCH => {
             if !api_supported(api_key, api_version) {
@@ -212,13 +222,21 @@ async fn process(
             if !api_supported(api_key, api_version) {
                 return Err(format!("{} v{} unsupported", api_label, api_version));
             }
-            Some(offsets_commit::handle_offset_fetch(&mut body, api_version, shared)?)
+            Some(offsets_commit::handle_offset_fetch(
+                &mut body,
+                api_version,
+                shared,
+            )?)
         }
         API_KEY_FIND_COORDINATOR => {
             if !api_supported(api_key, api_version) {
                 return Err(format!("{} v{} unsupported", api_label, api_version));
             }
-            Some(coordinator::api::handle_find_coordinator(&mut body, api_version, ad)?)
+            Some(coordinator::api::handle_find_coordinator(
+                &mut body,
+                api_version,
+                ad,
+            )?)
         }
         API_KEY_JOIN_GROUP => {
             if !api_supported(api_key, api_version) {
@@ -246,7 +264,11 @@ async fn process(
             if !api_supported(api_key, api_version) {
                 return Err(format!("{} v{} unsupported", api_label, api_version));
             }
-            Some(coordinator::api::handle_leave_group(&mut body, api_version, coord)?)
+            Some(coordinator::api::handle_leave_group(
+                &mut body,
+                api_version,
+                coord,
+            )?)
         }
         API_KEY_SYNC_GROUP => {
             if !api_supported(api_key, api_version) {
@@ -258,7 +280,11 @@ async fn process(
             if !api_supported(api_key, api_version) {
                 return Err(format!("{} v{} unsupported", api_label, api_version));
             }
-            Some(coordinator::api::handle_describe_groups(&mut body, api_version, coord)?)
+            Some(coordinator::api::handle_describe_groups(
+                &mut body,
+                api_version,
+                coord,
+            )?)
         }
         _ => Some(handshake::api_versions_body(0, errors::UNSUPPORTED_VERSION)),
     };

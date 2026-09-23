@@ -30,10 +30,18 @@ use crate::kafka::handshake::NODE_ID;
 
 /// FindCoordinator v0-v1: any group key resolves to THIS broker (the
 /// only coordinator; tx-type keys are rejected).
-pub fn handle_find_coordinator(body: &mut Reader<'_>, version: i16, ad: &(String, i32)) -> Result<Vec<u8>, String> {
+pub fn handle_find_coordinator(
+    body: &mut Reader<'_>,
+    version: i16,
+    ad: &(String, i32),
+) -> Result<Vec<u8>, String> {
     let bad = || "malformed findcoordinator request".to_string();
     let _key = body.string().ok_or_else(bad)?;
-    let ctype = if version >= 1 { body.i8().ok_or_else(bad)? } else { 0 };
+    let ctype = if version >= 1 {
+        body.i8().ok_or_else(bad)?
+    } else {
+        0
+    };
     let mut out = Vec::new();
     if version >= 1 {
         put_i32(&mut out, 0); // throttle_time_ms (v1+ leads with it)
@@ -62,7 +70,11 @@ pub fn handle_find_coordinator(body: &mut Reader<'_>, version: i16, ad: &(String
 
 /// Heartbeat v0-v4: refreshes the session deadline (see
 /// `state::heartbeat` for the error lattice).
-pub async fn handle_heartbeat(body: &mut Reader<'_>, version: i16, rt: &CoordRuntime) -> Result<Vec<u8>, String> {
+pub async fn handle_heartbeat(
+    body: &mut Reader<'_>,
+    version: i16,
+    rt: &CoordRuntime,
+) -> Result<Vec<u8>, String> {
     let bad = || "malformed heartbeat request".to_string();
     let (group, generation, member) = if version >= 4 {
         // v4 is the first flexible Heartbeat (compact framing + tags).
@@ -79,8 +91,10 @@ pub async fn handle_heartbeat(body: &mut Reader<'_>, version: i16, rt: &CoordRun
         (group, generation, member)
     };
     let now = session::now_ms();
-    let code = session::apply(rt, &group, |st| state::heartbeat(st, &member, generation, now))
-        .unwrap_or(errors::UNKNOWN_MEMBER_ID); // no such group
+    let code = session::apply(rt, &group, |st| {
+        state::heartbeat(st, &member, generation, now)
+    })
+    .unwrap_or(errors::UNKNOWN_MEMBER_ID); // no such group
     let mut out = Vec::new();
     if version >= 1 {
         put_i32(&mut out, 0); // throttle_time_ms
@@ -96,13 +110,19 @@ pub async fn handle_heartbeat(body: &mut Reader<'_>, version: i16, rt: &CoordRun
 /// `state::leave`. An unknown group or member answers
 /// UNKNOWN_MEMBER_ID (the v0/v1 broker behavior; v2 reports the same
 /// code per member).
-pub fn handle_leave_group(body: &mut Reader<'_>, version: i16, rt: &CoordRuntime) -> Result<Vec<u8>, String> {
+pub fn handle_leave_group(
+    body: &mut Reader<'_>,
+    version: i16,
+    rt: &CoordRuntime,
+) -> Result<Vec<u8>, String> {
     let bad = || "malformed leavegroup request".to_string();
     let group = body.string().ok_or_else(bad)?;
     let member = body.string().ok_or_else(bad)?;
-    let code = session::apply(rt, &group, |st| state::leave(st, &[member.clone()], session::now_ms()))
-        .map(|codes| codes[0])
-        .unwrap_or(errors::UNKNOWN_MEMBER_ID);
+    let code = session::apply(rt, &group, |st| {
+        state::leave(st, std::slice::from_ref(&member), session::now_ms())
+    })
+    .map(|codes| codes[0])
+    .unwrap_or(errors::UNKNOWN_MEMBER_ID);
     let mut out = Vec::new();
     if version >= 1 {
         put_i32(&mut out, 0); // throttle_time_ms (v1+ responses lead with it)
@@ -112,7 +132,11 @@ pub fn handle_leave_group(body: &mut Reader<'_>, version: i16, rt: &CoordRuntime
 }
 
 /// DescribeGroups v0-v3: a read-only snapshot per requested group.
-pub fn handle_describe_groups(body: &mut Reader<'_>, version: i16, rt: &CoordRuntime) -> Result<Vec<u8>, String> {
+pub fn handle_describe_groups(
+    body: &mut Reader<'_>,
+    version: i16,
+    rt: &CoordRuntime,
+) -> Result<Vec<u8>, String> {
     let bad = || "malformed describegroups request".to_string();
     let count = body.array_len().ok_or_else(bad)?.unwrap_or(0);
     let mut names = Vec::with_capacity(count);
@@ -150,7 +174,7 @@ pub fn handle_describe_groups(body: &mut Reader<'_>, version: i16, rt: &CoordRun
             }
             Some(st) => {
                 put_i16(&mut out, errors::NONE);
-                put_string(&mut out, &name);
+                put_string(&mut out, name);
                 put_string(&mut out, st.stage.name());
                 put_string(&mut out, &st.protocol_type);
                 put_nullable_string(&mut out, st.protocol_name.as_deref());

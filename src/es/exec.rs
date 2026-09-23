@@ -84,10 +84,11 @@ pub fn execute(
     let mut ctx = new_ctx(store, prefix, index, meta);
     let trivial_query = matches!(plan.query, Plan::MatchAll);
     let scored: Vec<(Vec<u8>, f64)> = if let Some(knn) = &plan.knn {
-        let filter = knn
-            .filter
-            .as_deref()
-            .or_else(|| if trivial_query { None } else { Some(&plan.query) });
+        let filter = knn.filter.as_deref().or(if trivial_query {
+            None
+        } else {
+            Some(&plan.query)
+        });
         run_knn(&mut ctx, knn, filter)?
     } else {
         eval(&mut ctx, &plan.query)?.docs.into_iter().collect()
@@ -100,7 +101,11 @@ pub fn execute(
     let by_field = sort.iter().any(|s| matches!(s, SortKey::Field { .. }));
     let mut rows: Vec<Row> = Vec::with_capacity(scored.len());
     for (docid, score) in scored {
-        let source = if by_field { load_source(&ctx, &docid) } else { None };
+        let source = if by_field {
+            load_source(&ctx, &docid)
+        } else {
+            None
+        };
         let keys = sort
             .iter()
             .map(|s| match s {
@@ -112,7 +117,12 @@ pub fn execute(
                 _ => SortVal::Missing, // Doc/Score compare from the row
             })
             .collect();
-        rows.push(Row { docid, score, keys, source });
+        rows.push(Row {
+            docid,
+            score,
+            keys,
+            source,
+        });
     }
     rows.sort_by(|a, b| cmp_rows(a, b, sort));
     let total = rows.len();
@@ -120,7 +130,11 @@ pub fn execute(
     // _score (ES field-sort behavior); max_score follows the same rule.
     let scored_reply = matches!(sort.first(), Some(SortKey::Score(_)));
     let max_score = if scored_reply && total > 0 {
-        Some(rows.iter().map(|r| r.score).fold(f64::NEG_INFINITY, f64::max))
+        Some(
+            rows.iter()
+                .map(|r| r.score)
+                .fold(f64::NEG_INFINITY, f64::max),
+        )
     } else {
         None
     };
@@ -128,7 +142,10 @@ pub fn execute(
     for row in rows.into_iter().skip(plan.from).take(plan.size) {
         let source = match row.source {
             Some(v) => filter_source(&v, &plan.source),
-            None => filter_source(&load_source(&ctx, &row.docid).unwrap_or(Value::Null), &plan.source),
+            None => filter_source(
+                &load_source(&ctx, &row.docid).unwrap_or(Value::Null),
+                &plan.source,
+            ),
         };
         hits.push(ExecHit {
             docid: row.docid,
@@ -136,7 +153,11 @@ pub fn execute(
             source,
         });
     }
-    Ok(ExecResult { total, max_score, hits })
+    Ok(ExecResult {
+        total,
+        max_score,
+        hits,
+    })
 }
 
 /// `_count` endpoint: the query tree's match count, docs unread, knn
@@ -157,12 +178,32 @@ mod tests {
 
     #[test]
     fn default_sort_is_score_desc() {
-        let low = Row { docid: b"a".to_vec(), score: 1.0, keys: vec![], source: None };
-        let high = Row { docid: b"z".to_vec(), score: 2.0, keys: vec![], source: None };
+        let low = Row {
+            docid: b"a".to_vec(),
+            score: 1.0,
+            keys: vec![],
+            source: None,
+        };
+        let high = Row {
+            docid: b"z".to_vec(),
+            score: 2.0,
+            keys: vec![],
+            source: None,
+        };
         assert_eq!(cmp_rows(&high, &low, &DEFAULT_SORT), Ordering::Less);
         // score ties fall through to docid asc
-        let tie = Row { docid: b"b".to_vec(), score: 1.0, keys: vec![], source: None };
-        let tie2 = Row { docid: b"a".to_vec(), score: 1.0, keys: vec![], source: None };
+        let tie = Row {
+            docid: b"b".to_vec(),
+            score: 1.0,
+            keys: vec![],
+            source: None,
+        };
+        let tie2 = Row {
+            docid: b"a".to_vec(),
+            score: 1.0,
+            keys: vec![],
+            source: None,
+        };
         assert_eq!(cmp_rows(&tie, &tie2, &DEFAULT_SORT), Ordering::Greater);
     }
 }

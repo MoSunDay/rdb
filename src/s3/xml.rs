@@ -79,8 +79,25 @@ pub struct ListArgs<'a> {
 
 /// GET /<bucket> (ListObjectsV2 / v1 list) response.
 pub fn list_bucket_result(a: &ListArgs) -> String {
-    let ListArgs { bucket, prefix, delimiter, max_keys, is_truncated, objects, common_prefixes, next_token, encoded, v1 } = *a;
-    let enc = |s: &str| if encoded { percent_encode_component(s) } else { escape(s) };
+    let ListArgs {
+        bucket,
+        prefix,
+        delimiter,
+        max_keys,
+        is_truncated,
+        objects,
+        common_prefixes,
+        next_token,
+        encoded,
+        v1,
+    } = *a;
+    let enc = |s: &str| {
+        if encoded {
+            percent_encode_component(s)
+        } else {
+            escape(s)
+        }
+    };
     let mut out = format!("{XML_DECL}<ListBucketResult xmlns=\"{NS}\">");
     out.push_str(&format!("<Name>{}</Name>", escape(bucket)));
     out.push_str(&format!("<Prefix>{}</Prefix>", enc(prefix)));
@@ -92,7 +109,10 @@ pub fn list_bucket_result(a: &ListArgs) -> String {
     }
     out.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
     // KeyCount = keys + folded prefixes returned on THIS page.
-    out.push_str(&format!("<KeyCount>{}</KeyCount>", objects.len() + common_prefixes.len()));
+    out.push_str(&format!(
+        "<KeyCount>{}</KeyCount>",
+        objects.len() + common_prefixes.len()
+    ));
     out.push_str(&format!(
         "<IsTruncated>{}</IsTruncated>",
         if is_truncated { "true" } else { "false" }
@@ -103,14 +123,19 @@ pub fn list_bucket_result(a: &ListArgs) -> String {
             // v1 pages with marker/NextMarker instead of a token.
             out.push_str(&format!("<NextMarker>{enc_tok}</NextMarker>"));
         } else {
-            out.push_str(&format!("<NextContinuationToken>{enc_tok}</NextContinuationToken>"));
+            out.push_str(&format!(
+                "<NextContinuationToken>{enc_tok}</NextContinuationToken>"
+            ));
         }
     }
     for meta in objects {
         out.push_str(&contents(meta, encoded));
     }
     for cp in common_prefixes {
-        out.push_str(&format!("<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>", enc(cp)));
+        out.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            enc(cp)
+        ));
     }
     out.push_str("</ListBucketResult>");
     out
@@ -169,7 +194,9 @@ mod tests {
             v1: false,
         });
         assert!(doc.contains("<Name>bkt</Name><Prefix>dir/</Prefix><Delimiter>/</Delimiter>"));
-        assert!(doc.contains("<MaxKeys>100</MaxKeys><KeyCount>2</KeyCount><IsTruncated>true</IsTruncated>"));
+        assert!(doc.contains(
+            "<MaxKeys>100</MaxKeys><KeyCount>2</KeyCount><IsTruncated>true</IsTruncated>"
+        ));
         assert!(doc.contains("<NextContinuationToken>dirx/</NextContinuationToken>"));
         assert!(!doc.contains("<NextMarker>"));
         assert!(doc.contains("<Contents><Key>dir/1.txt</Key>"));

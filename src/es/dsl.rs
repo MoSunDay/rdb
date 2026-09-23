@@ -136,7 +136,13 @@ pub fn parse_search(body: &[u8]) -> Result<SearchPlan, DslError> {
     let obj = match root {
         Value::Object(m) => m,
         Value::Null => Map::new(),
-        _ => return Err(err(400, "x_content_parse_exception", "request body must be a JSON object")),
+        _ => {
+            return Err(err(
+                400,
+                "x_content_parse_exception",
+                "request body must be a JSON object",
+            ))
+        }
     };
     let query = match obj.get("query") {
         None | Some(Value::Null) => Plan::MatchAll,
@@ -175,7 +181,11 @@ pub fn parse_search(body: &[u8]) -> Result<SearchPlan, DslError> {
 /// Dispatch on the query object's single (first) key.
 pub(super) fn parse_query(v: &Value) -> Result<Plan, DslError> {
     let Some(obj) = v.as_object() else {
-        return Err(err(400, "parsing_exception", "[_search] query clause must be an object"));
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[_search] query clause must be an object",
+        ));
     };
     let Some((kind, spec)) = obj.iter().next() else {
         return Err(err(400, "parsing_exception", "[query] cannot be empty"));
@@ -187,7 +197,11 @@ pub(super) fn parse_query(v: &Value) -> Result<Plan, DslError> {
         "terms" => parse_terms(spec),
         "range" => parse_range(spec),
         "bool" => parse_bool(spec),
-        other => Err(err(400, "parsing_exception", &format!("[unknown query type '{other}']"))),
+        other => Err(err(
+            400,
+            "parsing_exception",
+            &format!("[unknown query type '{other}']"),
+        )),
     }
 }
 
@@ -197,40 +211,74 @@ fn parse_match(spec: &Value) -> Result<Plan, DslError> {
         return Err(err(400, "parsing_exception", "[match] must be an object"));
     };
     let Some((field, cfg)) = obj.iter().next() else {
-        return Err(err(400, "parsing_exception", "[match] requires a field name"));
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[match] requires a field name",
+        ));
     };
     let (text, operator) = match cfg {
         Value::String(s) => (s.clone(), BoolOp::Or),
         Value::Object(body) => {
             let text = match body.get("query") {
                 Some(Value::String(s)) => s.clone(),
-                _ => return Err(err(400, "parsing_exception", "[match] query must be a string")),
+                _ => {
+                    return Err(err(
+                        400,
+                        "parsing_exception",
+                        "[match] query must be a string",
+                    ))
+                }
             };
             let operator = match body.get("operator") {
                 None => BoolOp::Or,
                 Some(Value::String(s)) if s == "or" => BoolOp::Or,
                 Some(Value::String(s)) if s == "and" => BoolOp::And,
                 Some(_) => {
-                    return Err(err(400, "parsing_exception", "[match] operator must be 'or' or 'and'"))
+                    return Err(err(
+                        400,
+                        "parsing_exception",
+                        "[match] operator must be 'or' or 'and'",
+                    ))
                 }
             };
             (text, operator)
         }
-        _ => return Err(err(400, "parsing_exception", "[match] query must be a string")),
+        _ => {
+            return Err(err(
+                400,
+                "parsing_exception",
+                "[match] query must be a string",
+            ))
+        }
     };
-    let terms = tokenize(&text).into_iter().map(|t| t.into_bytes()).collect();
-    Ok(Plan::Match { field: field.clone(), terms, operator })
+    let terms = tokenize(&text)
+        .into_iter()
+        .map(|t| t.into_bytes())
+        .collect();
+    Ok(Plan::Match {
+        field: field.clone(),
+        terms,
+        operator,
+    })
 }
 
 /// String scalars stay raw bytes, numbers become their f64 view.
 fn term_value(v: &Value) -> Result<TermValue, DslError> {
     match v {
         Value::String(s) => Ok(TermValue::Bytes(s.clone().into_bytes())),
-        Value::Number(x) => x
-            .as_f64()
-            .map(TermValue::Number)
-            .ok_or_else(|| err(400, "parsing_exception", "term query value must be string or number")),
-        _ => Err(err(400, "parsing_exception", "term query value must be string or number")),
+        Value::Number(x) => x.as_f64().map(TermValue::Number).ok_or_else(|| {
+            err(
+                400,
+                "parsing_exception",
+                "term query value must be string or number",
+            )
+        }),
+        _ => Err(err(
+            400,
+            "parsing_exception",
+            "term query value must be string or number",
+        )),
     }
 }
 
@@ -239,9 +287,16 @@ fn parse_term(spec: &Value) -> Result<Plan, DslError> {
         return Err(err(400, "parsing_exception", "[term] must be an object"));
     };
     let Some((field, raw)) = obj.iter().next() else {
-        return Err(err(400, "parsing_exception", "[term] requires a field name"));
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[term] requires a field name",
+        ));
     };
-    Ok(Plan::Term { field: field.clone(), value: term_value(raw)? })
+    Ok(Plan::Term {
+        field: field.clone(),
+        value: term_value(raw)?,
+    })
 }
 
 fn parse_terms(spec: &Value) -> Result<Plan, DslError> {
@@ -249,13 +304,27 @@ fn parse_terms(spec: &Value) -> Result<Plan, DslError> {
         return Err(err(400, "parsing_exception", "[terms] must be an object"));
     };
     let Some((field, raw)) = obj.iter().next() else {
-        return Err(err(400, "parsing_exception", "[terms] requires a field name"));
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[terms] requires a field name",
+        ));
     };
     let Some(items) = raw.as_array() else {
-        return Err(err(400, "parsing_exception", "[terms] value must be an array"));
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[terms] value must be an array",
+        ));
     };
-    let values = items.iter().map(term_value).collect::<Result<Vec<_>, _>>()?;
-    Ok(Plan::Terms { field: field.clone(), values })
+    let values = items
+        .iter()
+        .map(term_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Plan::Terms {
+        field: field.clone(),
+        values,
+    })
 }
 
 fn parse_range(spec: &Value) -> Result<Plan, DslError> {
@@ -263,10 +332,18 @@ fn parse_range(spec: &Value) -> Result<Plan, DslError> {
         return Err(err(400, "parsing_exception", "[range] must be an object"));
     };
     let Some((field, body)) = obj.iter().next() else {
-        return Err(err(400, "parsing_exception", "[range] requires a field name"));
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[range] requires a field name",
+        ));
     };
     let Some(body) = body.as_object() else {
-        return Err(err(400, "parsing_exception", "[range] bounds must be an object"));
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[range] bounds must be an object",
+        ));
     };
     let mut gte = None;
     let mut gt = None;
@@ -274,7 +351,11 @@ fn parse_range(spec: &Value) -> Result<Plan, DslError> {
     let mut lt = None;
     for (k, v) in body {
         let Some(x) = v.as_f64() else {
-            return Err(err(400, "parsing_exception", "range bounds must be numbers"));
+            return Err(err(
+                400,
+                "parsing_exception",
+                "range bounds must be numbers",
+            ));
         };
         match k.as_str() {
             "gte" => gte = Some(x),
@@ -284,7 +365,13 @@ fn parse_range(spec: &Value) -> Result<Plan, DslError> {
             _ => {} // relation/format/boost tolerated and ignored
         }
     }
-    Ok(Plan::Range { field: field.clone(), gte, gt, lte, lt })
+    Ok(Plan::Range {
+        field: field.clone(),
+        gte,
+        gt,
+        lte,
+        lt,
+    })
 }
 
 fn parse_bool(spec: &Value) -> Result<Plan, DslError> {
@@ -304,7 +391,12 @@ fn parse_bool(spec: &Value) -> Result<Plan, DslError> {
             _ => {} // minimum_should_match/boost tolerated and ignored
         }
     }
-    Ok(Plan::Bool { must, filter, should, must_not })
+    Ok(Plan::Bool {
+        must,
+        filter,
+        should,
+        must_not,
+    })
 }
 
 /// A bool sub-clause is one object or an array of objects.
