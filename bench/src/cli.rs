@@ -186,9 +186,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
             }
             "--host" => host = Some(flag_value(args, &mut i, name, inline)?),
             "--topic" => topic = Some(flag_value(args, &mut i, name, inline)?),
-            "--batch" => {
-                batch = Some(parse_count(&flag_value(args, &mut i, name, inline)?, name)?)
-            }
+            "--batch" => batch = Some(parse_count(&flag_value(args, &mut i, name, inline)?, name)?),
             "--workload" => {
                 let raw = flag_value(args, &mut i, name, inline)?;
                 workload = Some(Workload::parse(&raw).ok_or_else(|| {
@@ -303,7 +301,10 @@ mod tests {
         .expect("parse");
         assert_eq!(cfg.workload, Workload::KafkaProd);
         assert!(cfg.workload.is_kafka());
-        assert_eq!((cfg.host.as_str(), cfg.topic.as_str(), cfg.batch), ("k:9092", "tp", 7));
+        assert_eq!(
+            (cfg.host.as_str(), cfg.topic.as_str(), cfg.batch),
+            ("k:9092", "tp", 7)
+        );
         // Defaults: topic bench1, batch 100 records per request.
         let cfg = parse_args(&argv(&[
             "--addr=h:1",
@@ -323,7 +324,16 @@ mod tests {
             // kafka workload without --host
             argv(&["--addr", "h:1", "--token", "t", "--workload", "kafka-prod"]),
             // kafka workload with a malformed --host
-            argv(&["--addr", "h:1", "--token", "t", "--host", "nohost", "--workload", "kafka-fetch"]),
+            argv(&[
+                "--addr",
+                "h:1",
+                "--token",
+                "t",
+                "--host",
+                "nohost",
+                "--workload",
+                "kafka-fetch",
+            ]),
             // kafka flags on a RESP workload
             argv(&["--addr", "h:1", "--token", "t", "--host", "k:2"]),
             argv(&["--addr", "h:1", "--token", "t", "--topic", "t1"]),

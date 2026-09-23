@@ -18,6 +18,10 @@ struct FetchTarget {
     partition: i32,
 }
 
+/// Per-topic response sections: (topic, [(partition, committed
+/// offset, error code)]).
+type TopicSections = Vec<(Vec<u8>, Vec<(i32, i64, i16)>)>;
+
 /// Handle OffsetFetch v0-v7 (v6+ is flexible: compact framing, tagged
 /// tails; v7 ends the request with require_stable).
 pub fn handle_offset_fetch(
@@ -88,7 +92,7 @@ pub fn handle_offset_fetch(
         None => {
             let mut rows = ledger::scan_group(&shared.store, group.as_bytes())?;
             rows.sort_by(|a, b| a.stream.cmp(&b.stream));
-            let mut sections: Vec<(Vec<u8>, Vec<(i32, i64, i16)>)> = Vec::new();
+            let mut sections: TopicSections = Vec::new();
             for r in rows {
                 let Some((topic, partition, _child)) = split_stream(&r.stream) else {
                     continue;
@@ -106,8 +110,7 @@ pub fn handle_offset_fetch(
             put_sections(&mut out, version, flex, &sections);
         }
         Some(list) => {
-            let mut sections: Vec<(Vec<u8>, Vec<(i32, i64, i16)>)> =
-                Vec::with_capacity(list.len());
+            let mut sections: TopicSections = Vec::with_capacity(list.len());
             for (name, parts) in list {
                 let mut rows = Vec::with_capacity(parts.len());
                 for p in parts {
@@ -130,12 +133,7 @@ pub fn handle_offset_fetch(
 }
 
 /// Encode the per-topic sections array (classic or compact framed).
-fn put_sections(
-    out: &mut Vec<u8>,
-    version: i16,
-    flex: bool,
-    sections: &[(Vec<u8>, Vec<(i32, i64, i16)>)],
-) {
+fn put_sections(out: &mut Vec<u8>, version: i16, flex: bool, sections: &TopicSections) {
     if flex {
         crate::kafka::frame::put_compact_array_len(out, sections.len());
     } else {
@@ -173,8 +171,7 @@ fn fetch_one(
     }
     let parent = topic.as_bytes();
     let prefix = hash::slot_with_prefix(parent).1;
-    let Some(child) = mapping::partition_queue(&shared.store, &prefix, parent, t.partition)?
-    else {
+    let Some(child) = mapping::partition_queue(&shared.store, &prefix, parent, t.partition)? else {
         return Ok((-1, errors::UNKNOWN_TOPIC_OR_PARTITION));
     };
     let mut stream = parent.to_vec();

@@ -176,8 +176,16 @@ pub fn join(mut st: GroupState, a: &JoinArgs) -> (GroupState, Vec<Event>, JoinOu
         return (st, vec![], JoinOutcome::NeedMemberId);
     }
     if let Some(x) = a.instance_id {
-        let mine = st.members.get(a.member_id).and_then(|m| m.instance_id.as_deref());
-        if mine != Some(x) && st.members.values().any(|m| m.instance_id.as_deref() == Some(x)) {
+        let mine = st
+            .members
+            .get(a.member_id)
+            .and_then(|m| m.instance_id.as_deref());
+        if mine != Some(x)
+            && st
+                .members
+                .values()
+                .any(|m| m.instance_id.as_deref() == Some(x))
+        {
             return (st, vec![], JoinOutcome::FencedInstanceId);
         }
     }
@@ -315,7 +323,12 @@ pub fn sync(
 
 /// Heartbeat transition: refreshes the session deadline except while a
 /// rebalance is in flight (the client must rejoin instead).
-pub fn heartbeat(mut st: GroupState, member_id: &str, generation: i32, now_ms: i64) -> (GroupState, Vec<Event>, i16) {
+pub fn heartbeat(
+    mut st: GroupState,
+    member_id: &str,
+    generation: i32,
+    now_ms: i64,
+) -> (GroupState, Vec<Event>, i16) {
     let Some(m) = st.members.get_mut(member_id) else {
         return (st, vec![], code::UNKNOWN_MEMBER_ID);
     };
@@ -331,7 +344,11 @@ pub fn heartbeat(mut st: GroupState, member_id: &str, generation: i32, now_ms: i
 
 /// LeaveGroup transition (multi-member at the state layer; the v0-v2
 /// wire carries one). Returns per-request-member error codes.
-pub fn leave(mut st: GroupState, member_ids: &[String], now_ms: i64) -> (GroupState, Vec<Event>, Vec<i16>) {
+pub fn leave(
+    mut st: GroupState,
+    member_ids: &[String],
+    now_ms: i64,
+) -> (GroupState, Vec<Event>, Vec<i16>) {
     let mut codes = Vec::new();
     let mut removed = false;
     for id in member_ids {
@@ -371,7 +388,8 @@ pub fn expire(mut st: GroupState, now_ms: i64) -> (GroupState, Vec<Event>) {
             let before = st.members.len();
             // keep while the deadline has not STRICTLY passed (a sweep exactly at
             // the deadline still sees the member alive)
-            st.members.retain(|_, m| m.joined || m.rebalance_deadline_ms >= now_ms);
+            st.members
+                .retain(|_, m| m.joined || m.rebalance_deadline_ms >= now_ms);
             st.order.retain(|id| st.members.contains_key(id));
             if st.members.len() == before {
                 return (st, vec![]);

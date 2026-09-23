@@ -22,7 +22,11 @@ fn defaults_for_empty_bodies() {
 fn match_shorthand_and_operator() {
     let p = parse_search(br#"{"query":{"match":{"title":"Hello World"}}}"#).unwrap();
     match p.query {
-        Plan::Match { field, terms, operator } => {
+        Plan::Match {
+            field,
+            terms,
+            operator,
+        } => {
             assert_eq!(field, "title");
             assert_eq!(terms, vec![b"hello".to_vec(), b"world".to_vec()]);
             assert_eq!(operator, BoolOp::Or);
@@ -58,7 +62,13 @@ fn term_terms_and_range() {
     }
     let p = parse_search(br#"{"query":{"range":{"p":{"gte":1,"lt":5}}}}"#).unwrap();
     match p.query {
-        Plan::Range { field, gte, gt, lte, lt } => {
+        Plan::Range {
+            field,
+            gte,
+            gt,
+            lte,
+            lt,
+        } => {
             assert_eq!(field, "p");
             assert_eq!((gte, gt, lte, lt), (Some(1.0), None, None, Some(5.0)));
         }
@@ -74,7 +84,12 @@ fn bool_nesting_and_arrays() {
     )
     .unwrap();
     match p.query {
-        Plan::Bool { must, filter, should, must_not } => {
+        Plan::Bool {
+            must,
+            filter,
+            should,
+            must_not,
+        } => {
             assert_eq!(must.len(), 1);
             assert!(filter.is_empty());
             assert_eq!(should.len(), 2);
@@ -92,8 +107,14 @@ fn sort_forms() {
         vec![
             SortKey::Score(SortDir::Desc),
             SortKey::Doc,
-            SortKey::Field { field: "price".into(), dir: SortDir::Desc },
-            SortKey::Field { field: "name".into(), dir: SortDir::Asc },
+            SortKey::Field {
+                field: "price".into(),
+                dir: SortDir::Desc
+            },
+            SortKey::Field {
+                field: "name".into(),
+                dir: SortDir::Asc
+            },
             SortKey::Score(SortDir::Asc),
         ]
     );
@@ -102,10 +123,16 @@ fn sort_forms() {
 
 #[test]
 fn source_forms() {
-    assert!(parse_search(br#"{"_source":false}"#).unwrap().source.disabled);
+    assert!(
+        parse_search(br#"{"_source":false}"#)
+            .unwrap()
+            .source
+            .disabled
+    );
     let p = parse_search(br#"{"_source":["a.b"]}"#).unwrap();
     assert_eq!(p.source.includes, vec!["a.b".to_string()]);
-    let p = parse_search(br#"{"_source":{"includes":"x","excludes":["y"],"exclude":"z"}}"#).unwrap();
+    let p =
+        parse_search(br#"{"_source":{"includes":"x","excludes":["y"],"exclude":"z"}}"#).unwrap();
     assert_eq!(p.source.includes, vec!["x".to_string()]);
     assert_eq!(p.source.excludes, vec!["y".to_string(), "z".to_string()]);
 }
@@ -121,14 +148,19 @@ fn knn_defaults_and_bounds() {
     let e = parse_search(br#"{"knn":{"field":"v","query_vector":[1],"k":0}}"#).unwrap_err();
     assert_eq!(e.es_type, "illegal_argument_exception");
     assert!(parse_search(br#"{"knn":{"field":"v","query_vector":[]}}"#).is_err());
-    let p = parse_search(br#"{"knn":{"field":"v","query_vector":[1],"filter":{"term":{"t":"x"}}}}"#).unwrap();
+    let p =
+        parse_search(br#"{"knn":{"field":"v","query_vector":[1],"filter":{"term":{"t":"x"}}}}"#)
+            .unwrap();
     assert!(p.knn.unwrap().filter.is_some());
 }
 
 #[test]
 fn window_limit_and_unknown_query() {
     let e = parse_search(br#"{"from":9999,"size":10}"#).unwrap_err();
-    assert_eq!((e.status, e.es_type.as_str()), (400, "illegal_argument_exception"));
+    assert_eq!(
+        (e.status, e.es_type.as_str()),
+        (400, "illegal_argument_exception")
+    );
     assert!(e.reason.contains("Result window is too large"));
     let e = parse_search(br#"{"query":{"foo":{}}}"#).unwrap_err();
     assert_eq!(e.es_type, "parsing_exception");

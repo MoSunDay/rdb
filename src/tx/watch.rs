@@ -25,8 +25,7 @@ use crate::store::Store;
 /// layout (0x00) is hashed separately below; the expire index is
 /// derived state (its contents follow the data records) and is covered
 /// transitively.
-const USER_KINDS: std::ops::RangeInclusive<u8> =
-    codec::KIND_STRING_TTL..=codec::KIND_SEARCH_NUMVAL;
+const USER_KINDS: std::ops::RangeInclusive<u8> = codec::KIND_STRING_TTL..=codec::KIND_SEARCH_NUMVAL;
 
 /// Hash every physical byte stored for `key` under `prefix`.
 ///

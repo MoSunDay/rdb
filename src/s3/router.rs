@@ -20,7 +20,13 @@ use super::{http_date, parse_range, xml, Range};
 /// Entry point from `http::handle_conn`: `len` is the (already
 /// capped) PUT body length, `leftover` any body bytes the head read
 /// swallowed. An empty key (`/<bucket>/`) counts as bucket level.
-pub(crate) async fn route(ctx: &Ctx, req: Req, sock: &mut TcpStream, leftover: &mut Vec<u8>, len: u64) -> Response {
+pub(crate) async fn route(
+    ctx: &Ctx,
+    req: Req,
+    sock: &mut TcpStream,
+    leftover: &mut Vec<u8>,
+    len: u64,
+) -> Response {
     match req.key.as_deref() {
         None | Some("") => bucket_route(ctx, &req),
         Some(key) => object_route(ctx, &req, key, sock, leftover, len).await,
@@ -34,14 +40,22 @@ fn bucket_route(ctx: &Ctx, req: &Req) -> Response {
     if req.bucket.is_empty() {
         // "/" without a bucket: only ListAllMyBuckets exists.
         if req.method == "GET" {
-            return xml_reply(200, xml::list_all_my_buckets(&object::list_buckets(&ctx.store)));
+            return xml_reply(
+                200,
+                xml::list_all_my_buckets(&object::list_buckets(&ctx.store)),
+            );
         }
         return method_not_allowed(&resource);
     }
     // Malformed bucket names never reach the filesystem layer (which
     // would surface as a 500): 400 `InvalidBucketName`, like S3.
     if !object::valid_bucket_name(&req.bucket) {
-        return error_reply(400, "InvalidBucketName", "the specified bucket name is ill-formed", &resource);
+        return error_reply(
+            400,
+            "InvalidBucketName",
+            "the specified bucket name is ill-formed",
+            &resource,
+        );
     }
     match req.method.as_str() {
         "GET" => list_objects(ctx, req, &resource),
@@ -59,7 +73,12 @@ fn bucket_route(ctx: &Ctx, req: &Req) -> Response {
             if object::bucket_exists(&ctx.store, &req.bucket) {
                 empty_reply(200)
             } else {
-                error_reply(404, "NoSuchBucket", "the specified bucket does not exist", &resource)
+                error_reply(
+                    404,
+                    "NoSuchBucket",
+                    "the specified bucket does not exist",
+                    &resource,
+                )
             }
         }
         "DELETE" => delete_bucket(ctx, req, &resource),
@@ -70,7 +89,12 @@ fn bucket_route(ctx: &Ctx, req: &Req) -> Response {
 /// DELETE /{bucket}: 404 unknown, 409 non-empty, 204 on success.
 fn delete_bucket(ctx: &Ctx, req: &Req, resource: &str) -> Response {
     if !object::bucket_exists(&ctx.store, &req.bucket) {
-        return error_reply(404, "NoSuchBucket", "the specified bucket does not exist", resource);
+        return error_reply(
+            404,
+            "NoSuchBucket",
+            "the specified bucket does not exist",
+            resource,
+        );
     }
     // Non-empty check first so `remove_dir`'s refusal is only the
     // second line of defense (see object::delete_bucket).
@@ -79,14 +103,22 @@ fn delete_bucket(ctx: &Ctx, req: &Req, resource: &str) -> Response {
         Err(e) => return internal(&e, resource),
     };
     if occupied {
-        return error_reply(409, "BucketNotEmpty", "the bucket contains objects", resource);
+        return error_reply(
+            409,
+            "BucketNotEmpty",
+            "the bucket contains objects",
+            resource,
+        );
     }
     match object::delete_bucket(&ctx.store, &req.bucket) {
         Ok(()) => empty_reply(204),
         // raced with a PUT between the check and the delete: same 409
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            error_reply(409, "BucketNotEmpty", "the bucket contains objects", resource)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => error_reply(
+            409,
+            "BucketNotEmpty",
+            "the bucket contains objects",
+            resource,
+        ),
         Err(e) => internal(&e, resource),
     }
 }
@@ -95,7 +127,12 @@ fn delete_bucket(ctx: &Ctx, req: &Req, resource: &str) -> Response {
 /// flavor, which rides the identical path).
 fn list_objects(ctx: &Ctx, req: &Req, resource: &str) -> Response {
     if !object::bucket_exists(&ctx.store, &req.bucket) {
-        return error_reply(404, "NoSuchBucket", "the specified bucket does not exist", resource);
+        return error_reply(
+            404,
+            "NoSuchBucket",
+            "the specified bucket does not exist",
+            resource,
+        );
     }
     let prefix = req.q("prefix").unwrap_or("").to_string();
     let delimiter = req.q("delimiter").unwrap_or("").to_string();
@@ -105,7 +142,12 @@ fn list_objects(ctx: &Ctx, req: &Req, resource: &str) -> Response {
     };
     // continuation-token (v2) / start-after / marker (v1) all mean
     // "first entry strictly after this key".
-    let after = req.q("continuation-token").or_else(|| req.q("start-after")).or_else(|| req.q("marker")).unwrap_or("").to_string();
+    let after = req
+        .q("continuation-token")
+        .or_else(|| req.q("start-after"))
+        .or_else(|| req.q("marker"))
+        .unwrap_or("")
+        .to_string();
     let encoded = req.q("encoding-type").is_some_and(|v| v == "url");
     // v1 flavor (no `list-type=2`) pages with `marker`/`NextMarker`.
     let v1 = req.q("list-type") != Some("2");
@@ -150,7 +192,9 @@ fn list_objects(ctx: &Ctx, req: &Req, resource: &str) -> Response {
 /// `max-keys`: default 1000, clamped to 1000; negative/garbage ->
 /// 400 InvalidArgument.
 fn max_keys_of(req: &Req) -> Result<usize, Response> {
-    let Some(raw) = req.q("max-keys") else { return Ok(1000) };
+    let Some(raw) = req.q("max-keys") else {
+        return Ok(1000);
+    };
     match raw.parse::<i64>() {
         Ok(n) if n >= 0 => Ok(n.min(1000) as usize),
         _ => Err(error_reply(
@@ -166,10 +210,18 @@ fn max_keys_of(req: &Req) -> Result<usize, Response> {
 /// list: a folded prefix `d/` occupies exactly the sort slot of its
 /// first folded key (`d/1` etc. sort right after `d/`, before `d0`),
 /// so plain byte comparison interleaves correctly.
-fn merge_entries(objects: Vec<ObjectMeta>, common_prefixes: Vec<String>)
--> Vec<(String, Option<ObjectMeta>)> {
-    let mut objs = objects.into_iter().map(|m| (m.key.clone(), Some(m))).collect::<Vec<_>>();
-    let mut pfxs = common_prefixes.into_iter().map(|p| (p, None)).collect::<Vec<_>>();
+fn merge_entries(
+    objects: Vec<ObjectMeta>,
+    common_prefixes: Vec<String>,
+) -> Vec<(String, Option<ObjectMeta>)> {
+    let mut objs = objects
+        .into_iter()
+        .map(|m| (m.key.clone(), Some(m)))
+        .collect::<Vec<_>>();
+    let mut pfxs = common_prefixes
+        .into_iter()
+        .map(|p| (p, None))
+        .collect::<Vec<_>>();
     let mut merged = Vec::with_capacity(objs.len() + pfxs.len());
     while !objs.is_empty() || !pfxs.is_empty() {
         let from_obj = pfxs.is_empty() || (!objs.is_empty() && objs[0].0 <= pfxs[0].0);
@@ -181,10 +233,22 @@ fn merge_entries(objects: Vec<ObjectMeta>, common_prefixes: Vec<String>)
 
 // ---- object level --------------------------------------------------------
 
-async fn object_route(ctx: &Ctx, req: &Req, key: &str, sock: &mut TcpStream, leftover: &mut Vec<u8>, len: u64) -> Response {
+async fn object_route(
+    ctx: &Ctx,
+    req: &Req,
+    key: &str,
+    sock: &mut TcpStream,
+    leftover: &mut Vec<u8>,
+    len: u64,
+) -> Response {
     let resource = format!("/{}/{}", req.bucket, key);
     if !object::valid_bucket_name(&req.bucket) || !object::valid_key(key) {
-        return error_reply(400, "InvalidArgument", "invalid bucket name or object key", &resource);
+        return error_reply(
+            400,
+            "InvalidArgument",
+            "invalid bucket name or object key",
+            &resource,
+        );
     }
     match req.method.as_str() {
         "PUT" => put_object(ctx, req, key, sock, leftover, len, &resource).await,
@@ -202,7 +266,15 @@ async fn object_route(ctx: &Ctx, req: &Req, key: &str, sock: &mut TcpStream, lef
 /// PUT /{bucket}/{key}: stream the (length-capped) body into the
 /// staged tmp file with a running md5, then `object::commit` renames
 /// it into place with its sidecar. Replies 200 + ETag.
-async fn put_object(ctx: &Ctx, req: &Req, key: &str, sock: &mut TcpStream, leftover: &mut Vec<u8>, len: u64, resource: &str) -> Response {
+async fn put_object(
+    ctx: &Ctx,
+    req: &Req,
+    key: &str,
+    sock: &mut TcpStream,
+    leftover: &mut Vec<u8>,
+    len: u64,
+    resource: &str,
+) -> Response {
     let (tmp, final_path) = match object::stage_paths(&ctx.store, &req.bucket, key) {
         Ok(pair) => pair,
         Err(e) => return internal(&e, resource),
@@ -210,37 +282,52 @@ async fn put_object(ctx: &Ctx, req: &Req, key: &str, sock: &mut TcpStream, lefto
     // Reject control bytes up front: the stored Content-Type is
     // echoed verbatim in GET/HEAD heads, and a bare CR/LF there would
     // split the response (header injection).
-    let content_type = req.header("content-type").unwrap_or("application/octet-stream").to_string();
+    let content_type = req
+        .header("content-type")
+        .unwrap_or("application/octet-stream")
+        .to_string();
     if !valid_header_value(&content_type) {
         let _ = std::fs::remove_file(&tmp);
-        return error_reply(400, "InvalidArgument", "content-type must not contain control characters", resource);
+        return error_reply(
+            400,
+            "InvalidArgument",
+            "content-type must not contain control characters",
+            resource,
+        );
     }
     match read_body_to_file(sock, leftover, len, &tmp).await {
-        Ok(etag) => {
-            match object::commit(&final_path, &tmp, &etag, &content_type) {
-                Ok(()) => Response {
-                    status: 200,
-                    content_type: "application/xml".into(),
-                    headers: vec![("ETag".into(), etag)],
-                    body: Body::Empty,
-                },
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    internal(&e, resource)
-                }
+        Ok(etag) => match object::commit(&final_path, &tmp, &etag, &content_type) {
+            Ok(()) => Response {
+                status: 200,
+                content_type: "application/xml".into(),
+                headers: vec![("ETag".into(), etag)],
+                body: Body::Empty,
+            },
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                internal(&e, resource)
             }
-        }
+        },
         Err(e) => {
             let _ = std::fs::remove_file(&tmp); // never leave staging behind
-            error_reply(400, "IncompleteBody", &format!("request body read failed: {e}"), resource)
+            error_reply(
+                400,
+                "IncompleteBody",
+                &format!("request body read failed: {e}"),
+                resource,
+            )
         }
     }
 }
 
 /// Drain `leftover`, then the socket, into `tmp` in CHUNK-sized reads
 /// under BODY_TIMEOUT; returns the quoted-md5 etag.
-async fn read_body_to_file(sock: &mut TcpStream, leftover: &mut Vec<u8>, len: u64, tmp: &Path)
--> std::io::Result<String> {
+async fn read_body_to_file(
+    sock: &mut TcpStream,
+    leftover: &mut Vec<u8>,
+    len: u64,
+    tmp: &Path,
+) -> std::io::Result<String> {
     let mut file = tokio::fs::File::create(tmp).await?;
     let mut hasher = Md5::new();
     let mut buf = vec![0u8; CHUNK];
@@ -273,7 +360,12 @@ async fn read_body_to_file(sock: &mut TcpStream, leftover: &mut Vec<u8>, len: u6
 /// the end. Multi-range / non-bytes specs are ignored (serve 200).
 fn get_object(ctx: &Ctx, req: &Req, key: &str, resource: &str) -> Response {
     let Some(meta) = object::head(&ctx.store, &req.bucket, key) else {
-        return error_reply(404, "NoSuchKey", "the specified key does not exist", resource);
+        return error_reply(
+            404,
+            "NoSuchKey",
+            "the specified key does not exist",
+            resource,
+        );
     };
     let path: PathBuf = object::object_path(&ctx.store, &req.bucket, key).expect("validated key");
     let mut headers = base_object_headers(&meta);
@@ -285,10 +377,22 @@ fn get_object(ctx: &Ctx, req: &Req, key: &str, resource: &str) -> Response {
                     "Content-Range".to_string(),
                     format!("bytes {first}-{last}/{}", meta.size),
                 ));
-                return file_reply(206, meta.content_type, headers, path, first, last - first + 1);
+                return file_reply(
+                    206,
+                    meta.content_type,
+                    headers,
+                    path,
+                    first,
+                    last - first + 1,
+                );
             }
             Range::Unsatisfiable => {
-                return error_reply(416, "InvalidRange", "the requested range is not satisfiable", resource)
+                return error_reply(
+                    416,
+                    "InvalidRange",
+                    "the requested range is not satisfiable",
+                    resource,
+                )
             }
         }
     }
@@ -302,16 +406,31 @@ fn head_object(ctx: &Ctx, req: &Req, key: &str, resource: &str) -> Response {
         Some(meta) => {
             let path: PathBuf =
                 object::object_path(&ctx.store, &req.bucket, key).expect("validated key");
-            file_reply(200, meta.content_type.clone(), base_object_headers(&meta), path, 0, meta.size)
+            file_reply(
+                200,
+                meta.content_type.clone(),
+                base_object_headers(&meta),
+                path,
+                0,
+                meta.size,
+            )
         }
-        None => error_reply(404, "NoSuchKey", "the specified key does not exist", resource),
+        None => error_reply(
+            404,
+            "NoSuchKey",
+            "the specified key does not exist",
+            resource,
+        ),
     }
 }
 
 fn base_object_headers(meta: &ObjectMeta) -> Vec<(String, String)> {
     vec![
         ("ETag".to_string(), meta.etag.clone()),
-        ("Last-Modified".to_string(), http_date(meta.last_modified_ms / 1000)),
+        (
+            "Last-Modified".to_string(),
+            http_date(meta.last_modified_ms / 1000),
+        ),
         ("Accept-Ranges".to_string(), "bytes".to_string()),
     ]
 }
@@ -338,7 +457,12 @@ fn file_reply(
     offset: u64,
     len: u64,
 ) -> Response {
-    Response { status, content_type, headers, body: Body::File(path, offset, len) }
+    Response {
+        status,
+        content_type,
+        headers,
+        body: Body::File(path, offset, len),
+    }
 }
 
 fn internal(e: &std::io::Error, resource: &str) -> Response {
@@ -362,8 +486,10 @@ mod tests {
             last_modified_ms: 0,
             content_type: "application/octet-stream".to_string(),
         };
-        let merged =
-            merge_entries(vec![meta("a.txt"), meta("e")], vec!["d/".to_string(), "dirx/".to_string()]);
+        let merged = merge_entries(
+            vec![meta("a.txt"), meta("e")],
+            vec!["d/".to_string(), "dirx/".to_string()],
+        );
         let keys: Vec<&str> = merged.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["a.txt", "d/", "dirx/", "e"]);
         assert!(merged[0].1.is_some() && merged[1].1.is_none() && merged[3].1.is_some());

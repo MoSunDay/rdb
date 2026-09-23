@@ -119,10 +119,7 @@ pub fn doc_found(index: &str, id: &str, source: &Value) -> Reply {
 
 /// Miss body (`found:false`); the caller picked 404 already.
 pub fn doc_missing(index: &str, id: &str) -> Reply {
-    json(
-        404,
-        json!({"_index": index, "_id": id, "found": false}),
-    )
+    json(404, json!({"_index": index, "_id": id, "found": false}))
 }
 
 /// `DELETE /{index}/_doc/{id}`: "deleted" or "not_found" (both 200
@@ -284,6 +281,9 @@ mod tests {
             None,
             Some(json!({"type": "action_request_validation_exception"})),
         );
-        assert_eq!(bad["update"]["error"]["type"], "action_request_validation_exception");
+        assert_eq!(
+            bad["update"]["error"]["type"],
+            "action_request_validation_exception"
+        );
     }
 }

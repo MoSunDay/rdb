@@ -291,7 +291,9 @@ pub enum Classification {
 
 pub fn classify(after_prefix: &[u8]) -> Classification {
     match after_prefix.first() {
-        Some(&b) if b <= KIND_SEARCH_NUMVAL || b == KIND_EXPIRE_INDEX || b == KIND_STREAM_OFFSET => {
+        Some(&b)
+            if b <= KIND_SEARCH_NUMVAL || b == KIND_EXPIRE_INDEX || b == KIND_STREAM_OFFSET =>
+        {
             Classification::Typed(b)
         }
         _ => Classification::Raw,

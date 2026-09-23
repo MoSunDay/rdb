@@ -70,25 +70,36 @@ pub fn handle_list_offsets(
 /// Resolve one query against the Lite store; `Err` = storage failure,
 /// every Kafka-level miss is an in-band error code.
 fn resolve(shared: &Shared, topic: &str, q: &OffsetQuery) -> Result<OffsetOut, String> {
-    let miss = |code: i16| OffsetOut { error: code, offset: -1, timestamp: -1 };
+    let miss = |code: i16| OffsetOut {
+        error: code,
+        offset: -1,
+        timestamp: -1,
+    };
     if let Err(code) = mapping::validate_topic(topic.as_bytes()) {
         return Ok(miss(code));
     }
     let parent = topic.as_bytes();
     let prefix = hash::slot_with_prefix(parent).1;
-    let Some(child) = mapping::partition_queue(&shared.store, &prefix, parent, q.partition)?
-    else {
+    let Some(child) = mapping::partition_queue(&shared.store, &prefix, parent, q.partition)? else {
         return Ok(miss(errors::UNKNOWN_TOPIC_OR_PARTITION));
     };
     let mut stream = parent.to_vec();
     stream.push(b'/');
     stream.extend_from_slice(&child);
     match q.timestamp {
-        -2 => Ok(OffsetOut { error: errors::NONE, offset: 0, timestamp: -1 }),
+        -2 => Ok(OffsetOut {
+            error: errors::NONE,
+            offset: 0,
+            timestamp: -1,
+        }),
         -1 | -3 => {
             let len = mapping::latest_ordinal(&shared.store, &prefix, &stream)?
                 .ok_or_else(|| "stream vanished".to_string())?;
-            Ok(OffsetOut { error: errors::NONE, offset: len as i64, timestamp: -1 })
+            Ok(OffsetOut {
+                error: errors::NONE,
+                offset: len as i64,
+                timestamp: -1,
+            })
         }
         ts => {
             // By-timestamp: first entry with arrival ms >= ts (negative
@@ -145,7 +156,10 @@ mod tests {
             meta.last_seq = seq;
         }
         let mut wb = WriteBatch::default();
-        wb.put(model::meta_key(&prefix, &stream), model::encode_meta_at(&meta, 0));
+        wb.put(
+            model::meta_key(&prefix, &stream),
+            model::encode_meta_at(&meta, 0),
+        );
         for &(ms, seq) in ids {
             wb.put(
                 model::entry_key(&prefix, &stream, model::EntryId { ms, seq }),
@@ -175,7 +189,15 @@ mod tests {
         let body = handle_list_offsets(
             &mut Reader::new(&req(
                 "tt",
-                &[(0, -1), (0, -2), (0, -3), (0, 100), (0, 150), (0, 9999), (7, -1)],
+                &[
+                    (0, -1),
+                    (0, -2),
+                    (0, -3),
+                    (0, 100),
+                    (0, 150),
+                    (0, 9999),
+                    (7, -1),
+                ],
             )),
             1,
             &sh,
@@ -238,12 +260,8 @@ mod tests {
     #[test]
     fn invalid_topic_name_is_error_17() {
         let sh = state::testutil::shared_with(state::testutil::test_config());
-        let body = handle_list_offsets(
-            &mut Reader::new(&req("bad name", &[(0, -1)])),
-            1,
-            &sh,
-        )
-        .unwrap();
+        let body =
+            handle_list_offsets(&mut Reader::new(&req("bad name", &[(0, -1)])), 1, &sh).unwrap();
         let mut r = Reader::new(&body);
         assert_eq!(r.array_len(), Some(Some(1)));
         r.string();

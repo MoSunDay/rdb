@@ -54,7 +54,11 @@ fn walk(v: &Value, path: &str, f: &SourceFilter) -> Option<Value> {
     };
     let mut out = Map::new();
     for (k, child) in map {
-        let child_path = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+        let child_path = if path.is_empty() {
+            k.clone()
+        } else {
+            format!("{path}.{k}")
+        };
         if f.excludes.iter().any(|p| covers(p, &child_path)) {
             continue;
         }
@@ -132,13 +136,25 @@ mod tests {
     #[test]
     fn filter_source_include_exclude_wildcards() {
         let v = json!({"a": {"b": 1, "c": 2}, "d": 3, "e": {"f": 4}});
-        let f = SourceFilter { includes: vec!["a.b".into(), "d".into()], ..Default::default() };
+        let f = SourceFilter {
+            includes: vec!["a.b".into(), "d".into()],
+            ..Default::default()
+        };
         assert_eq!(filter_source(&v, &f), json!({"a": {"b": 1}, "d": 3}));
-        let f = SourceFilter { excludes: vec!["a.*".into()], ..Default::default() };
+        let f = SourceFilter {
+            excludes: vec!["a.*".into()],
+            ..Default::default()
+        };
         assert_eq!(filter_source(&v, &f), json!({"d": 3, "e": {"f": 4}}));
-        let f = SourceFilter { includes: vec!["a.z".into()], ..Default::default() };
+        let f = SourceFilter {
+            includes: vec!["a.z".into()],
+            ..Default::default()
+        };
         assert_eq!(filter_source(&v, &f), json!({})); // nothing matched
-        let f = SourceFilter { disabled: true, ..Default::default() };
+        let f = SourceFilter {
+            disabled: true,
+            ..Default::default()
+        };
         assert_eq!(filter_source(&v, &f), Value::Null);
         let f = SourceFilter::default();
         assert_eq!(filter_source(&v, &f), v); // no patterns = whole doc

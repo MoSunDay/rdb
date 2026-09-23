@@ -36,8 +36,13 @@ pub(super) fn spawn_once(dir: &str, s3_token: &str) -> Node {
     // (Re)create the node dir: a failed spawn's `Node::drop` removes it,
     // and the retry loop below comes straight back here.
     std::fs::create_dir_all(dir).expect("create node dir");
-    let (bind, raft, raft_http, monitor, http) =
-        (free_addr(), free_addr(), free_addr(), free_addr(), free_addr());
+    let (bind, raft, raft_http, monitor, http) = (
+        free_addr(),
+        free_addr(),
+        free_addr(),
+        free_addr(),
+        free_addr(),
+    );
     let s3root = PathBuf::from(dir).join("s3data");
     let yaml = format!(
         "bind: \"{bind}\"\nstore_path: \"{dir}\"\nraft_bind_address: \"{raft}\"\n\
@@ -60,7 +65,14 @@ pub(super) fn spawn_once(dir: &str, s3_token: &str) -> Node {
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn rdb binary");
-    Node { child, dir: PathBuf::from(dir), stderr_path, bind, http, s3root }
+    Node {
+        child,
+        dir: PathBuf::from(dir),
+        stderr_path,
+        bind,
+        http,
+        s3root,
+    }
 }
 
 pub(super) fn spawn_s3_node(dir: &str) -> Node {
@@ -85,7 +97,10 @@ fn spawn_s3_node_retry(dir: &str, s3_token: &str) -> Node {
     }
     let mut node = spawn_once(dir, s3_token);
     node.child.wait().expect("rdb run");
-    panic!("rdb kept failing to bind; see {}", node.stderr_path.display());
+    panic!(
+        "rdb kept failing to bind; see {}",
+        node.stderr_path.display()
+    );
 }
 
 pub(super) async fn wait_accepting(node: &mut Node, addr: &str, what: &str) {
@@ -98,13 +113,15 @@ pub(super) async fn wait_accepting(node: &mut Node, addr: &str, what: &str) {
         if TcpStream::connect(addr).await.is_ok() {
             return;
         }
-        assert!(Instant::now() < deadline, "rdb {what} never accepted on {addr}");
+        assert!(
+            Instant::now() < deadline,
+            "rdb {what} never accepted on {addr}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 pub(super) fn dir_for(tag: &str) -> String {
-    let dir = std::env::temp_dir()
-        .join(format!("rdb-s3-e2e-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rdb-s3-e2e-{tag}-{}", std::process::id()));
     dir.to_string_lossy().into_owned()
 }

@@ -88,7 +88,12 @@ async fn handle_conn(sock: TcpStream, shared: Arc<Shared>) {
                 break i;
             }
             if buf.len() > MAX_HEAD_BYTES {
-                let _ = write_reply(&mut wr, &HttpReply::text(431, "request head too large"), false).await;
+                let _ = write_reply(
+                    &mut wr,
+                    &HttpReply::text(431, "request head too large"),
+                    false,
+                )
+                .await;
                 return;
             }
             match read_some(&mut rd, &mut buf).await {
@@ -106,7 +111,12 @@ async fn handle_conn(sock: TcpStream, shared: Arc<Shared>) {
         buf.drain(..head_end + 4);
         // ---- body ----
         if head.chunked() {
-            let _ = write_reply(&mut wr, &HttpReply::text(501, "chunked bodies not supported"), false).await;
+            let _ = write_reply(
+                &mut wr,
+                &HttpReply::text(501, "chunked bodies not supported"),
+                false,
+            )
+            .await;
             return;
         }
         let len = head.content_length.unwrap_or(0) as usize;
@@ -119,7 +129,13 @@ async fn handle_conn(sock: TcpStream, shared: Arc<Shared>) {
             .await;
             return;
         }
-        if head.expects_continue() && len > 0 && wr.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err() {
+        if head.expects_continue()
+            && len > 0
+            && wr
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .is_err()
+        {
             return;
         }
         while buf.len() < len {
@@ -221,7 +237,8 @@ impl Head {
 
 /// Parse the head section (everything before `\r\n\r\n`). Pure.
 fn parse_head(bytes: &[u8]) -> Result<Head, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "request head must be ASCII/UTF-8".to_string())?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "request head must be ASCII/UTF-8".to_string())?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().ok_or("empty request head")?;
     let mut parts = request_line.split(' ');
@@ -231,7 +248,9 @@ fn parse_head(bytes: &[u8]) -> Result<Head, String> {
     if parts.next().is_some()
         || method.is_empty()
         || !target.starts_with('/')
-        || !method.bytes().all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
+        || !method
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
     {
         return Err("malformed request line".to_string());
     }
@@ -255,7 +274,10 @@ fn parse_head(bytes: &[u8]) -> Result<Head, String> {
     let content_length = headers
         .iter()
         .find(|(n, _)| n == "content-length")
-        .map(|(_, v)| v.parse::<u64>().map_err(|_| "malformed content-length".to_string()))
+        .map(|(_, v)| {
+            v.parse::<u64>()
+                .map_err(|_| "malformed content-length".to_string())
+        })
         .transpose()?;
     Ok(Head {
         method: method.to_string(),
@@ -292,7 +314,11 @@ async fn write_reply(
         reply.content_type,
         reply.body.len(),
         if keep { "keep-alive" } else { "close" },
-        if reply.allow_post { "Allow: POST\r\n" } else { "" },
+        if reply.allow_post {
+            "Allow: POST\r\n"
+        } else {
+            ""
+        },
     );
     wr.write_all(head.as_bytes()).await?;
     wr.write_all(&reply.body).await?;
@@ -339,7 +365,10 @@ mod tests {
 
     #[test]
     fn target_split() {
-        assert_eq!(split_target("/produce?channel=a&n=2"), ("/produce", "channel=a&n=2"));
+        assert_eq!(
+            split_target("/produce?channel=a&n=2"),
+            ("/produce", "channel=a&n=2")
+        );
         assert_eq!(split_target("/ack"), ("/ack", ""));
         assert_eq!(split_target("/x?a#f"), ("/x", "a"));
         assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\n"), Some(14));

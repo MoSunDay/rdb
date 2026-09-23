@@ -43,7 +43,10 @@ async fn read_reply(sock: &mut TcpStream) -> (String, Vec<u8>) {
             }
         }
     }
-    let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head end");
+    let head_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("head end");
     let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
     let status = head.split(' ').nth(1).expect("status").to_string();
     (status, buf[head_end + 4..].to_vec())
@@ -77,9 +80,8 @@ async fn full_surface_over_raw_sockets() {
     assert_eq!(status, "401");
     assert!(has(&body, "security_exception"), "{body:?}");
 
-    let get = |path: &str| {
-        format!("GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n")
-    };
+    let get =
+        |path: &str| format!("GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n");
     // root
     let (status, body) = roundtrip(&addr, get("/").as_bytes()).await;
     assert_eq!(status, "200");
@@ -107,7 +109,10 @@ async fn full_surface_over_raw_sockets() {
     let (status, body) = roundtrip(&addr, get("/books").as_bytes()).await;
     assert_eq!(status, "200");
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(v["books"]["mappings"]["properties"]["title"]["type"], "text");
+    assert_eq!(
+        v["books"]["mappings"]["properties"]["title"]["type"],
+        "text"
+    );
     assert_eq!(v["books"]["mappings"]["properties"]["n"]["type"], "long");
 
     // index a doc (201), re-index (200), search + count
@@ -191,10 +196,22 @@ async fn bulk_with_100_continue() {
 
     let (status, body) = read_reply(&mut sock).await;
     assert_eq!(status, "200");
-    assert!(has(&body, "\"errors\":false"), "{}", String::from_utf8_lossy(&body));
-    assert!(has(&body, "\"result\":\"created\""), "{}", String::from_utf8_lossy(&body));
+    assert!(
+        has(&body, "\"errors\":false"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        has(&body, "\"result\":\"created\""),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
     // delete-miss: not_found status, but errors stays false
-    assert!(has(&body, "\"result\":\"not_found\""), "{}", String::from_utf8_lossy(&body));
+    assert!(
+        has(&body, "\"result\":\"not_found\""),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 #[tokio::test]

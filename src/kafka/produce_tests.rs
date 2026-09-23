@@ -29,7 +29,13 @@ fn rec(key: Option<&[u8]>, value: Option<&[u8]>, headers: Vec<(&str, Option<&[u8
 #[test]
 fn field_pair_map() {
     let kv = record_fields(&rec(Some(b"k"), Some(b"v"), vec![]));
-    assert_eq!(kv, vec![(b"k".to_vec(), b"k".to_vec()), (b"v".to_vec(), b"v".to_vec())]);
+    assert_eq!(
+        kv,
+        vec![
+            (b"k".to_vec(), b"k".to_vec()),
+            (b"v".to_vec(), b"v".to_vec())
+        ]
+    );
     // key null, no headers: 1 pair
     assert_eq!(
         record_fields(&rec(None, Some(b"v"), vec![])),
@@ -48,7 +54,10 @@ fn field_pair_map() {
     // tombstone with a key: k pair + __null__ slot
     assert_eq!(
         record_fields(&rec(Some(b"k"), None, vec![])),
-        vec![(b"k".to_vec(), b"k".to_vec()), (b"__null__".to_vec(), Vec::new())]
+        vec![
+            (b"k".to_vec(), b"k".to_vec()),
+            (b"__null__".to_vec(), Vec::new())
+        ]
     );
     // headers: k + v + h (2 pairs when the key is null)
     let h = record_fields(&rec(
@@ -64,18 +73,30 @@ fn field_pair_map() {
     );
     let h2 = record_fields(&rec(None, Some(b"v"), vec![("only", None)]));
     assert_eq!(h2.len(), 2);
-    assert_eq!(String::from_utf8_lossy(&h2[1].1), r#"[{"n":"only","v":null}]"#);
+    assert_eq!(
+        String::from_utf8_lossy(&h2[1].1),
+        r#"[{"n":"only","v":null}]"#
+    );
 }
 
 #[test]
 fn parse_error_classification() {
-    assert_eq!(classify_parse_err("unsupported magic 1 (v2 only)".into()), errors::UNSUPPORTED_VERSION);
+    assert_eq!(
+        classify_parse_err("unsupported magic 1 (v2 only)".into()),
+        errors::UNSUPPORTED_VERSION
+    );
     assert_eq!(
         classify_parse_err("compressed batches unsupported (attributes 3)".into()),
         errors::UNSUPPORTED_COMPRESSION_TYPE
     );
-    assert_eq!(classify_parse_err("crc mismatch: ..".into()), errors::CORRUPT_MESSAGE);
-    assert_eq!(classify_parse_err("truncated batch".into()), errors::CORRUPT_MESSAGE);
+    assert_eq!(
+        classify_parse_err("crc mismatch: ..".into()),
+        errors::CORRUPT_MESSAGE
+    );
+    assert_eq!(
+        classify_parse_err("truncated batch".into()),
+        errors::CORRUPT_MESSAGE
+    );
 }
 
 #[tokio::test]
@@ -87,7 +108,13 @@ async fn produce_appends_and_answers_base_offset() {
     let mut wb = WriteBatch::default();
     let prefix = hash::slot_with_prefix(b"tp").1;
     let mkey = model::meta_key(&prefix, b"tp/q0");
-    let mp = model::MetaPayload { created_ms: 1, len: 1, last_ms: 7, last_seq: 0, ..Default::default() };
+    let mp = model::MetaPayload {
+        created_ms: 1,
+        len: 1,
+        last_ms: 7,
+        last_seq: 0,
+        ..Default::default()
+    };
     wb.put(&mkey, model::encode_meta_at(&mp, 0));
     wb.put(
         model::entry_key(&prefix, b"tp/q0", model::EntryId { ms: 7, seq: 0 }),
@@ -99,8 +126,18 @@ async fn produce_appends_and_answers_base_offset() {
         0,
         1_000,
         &[
-            crate::kafka::record::BatchRecord { timestamp_delta: 0, key: Some(b"k1"), value: Some(b"v1"), headers: vec![] },
-            crate::kafka::record::BatchRecord { timestamp_delta: 5, key: None, value: Some(b"v2"), headers: vec![] },
+            crate::kafka::record::BatchRecord {
+                timestamp_delta: 0,
+                key: Some(b"k1"),
+                value: Some(b"v1"),
+                headers: vec![],
+            },
+            crate::kafka::record::BatchRecord {
+                timestamp_delta: 5,
+                key: None,
+                value: Some(b"v2"),
+                headers: vec![],
+            },
         ],
     );
     let mut req = Vec::new();
@@ -130,17 +167,30 @@ async fn produce_appends_and_answers_base_offset() {
     // Two entries landed with the mapped field pairs; meta len -> 3.
     let entries = scan_entries(&sh.store, &prefix, b"tp/q0", MIN_ID, 10).unwrap();
     assert_eq!(entries.len(), 3);
-    assert_eq!(entries[1].fields, vec![(b"k".to_vec(), b"k1".to_vec()), (b"v".to_vec(), b"v1".to_vec())]);
+    assert_eq!(
+        entries[1].fields,
+        vec![
+            (b"k".to_vec(), b"k1".to_vec()),
+            (b"v".to_vec(), b"v1".to_vec())
+        ]
+    );
     assert_eq!(entries[2].fields, vec![(b"v".to_vec(), b"v2".to_vec())]);
     assert_eq!(
-        model::read_meta(&sh.store, &prefix, b"tp/q0", None).unwrap().live().unwrap().len,
+        model::read_meta(&sh.store, &prefix, b"tp/q0", None)
+            .unwrap()
+            .live()
+            .unwrap()
+            .len,
         3
     );
 
     // acks=0: no response frame at all.
     let mut req0 = req.clone();
     req0[1] = 0; // acks = 0 (low byte of the i16)
-    assert!(handle_produce(&mut Reader::new(&req0), 2, &sh).await.unwrap().is_none());
+    assert!(handle_produce(&mut Reader::new(&req0), 2, &sh)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// P5b (kafka-codecs): a gzip-wrapped batch rides the ordinary append
@@ -159,7 +209,13 @@ async fn compressed_produce_appends_through_the_lite_path() {
     // One RESP-born entry seeds partition 0 (the q0 queue) at len 1.
     let mut wb = WriteBatch::default();
     let mkey = model::meta_key(&prefix, b"tp/q0");
-    let mp = model::MetaPayload { created_ms: 1, len: 1, last_ms: 7, last_seq: 0, ..Default::default() };
+    let mp = model::MetaPayload {
+        created_ms: 1,
+        len: 1,
+        last_ms: 7,
+        last_seq: 0,
+        ..Default::default()
+    };
     wb.put(&mkey, model::encode_meta_at(&mp, 0));
     wb.put(
         model::entry_key(&prefix, b"tp/q0", model::EntryId { ms: 7, seq: 0 }),
@@ -173,9 +229,24 @@ async fn compressed_produce_appends_through_the_lite_path() {
         0,
         1_000,
         &[
-            crate::kafka::record::BatchRecord { timestamp_delta: 0, key: Some(b"c0"), value: Some(b"v0"), headers: vec![] },
-            crate::kafka::record::BatchRecord { timestamp_delta: 3, key: Some(b"c1"), value: Some(b"v1"), headers: vec![] },
-            crate::kafka::record::BatchRecord { timestamp_delta: 6, key: Some(b"c2"), value: Some(b"v2"), headers: vec![] },
+            crate::kafka::record::BatchRecord {
+                timestamp_delta: 0,
+                key: Some(b"c0"),
+                value: Some(b"v0"),
+                headers: vec![],
+            },
+            crate::kafka::record::BatchRecord {
+                timestamp_delta: 3,
+                key: Some(b"c1"),
+                value: Some(b"v1"),
+                headers: vec![],
+            },
+            crate::kafka::record::BatchRecord {
+                timestamp_delta: 6,
+                key: Some(b"c2"),
+                value: Some(b"v2"),
+                headers: vec![],
+            },
         ],
     );
     let area = plain[61..].to_vec();
@@ -224,7 +295,11 @@ async fn compressed_produce_appends_through_the_lite_path() {
         );
     }
     assert_eq!(
-        model::read_meta(&sh.store, &prefix, b"tp/q0", None).unwrap().live().unwrap().len,
+        model::read_meta(&sh.store, &prefix, b"tp/q0", None)
+            .unwrap()
+            .live()
+            .unwrap()
+            .len,
         4
     );
 }

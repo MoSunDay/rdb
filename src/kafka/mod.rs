@@ -13,6 +13,11 @@
 //! `kafka_bind` disables the front; the backup listener never wires it.
 
 pub mod catalog;
+#[cfg(feature = "kafka-codecs")]
+pub mod codec;
+#[cfg(all(test, feature = "kafka-codecs"))]
+#[path = "codec_tests.rs"]
+mod codec_tests;
 pub mod conn;
 pub mod coordinator;
 pub mod errors;
@@ -35,11 +40,6 @@ pub mod produce;
 #[path = "produce_tests.rs"]
 mod produce_tests;
 pub mod record;
-#[cfg(feature = "kafka-codecs")]
-pub mod codec;
-#[cfg(all(test, feature = "kafka-codecs"))]
-#[path = "codec_tests.rs"]
-mod codec_tests;
 
 use std::sync::Arc;
 use std::time::Duration;

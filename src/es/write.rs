@@ -204,8 +204,8 @@ pub async fn put_doc(
         }
         IndexState::Present(meta) => meta,
     };
-    let old = ft_index::read_doc(&shared.store, &prefix, key, docid.as_bytes())
-        .map_err(EsErr::from)?;
+    let old =
+        ft_index::read_doc(&shared.store, &prefix, key, docid.as_bytes()).map_err(EsErr::from)?;
     if create_only && old.is_some() {
         return Err(EsErr::new(
             409,
@@ -213,8 +213,13 @@ pub async fn put_doc(
             format!("[{docid}]: version conflict, document already exists (1)"),
         ));
     }
-    let (rec, numvals) = doc_record_of(&meta, body)
-        .map_err(|e| EsErr::new(400, "document_parsing_exception", e.trim_start_matches("ERR ")))?;
+    let (rec, numvals) = doc_record_of(&meta, body).map_err(|e| {
+        EsErr::new(
+            400,
+            "document_parsing_exception",
+            e.trim_start_matches("ERR "),
+        )
+    })?;
     let batch = ft_index::build_add_batch(
         &shared.store,
         &prefix,

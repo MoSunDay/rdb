@@ -44,20 +44,30 @@ pub fn bind(addr: &str) -> Result<TcpListener, String> {
 /// `checkpoint::spawn_publisher`).
 pub async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     let conf = &shared.conf;
-    let bucket = if conf.s3_bucket.is_empty() { "rdb".to_string() } else { conf.s3_bucket.clone() };
+    let bucket = if conf.s3_bucket.is_empty() {
+        "rdb".to_string()
+    } else {
+        conf.s3_bucket.clone()
+    };
     let root = if conf.s3_store_path.is_empty() {
         PathBuf::from(&conf.store_path).join("s3")
     } else {
         PathBuf::from(&conf.s3_store_path)
     };
     let ctx = match object::open(&root) {
-        Ok(store) => Arc::new(Ctx { store, token: conf.s3_token.clone() }),
+        Ok(store) => Arc::new(Ctx {
+            store,
+            token: conf.s3_token.clone(),
+        }),
         Err(e) => {
             eprintln!("s3: open object store at {} failed: {e}", root.display());
             return;
         }
     };
-    eprintln!("s3: front bound for bucket \"{bucket}\" under {}", root.display());
+    eprintln!(
+        "s3: front bound for bucket \"{bucket}\" under {}",
+        root.display()
+    );
     loop {
         match listener.accept().await {
             Ok((sock, _)) => {
@@ -88,10 +98,16 @@ pub(crate) struct Req {
 
 impl Req {
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
     pub(crate) fn q(&self, name: &str) -> Option<&str> {
-        self.query.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+        self.query
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -133,7 +149,12 @@ pub(crate) fn error_reply(status: u16, code: &str, msg: &str, resource: &str) ->
 }
 
 pub(crate) fn method_not_allowed(resource: &str) -> Response {
-    error_reply(405, "MethodNotAllowed", "method not allowed against this resource", resource)
+    error_reply(
+        405,
+        "MethodNotAllowed",
+        "method not allowed against this resource",
+        resource,
+    )
 }
 
 fn reason(status: u16) -> &'static str {
@@ -164,7 +185,9 @@ pub(crate) fn authorized(headers: &[(String, String)], token: &str) -> bool {
         return true;
     }
     let expected = format!("bearer {}", token.to_ascii_lowercase());
-    headers.iter().any(|(n, v)| n == "authorization" && v.trim().to_ascii_lowercase() == expected)
+    headers
+        .iter()
+        .any(|(n, v)| n == "authorization" && v.trim().to_ascii_lowercase() == expected)
 }
 
 /// Header values we are willing to store and echo back: no control
@@ -177,7 +200,9 @@ pub(crate) fn valid_header_value(v: &str) -> bool {
 /// Strip CR/LF/NUL before a value enters the response head (defense
 /// in depth behind `valid_header_value`).
 fn sanitize_header_value(v: &str) -> String {
-    v.chars().filter(|c| *c != '\r' && *c != '\n' && *c != '\0').collect()
+    v.chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+        .collect()
 }
 
 async fn handle_conn(mut sock: TcpStream, ctx: Arc<Ctx>) {
@@ -188,7 +213,16 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<Ctx>) {
     };
     // ---- framing ----
     if head.headers.iter().any(|(n, _)| n == "transfer-encoding") {
-        return reply_and_close(&mut sock, error_reply(501, "NotImplemented", "chunked transfer encoding is not supported", "/")).await;
+        return reply_and_close(
+            &mut sock,
+            error_reply(
+                501,
+                "NotImplemented",
+                "chunked transfer encoding is not supported",
+                "/",
+            ),
+        )
+        .await;
     }
     // PUT is the only method with a body here and MUST carry
     // Content-Length (chunked is refused above) -- without it we
@@ -199,7 +233,12 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<Ctx>) {
             None => {
                 return reply_and_close(
                     &mut sock,
-                    error_reply(411, "MissingContentLength", "PUT requires a Content-Length header", "/"),
+                    error_reply(
+                        411,
+                        "MissingContentLength",
+                        "PUT requires a Content-Length header",
+                        "/",
+                    ),
                 )
                 .await
             }
@@ -208,7 +247,16 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<Ctx>) {
         0
     };
     if len > MAX_BODY_BYTES {
-        return reply_and_close(&mut sock, error_reply(413, "EntityTooLarge", "request body exceeds the 1 GiB limit", "/")).await;
+        return reply_and_close(
+            &mut sock,
+            error_reply(
+                413,
+                "EntityTooLarge",
+                "request body exceeds the 1 GiB limit",
+                "/",
+            ),
+        )
+        .await;
     }
     let expects_continue = head
         .headers
@@ -220,7 +268,16 @@ async fn handle_conn(mut sock: TcpStream, ctx: Arc<Ctx>) {
     // ---- auth: non-empty token requires `Bearer <token>` (see
     // `authorized`; not timing-hardened, like the RESP AUTH path) ----
     if !authorized(&head.headers, &ctx.token) {
-        return reply_and_close(&mut sock, error_reply(401, "AccessDenied", "missing or invalid bearer credentials", "/")).await;
+        return reply_and_close(
+            &mut sock,
+            error_reply(
+                401,
+                "AccessDenied",
+                "missing or invalid bearer credentials",
+                "/",
+            ),
+        )
+        .await;
     }
     // ---- route ----
     let rep = match build_req(&head) {
@@ -239,7 +296,11 @@ async fn reply_and_close(sock: &mut TcpStream, rep: Response) {
 /// Serialize + send. `is_head` sends headers only (Content-Length
 /// still reflects the body GET would have carried, per RFC). Every
 /// reply carries Date/Server/x-amz-request-id and Connection: close.
-async fn write_response(sock: &mut TcpStream, rep: &Response, is_head: bool) -> std::io::Result<()> {
+async fn write_response(
+    sock: &mut TcpStream,
+    rep: &Response,
+    is_head: bool,
+) -> std::io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nDate: {}\r\nServer: rdb-s3\r\nx-amz-request-id: {}\r\n",
         rep.status,
@@ -255,7 +316,11 @@ async fn write_response(sock: &mut TcpStream, rep: &Response, is_head: bool) -> 
         ));
     }
     for (n, v) in &rep.headers {
-        head.push_str(&format!("{}: {}\r\n", sanitize_header_value(n), sanitize_header_value(v)));
+        head.push_str(&format!(
+            "{}: {}\r\n",
+            sanitize_header_value(n),
+            sanitize_header_value(v)
+        ));
     }
     head.push_str("Connection: close\r\n\r\n");
     sock.write_all(head.as_bytes()).await?;
@@ -293,7 +358,12 @@ async fn read_head(sock: &mut TcpStream) -> Result<Option<(Head, Vec<u8>)>, Resp
             break pos;
         }
         if buf.len() > MAX_HEAD_BYTES {
-            return Err(error_reply(431, "BadRequest", "request head exceeds the maximum allowed length", "/"));
+            return Err(error_reply(
+                431,
+                "BadRequest",
+                "request head exceeds the maximum allowed length",
+                "/",
+            ));
         }
         let n = match tokio::time::timeout(HEAD_TIMEOUT, sock.read(&mut chunk)).await {
             Ok(Ok(0)) => return Ok(None),
@@ -303,7 +373,8 @@ async fn read_head(sock: &mut TcpStream) -> Result<Option<(Head, Vec<u8>)>, Resp
         buf.extend_from_slice(&chunk[..n]);
     };
     let leftover = buf[end + 4..].to_vec();
-    parse_head(&buf[..end]).map(|head| Some((head, leftover)))
+    parse_head(&buf[..end])
+        .map(|head| Some((head, leftover)))
         .map_err(|e| error_reply(400, "BadRequest", &e, "/"))
 }
 
@@ -317,7 +388,8 @@ struct Head {
 }
 
 fn parse_head(bytes: &[u8]) -> Result<Head, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "request head must be ASCII/UTF-8".to_string())?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "request head must be ASCII/UTF-8".to_string())?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().ok_or("empty request head")?;
     let mut parts = request_line.split(' ');
@@ -330,7 +402,9 @@ fn parse_head(bytes: &[u8]) -> Result<Head, String> {
         || method.is_empty()
         || !target.starts_with('/')
         || !version.starts_with("HTTP/1.")
-        || !method.bytes().all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
+        || !method
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
     {
         return Err("malformed request line".to_string());
     }
@@ -348,9 +422,17 @@ fn parse_head(bytes: &[u8]) -> Result<Head, String> {
     let content_length = headers
         .iter()
         .find(|(n, _)| n == "content-length")
-        .map(|(_, v)| v.parse::<u64>().map_err(|_| "malformed content-length".to_string()))
+        .map(|(_, v)| {
+            v.parse::<u64>()
+                .map_err(|_| "malformed content-length".to_string())
+        })
         .transpose()?;
-    Ok(Head { method: method.to_string(), target: target.to_string(), headers, content_length })
+    Ok(Head {
+        method: method.to_string(),
+        target: target.to_string(),
+        headers,
+        content_length,
+    })
 }
 
 /// Head -> routing request: segment 1 is the RAW bucket, everything
@@ -365,7 +447,10 @@ fn build_req(head: &Head) -> Result<Req, String> {
     let trimmed = raw_path.strip_prefix('/').unwrap_or(raw_path);
     let (bucket, raw_key) = match trimmed.find('/') {
         None => (trimmed.to_string(), None),
-        Some(i) => (trimmed[..i].to_string(), Some(percent_decode(&trimmed[i + 1..])?)),
+        Some(i) => (
+            trimmed[..i].to_string(),
+            Some(percent_decode(&trimmed[i + 1..])?),
+        ),
     };
     let mut query = Vec::new();
     for part in raw_query.split('&').filter(|s| !s.is_empty()) {
@@ -389,8 +474,16 @@ fn percent_decode(s: &str) -> Result<String, String> {
     while i < bytes.len() {
         match bytes[i] {
             b'%' => {
-                let hi = bytes.get(i + 1).copied().and_then(hex_digit).ok_or("bad percent-escape")?;
-                let lo = bytes.get(i + 2).copied().and_then(hex_digit).ok_or("bad percent-escape")?;
+                let hi = bytes
+                    .get(i + 1)
+                    .copied()
+                    .and_then(hex_digit)
+                    .ok_or("bad percent-escape")?;
+                let lo = bytes
+                    .get(i + 2)
+                    .copied()
+                    .and_then(hex_digit)
+                    .ok_or("bad percent-escape")?;
                 out.push(hi * 16 + lo);
                 i += 3;
             }
@@ -412,7 +505,10 @@ fn decode_query(s: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'+' => out.push(b' '),
-            b'%' => match (bytes.get(i + 1).and_then(|b| hex_digit(*b)), bytes.get(i + 2).and_then(|b| hex_digit(*b))) {
+            b'%' => match (
+                bytes.get(i + 1).and_then(|b| hex_digit(*b)),
+                bytes.get(i + 2).and_then(|b| hex_digit(*b)),
+            ) {
                 (Some(hi), Some(lo)) => {
                     out.push(hi * 16 + lo);
                     i += 3;
@@ -462,7 +558,10 @@ mod tests {
         }
         assert!(valid_header_value("text/plain; charset=utf-8"));
         // the wire-side guard never lets a CR/LF reach the raw head
-        assert_eq!(sanitize_header_value("evil\nX-Injected: 1"), "evilX-Injected: 1");
+        assert_eq!(
+            sanitize_header_value("evil\nX-Injected: 1"),
+            "evilX-Injected: 1"
+        );
         assert_eq!(sanitize_header_value("clean"), "clean");
     }
 
@@ -472,6 +571,9 @@ mod tests {
         assert!(head.content_length.is_none());
         let head = parse_head(b"PUT /b/k HTTP/1.1\r\nContent-Length: 5\r\n\r\n").expect("parse");
         assert_eq!(head.content_length, Some(5));
-        assert_eq!(head.headers[0], ("content-length".to_string(), "5".to_string()));
+        assert_eq!(
+            head.headers[0],
+            ("content-length".to_string(), "5".to_string())
+        );
     }
 }

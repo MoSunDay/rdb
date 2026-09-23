@@ -15,16 +15,16 @@
 //! barrier / sync handoff), `api.rs` + `group_api.rs` (wire handlers).
 
 pub mod api;
-pub mod group_api;
-pub mod join;
-pub mod session;
-pub mod state;
 #[cfg(test)]
 #[path = "api_tests.rs"]
 mod api_tests;
+pub mod group_api;
 #[cfg(test)]
 #[path = "group_api_tests.rs"]
 mod group_api_tests;
+pub mod join;
+pub mod session;
+pub mod state;
 #[cfg(test)]
 #[path = "state_tests.rs"]
 mod state_tests;
@@ -87,7 +87,13 @@ pub fn next_member_id(rt: &CoordRuntime, group: &str) -> String {
 /// Keep ids ASCII-safe without '/' (group names may carry odd bytes).
 fn sanitize(s: &str) -> String {
     s.bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' { b } else { b'_' })
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+                b
+            } else {
+                b'_'
+            }
+        })
         .take(32)
         .map(|b| b as char)
         .collect()
@@ -109,7 +115,12 @@ fn active(st: &state::GroupState) -> bool {
 /// - group active: member must be enrolled and the generation must be
 ///   the CURRENT one (older -> ILLEGAL_GENERATION, unknown member ->
 ///   UNKNOWN_MEMBER_ID; a zombie cannot pass either).
-pub fn commit_fence(rt: &CoordRuntime, group: &str, generation: i32, member_id: &str) -> Option<i16> {
+pub fn commit_fence(
+    rt: &CoordRuntime,
+    group: &str,
+    generation: i32,
+    member_id: &str,
+) -> Option<i16> {
     let groups = rt
         .groups
         .read()
@@ -143,7 +154,10 @@ mod tests {
         // The seed is the process clock, so a restarted process hands
         // out ids the old one could never have issued.
         let seed = rt.member_seq.load(Ordering::Relaxed);
-        assert!(seed > 1_000_000_000_000, "seeded from the wall clock: {seed}");
+        assert!(
+            seed > 1_000_000_000_000,
+            "seeded from the wall clock: {seed}"
+        );
     }
 
     #[test]
@@ -168,9 +182,19 @@ mod tests {
         let (st2, _, _) = state::join(st.clone(), &a);
         st = st2;
         rt.groups.write().unwrap().insert("g".into(), st);
-        assert_eq!(commit_fence(&rt, "g", 1, "m1"), None, "enrolled, current gen");
-        assert_eq!(commit_fence(&rt, "g", 0, "m1"), Some(errors::ILLEGAL_GENERATION));
-        assert_eq!(commit_fence(&rt, "g", 1, "ghost"), Some(errors::UNKNOWN_MEMBER_ID));
+        assert_eq!(
+            commit_fence(&rt, "g", 1, "m1"),
+            None,
+            "enrolled, current gen"
+        );
+        assert_eq!(
+            commit_fence(&rt, "g", 0, "m1"),
+            Some(errors::ILLEGAL_GENERATION)
+        );
+        assert_eq!(
+            commit_fence(&rt, "g", 1, "ghost"),
+            Some(errors::UNKNOWN_MEMBER_ID)
+        );
         // Empty group: degraded mode again.
         let empty = state::to_empty(state::new_group("consumer"));
         rt.groups.write().unwrap().insert("g".into(), empty);

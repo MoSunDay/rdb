@@ -29,7 +29,11 @@ fn round_finding(body: &[u8], version: i16) -> (i16, Option<String>, i32, String
         assert_eq!(r.i32(), Some(0), "v1+ leads with throttle_time_ms");
     }
     let err = r.i16().unwrap();
-    let msg = if version >= 1 { r.nullable_string().unwrap() } else { None };
+    let msg = if version >= 1 {
+        r.nullable_string().unwrap()
+    } else {
+        None
+    };
     let node = r.i32().unwrap();
     let host = r.string().unwrap();
     let port = r.i32().unwrap();
@@ -52,7 +56,7 @@ fn find_coordinator_roundtrips() {
     }
     // v1 with a non-group coordinator type: INVALID_REQUEST + null node.
     let req = find_req(1, "tx-1", Some(1));
-        let mut r = Reader::new(&req);
+    let mut r = Reader::new(&req);
     let body = api::handle_find_coordinator(&mut r, 1, &(AD.0.into(), AD.1)).unwrap();
     let (err, msg, node, host, port) = round_finding(&body, 1);
     assert_eq!(err, errors::INVALID_REQUEST);
@@ -61,7 +65,7 @@ fn find_coordinator_roundtrips() {
     assert_eq!(host, "");
     // v0 has no type field: any key is a group key.
     let req = find_req(0, "anything", None);
-        let mut r = Reader::new(&req);
+    let mut r = Reader::new(&req);
     let body = api::handle_find_coordinator(&mut r, 0, &(AD.0.into(), AD.1)).unwrap();
     assert_eq!(round_finding(&body, 0).0, errors::NONE);
 }
@@ -138,7 +142,7 @@ async fn heartbeat_roundtrips() {
         assert_eq!(r.i16(), Some(want));
     }
     let req = hb_req(0, "nope", 1, "m1");
-        let mut r = Reader::new(&req);
+    let mut r = Reader::new(&req);
     let body = api::handle_heartbeat(&mut r, 0, &rt).await.unwrap();
     assert_eq!(Reader::new(&body).i16(), Some(errors::UNKNOWN_MEMBER_ID));
 }
@@ -159,7 +163,10 @@ fn leave_group_roundtrips() {
         }
         assert_eq!(r.i16(), Some(errors::NONE));
         assert_eq!(r.remaining(), 0);
-        assert!(rt.groups.read().unwrap()["g1"].members.is_empty(), "left -> Empty");
+        assert!(
+            rt.groups.read().unwrap()["g1"].members.is_empty(),
+            "left -> Empty"
+        );
     }
     // Unknown group/member: UNKNOWN_MEMBER_ID on every version.
     let rt = CoordRuntime::new();

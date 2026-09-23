@@ -5,8 +5,8 @@
 //! is an explicit parameter.
 
 use super::state::{
-    complete_barrier, expire, heartbeat, join, leave, new_group, sync, to_empty, Event,
-    GroupStage, JoinArgs, JoinOutcome, SyncOutcome,
+    complete_barrier, expire, heartbeat, join, leave, new_group, sync, to_empty, Event, GroupStage,
+    JoinArgs, JoinOutcome, SyncOutcome,
 };
 use crate::kafka::errors;
 
@@ -73,7 +73,11 @@ fn full_cycle_with_kicks_and_empty() {
     assert_eq!(hb, errors::REBALANCE_IN_PROGRESS);
 
     let (st, _, out) = join(st, &args("m1", 1000, 12));
-    assert_eq!(out, JoinOutcome::Joined { is_leader: true }, "oldest joiner leads");
+    assert_eq!(
+        out,
+        JoinOutcome::Joined { is_leader: true },
+        "oldest joiner leads"
+    );
     assert_eq!(st.generation, 2);
     let assigns = vec![
         ("m1".to_string(), b"a1".to_vec()),
@@ -186,8 +190,8 @@ fn session_expiry_kicks_and_empties() {
     let (st, _, _) = join(st, &args("m2", 500, 10));
     let (st, _, _) = join(st, &args("m1", 500, 11)); // barrier -> gen 2
     let (st, _, _) = sync(st, "m1", 2, &[], 12); // Stable, sessions 12+500
-    // m1 keeps heartbeating (session armed to 10_300); m2 goes quiet
-    // and its session (512) lapses.
+                                                 // m1 keeps heartbeating (session armed to 10_300); m2 goes quiet
+                                                 // and its session (512) lapses.
     let (st, _, code) = heartbeat(st, "m1", 2, 9800);
     assert_eq!(code, errors::NONE);
     let (st, ev) = expire(st, 10_000);
@@ -208,7 +212,7 @@ fn rebalance_deadline_completes_with_rejoined() {
     let st = new_group("consumer");
     let (st, _, _) = join(st, &args("m1", 1000, 0)); // barrier gen 1
     let (st, _, _) = sync(st, "m1", 1, &[], 1); // Stable
-    // m2 joins: kick into PreparingRebalance. m2 rejoined, m1 did not.
+                                                // m2 joins: kick into PreparingRebalance. m2 rejoined, m1 did not.
     let (st, _, _) = join(st, &args("m2", 1000, 2));
     assert_eq!(st.stage, GroupStage::PreparingRebalance);
     assert!(st.members["m2"].joined);
@@ -218,7 +222,10 @@ fn rebalance_deadline_completes_with_rejoined() {
     assert!(ev.is_empty(), "at the deadline the member is still alive");
     // Past it: m1 (never rejoined) drops and m2 carries the barrier.
     let (st, ev) = expire(st, 4001);
-    assert!(ev.contains(&Event::BarrierComplete), "deadline completes with the rejoined");
+    assert!(
+        ev.contains(&Event::BarrierComplete),
+        "deadline completes with the rejoined"
+    );
     assert_eq!(st.stage, GroupStage::CompletingSync);
     assert!(!st.members.contains_key("m1"));
     assert_eq!(st.leader, "m2");
@@ -230,8 +237,8 @@ fn leave_during_prepare_completes_barrier() {
     let st = new_group("consumer");
     let (st, _, _) = join(st, &args("m1", 1000, 0)); // barrier -> CS gen 1
     let (st, _, _) = join(st, &args("m2", 1000, 1)); // kick -> PR, m2 rejoined
-    // m1 is the only member that has NOT rejoined: its leave finishes
-    // the barrier for m2 alone.
+                                                     // m1 is the only member that has NOT rejoined: its leave finishes
+                                                     // the barrier for m2 alone.
     let (st, ev, codes) = leave(st.clone(), &["m1".to_string()], 2);
     assert_eq!(codes, vec![errors::NONE]);
     assert!(ev.contains(&Event::BarrierComplete));
@@ -265,7 +272,10 @@ fn heartbeat_refresh_and_errors() {
     assert_eq!(code, errors::ILLEGAL_GENERATION);
     let (st, _, code) = heartbeat(st, "m1", 1, 900);
     assert_eq!(code, errors::NONE);
-    assert_eq!(st.members["m1"].session_deadline_ms, 1900, "deadline refreshed");
+    assert_eq!(
+        st.members["m1"].session_deadline_ms, 1900,
+        "deadline refreshed"
+    );
     let (_, ev) = expire(st, 1900);
     assert!(ev.is_empty(), "refresh beat the sweep");
 }
@@ -278,8 +288,8 @@ fn barrier_completes_empty_when_all_lapsed() {
     let (st, _, _) = join(st, &args("m2", 500, 1)); // kick -> PR
     let (st, _, _) = join(st, &args("m1", 500, 2)); // barrier gen 2 @2
     let (st, _, _) = sync(st, "m1", 2, &[], 3); // Stable, sessions 503
-    // m1 heartbeats; m2 goes quiet. Sessions were armed at 3 + 500;
-    // at exactly 503 both are still alive, past it m2 lapses.
+                                                // m1 heartbeats; m2 goes quiet. Sessions were armed at 3 + 500;
+                                                // at exactly 503 both are still alive, past it m2 lapses.
     let (st, _, _) = heartbeat(st, "m1", 2, 600);
     let (st, ev) = expire(st.clone(), 503);
     assert!(ev.is_empty(), "the deadline itself is still alive");

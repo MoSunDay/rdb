@@ -44,17 +44,21 @@ pub(super) fn collect_records(
         let mut last = after;
         for e in &chunk {
             if ordinal >= from_ordinal {
-                let size = 64 + e
-                    .fields
-                    .iter()
-                    .map(|(f, v)| f.len() + v.len())
-                    .sum::<usize>();
+                let size = 64
+                    + e.fields
+                        .iter()
+                        .map(|(f, v)| f.len() + v.len())
+                        .sum::<usize>();
                 if !recs.is_empty() && used + size > budget {
                     break 'walk;
                 }
                 used += size;
                 let (key, value) = to_key_value(&e.fields);
-                recs.push(RawRec { ms: e.id.ms, key, value });
+                recs.push(RawRec {
+                    ms: e.id.ms,
+                    key,
+                    value,
+                });
             }
             ordinal += 1;
             last = e.id;

@@ -133,16 +133,15 @@ fn commit_one(
     }
     let parent = topic.as_bytes();
     let prefix = hash::slot_with_prefix(parent).1;
-    let Some(child) = mapping::partition_queue(&shared.store, &prefix, parent, t.partition)
-        .unwrap_or(None)
+    let Some(child) =
+        mapping::partition_queue(&shared.store, &prefix, parent, t.partition).unwrap_or(None)
     else {
         return errors::UNKNOWN_TOPIC_OR_PARTITION;
     };
     let mut stream = parent.to_vec();
     stream.push(b'/');
     stream.extend_from_slice(&child);
-    let existing = ledger::load(&shared.store, &prefix, &stream, group.as_bytes())
-        .unwrap_or(None);
+    let existing = ledger::load(&shared.store, &prefix, &stream, group.as_bytes()).unwrap_or(None);
     if version >= 1 {
         if let Some(ref row) = existing {
             if row.generation > generation {

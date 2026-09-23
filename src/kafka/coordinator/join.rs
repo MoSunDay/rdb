@@ -159,9 +159,9 @@ pub async fn join_group(
                     .and_then(|rows| rows.iter().map(|r| r.generation).max())
                     .unwrap_or(0)
                     .max(0);
-                groups.entry(req.group.clone()).or_insert_with(|| {
-                    state::new_group_seeded(&req.protocol_type, seed)
-                })
+                groups
+                    .entry(req.group.clone())
+                    .or_insert_with(|| state::new_group_seeded(&req.protocol_type, seed))
             }
         };
         let args = state::JoinArgs {
@@ -183,9 +183,15 @@ pub async fn join_group(
         out
     };
     match outcome {
-        state::JoinOutcome::NeedMemberId => err_reply(errors::UNKNOWN_MEMBER_ID, &req.candidate_member_id),
-        state::JoinOutcome::FencedInstanceId => err_reply(errors::FENCED_INSTANCE_ID, &req.member_id),
-        state::JoinOutcome::InconsistentProtocol => err_reply(errors::INCONSISTENT_GROUP_PROTOCOL, &req.member_id),
+        state::JoinOutcome::NeedMemberId => {
+            err_reply(errors::UNKNOWN_MEMBER_ID, &req.candidate_member_id)
+        }
+        state::JoinOutcome::FencedInstanceId => {
+            err_reply(errors::FENCED_INSTANCE_ID, &req.member_id)
+        }
+        state::JoinOutcome::InconsistentProtocol => {
+            err_reply(errors::INCONSISTENT_GROUP_PROTOCOL, &req.member_id)
+        }
         state::JoinOutcome::Joined { .. } | state::JoinOutcome::Waiting => {
             // Barrier already carried this member (or completed in
             // somebody else's call): the resolver returns immediately.
@@ -221,7 +227,10 @@ pub async fn sync_group(
     generation: i32,
     assignments: Vec<(String, Vec<u8>)>,
 ) -> SyncReply {
-    let fenced = |code: i16| SyncReply { error: code, assignment: Vec::new() };
+    let fenced = |code: i16| SyncReply {
+        error: code,
+        assignment: Vec::new(),
+    };
     if group.is_empty() {
         return fenced(errors::INVALID_GROUP_ID);
     }
@@ -238,7 +247,10 @@ pub async fn sync_group(
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match groups.get(group).and_then(|st| st.members.get(member_id)) {
-                Some(m) => SyncReply { error: errors::NONE, assignment: m.assignment.clone() },
+                Some(m) => SyncReply {
+                    error: errors::NONE,
+                    assignment: m.assignment.clone(),
+                },
                 None => fenced(errors::UNKNOWN_MEMBER_ID),
             }
         }
@@ -262,9 +274,10 @@ pub async fn sync_group(
                     return Some(fenced(errors::ILLEGAL_GENERATION));
                 }
                 match st.stage {
-                    GroupStage::Stable => {
-                        Some(SyncReply { error: errors::NONE, assignment: m.assignment.clone() })
-                    }
+                    GroupStage::Stable => Some(SyncReply {
+                        error: errors::NONE,
+                        assignment: m.assignment.clone(),
+                    }),
                     GroupStage::PreparingRebalance => Some(fenced(errors::REBALANCE_IN_PROGRESS)),
                     _ => None, // CompletingSync: still waiting on the leader
                 }
@@ -302,7 +315,7 @@ async fn wait_state<T>(
                 .groups
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            groups.get(group).and_then(|st| resolve(st))
+            groups.get(group).and_then(&resolve)
         };
         if got.is_some() {
             return got;
@@ -310,7 +323,10 @@ async fn wait_state<T>(
         if permitted {
             continue; // stored permit consumed: re-read before parking
         }
-        if tokio::time::timeout_at(deadline, notified.as_mut()).await.is_err() {
+        if tokio::time::timeout_at(deadline, notified.as_mut())
+            .await
+            .is_err()
+        {
             return None;
         }
     }

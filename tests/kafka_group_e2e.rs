@@ -63,7 +63,16 @@ async fn two_consumers_full_rebalance_conversation() {
     // m2's join kicks the rebalance and PARKS until m1 rejoins.
     let id2_for_task = id2.clone();
     let parked = tokio::spawn(async move {
-        let r = join_v1(&mut m2, 4, "g1", SESSION_MS, 60_000, &id2_for_task, b"sub[t0]").await;
+        let r = join_v1(
+            &mut m2,
+            4,
+            "g1",
+            SESSION_MS,
+            60_000,
+            &id2_for_task,
+            b"sub[t0]",
+        )
+        .await;
         (r, m2)
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -79,7 +88,15 @@ async fn two_consumers_full_rebalance_conversation() {
     assert_eq!(r2.members.len(), 0, "follower list is empty");
 
     // Leader distributes; both Stable replies carry their own slice.
-    let (err, a) = sync_v1(&mut m1, 6, "g1", &id1, 2, &[(id1.as_str(), b"[t0p0]"), (id2.as_str(), b"[t0p1]")]).await;
+    let (err, a) = sync_v1(
+        &mut m1,
+        6,
+        "g1",
+        &id1,
+        2,
+        &[(id1.as_str(), b"[t0p0]"), (id2.as_str(), b"[t0p1]")],
+    )
+    .await;
     assert_eq!(err, errors::NONE);
     assert_eq!(a, b"[t0p0]");
     let (err, a) = sync_v1(&mut m2, 7, "g1", &id2, 2, &[]).await;
@@ -100,14 +117,20 @@ async fn two_consumers_full_rebalance_conversation() {
     assert_eq!(heartbeat_v0(&mut m2, 10, "g1", 2, &id2).await, errors::NONE);
 
     // An enrolled member at the current generation commits durably.
-    assert_eq!(commit_v2(&mut m1, 11, "g1", 2, &id1, "t", 0, 5).await, errors::NONE);
+    assert_eq!(
+        commit_v2(&mut m1, 11, "g1", 2, &id1, "t", 0, 5).await,
+        errors::NONE
+    );
     assert_eq!(fetch_offset_v0(&mut m1, 12, "g1", "t", 0).await, 5);
 
     // Scenario 2: m2 leaves -> the group rebalances; m1's next
     // heartbeat answers REBALANCE_IN_PROGRESS and its rejoin (the
     // client-native reaction) lands generation 3 alone.
     assert_eq!(leave_v0(&mut m2, 13, "g1", &id2).await, errors::NONE);
-    assert_eq!(heartbeat_v0(&mut m1, 14, "g1", 2, &id1).await, errors::REBALANCE_IN_PROGRESS);
+    assert_eq!(
+        heartbeat_v0(&mut m1, 14, "g1", 2, &id1).await,
+        errors::REBALANCE_IN_PROGRESS
+    );
     let d = describe_v0(&mut m1, 15, "g1").await;
     assert_eq!(d.state, "PreparingRebalance");
     let r = join_v1(&mut m1, 16, "g1", SESSION_MS, 60_000, &id1, b"sub[t0]").await;
@@ -121,12 +144,31 @@ async fn two_consumers_full_rebalance_conversation() {
     assert_eq!(d.member_ids, vec![id1.clone()]);
 
     // Scenario 4: the commit-fencing lattice around the live group.
-    assert_eq!(commit_v2(&mut m1, 19, "g1", 2, &id1, "t", 0, 9).await, errors::ILLEGAL_GENERATION, "stale generation");
-    assert_eq!(commit_v2(&mut m1, 20, "g1", 3, "ghost", "t", 0, 9).await, errors::UNKNOWN_MEMBER_ID, "zombie member");
+    assert_eq!(
+        commit_v2(&mut m1, 19, "g1", 2, &id1, "t", 0, 9).await,
+        errors::ILLEGAL_GENERATION,
+        "stale generation"
+    );
+    assert_eq!(
+        commit_v2(&mut m1, 20, "g1", 3, "ghost", "t", 0, 9).await,
+        errors::UNKNOWN_MEMBER_ID,
+        "zombie member"
+    );
     // The leaver fails the MEMBERSHIP check first (the broker checks
     // the member before the generation).
-    assert_eq!(commit_v2(&mut m2, 21, "g1", 2, &id2, "t", 0, 9).await, errors::UNKNOWN_MEMBER_ID, "the leaver is fenced");
-    assert_eq!(fetch_offset_v0(&mut m1, 22, "g1", "t", 0).await, 5, "fenced commits wrote nothing");
-    assert_eq!(commit_v2(&mut m1, 23, "g1", 3, &id1, "t", 0, 6).await, errors::NONE);
+    assert_eq!(
+        commit_v2(&mut m2, 21, "g1", 2, &id2, "t", 0, 9).await,
+        errors::UNKNOWN_MEMBER_ID,
+        "the leaver is fenced"
+    );
+    assert_eq!(
+        fetch_offset_v0(&mut m1, 22, "g1", "t", 0).await,
+        5,
+        "fenced commits wrote nothing"
+    );
+    assert_eq!(
+        commit_v2(&mut m1, 23, "g1", 3, &id1, "t", 0, 6).await,
+        errors::NONE
+    );
     assert_eq!(fetch_offset_v0(&mut m1, 24, "g1", "t", 0).await, 6);
 }

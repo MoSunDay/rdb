@@ -55,7 +55,7 @@ pub fn partition_queue(
     partition: i32,
 ) -> Result<Option<Vec<u8>>, String> {
     let children = select::discover_children(store, prefix, parent, catalog::QUEUE_LIMIT)?;
-    for tag in [b'p', b'q'] {
+    for tag in *b"pq" {
         let want = format!("{}{}", tag as char, partition);
         if children.iter().any(|c| c.as_slice() == want.as_bytes()) {
             return Ok(Some(want.into_bytes()));
@@ -66,7 +66,9 @@ pub fn partition_queue(
 
 /// Latest offset = the stream meta `len`; `None` = no live stream.
 pub fn latest_ordinal(store: &Store, prefix: &[u8], stream: &[u8]) -> Result<Option<u64>, String> {
-    Ok(model::read_meta(store, prefix, stream, None)?.live().map(|m| m.len))
+    Ok(model::read_meta(store, prefix, stream, None)?
+        .live()
+        .map(|m| m.len))
 }
 
 /// Entry id at `ordinal` (0-based); `None` when `ordinal >= len`.
@@ -178,7 +180,7 @@ mod tests {
 
     /// Seed `parent/child` with `ids` (one dummy field pair each).
     fn seed(sh: &crate::state::Shared, parent: &str, child: &str, ids: &[EntryId]) {
-        let mut stream = format!("{parent}/{child}").into_bytes();
+        let stream = format!("{parent}/{child}").into_bytes();
         let prefix = hash::slot_with_prefix(parent.as_bytes()).1;
         let mut meta = model::MetaPayload {
             created_ms: 1,
@@ -190,7 +192,10 @@ mod tests {
             meta.last_seq = last.seq;
         }
         let mut batch = WriteBatch::default();
-        batch.put(model::meta_key(&prefix, &stream), model::encode_meta_at(&meta, 0));
+        batch.put(
+            model::meta_key(&prefix, &stream),
+            model::encode_meta_at(&meta, 0),
+        );
         for id in ids {
             batch.put(
                 model::entry_key(&prefix, &stream, *id),
@@ -250,11 +255,11 @@ mod tests {
         seed(&sh, "t", "p0", &set);
         let prefix = hash::slot_with_prefix(b"t").1;
         let stream = b"t/p0".to_vec();
-        assert_eq!(latest_ordinal(&sh.store, &prefix, &stream).unwrap(), Some(5));
         assert_eq!(
-            latest_ordinal(&sh.store, &prefix, b"t/none").unwrap(),
-            None
+            latest_ordinal(&sh.store, &prefix, &stream).unwrap(),
+            Some(5)
         );
+        assert_eq!(latest_ordinal(&sh.store, &prefix, b"t/none").unwrap(), None);
         for (ordinal, want) in set.iter().enumerate() {
             let got = ordinal_to_id(&sh.store, &prefix, &stream, ordinal as u64)
                 .unwrap()

@@ -210,6 +210,7 @@ pub fn produce_request(
 
 /// One Fetch v4 request: no replica, long-poll budgets, one topic /
 /// partition 0 from `offset`.
+#[allow(clippy::too_many_arguments)] // one arg per Fetch v4 wire field
 pub fn fetch_request(
     corr: i32,
     client_id: &str,

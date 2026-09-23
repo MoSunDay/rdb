@@ -47,7 +47,9 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Open (or create) the store rooted at `root`.
 pub fn open(root: &Path) -> io::Result<ObjectStore> {
     fs::create_dir_all(root)?;
-    Ok(ObjectStore { root: root.to_path_buf() })
+    Ok(ObjectStore {
+        root: root.to_path_buf(),
+    })
 }
 
 /// S3 bucket name rules: 1..=63 chars from [a-z0-9.-], not starting
@@ -67,7 +69,9 @@ pub fn valid_key(key: &str) -> bool {
         && key.len() <= 1024
         && !key.contains('\0')
         && !key.ends_with('/')
-        && !key.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+        && !key
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
 }
 
 /// Validated bucket directory, or `None` on an illegal name.
@@ -143,7 +147,10 @@ pub fn stage_paths(store: &ObjectStore, bucket: &str, key: &str) -> io::Result<(
     }
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = final_path.file_name().unwrap_or_default().to_string_lossy();
-    Ok((final_path.with_file_name(format!("{name}.{n}.tmp")), final_path))
+    Ok((
+        final_path.with_file_name(format!("{name}.{n}.tmp")),
+        final_path,
+    ))
 }
 
 /// Sidecar path for an object path: `<obj>.s3meta.json`.
@@ -181,13 +188,21 @@ pub fn commit(dst: &Path, tmp: &Path, etag: &str, content_type: &str) -> io::Res
         File::open(dir)?.sync_all()?;
     }
     let meta = serde_json::json!({"etag": etag, "content_type": content_type});
-    write_durably(&sidecar_path(dst), &serde_json::to_vec(&meta).unwrap_or_default())
+    write_durably(
+        &sidecar_path(dst),
+        &serde_json::to_vec(&meta).unwrap_or_default(),
+    )
 }
 
 /// Copy `src` into `(bucket, key)` streaming through a 64 KiB buffer
 /// with a running md5; the etag is the quoted md5 hex.
-pub fn put_file(store: &ObjectStore, bucket: &str, key: &str, src: &Path, content_type: &str)
--> io::Result<PutResult> {
+pub fn put_file(
+    store: &ObjectStore,
+    bucket: &str,
+    key: &str,
+    src: &Path,
+    content_type: &str,
+) -> io::Result<PutResult> {
     let mut reader = File::open(src)?;
     let (tmp, final_path) = stage_paths(store, bucket, key)?;
     let mut out = File::create(&tmp)?;
@@ -224,15 +239,29 @@ pub fn head(store: &ObjectStore, bucket: &str, key: &str) -> Option<ObjectMeta> 
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)?;
-    let fallback = || (format!("\"{size}-{}\"", mtime_ms / 1000), "application/octet-stream".to_string());
+    let fallback = || {
+        (
+            format!("\"{size}-{}\"", mtime_ms / 1000),
+            "application/octet-stream".to_string(),
+        )
+    };
     let (etag, content_type) = fs::read(sidecar_path(&path))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| {
-            Some((v["etag"].as_str()?.to_string(), v["content_type"].as_str()?.to_string()))
+            Some((
+                v["etag"].as_str()?.to_string(),
+                v["content_type"].as_str()?.to_string(),
+            ))
         })
         .unwrap_or_else(fallback);
-    Some(ObjectMeta { key: key.to_string(), size, etag, last_modified_ms: mtime_ms, content_type })
+    Some(ObjectMeta {
+        key: key.to_string(),
+        size,
+        etag,
+        last_modified_ms: mtime_ms,
+        content_type,
+    })
 }
 
 /// Delete an object and its sidecar; `true` when the object existed.
@@ -272,7 +301,11 @@ fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> io::Result<()> {
         if name.starts_with('.') || name.ends_with(".s3meta.json") {
             continue;
         }
-        let rel_name = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+        let rel_name = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
         let ft = entry.file_type()?;
         if ft.is_dir() {
             walk(&entry.path(), &rel_name, out)?;
@@ -287,14 +320,23 @@ fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> io::Result<()> {
 /// folding into deduplicated common prefixes, at most `max_keys`
 /// entries (objects + prefixes) per page; `max_keys == 0` -> empty,
 /// non-truncated page (S3 semantics).
-pub fn list(store: &ObjectStore, bucket: &str, prefix: &str, delimiter: &str, max_keys: usize)
--> io::Result<ListPage> {
+pub fn list(
+    store: &ObjectStore,
+    bucket: &str,
+    prefix: &str,
+    delimiter: &str,
+    max_keys: usize,
+) -> io::Result<ListPage> {
     let root = bucket_path(store, bucket).ok_or_else(|| invalid("invalid bucket name"))?;
     let mut keys = Vec::new();
     walk(&root, "", &mut keys)?;
     keys.sort(); // byte order (Rust String Ord is bytewise)
-    let mut page =
-        ListPage { objects: Vec::new(), common_prefixes: Vec::new(), truncated: false, next_after: None };
+    let mut page = ListPage {
+        objects: Vec::new(),
+        common_prefixes: Vec::new(),
+        truncated: false,
+        next_after: None,
+    };
     if max_keys == 0 {
         return Ok(page);
     }
@@ -306,7 +348,10 @@ pub fn list(store: &ObjectStore, bucket: &str, prefix: &str, delimiter: &str, ma
             break;
         }
         let tail = &key[prefix.len()..];
-        if let Some(i) = (!delimiter.is_empty()).then(|| tail.find(delimiter)).flatten() {
+        if let Some(i) = (!delimiter.is_empty())
+            .then(|| tail.find(delimiter))
+            .flatten()
+        {
             let cp = format!("{}{}{}", &key[..prefix.len()], &tail[..i], delimiter);
             if last_prefix.as_deref() != Some(cp.as_str()) {
                 last_prefix = Some(cp.clone());
@@ -361,16 +406,34 @@ mod tests {
     #[test]
     fn bucket_and_key_validation() {
         assert!(valid_bucket_name("a") && valid_bucket_name("rdb.check-1"));
-        for bad in ["", "-a", "a-", ".a", "a.", "A", "a_b", "a/b", &"x".repeat(64)] {
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            ".a",
+            "a.",
+            "A",
+            "a_b",
+            "a/b",
+            &"x".repeat(64),
+        ] {
             assert!(!valid_bucket_name(bad), "{bad:?}");
         }
         assert!(valid_key("a/b/c.txt"));
-        for bad in ["", "/a", "a/", "a//b", "a/./b", "a/../b", "a\0b", &"k".repeat(1025)] {
+        for bad in [
+            "",
+            "/a",
+            "a/",
+            "a//b",
+            "a/./b",
+            "a/../b",
+            "a\0b",
+            &"k".repeat(1025),
+        ] {
             assert!(!valid_key(bad), "{bad:?}");
         }
         assert!(object_path(&store().1, "b", "../x").is_none());
     }
-
 
     #[test]
     fn list_folds_delimiters_and_truncates() {
@@ -444,6 +507,9 @@ mod tests {
         // a real object still refuses the delete
         create_bucket(&s, "b").expect("recreate");
         put(&s, "b", "keep.bin", b"v");
-        assert_eq!(delete_bucket(&s, "b").unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            delete_bucket(&s, "b").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 }

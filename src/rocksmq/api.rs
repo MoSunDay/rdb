@@ -132,8 +132,7 @@ fn msgs_json(msgs: Vec<Msg>) -> HttpReply {
 /// Hand-rolled standard base64 (A-Za-z0-9+/ with padding): no crate
 /// added for one encoder.
 pub(crate) fn base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let mut n = (chunk[0] as u32) << 16;
@@ -226,8 +225,17 @@ async fn consume_group(shared: &Shared, stream: &str, group: &str, n: usize) -> 
     let mut out = run(shared, &argv).await;
     if out.starts_with(b"-NOGROUP") {
         // RocksMQ has no create-group endpoint: first consume creates it.
-        let created =
-            run(shared, &[b"XGROUP", b"CREATE", stream.as_bytes(), group.as_bytes(), b"0-0"]).await;
+        let created = run(
+            shared,
+            &[
+                b"XGROUP",
+                b"CREATE",
+                stream.as_bytes(),
+                group.as_bytes(),
+                b"0-0",
+            ],
+        )
+        .await;
         if created.starts_with(b"-ERR The XGROUP subcommand requires the key to exist") {
             return msgs_json(Vec::new()); // stream missing: empty by contract
         }
@@ -335,7 +343,11 @@ pub async fn ack(shared: &Shared, query: &Query) -> HttpReply {
     if probe.starts_with(b"-NOGROUP") {
         return HttpReply::text(404, "no such consumer group");
     }
-    let out = run(shared, &[b"XACK", stream.as_bytes(), group.as_bytes(), id.as_bytes()]).await;
+    let out = run(
+        shared,
+        &[b"XACK", stream.as_bytes(), group.as_bytes(), id.as_bytes()],
+    )
+    .await;
     match respv::parse(&out) {
         Ok(Value::Int(_)) => HttpReply::text(200, "ok"),
         Ok(Value::Error(e)) => {

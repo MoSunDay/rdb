@@ -39,26 +39,45 @@ fn seed(shared: &Shared, topic: &[u8], n: u64) -> Vec<u8> {
     let stream = [topic, b"/q0"].concat();
     let prefix = hash::slot_with_prefix(topic).1;
     let mut wb = WriteBatch::default();
-    let mut meta = model::MetaPayload { created_ms: 1, ..Default::default() };
+    let mut meta = model::MetaPayload {
+        created_ms: 1,
+        ..Default::default()
+    };
     for i in 0..n {
-        let id = model::EntryId { ms: 100 + i, seq: 0 };
+        let id = model::EntryId {
+            ms: 100 + i,
+            seq: 0,
+        };
         let k = format!("k{i}").into_bytes();
         let v = format!("v{i}").into_bytes();
         wb.put(
             model::entry_key(&prefix, &stream, id),
-            model::encode_entry(&[(b"k".as_slice(), k.as_slice()), (b"v".as_slice(), v.as_slice())]),
+            model::encode_entry(&[
+                (b"k".as_slice(), k.as_slice()),
+                (b"v".as_slice(), v.as_slice()),
+            ]),
         );
         meta.len += 1;
         meta.last_ms = id.ms;
         meta.last_seq = id.seq;
     }
-    wb.put(&model::meta_key(&prefix, &stream), model::encode_meta_at(&meta, 0));
+    wb.put(
+        model::meta_key(&prefix, &stream),
+        model::encode_meta_at(&meta, 0),
+    );
     ops::batch_write(&shared.store, wb).unwrap();
     prefix
 }
 
 /// v0/v4/v10 fetch request for partition 0 of `topic`.
-fn req(version: i16, topic: &str, offset: i64, pmax: i32, max_wait: i32, min_bytes: i32) -> Vec<u8> {
+fn req(
+    version: i16,
+    topic: &str,
+    offset: i64,
+    pmax: i32,
+    max_wait: i32,
+    min_bytes: i32,
+) -> Vec<u8> {
     let mut r = Vec::new();
     put_i32(&mut r, -1); // replica_id (any consumer: -1)
     put_i32(&mut r, max_wait);
@@ -111,7 +130,10 @@ async fn one_partition(sh: &Shared, version: i16, request: &[u8]) -> (Vec<u8>, i
 fn inverse_field_map() {
     assert_eq!(to_key_value(&pairs(&[])), (None, None));
     // value-only + null-null tombstone (1-pair shapes)
-    assert_eq!(to_key_value(&pairs(&[(b"v", b"x")])), (None, Some(b"x".to_vec())));
+    assert_eq!(
+        to_key_value(&pairs(&[(b"v", b"x")])),
+        (None, Some(b"x".to_vec()))
+    );
     assert_eq!(to_key_value(&pairs(&[(b"__null__", b"")])), (None, None));
     // 2-pair shapes: k+v and k+null-value
     assert_eq!(

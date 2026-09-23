@@ -37,7 +37,10 @@ pub fn report(cfg: &Config, wall_secs: f64, all: &[ClientStats]) -> i32 {
     // batch size instead of the RESP pipeline depth; the RESP line
     // format is unchanged byte for byte.
     let (addr, tail) = if cfg.workload.is_kafka() {
-        (cfg.host.as_str(), format!("topic={} batch={}", cfg.topic, cfg.batch))
+        (
+            cfg.host.as_str(),
+            format!("topic={} batch={}", cfg.topic, cfg.batch),
+        )
     } else {
         (cfg.addr.as_str(), format!("pipeline={}", cfg.pipeline))
     };

@@ -38,8 +38,8 @@ pub fn fields_of_mappings(body: &[u8]) -> Result<Vec<IndexField>, String> {
     if body.iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(Vec::new());
     }
-    let root: Value = serde_json::from_slice(body)
-        .map_err(|e| format!("failed to parse mappings: {e}"))?;
+    let root: Value =
+        serde_json::from_slice(body).map_err(|e| format!("failed to parse mappings: {e}"))?;
     let Some(props) = root.get("mappings").and_then(|m| m.get("properties")) else {
         return Ok(Vec::new());
     };
@@ -57,10 +57,7 @@ pub fn fields_of_mappings(body: &[u8]) -> Result<Vec<IndexField>, String> {
 /// (serde collapses duplicate object keys) but keeps the invariant
 /// for programmatic callers.
 fn push_field(fields: &mut Vec<IndexField>, field: IndexField) -> Result<(), String> {
-    if fields
-        .iter()
-        .any(|f: &IndexField| f.name == field.name)
-    {
+    if fields.iter().any(|f: &IndexField| f.name == field.name) {
         return Err(format!(
             "duplicate field name '{}'",
             String::from_utf8_lossy(&field.name)
@@ -137,7 +134,13 @@ mod tests {
 
     #[test]
     fn empty_and_absent_mappings_are_empty_schemas() {
-        for body in [&b""[..], b"   ", b"{}", br#"{"aliases":{}}"#, br#"{"mappings":{}}"#] {
+        for body in [
+            &b""[..],
+            b"   ",
+            b"{}",
+            br#"{"aliases":{}}"#,
+            br#"{"mappings":{}}"#,
+        ] {
             assert!(fields(body).is_empty(), "{body:?}");
         }
     }
@@ -154,10 +157,22 @@ mod tests {
         assert_eq!(
             f,
             vec![
-                IndexField { name: b"title".to_vec(), ftype: FieldType::Text },
-                IndexField { name: b"tag".to_vec(), ftype: FieldType::Keyword },
-                IndexField { name: b"n".to_vec(), ftype: FieldType::Numeric },
-                IndexField { name: b"v".to_vec(), ftype: FieldType::Vector { dim: 8 } },
+                IndexField {
+                    name: b"title".to_vec(),
+                    ftype: FieldType::Text
+                },
+                IndexField {
+                    name: b"tag".to_vec(),
+                    ftype: FieldType::Keyword
+                },
+                IndexField {
+                    name: b"n".to_vec(),
+                    ftype: FieldType::Numeric
+                },
+                IndexField {
+                    name: b"v".to_vec(),
+                    ftype: FieldType::Vector { dim: 8 }
+                },
             ]
         );
         // every numeric type folds to Numeric
@@ -169,11 +184,11 @@ mod tests {
         let j = mappings_json(&f);
         assert_eq!(j["properties"]["title"], json!({"type": "text"}));
         assert_eq!(j["properties"]["n"], json!({"type": "long"}));
-        assert_eq!(j["properties"]["v"], json!({"type": "dense_vector", "dims": 8}));
-        let back = fields_of_mappings(
-            json!({"mappings": j}).to_string().as_bytes(),
-        )
-        .unwrap();
+        assert_eq!(
+            j["properties"]["v"],
+            json!({"type": "dense_vector", "dims": 8})
+        );
+        let back = fields_of_mappings(json!({"mappings": j}).to_string().as_bytes()).unwrap();
         assert_eq!(back, f);
     }
 
@@ -201,16 +216,21 @@ mod tests {
         // serde_json collapses exact-duplicate JSON keys (last wins),
         // so the duplicate-name guard in `fields_of_mappings` is
         // defense-in-depth, never a JSON-visible error.
-        let f = fields(
-            br#"{"mappings":{"properties":{"x":{"type":"text"},"x":{"type":"keyword"}}}}"#,
-        );
+        let f =
+            fields(br#"{"mappings":{"properties":{"x":{"type":"text"},"x":{"type":"keyword"}}}}"#);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].ftype, FieldType::Keyword);
         // the guard itself:
-        let mut dup = vec![IndexField { name: b"x".to_vec(), ftype: FieldType::Text }];
+        let mut dup = vec![IndexField {
+            name: b"x".to_vec(),
+            ftype: FieldType::Text,
+        }];
         let err = push_field(
             &mut dup,
-            IndexField { name: b"x".to_vec(), ftype: FieldType::Keyword },
+            IndexField {
+                name: b"x".to_vec(),
+                ftype: FieldType::Keyword,
+            },
         );
         assert_eq!(err.unwrap_err(), "duplicate field name 'x'");
     }

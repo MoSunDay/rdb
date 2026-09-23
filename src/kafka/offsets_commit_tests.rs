@@ -7,7 +7,9 @@
 use rocksdb::WriteBatch;
 
 use crate::kafka::errors;
-use crate::kafka::frame::{put_array_len, put_i32, put_i64, put_nullable_string, put_string, Reader};
+use crate::kafka::frame::{
+    put_array_len, put_i32, put_i64, put_nullable_string, put_string, Reader,
+};
 use crate::kafka::offsets_commit::{handle_offset_commit, handle_offset_fetch};
 use crate::lite::model;
 use crate::state::testutil;
@@ -24,9 +26,14 @@ fn seed(shared: &Shared, topic: &[u8]) {
         model::encode_entry(&[(b"v".as_slice(), b"x".as_slice())]),
     );
     wb.put(
-        &model::meta_key(&prefix, &stream),
+        model::meta_key(&prefix, &stream),
         model::encode_meta_at(
-            &model::MetaPayload { created_ms: 1, len: 1, last_ms: 5, ..Default::default() },
+            &model::MetaPayload {
+                created_ms: 1,
+                len: 1,
+                last_ms: 5,
+                ..Default::default()
+            },
             0,
         ),
     );
@@ -120,7 +127,14 @@ async fn commit_then_fetch_roundtrip_v2_v0_v7() {
     // v2 commit at offset 1 (generation 5, member m-1).
     let req = commit_req(2, "g1", 5, "m-1", "ct", 0, 1);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 2, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(
+        &mut r,
+        2,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_row(&body), (0, errors::NONE));
 
     // v7 fetch (flexible: throttle + leader epoch + compact strings).
@@ -137,8 +151,16 @@ async fn commit_then_fetch_roundtrip_v2_v0_v7() {
     assert_eq!(r.i32(), Some(-1), "committed_leader_epoch");
     assert_eq!(r.compact_nullable_string(), Some(None), "metadata null");
     assert_eq!(r.i16(), Some(0));
-    assert_eq!(r.remaining(), 5, "partition+topic tags, error, message tags");
-    assert_eq!(&body[body.len() - 3..], &[0, 0, 0], "top error + message tag");
+    assert_eq!(
+        r.remaining(),
+        5,
+        "partition+topic tags, error, message tags"
+    );
+    assert_eq!(
+        &body[body.len() - 3..],
+        &[0, 0, 0],
+        "top error + message tag"
+    );
 
     // v0 fetch: no throttle, no leader epoch.
     let req = fetch_req(0, "g1", Some("ct"));
@@ -197,11 +219,25 @@ async fn generation_rule_and_v0_preserves_fencing() {
     // Commit at generation 5.
     let req = commit_req(2, "g1", 5, "m-1", "ct", 0, 1);
     let mut r = Reader::new(&req);
-    handle_offset_commit(&mut r, 2, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    handle_offset_commit(
+        &mut r,
+        2,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     // Older generation: ILLEGAL_GENERATION, nothing changes.
     let req = commit_req(2, "g1", 3, "m-2", "ct", 0, 2);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 2, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(
+        &mut r,
+        2,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_row(&body), (0, errors::ILLEGAL_GENERATION));
     let req = fetch_req(0, "g1", Some("ct"));
     let mut r = Reader::new(&req);
@@ -216,14 +252,28 @@ async fn generation_rule_and_v0_preserves_fencing() {
     // Equal generation commits fine.
     let req = commit_req(1, "g1", 5, "m-2", "ct", 0, 2);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 1, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(
+        &mut r,
+        1,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_row(&body), (0, errors::NONE));
 
     // v0 has no generation field: the commit lands and PRESERVES the
     // stored generation/leader.
     let req = commit_req(0, "g1", -1, "", "ct", 0, 3);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 0, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(
+        &mut r,
+        0,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_row(&body), (0, errors::NONE));
     let row = crate::kafka::ledger::load(
         &sh.store,
@@ -239,7 +289,14 @@ async fn generation_rule_and_v0_preserves_fencing() {
     // A v0 commit never trips ILLEGAL_GENERATION even against gen 5.
     let req = commit_req(0, "g1", -1, "", "ct", 0, 4);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 0, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(
+        &mut r,
+        0,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_row(&body), (0, errors::NONE));
 }
 
@@ -249,16 +306,37 @@ async fn commit_rejects_negative_and_missing_partition() {
     seed(&sh, b"ct");
     let req = commit_req(2, "g1", 1, "m", "ct", 0, -3);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 2, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(
+        &mut r,
+        2,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_row(&body), (0, errors::OFFSET_OUT_OF_RANGE));
     // Commit past the log end IS accepted (stored; Fetch will 1 later).
     let req = commit_req(2, "g1", 1, "m", "ct", 0, 99);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 2, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(
+        &mut r,
+        2,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_row(&body), (0, errors::NONE));
     let req = commit_req(2, "g1", 1, "m", "ct", 7, 0);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 2, &sh, &crate::kafka::coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(
+        &mut r,
+        2,
+        &sh,
+        &crate::kafka::coordinator::CoordRuntime::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_row(&body), (7, errors::UNKNOWN_TOPIC_OR_PARTITION));
 }
 
@@ -319,10 +397,14 @@ async fn commit_fence_layers() {
     // degraded path still fences a generation OLDER than the ledger's.
     let req = commit_req(2, "g1", 0, "m1", "ct", 0, 1);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 2, &sh, &coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(&mut r, 2, &sh, &coordinator::CoordRuntime::new())
+        .await
+        .unwrap();
     assert_eq!(commit_row(&body), (0, errors::ILLEGAL_GENERATION));
     let req = commit_req(2, "g1", 1, "m1", "ct", 0, 7);
     let mut r = Reader::new(&req);
-    let body = handle_offset_commit(&mut r, 2, &sh, &coordinator::CoordRuntime::new()).await.unwrap();
+    let body = handle_offset_commit(&mut r, 2, &sh, &coordinator::CoordRuntime::new())
+        .await
+        .unwrap();
     assert_eq!(commit_row(&body), (0, errors::NONE), "same gen re-commits");
 }

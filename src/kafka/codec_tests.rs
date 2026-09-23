@@ -112,7 +112,11 @@ fn gzip_both_shapes_roundtrip() {
     let full = gzip_bytes(area, false);
     assert_eq!(decompress_batch(1, &full).unwrap(), area);
     let bare = gzip_bytes(area, true);
-    assert_eq!(decompress_batch(1, &bare).unwrap(), area, "raw deflate fallback");
+    assert_eq!(
+        decompress_batch(1, &bare).unwrap(),
+        area,
+        "raw deflate fallback"
+    );
     // Not gzip at all: CORRUPT_MESSAGE-class text (no "magic"/"compressed").
     let e = decompress_batch(1, b"not-a-gzip-stream").unwrap_err();
     assert!(e.contains("gzip decode failed"), "{e}");
@@ -169,7 +173,10 @@ fn librdkafka_wire_fixtures_decode() {
 fn zstd_and_unknown_kinds_rejected() {
     for kind in [4u8, 5, 6, 7] {
         let e = decompress_batch(kind, b"x").unwrap_err();
-        assert!(e.contains("compressed batches unsupported"), "kind {kind}: {e}");
+        assert!(
+            e.contains("compressed batches unsupported"),
+            "kind {kind}: {e}"
+        );
     }
 }
 
@@ -184,8 +191,7 @@ fn compressed_parse_batch_pipeline() {
         (3, lz4_frame(&area)),
     ] {
         let batch = reseal(plain.clone(), kind, &blob);
-        let parsed = parse_batch(&batch)
-            .unwrap_or_else(|e| panic!("kind {kind}: {e}"));
+        let parsed = parse_batch(&batch).unwrap_or_else(|e| panic!("kind {kind}: {e}"));
         assert_eq!(parsed.attributes & 0x7, kind as i16);
         assert_eq!(parsed.base_offset, 7);
         assert_eq!(parsed.first_timestamp, 5_000);

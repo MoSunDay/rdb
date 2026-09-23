@@ -10,8 +10,12 @@ pub(super) fn split_response(buf: &[u8]) -> (u16, String, Vec<u8>) {
         .position(|w| w == b"\r\n\r\n")
         .expect("response head \\r\\n\\r\\n");
     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-    let status: u16 =
-        head.lines().next().and_then(|l| l.split(' ').nth(1)).and_then(|s| s.parse().ok()).expect("status line");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse().ok())
+        .expect("status line");
     let len: usize = head
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
@@ -20,14 +24,26 @@ pub(super) fn split_response(buf: &[u8]) -> (u16, String, Vec<u8>) {
         .unwrap_or(0);
     let body = buf[head_end + 4..].to_vec();
     // HEAD responses advertise Content-Length without sending a body.
-    assert!(body.len() >= len || body.is_empty(), "short body: head\n{head}");
+    assert!(
+        body.len() >= len || body.is_empty(),
+        "short body: head\n{head}"
+    );
     (status, head, body[..len.min(body.len())].to_vec())
 }
 
-pub(super) async fn s3(addr: &str, method: &str, target: &str, extra: &[(&str, &str)], body: &[u8]) -> (u16, String, Vec<u8>) {
+pub(super) async fn s3(
+    addr: &str,
+    method: &str,
+    target: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, String, Vec<u8>) {
     let mut heads = String::new();
     // extra may carry its own Authorization (auth-focused tests)
-    if !extra.iter().any(|(n, _)| n.eq_ignore_ascii_case("authorization")) {
+    if !extra
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case("authorization"))
+    {
         heads.push_str(&format!("Authorization: Bearer {TOKEN}\r\n"));
     }
     for (n, v) in extra {

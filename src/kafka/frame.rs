@@ -112,7 +112,7 @@ impl<'a> Reader<'a> {
     /// Classic string; a -1 length is malformed here (use the nullable
     /// variant where the schema allows null).
     pub fn string(&mut self) -> Option<String> {
-        self.nullable_string()?.map_or(None, Some)
+        self.nullable_string().flatten()
     }
 
     /// Compact string (flexible): uvarint(len+1); 0 = null.
@@ -122,7 +122,7 @@ impl<'a> Reader<'a> {
     }
 
     pub fn compact_string(&mut self) -> Option<String> {
-        self.compact_nullable_string()?.map_or(None, Some)
+        self.compact_nullable_string().flatten()
     }
 
     /// Classic bytes (int32 length); `Some(None)` = null (-1).

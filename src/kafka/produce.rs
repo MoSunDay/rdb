@@ -22,8 +22,8 @@
 //! - a NULL key/value slot is written as the pair ("__null__", b"") so
 //!   tombstones round-trip (an empty byte value stays ("v", b""))
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use rocksdb::WriteBatch;
 
@@ -64,18 +64,30 @@ pub async fn handle_produce(
     shared: &Shared,
 ) -> Result<Option<Vec<u8>>, String> {
     let req = parse_produce_req(body, version)?;
-    let valid_acks = matches!(req.required_acks, -1 | 0 | 1);
+    let valid_acks = matches!(req.required_acks, -1..=1);
     let mut topics_out = Vec::with_capacity(req.topics.len());
     for (name, targets) in &req.topics {
         let mut parts = Vec::with_capacity(targets.len());
         for t in targets {
             let out = if !valid_acks {
                 // Kafka: any acks other than 0/1/-1 fails every partition.
-                PartitionOut { partition: t.partition, error: errors::INVALID_REQUIRED_ACKS, base_offset: -1 }
+                PartitionOut {
+                    partition: t.partition,
+                    error: errors::INVALID_REQUIRED_ACKS,
+                    base_offset: -1,
+                }
             } else {
                 match produce_one(shared, name, t, req.required_acks == 0).await {
-                    Ok(base) => PartitionOut { partition: t.partition, error: errors::NONE, base_offset: base },
-                    Err(code) => PartitionOut { partition: t.partition, error: code, base_offset: -1 },
+                    Ok(base) => PartitionOut {
+                        partition: t.partition,
+                        error: errors::NONE,
+                        base_offset: base,
+                    },
+                    Err(code) => PartitionOut {
+                        partition: t.partition,
+                        error: code,
+                        base_offset: -1,
+                    },
                 }
             };
             parts.push(out);
@@ -103,13 +115,9 @@ async fn produce_one(
     let child = mapping::partition_queue(&shared.store, &prefix, &parent, target.partition)
         .map_err(|_| errors::UNKNOWN_SERVER_ERROR)?
         .ok_or(errors::UNKNOWN_TOPIC_OR_PARTITION)?;
-    let raw = target
-        .records
-        .as_deref()
-        .ok_or(errors::CORRUPT_MESSAGE)?; // null records: nothing to append
+    let raw = target.records.as_deref().ok_or(errors::CORRUPT_MESSAGE)?; // null records: nothing to append
     let batch = parse_batch(raw).map_err(classify_parse_err)?;
-    let fields: Vec<Vec<(Vec<u8>, Vec<u8>)>> =
-        batch.records.iter().map(record_fields).collect();
+    let fields: Vec<Vec<(Vec<u8>, Vec<u8>)>> = batch.records.iter().map(record_fields).collect();
 
     let mut stream = parent.clone();
     stream.push(b'/');
@@ -159,19 +167,31 @@ async fn produce_one(
     let mut wb = WriteBatch::default();
     wb.put(&mkey, model::encode_meta_at(&next, new_expire));
     for (id, pairs) in ids.iter().zip(&fields) {
-        let flat: Vec<(&[u8], &[u8])> =
-            pairs.iter().map(|(f, v)| (f.as_slice(), v.as_slice())).collect();
-        wb.put(model::entry_key(&prefix, &stream, *id), model::encode_entry(&flat));
+        let flat: Vec<(&[u8], &[u8])> = pairs
+            .iter()
+            .map(|(f, v)| (f.as_slice(), v.as_slice()))
+            .collect();
+        wb.put(
+            model::entry_key(&prefix, &stream, *id),
+            model::encode_entry(&flat),
+        );
     }
     expire::set_ttl_entries(&mut wb, &prefix, mkey.clone(), old_expire, new_expire);
     if fire_and_forget {
         ops::spawn_batch_write(Arc::clone(&shared.store), wb);
-    } else if ops::batch_write_async(Arc::clone(&shared.store), wb).await.is_err() {
+    } else if ops::batch_write_async(Arc::clone(&shared.store), wb)
+        .await
+        .is_err()
+    {
         return Err(errors::UNKNOWN_SERVER_ERROR);
     }
 
     if fresh {
-        shared.lite.stats.streams_live.fetch_add(1, Ordering::Relaxed);
+        shared
+            .lite
+            .stats
+            .streams_live
+            .fetch_add(1, Ordering::Relaxed);
         offset::remove_stream(&shared.lite.offsets, &stream);
     }
     stat_bump(&shared.lite.stats.messages, ids.len() as u64);
@@ -247,11 +267,17 @@ fn parse_produce_req(body: &mut Reader<'_>, version: i16) -> Result<ProduceReq, 
     }
     let required_acks = body.i16().ok_or("malformed produce request")?;
     let _timeout_ms = body.i32().ok_or("malformed produce request")?;
-    let n_topics = body.array_len().ok_or("malformed produce request")?.unwrap_or(0);
+    let n_topics = body
+        .array_len()
+        .ok_or("malformed produce request")?
+        .unwrap_or(0);
     let mut topics = Vec::with_capacity(n_topics.min(1024));
     for _ in 0..n_topics {
         let name = body.string().ok_or("malformed produce topic")?;
-        let n_parts = body.array_len().ok_or("malformed produce request")?.unwrap_or(0);
+        let n_parts = body
+            .array_len()
+            .ok_or("malformed produce request")?
+            .unwrap_or(0);
         let mut targets = Vec::with_capacity(n_parts.min(1024));
         for _ in 0..n_parts {
             let partition = body.i32().ok_or("malformed produce partition")?;
@@ -263,7 +289,10 @@ fn parse_produce_req(body: &mut Reader<'_>, version: i16) -> Result<ProduceReq, 
         }
         topics.push((name, targets));
     }
-    Ok(ProduceReq { required_acks, topics })
+    Ok(ProduceReq {
+        required_acks,
+        topics,
+    })
 }
 
 /// Response body v0-v2: responses[topic[partition,error,base_offset

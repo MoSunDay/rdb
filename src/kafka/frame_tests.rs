@@ -2,7 +2,19 @@ use super::*;
 
 #[test]
 fn varints_roundtrip() {
-    for v in [0i64, 1, -1, 63, 64, -64, -65, 300, -12345, i64::MAX, i64::MIN] {
+    for v in [
+        0i64,
+        1,
+        -1,
+        63,
+        64,
+        -64,
+        -65,
+        300,
+        -12345,
+        i64::MAX,
+        i64::MIN,
+    ] {
         let mut buf = Vec::new();
         put_varint(&mut buf, v);
         assert_eq!(Reader::new(&buf).varint(), Some(v), "zigzag {v}");

@@ -50,11 +50,7 @@ pub fn decompress_batch(kind: u8, buf: &[u8]) -> Result<Vec<u8>, String> {
 /// `count` bare records out of it (count comes from the outer header;
 /// the inner blob is a headerless run of varint-length-prefixed
 /// records).
-pub fn decompress_records(
-    kind: u8,
-    blob: &[u8],
-    count: usize,
-) -> Result<Vec<Record>, String> {
+pub fn decompress_records(kind: u8, blob: &[u8], count: usize) -> Result<Vec<Record>, String> {
     let raw = decompress_batch(kind, blob)?;
     let mut r = Reader::new(&raw);
     let mut out = Vec::with_capacity(count.min(8192));

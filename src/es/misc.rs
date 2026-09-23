@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use crate::ds::codec::{classify, decode_data_key, decode_envelope, Classification, KIND_SEARCH_META};
+use crate::ds::codec::{
+    classify, decode_data_key, decode_envelope, Classification, KIND_SEARCH_META,
+};
 use crate::hash;
 use crate::search::ft_index;
 use crate::state::Shared;
@@ -102,8 +104,7 @@ const MAX_INDEXES: usize = 10_000;
 
 /// Pure table formatter (header always shown, ES `_cat` style).
 fn cat_table(rows: &[(String, String, u64)]) -> String {
-    let mut out =
-        String::from("health status index uuid pri rep docs.count store.size\n");
+    let mut out = String::from("health status index uuid pri rep docs.count store.size\n");
     for (name, uuid, docs) in rows {
         out.push_str(&format!("green open {name} {uuid} 1 0 {docs} 0b\n"));
     }
@@ -112,7 +113,10 @@ fn cat_table(rows: &[(String, String, u64)]) -> String {
 
 /// Shared `/_count` + `/_search` prelude: the index meta, or the 404
 /// / error reply a missing index must produce.
-fn meta_or_404(shared: &Shared, index: &str) -> Result<crate::search::index_codec::IndexMeta, Reply> {
+fn meta_or_404(
+    shared: &Shared,
+    index: &str,
+) -> Result<crate::search::index_codec::IndexMeta, Reply> {
     match write::index_meta(shared, index) {
         Ok(Some(meta)) => Ok(meta),
         Ok(None) => Err(reply::error(
@@ -137,7 +141,11 @@ pub fn count_endpoint(shared: &Shared, index: &str, body: &[u8]) -> Reply {
     let (_slot, prefix) = hash::slot_with_prefix(index.as_bytes());
     match exec::count(&shared.store, &prefix, index.as_bytes(), &meta, &plan) {
         Ok(n) => reply::count(n),
-        Err(e) => reply::error(500, "search_phase_execution_exception", &format!("phase[query]: {e}")),
+        Err(e) => reply::error(
+            500,
+            "search_phase_execution_exception",
+            &format!("phase[query]: {e}"),
+        ),
     }
 }
 
@@ -156,7 +164,11 @@ pub fn search_endpoint(shared: &Shared, index: &str, body: &[u8], took_start: In
     let (_slot, prefix) = hash::slot_with_prefix(index.as_bytes());
     match exec::execute(&shared.store, &prefix, index.as_bytes(), &meta, &plan) {
         Ok(result) => reply::search(index, &result, took_start.elapsed().as_millis()),
-        Err(e) => reply::error(500, "search_phase_execution_exception", &format!("phase[query]: {e}")),
+        Err(e) => reply::error(
+            500,
+            "search_phase_execution_exception",
+            &format!("phase[query]: {e}"),
+        ),
     }
 }
 

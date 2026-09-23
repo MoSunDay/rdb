@@ -164,13 +164,12 @@ pub(crate) fn text_of(v: &Value) -> Option<String> {
     }
 }
 
+type DocRecordWithNumFields = Result<(DocRecord, Vec<(Vec<u8>, f64)>), &'static str>;
+
 /// Build the DocRecord (terms + doclen + vector) from the JSON body,
 /// plus the (field, value) pairs of NUMERIC fields for the kind 0x19
 /// doc-value records (written by `build_add_batch`).
-pub(crate) fn doc_record_of(
-    meta: &IndexMeta,
-    body: &[u8],
-) -> Result<(DocRecord, Vec<(Vec<u8>, f64)>), &'static str> {
+pub(crate) fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> DocRecordWithNumFields {
     let json: Value = serde_json::from_slice(body).map_err(|_| "ERR invalid JSON document")?;
     let Value::Object(map) = json else {
         return Err("ERR document must be a JSON object");
@@ -204,16 +203,15 @@ pub(crate) fn doc_record_of(
                     Value::Array(items) => {
                         let mut vals = Vec::with_capacity(items.len());
                         for it in items {
-                            let s = match it {
-                                Value::String(s) => s.clone(),
-                                Value::Number(n) => n.to_string(),
-                                Value::Bool(b) => b.to_string(),
-                                _ => {
-                                    return Err(
-                                        "ERR keyword field must be a string or array of strings"
-                                    )
-                                }
-                            };
+                            let s =
+                                match it {
+                                    Value::String(s) => s.clone(),
+                                    Value::Number(n) => n.to_string(),
+                                    Value::Bool(b) => b.to_string(),
+                                    _ => return Err(
+                                        "ERR keyword field must be a string or array of strings",
+                                    ),
+                                };
                             vals.push(s);
                         }
                         vals

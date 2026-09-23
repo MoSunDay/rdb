@@ -7,7 +7,7 @@ mod common;
 mod kafka_front_common;
 
 use kafka_front_common::{kafka_req, kafka_round, resp_one_shot, spawn_kafka_node, wait_accepting};
-use rdb::kafka::frame::{put_i32, put_i64, put_array_len, put_nullable_string, put_string, Reader};
+use rdb::kafka::frame::{put_array_len, put_i32, put_i64, put_nullable_string, put_string, Reader};
 use tokio::net::TcpStream;
 
 const API_OFFSET_COMMIT: i16 = 8;
@@ -15,8 +15,11 @@ const API_OFFSET_FETCH: i16 = 9;
 
 async fn offset_fetch_round(sock: &mut TcpStream, corr: i32, version: i16, body: &[u8]) -> Vec<u8> {
     // OffsetFetch turns flexible at v6: header + body both compact.
-    let payload =
-        kafka_round(sock, &kafka_req(API_OFFSET_FETCH, version, corr, version >= 6, body)).await;
+    let payload = kafka_round(
+        sock,
+        &kafka_req(API_OFFSET_FETCH, version, corr, version >= 6, body),
+    )
+    .await;
     let mut r = Reader::new(&payload);
     assert_eq!(r.i32(), Some(corr));
     if version >= 6 {
@@ -27,7 +30,17 @@ async fn offset_fetch_round(sock: &mut TcpStream, corr: i32, version: i16, body:
 }
 
 async fn xadd(resp: &str, stream: &str, key: &str, val: &str) {
-    resp_one_shot(resp, &[b"XADD", stream.as_bytes(), b"*", key.as_bytes(), val.as_bytes()]).await;
+    resp_one_shot(
+        resp,
+        &[
+            b"XADD",
+            stream.as_bytes(),
+            b"*",
+            key.as_bytes(),
+            val.as_bytes(),
+        ],
+    )
+    .await;
 }
 
 /// OffsetCommit v2 request: group, generation, member, retention,

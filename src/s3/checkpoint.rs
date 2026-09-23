@@ -57,6 +57,7 @@ pub fn publish_checkpoint(
     Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)] // explicit checkpoint inputs beat a param struct
 fn publish_inner(
     db: &rocksdb::DB,
     root: &Path,
@@ -88,10 +89,20 @@ fn publish_inner(
     let mut total = 0u64;
     for rel in &rels {
         let key = format!("rocksdb/{node}/{id}/{rel}");
-        let put = object::put_file(&store, bucket, &key, &staging.join(rel), "application/octet-stream")
-            .map_err(|e| format!("upload {key}: {e}"))?;
+        let put = object::put_file(
+            &store,
+            bucket,
+            &key,
+            &staging.join(rel),
+            "application/octet-stream",
+        )
+        .map_err(|e| format!("upload {key}: {e}"))?;
         total += put.size;
-        files.push(CheckpointFile { key, size: put.size, etag: put.etag });
+        files.push(CheckpointFile {
+            key,
+            size: put.size,
+            etag: put.etag,
+        });
     }
     let meta = CheckpointMeta {
         node: node.to_string(),
@@ -106,8 +117,14 @@ fn publish_inner(
     // meta.json lands LAST on purpose: readers treat its presence as
     // "this ckpt_* set is fully published", so it must never point at
     // a set with missing files (the rowset-meta ordering).
-    object::put_file(&store, bucket, &format!("rocksdb/{node}/{id}/meta.json"), &meta_local, "application/json")
-        .map_err(|e| format!("upload meta.json: {e}"))?;
+    object::put_file(
+        &store,
+        bucket,
+        &format!("rocksdb/{node}/{id}/meta.json"),
+        &meta_local,
+        "application/json",
+    )
+    .map_err(|e| format!("upload meta.json: {e}"))?;
     fs::remove_dir_all(staging).map_err(|e| format!("drop staging: {e}"))?;
     Ok(())
 }
@@ -121,7 +138,11 @@ fn collect_files(dir: &Path, rel: &str, out: &mut Vec<String>) -> io::Result<()>
         if name == "LOG" || name.starts_with("LOG.old.") {
             continue;
         }
-        let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        let child = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
         if entry.file_type()?.is_dir() {
             collect_files(&entry.path(), &child, out)?;
         } else if entry.file_type()?.is_file() {
@@ -137,7 +158,9 @@ fn collect_files(dir: &Path, rel: &str, out: &mut Vec<String>) -> io::Result<()>
 fn sweep_retention(root: &Path, bucket: &str, node: &str, retention: u32) {
     let keep = if retention == 0 { 2 } else { retention.max(1) } as usize;
     let dir = root.join(bucket).join("rocksdb").join(node);
-    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
     let mut ids: Vec<String> = entries
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -161,15 +184,20 @@ pub fn spawn_publisher(shared: Arc<crate::state::Shared>) {
     }
     // Same snapshot rules as http::serve: bucket default "rdb", root
     // falling back to <store_path>/s3.
-    let bucket = if conf.s3_bucket.is_empty() { "rdb".to_string() } else { conf.s3_bucket.clone() };
+    let bucket = if conf.s3_bucket.is_empty() {
+        "rdb".to_string()
+    } else {
+        conf.s3_bucket.clone()
+    };
     let root: PathBuf = if conf.s3_store_path.is_empty() {
         PathBuf::from(&conf.store_path).join("s3")
     } else {
         PathBuf::from(&conf.s3_store_path)
     };
     let node = conf.bind.clone();
-    let source =
-        crate::store::rocksdb::data_path(&conf.store_path, &conf.bind).display().to_string();
+    let source = crate::store::rocksdb::data_path(&conf.store_path, &conf.bind)
+        .display()
+        .to_string();
     let interval = Duration::from_millis(conf.s3_checkpoint_interval_ms);
     let retention = conf.s3_checkpoint_retention;
     tokio::spawn(async move {
@@ -177,7 +205,8 @@ pub fn spawn_publisher(shared: Arc<crate::state::Shared>) {
             // Startup grace: let the fronts and raft settle first.
             tokio::time::sleep(Duration::from_secs(3)).await;
             let db = Arc::clone(&shared.store);
-            let (root, bucket, node, source) = (root.clone(), bucket.clone(), node.clone(), source.clone());
+            let (root, bucket, node, source) =
+                (root.clone(), bucket.clone(), node.clone(), source.clone());
             match tokio::task::spawn_blocking(move || {
                 publish_checkpoint(&db.db, &root, &bucket, &node, &source, retention)
             })
@@ -205,7 +234,11 @@ mod tests {
         let db_path = dir.path().join("db");
         let store = crate::store::rocksdb::open(db_path.to_str().unwrap()).expect("open db");
         for i in 0..5 {
-            store.db.put(format!("k{i}"), format!("value-{i}")).map_err(|e| e.to_string()).unwrap();
+            store
+                .db
+                .put(format!("k{i}"), format!("value-{i}"))
+                .map_err(|e| e.to_string())
+                .unwrap();
         }
         let root = dir.path().join("objroot");
 
@@ -222,7 +255,10 @@ mod tests {
         assert!(!meta.files.is_empty());
         let mut listed = 0u64;
         for f in &meta.files {
-            let rel = f.key.strip_prefix(&format!("rocksdb/node-a/{id1}/")).expect("key prefix");
+            let rel = f
+                .key
+                .strip_prefix(&format!("rocksdb/node-a/{id1}/"))
+                .expect("key prefix");
             let path = set.join(rel);
             assert!(path.is_file(), "{} missing", path.display());
             let size = path.metadata().expect("stat").len();
