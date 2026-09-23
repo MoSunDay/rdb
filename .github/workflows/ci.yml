@@ -52,9 +52,13 @@ jobs:
         # red instead of burning the 360-min job cap.
         timeout-minutes: 60
         run: |
+          # -e must NOT be active across the pipeline: errexit+pipefail
+          # would abort before the ::error below can name the failures.
+          set +e
           set -o pipefail
-          cargo test --workspace 2>&1 | tee /tmp/test-out.log
+          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/test-out.log
           rc=${PIPESTATUS[0]}
+          set -e
           if [ "$rc" -ne 0 ]; then
             names=$(grep '^---- ' /tmp/test-out.log | sed 's/^---- //; s/ stdout ----$//' | head -10 | paste -sd, -)
             echo "::error title=test-failures::${names:-no-test-names-detected}"
