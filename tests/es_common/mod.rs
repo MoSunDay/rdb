@@ -6,6 +6,10 @@
 //! EOF; connect/read failures surface as status 0 so poll loops can
 //! simply retry.
 
+// Each mounting test binary uses a different subset of the helpers
+// (same policy as common/mod.rs and kafka_front_common/mod.rs).
+#![allow(dead_code)]
+
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
