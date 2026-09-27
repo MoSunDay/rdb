@@ -194,14 +194,17 @@ fn expire_in_past_deletes_and_expireat_absolute() {
         b":0\r\n".to_vec()
     );
     // EXPIREAT a few seconds out reports the remaining seconds (floored).
+    // The +5s window (assert 3..=5) tolerates scheduler delays of up to
+    // ~2s between the deadline computation and the TTL read -- a +3s
+    // window flaked under full-suite parallel load (seen 2026-09-26).
     set_raw(&s, b"k2", b"v");
-    let deadline = (crate::ds::expire::now_ms() as i64 / 1000 + 3).to_string();
+    let deadline = (crate::ds::expire::now_ms() as i64 / 1000 + 5).to_string();
     assert_eq!(
         call(&s, |c| Box::pin(expireat(c)), &[b"k2", deadline.as_bytes()]),
         b":1\r\n".to_vec()
     );
     let secs = int_of(&call(&s, |c| Box::pin(ttl(c)), &[b"k2"]));
-    assert!((2..=3).contains(&secs), "ttl {secs}");
+    assert!((3..=5).contains(&secs), "ttl {secs}");
 }
 
 #[test]
