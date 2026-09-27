@@ -97,4 +97,56 @@ pub(super) async fn put(node: &Node, key: &str, body: &[u8]) -> (u16, String, St
     (s, head.to_ascii_lowercase(), head)
 }
 
+// ---- checkpoint-set helpers ----------------------------------------------
+
+/// On-disk `ckpt_*` names under the node's checkpoint root, sorted
+/// (ids are ms timestamps, so string order == age order).
+pub(super) fn ckpt_ids_on_disk(ckpt_root: &std::path::Path) -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(ckpt_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("ckpt_"))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Checkpoint ids visible over the S3 face: the folded prefixes of
+/// `GET /rdb?list-type=2&prefix=rocksdb/<bind>/&delimiter=/`.
+pub(super) async fn ckpt_ids_over_s3(node: &Node) -> Vec<String> {
+    let target = format!("/rdb?list-type=2&prefix=rocksdb/{}/&delimiter=/", node.bind);
+    let (s, _, body) = s3(&node.http, "GET", &target, &[], b"").await;
+    if s == 404 {
+        return Vec::new(); // no bucket until the first publish lands
+    }
+    assert_eq!(s, 200, "list checkpoints over s3");
+    let doc = String::from_utf8_lossy(&body).to_string();
+    let want = format!("rocksdb/{}/ckpt_", node.bind);
+    let mut ids: Vec<String> = all_tags(&doc, "Prefix")
+        .into_iter()
+        .filter(|p| p.starts_with(&want) && p.ends_with('/'))
+        .map(|p| {
+            p.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Extend `ever` with ids not seen before (sampling bookkeeping).
+pub(super) fn push_unique(ever: &mut Vec<String>, ids: &[String]) {
+    for id in ids {
+        if !ever.contains(id) {
+            ever.push(id.clone());
+        }
+    }
+}
+
 // ---- tests ---------------------------------------------------------------

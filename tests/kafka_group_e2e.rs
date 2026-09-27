@@ -172,3 +172,70 @@ async fn two_consumers_full_rebalance_conversation() {
     );
     assert_eq!(fetch_offset_v0(&mut m1, 24, "g1", "t", 0).await, 6);
 }
+
+/// LeaveGroup / DescribeGroups against ids the coordinator has never
+/// seen, pinned against `coordinator::api`:
+/// - LeaveGroup v0 answers UNKNOWN_MEMBER_ID(25) for BOTH an unknown
+///   member on a live group AND an unknown group id (the v0/v1 broker
+///   behavior; the map miss and the member miss share one code).
+/// - DescribeGroups v0 for an unknown group answers group-level
+///   NONE(0) with state "Dead", empty protocol_type, null protocol
+///   and zero members -- the broker reports the state, not an error
+///   (NOT UNKNOWN_GROUP_OR_MEMBER).
+/// Neither request disturbs the live group.
+#[tokio::test]
+async fn leave_and_describe_unknown_member_and_group() {
+    // Fresh dir: tests in one binary run concurrently and the helper
+    // puts conf.yaml + the store straight inside `dir`.
+    let dir = std::env::temp_dir().join(format!("rdb-kafka-group-unknown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut node = spawn_kafka_node(&dir);
+    let (resp, kafka) = (node.resp.clone(), node.kafka.clone());
+    wait_accepting(&resp, &mut node, "resp").await;
+    seed_stream(&resp).await;
+    wait_accepting(&kafka, &mut node, "kafka").await;
+
+    // A real, Stable single-member group to probe around.
+    let mut m1 = TcpStream::connect(&kafka).await.expect("connect m1");
+    let r = join_v1(&mut m1, 1, "g2", SESSION_MS, 60_000, "", b"sub[t0]").await;
+    assert_eq!(r.error, errors::MEMBER_ID_REQUIRED);
+    let id = r.member_id.clone();
+    let r = join_v1(&mut m1, 2, "g2", SESSION_MS, 60_000, &id, b"sub[t0]").await;
+    assert_eq!(r.error, errors::NONE);
+    assert_eq!(r.generation, 1);
+    let (err, a) = sync_v1(&mut m1, 3, "g2", &id, 1, &[(id.as_str(), b"[t0p0]")]).await;
+    assert_eq!((err, a.as_slice()), (errors::NONE, &b"[t0p0]"[..]));
+
+    // LeaveGroup for an UNKNOWN member on the live group -> 25, and
+    // the group is untouched (state, member and heartbeat all live on).
+    assert_eq!(
+        leave_v0(&mut m1, 4, "g2", "rdb-g2-ghost-member").await,
+        errors::UNKNOWN_MEMBER_ID
+    );
+    let d = describe_v0(&mut m1, 5, "g2").await;
+    assert_eq!(d.state, "Stable");
+    assert_eq!(d.member_ids, vec![id.clone()]);
+    assert_eq!(heartbeat_v0(&mut m1, 6, "g2", 1, &id).await, errors::NONE);
+
+    // LeaveGroup on an UNKNOWN group id -> the SAME code (the v0/v1
+    // broker collapses group-miss and member-miss into 25).
+    assert_eq!(
+        leave_v0(&mut m1, 7, "no-such-group", "whoever").await,
+        errors::UNKNOWN_MEMBER_ID
+    );
+
+    // DescribeGroups for an UNKNOWN group: group-level error NONE,
+    // state "Dead", empty protocol_type, null protocol, no members.
+    let d = describe_v0(&mut m1, 8, "no-such-group").await;
+    assert_eq!(d.state, "Dead", "unknown groups report Dead, not an error");
+    assert_eq!(d.protocol_type, "");
+    assert_eq!(d.protocol, None);
+    assert!(d.member_ids.is_empty(), "Dead groups carry no members");
+
+    // The live group still contrasts: consumer/range + the one member.
+    let d = describe_v0(&mut m1, 9, "g2").await;
+    assert_eq!(d.state, "Stable");
+    assert_eq!(d.protocol_type, "consumer");
+    assert_eq!(d.protocol.as_deref(), Some("range"));
+    assert_eq!(d.member_ids, vec![id.clone()]);
+}

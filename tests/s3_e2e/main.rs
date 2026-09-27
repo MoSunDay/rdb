@@ -3,7 +3,9 @@
 mod client;
 mod fixture;
 
-use client::{all_tags, put, s3, split_response, xml_text};
+use client::{
+    all_tags, ckpt_ids_on_disk, ckpt_ids_over_s3, push_unique, put, s3, split_response, xml_text,
+};
 use fixture::{dir_for, spawn_s3_node, spawn_s3_node_with_token, wait_accepting};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -301,6 +303,97 @@ async fn checkpoint_publisher_lands_real_files() {
     let (s, _, got) = s3(&node.http, "GET", &format!("/rdb/{key}"), &[], b"").await;
     assert_eq!(s, 200, "GET {key}");
     assert!(!got.is_empty(), "checkpoint file must carry bytes");
+}
+
+// ---- checkpoint retention + content consistency ---------------------------
+
+#[tokio::test]
+async fn checkpoint_retention_prunes_and_content_matches() {
+    // The fixture yaml sets no s3_checkpoint_retention, so the source
+    // default applies: keep 2, sweep right after each NEW publish.
+    const RETENTION: usize = 2;
+    let mut node = spawn_s3_node(&dir_for("ckpt-retention"));
+    let http = node.http.clone();
+    wait_accepting(&mut node, &http, "s3 http").await;
+    let ckpt_root = node.s3root.join("rdb/rocksdb").join(&node.bind);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // every id observed so far, on disk or over the protocol face
+    let mut ever: Vec<String> = Vec::new();
+    // Phase 1: the sweep only fires per publish, so wait until at
+    // least RETENTION+2 distinct ids have existed (publisher tick is
+    // 3s grace + 500ms interval, i.e. ~3.5s per checkpoint).
+    while ever.len() < RETENTION + 2 {
+        push_unique(&mut ever, &ckpt_ids_on_disk(&ckpt_root));
+        push_unique(&mut ever, &ckpt_ids_over_s3(&node).await);
+        assert!(
+            Instant::now() < deadline,
+            "only {} checkpoints in 30s; stderr:\n{}",
+            ever.len(),
+            std::fs::read_to_string(&node.stderr_path).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Phase 2: settle on a sample where disk and the protocol face
+    // agree AND the sweep has landed (a set mid-upload shows up as a
+    // third prefix for a few ms; such samples are simply retried).
+    let (disk, listed) = loop {
+        let disk = ckpt_ids_on_disk(&ckpt_root);
+        let listed = ckpt_ids_over_s3(&node).await;
+        push_unique(&mut ever, &disk);
+        push_unique(&mut ever, &listed);
+        if disk == listed && disk.len() == RETENTION {
+            break (disk, listed);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retention never settled at {RETENTION}; disk {disk:?} s3 {listed:?}; stderr:\n{}",
+            std::fs::read_to_string(&node.stderr_path).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    // Pruning is proven: RETENTION+2 ids existed, exactly the newest
+    // RETENTION survive, on disk AND as published objects (one tree).
+    assert_eq!(disk.len(), RETENTION, "on-disk sets: {disk:?}");
+    assert_eq!(listed, disk, "published ids must mirror disk exactly");
+    let mut newest_first = ever.clone();
+    newest_first.sort();
+    newest_first.reverse();
+    let mut kept_desc = disk.clone();
+    kept_desc.reverse(); // disk is age-ascending
+    assert_eq!(
+        &newest_first[..RETENTION],
+        kept_desc.as_slice(),
+        "newest {RETENTION} ids must survive: ever {ever:?}"
+    );
+    let pruned: Vec<&String> = ever.iter().filter(|id| !disk.contains(id)).collect();
+    assert!(pruned.len() >= 2, "need pruned ids to check: {ever:?}");
+    for id in &pruned {
+        let target = format!("/rdb/rocksdb/{}/{id}/meta.json", node.bind);
+        let (s, _, _) = s3(&node.http, "GET", &target, &[], b"").await;
+        assert_eq!(s, 404, "pruned {id} must not stay downloadable");
+    }
+    // Content consistency: the newest set, downloaded over the S3
+    // protocol, must be byte-identical to the local checkpoint dir.
+    let id = disk.last().expect("newest id");
+    let local_dir = ckpt_root.join(id);
+    let target = format!("/rdb/rocksdb/{}/{id}/meta.json", node.bind);
+    let (s, _, meta_s3) = s3(&node.http, "GET", &target, &[], b"").await;
+    assert_eq!(s, 200, "GET meta.json of {id}");
+    let meta_local = std::fs::read(local_dir.join("meta.json")).expect("local meta.json");
+    assert_eq!(meta_s3, meta_local, "meta.json bytes must match disk");
+    let meta: serde_json::Value = serde_json::from_slice(&meta_s3).expect("meta.json json");
+    let files = meta["files"].as_array().expect("files array");
+    assert!(files.len() >= 3, "want >= 3 files to compare: {files:?}");
+    let prefix = format!("rocksdb/{}/{id}/", node.bind);
+    for f in files {
+        let key = f["key"].as_str().expect("file key");
+        let rel = key.strip_prefix(&prefix).expect("key under ckpt set");
+        let local = std::fs::read(local_dir.join(rel))
+            .unwrap_or_else(|e| panic!("listed {key} missing locally: {e}"));
+        let (s, _, got) = s3(&node.http, "GET", &format!("/rdb/{key}"), &[], b"").await;
+        assert_eq!(s, 200, "GET {key}");
+        assert_eq!(got, local, "{key} bytes must match disk");
+    }
 }
 
 #[tokio::test]
