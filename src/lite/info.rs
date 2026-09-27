@@ -55,10 +55,11 @@ fn groups_info(ctx: &mut Ctx<'_>, stream: &[u8], prefix: &[u8]) {
     };
     resp::append_array(ctx.out, groups.len());
     for (name, p) in groups {
-        // 7 pairs: the Redis-ish trio plus the ordered-group surface
-        // (always present; owner is nil unless an ordered group has a
-        // live owner this process).
-        resp::append_array(ctx.out, 14);
+        // The bare group name plus 6 labeled fields (last-delivered-id,
+        // committed-id, ordered, inflight, owner, epoch) = 13 elements:
+        // the header once said 14, which hung strict RESP clients
+        // (redis-cli) waiting for an element that never arrives.
+        resp::append_array(ctx.out, 13);
         resp::append_bulk(ctx.out, &name);
         resp::append_bulk_string(ctx.out, "last-delivered-id");
         append_id_field(
