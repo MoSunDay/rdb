@@ -408,3 +408,62 @@ fn ft_search_reply_is_a_flat_array() {
     );
     assert!(r.starts_with(b"*5\r\n:2\r\n"), "knn/score shape: {r:?}");
 }
+
+/// FT.DROPINDEX is a plain ALIAS of FT.DROP (one shared handler): both
+/// wipe the whole search family -- index meta, postings AND documents --
+/// unlike RediSearch, where DROPINDEX keeps docs unless DD is passed.
+/// No DD option exists here; the arity error even leaks the canonical
+/// 'ft.drop' name.
+#[test]
+fn ft_dropindex_alias_drops_docs_like_ft_drop() {
+    let (shared, _dir) = shared_at("45411");
+    let create = |idx: &[u8]| {
+        ok(
+            &call(&shared, "ft.create", &[idx, b"SCHEMA", b"body", b"TEXT"]),
+            "create",
+        );
+    };
+    // No DD option: exactly one argument, whichever spelling is used.
+    err_has(
+        &call(&shared, "ft.dropindex", &[b"i1", b"DD"]),
+        "wrong number of arguments for 'ft.drop' command",
+        "dropindex DD",
+    );
+    // After either drop the index is gone AND the doc records died with
+    // it: a re-created index starts empty (num_docs 0, old terms find
+    // nothing) -- docs are NOT kept like RediSearch's DROPINDEX.
+    let gone = |idx: &[u8]| {
+        err_has(
+            &call(&shared, "ft.search", &[idx, b"*"]),
+            "unknown index",
+            "post-drop",
+        );
+        assert_eq!(call(&shared, "exists", &[idx]), b":0\r\n".to_vec());
+        create(idx);
+        let r = call(&shared, "ft.search", &[idx, b"@body:hello"]);
+        assert!(contains_bytes(&r, b":0\r\n"), "stale docs: {r:?}");
+        let info = call(&shared, "ft.info", &[idx]);
+        assert!(
+            contains_bytes(&info, b"num_docs\r\n:0\r\n"),
+            "info {info:?}"
+        );
+    };
+    for (idx, cmd) in [(b"i1".as_slice(), "ft.dropindex"), (b"i2", "ft.drop")] {
+        create(idx);
+        assert_eq!(
+            call(&shared, "ft.add", &[idx, b"d1", br#"{"body":"hello"}"#]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            call(&shared, "ft.add", &[idx, b"d2", br#"{"body":"world"}"#]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(call(&shared, cmd, &[idx]), b":1\r\n".to_vec(), "in '{cmd}'");
+        gone(idx);
+        err_has(
+            &call(&shared, cmd, &[b"nope"]),
+            "unknown index",
+            "drop unknown",
+        );
+    }
+}
