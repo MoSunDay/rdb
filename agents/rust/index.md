@@ -92,6 +92,8 @@ Commit: 98e17a5
 
 ## 测试
 - 单元测试内联于各模块 `#[cfg(test)]`；集成测试位于 `tests/`：
+  - 覆盖台账：[features/e2e-coverage.md](../../features/e2e-coverage.md)（2026-09-26 基线 f071032 量化比对的缺口已全部补齐：命令面 30 个零覆盖清零、进程级 backup 接管、ES token/routing、S3 retention、备份 allowlist 87/87、CLI 9 场景，详见 changelog 2026-09-26）；
+  - 命令面补齐套件：`hash_read_e2e.rs`/`set_more_e2e.rs`/`zset_more_e2e.rs`/`keys_more_e2e.rs`（hash 读族、set 采样/集合、zset 删/排名/读族（含 ZREVRANGEBYLEX 首条成功路径）、keys 族杂项 + CONFIG 桩）；`wire_families_e2e.rs`/`wire_ft_config_e2e.rs`（JSON/Vector 与 FT.*/CONFIG 真实 TCP wire）；`asking_restore_e2e.rs`（IMPORTING 槽 ASKING 单次放行门 + DUMP→RESTORE wire 成功往返/ABSTTL 空操作/坏载荷）；`backup_failover_e2e.rs`（3 真进程 + backup_target_map：kill -9 → MOVED 指向存活同伴 backup 监听（可读/-READONLY 拒写）→ 重启回切）；`backup_surface_e2e.rs`（备份监听 allowlist 87/87 全量过门 + 33 写命令负向，表在 `tests/backup_surface_common/` 含与 `readonly::ALLOWED` 的集合相等断言）；`es_auth_e2e.rs`（es_token 401 矩阵 + 双节点 remote-slot 400 routing_exception）；`kafka_group_e2e.rs` 增 LeaveGroup/DescribeGroups 未知 id；`s3_e2e` 增 checkpoint retention 剪裁 + 内容一致性；
   - `resp_e2e.rs`：RESP 层 e2e（AUTH 门、字符串命令、MOVED、协议错误）；
   - `lite_e2e.rs` / `lite_streams_e2e.rs` / `lite_group_e2e.rs` / `lite_proc_e2e.rs`：Lite Mode e2e（含非 UTF8 组名隔离、XDEL 重复 ID/XTRIM 越界回归）——父主题自动选队列、XPICK、XINFO、组生命周期与补读、重启自已提交水位恢复、空闲 TTL 整流回收、BLOCK 跨连接唤醒、指标暴露；XRANGE 边界/COUNT、XTRIM MAXLEN 裁剪、XDEL 命中与 missing；进程级 kill -9 重启恢复；公共工具 `tests/common/lite.rs`；`lite_ordered_e2e.rs`：有序消费组 e2e——严格串行默认与 INFLIGHT 旋钮、独占所有权/空闲迁移/epoch 隔离、XCLAIM 与 XAUTOCLAIM 只认 PEL 头、连续前缀提交 + 重启重投尾部、有序配置跨重启存活、满窗/被 fence BLOCK 门控停靠（XACK 唤醒、租约到期自助接管）；
   - `raft_cluster_e2e.rs`：bootstrap + HTTP join/depart 的两节点集群；

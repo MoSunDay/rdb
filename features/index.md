@@ -12,6 +12,7 @@ Commit: 98e17a5
 - [SQL 数据面（MySQL 协议 + 分布式事务）](./sql-dataplane.md)
 - [ES Front（Elasticsearch 兼容 HTTP 前置，同一检索内核）](./es-front.md)
 - [S3 对象存储前置（本地文件系统后端 + RocksDB checkpoint 发布）](./s3-object-storage.md)
+- [E2E 覆盖地图与缺口台账（覆盖现状 + 残余缺口）](./e2e-coverage.md)
 
 ## Changelog
 - [changelog](./changelog/)
