@@ -9,6 +9,8 @@
 #   e. hash tag: {sess:u1001}:a and {sess:u1001}:b share one slot
 #   f. MOVED: foreign-slot SET on node1 -> text format -> redis-cli -c follows
 #   g. MULTI/EXEC batch of session writes -> read every key back
+#   h. redis-py RedisCluster(): handshake + remote-band SET/GET roundtrip
+#      the SDK routes to the owner itself (self-skip without redis-py)
 # plus a compatibility smoke (source-confirmed probe commands only).
 #
 # Semantics verified against source/tests BEFORE writing this script:
@@ -42,10 +44,13 @@
 #   scores rendered like Rust f64 Display ("98.5", "72" not "72.0")
 #   (src/command/zset_range.rs:68-88, src/command/zset_util.rs:124-126).
 # - HGETALL of a missing key is an empty array (src/command/hash_tests.rs:125).
-# - Probe-command smoke: rdb has NO top-level INFO/COMMAND (src/command/
-#   mod.rs dispatch -> "ERR unknown command '<name>'", mod.rs:364-370), so
-#   the smoke uses source-confirmed CLUSTER INFO (cluster.rs:44,187-215)
-#   and CLUSTER KEYSLOT, then proves the connection still PINGs.
+# - Probe-command smoke: uses source-confirmed CLUSTER INFO (cluster.rs:44,
+#   187-215) + CLUSTER KEYSLOT; rdb NOW also implements top-level COMMAND
+#   (COUNT/INFO/DOCS/GETKEYS) + INFO, src/command/server_cmd.rs (unblocks h).
+# - redis-py RedisCluster() (step h): protocol=2 keeps the per-connection
+#   handshake AUTH-only (no HELLO; its CLIENT SETINFO probes are tolerated
+#   by redis-py); COMMAND supplies the key table, CLUSTER SLOTS the topology
+#   (bands tile 0..16383, so the require_full_coverage default passes).
 # - Cluster metadata: env.sh does NOT run CLUSTER INIT; the topology only
 #   materializes after "CLUSTER INIT <resp_bind0>,<bind1>,<bind2>" on the
 #   raft leader (src/command/cluster.rs:292-325; tests/common/mod.rs:533-542)
@@ -379,6 +384,65 @@ main () {
         "$(rc "$tx_idx" GET '{sess:u1001}:cart')"
     assert_eq "profile field written by EXEC reads back" "Shanghai" \
         "$(rc "$tx_idx" HGET '{sess:u1001}:profile' city)"
+
+    # ---- (h) redis-py RedisCluster(): cluster-aware SDK routing ----------
+    # The vector scenario only proves single-node Redis(); RedisCluster()
+    # handshakes COMMAND + CLUSTER SLOTS and dials every primary it maps
+    # (see header): any assert failing below is a real regression.
+    if ! python3 -c 'import redis' >/dev/null 2>&1; then
+        echo "SKIP - redis-py not importable; RedisCluster() probe (h) vacuous"
+    else
+        # Startup node = raft leader; find a key whose home band is NOT it.
+        local py_key="" py_i py_probe py_owner py_owner_idx py_out
+        for py_i in $(seq 0 39); do
+            py_probe="$(owner_probe "$leader" "sess:pycluster:$py_i")"
+            case "$py_probe" in
+            "$E2E_HOST":*) py_key="sess:pycluster:$py_i"; py_owner="$py_probe"; break ;;
+            *) : ;; # LOCAL / UNEXPECTED: keep probing
+            esac
+        done
+        assert_eq "found a key outside the startup node's band" "ok" \
+            "$([ -n "$py_key" ] && echo ok || echo 'none in 40 probes')"
+        [ -n "$py_key" ] || py_key="sess:pycluster:none" # keep argv sane
+        _py_cluster="$E2E_WORKDIR/py_cluster.py"
+        cat > "$_py_cluster" <<'PYEOF'
+import os
+from redis.cluster import RedisCluster
+key, val = os.environ["PY_KEY"], "cluster-sdk-roundtrip"
+rc = RedisCluster(host=os.environ["PY_HOST"], port=int(os.environ["PY_PORT"]),
+                  password=os.environ["PY_TOKEN"], decode_responses=True,
+                  protocol=2, socket_timeout=10, socket_connect_timeout=5)
+info = rc.cluster_info()  # constructor done == AUTH+COMMAND+SLOTS handshake
+ok = (bool(info) and info.get("cluster_state") == "true"
+      and info.get("cluster_known_nodes") == "3"
+      and info.get("cluster_slots_assigned") == "16384")
+print("cluster_info", 1 if ok else 0)
+print("set", 1 if rc.set(key, val) is True else 0)  # remote band: SDK routes
+print("get", 1 if rc.get(key) == val else 0)
+print("slots", len(rc.execute_command("CLUSTER", "SLOTS")))
+PYEOF
+        py_out="$(PY_HOST="$E2E_HOST" PY_PORT="$(node_resp "$leader")" \
+            PY_TOKEN="$RDB_E2E_TOKEN" PY_KEY="$py_key" python3 "$_py_cluster" 2>&1)"
+        pyc_val () { printf '%s\n' "$py_out" | sed -n "s/^$1 //p" | head -n1; }
+        if [ -z "$(pyc_val slots)" ]; then
+            printf '%s\n' "$py_out" | tail -n 5
+        fi
+        assert_eq "handshake + cluster_info(): state true / 3 nodes / 16384 slots" \
+            "1" "$(pyc_val cluster_info)"
+        assert_eq "RedisCluster() SET on a remote-band key returns True" "1" \
+            "$(pyc_val set)"
+        assert_eq "RedisCluster() GET on the remote-band key round-trips" "1" \
+            "$(pyc_val get)"
+        assert_eq "client-side CLUSTER SLOTS shows the 3 ownership bands" "3" \
+            "$(pyc_val slots)"
+        # Cross-check the SDK wrote on the OWNER: it reads the value locally
+        # while the startup node still answers MOVED for the key.
+        py_owner_idx="$(idx_of_addr "$py_owner")"
+        assert_eq "value readable on the owner node (${py_owner_idx:-?})" \
+            "cluster-sdk-roundtrip" "$(rc "${py_owner_idx:-0}" GET "$py_key")"
+        assert_contains "startup node still MOVEDs the remote-band key" "MOVED" \
+            "$(rc "$leader" GET "$py_key")"
+    fi
 
     e2e_finish "$scenario"
 }

@@ -1,8 +1,27 @@
 # E2E scenario results -- rdb real-client acceptance
 
-Last full green run: **2026-09-16**, git `5b67c47`,
-binary `target/release/rdb`.
-Runner: `run_all.sh` -> **4 pass, 0 fail**.
+Last full green run: **2026-09-26**, git `98e17a5` + e2e-coverage
+closeout working tree, binary `target/release/rdb`.
+Runner: `run_all.sh` -> **9 pass, 0 fail** (every `scenario_*.sh`:
+kafka_bench, kafka_sdk, mysql_orders, redis_session, starrocks_analytics,
+vector_search + the 2026-09-26 additions ha_failover / lite_mq / migrate).
+Prior full green: 2026-09-16, git `5b67c47`, 4 pass (suite has grown
+since -- see the audit note below).
+
+2026-09-26: `scenario_redis_session.sh` grew step (h), a redis-py
+`RedisCluster()` probe -- the long-standing gap entry ("RedisCluster()
+cannot connect: COMMAND unimplemented") is RESOLVED. Constructed with
+`password=<raft_token>`, `protocol=2` (keeps the per-connection
+handshake AUTH-only; no HELLO -- CLIENT SETINFO error replies are
+tolerated by redis-py) and `decode_responses=True`, the constructor
+completes the full cluster handshake: AUTH on the startup node, the
+COMMAND key table, the CLUSTER SLOTS topology map, then dials all 3
+primaries. `cluster_info()` reports state true / 3 nodes / 16384
+assigned slots, and a remote-band SET/GET round-trips through the SDK
+(cross-checked server-side: the owner node holds the value while the
+startup node still answers MOVED). No `require_full_coverage` override
+needed -- the 3 bands tile 0..16383. Self-skips only when redis-py is
+not importable. Result: **PASS, 46 assertions** (was 39).
 
 2026-09-18: `scenario_kafka_sdk.sh` grew step 7 (compression, P5b) --
 gzip/snappy/lz4 x 30 msgs each via the real SDK (`batch.num.messages=10`
@@ -21,8 +40,9 @@ load generator instead of a client library: rdb-bench grew
 `kafka-prod` (Produce v2, acks=1, 100 records/request, 2 clients) and
 `kafka-fetch` (Fetch v4, 1 client, 500ms long-poll tail) workloads
 from a hand-rolled client in `bench/src/kafka_wire.rs` /
-`kafka_reply.rs` / `kafka.rs` (no rdb-lib link). Standalone, NOT part
-of `run_all.sh` (~55s). Result: **PASS** -- produce 1,159,800 records
+`kafka_reply.rs` / `kafka.rs` (no rdb-lib link). Also runnable
+standalone; it IS part of `run_all.sh` (the `scenario_*.sh` glob
+picks it up; ~55s). Result: **PASS** -- produce 1,159,800 records
 @ ~77k/s zero error replies, then the fetcher reads 1,159,802
 (= produced + the 2 XADD topic-seed entries) inside its 30s window;
 base_offset monotonicity asserted client-side. Usage of the two
@@ -108,7 +128,7 @@ binary rebuilt from the same working tree first.
 | redis-cli  | 6.0.16    | all scenarios               |
 | iredis     | 1.16.1    | redis_session, vector       |
 | python     | 3.13.3    | vector (redis-py SDK block) |
-| redis-py   | 7.4.1     | vector section I            |
+| redis-py   | 7.4.1     | vector I; session (h)       |
 | mysql      | 8.0.44    | mysql_orders, starrocks     |
 
 The harness generates per-run yaml whose raft token comes from
@@ -130,18 +150,20 @@ Latest results (assertions = `^ok` lines in the per-scenario log):
 
 | scenario                        | story                       | assertions | result |
 |---------------------------------|-----------------------------|-----------:|--------|
-| scenario_redis_session.sh       | session cache / leaderboard |         39 | PASS   |
+| scenario_redis_session.sh       | session cache / leaderboard |         46 | PASS   |
 | scenario_mysql_orders.sh        | orders + 2PC transactions   |        117 | PASS   |
 | scenario_starrocks_analytics.sh | DDL compatibility/analytics |         76 | PASS   |
 | scenario_vector_search.sh       | vector + FT.* search        |         60 | PASS   |
-| **total**                       |                             |  **292**   | **4/4**|
+| **total**                       |                             |  **299**   | **4/4**|
 
 Per-scenario coverage (see each script header for source-verified
 semantics):
 
 - **redis_session**: SET/GET (spaces, non-ASCII), TTL expiry, HASH
   profile, ZSET leaderboard ordering, hash-tag slot sharing, MOVED
-  redirect (raw text + `redis-cli -c` following), MULTI/EXEC batch.
+  redirect (raw text + `redis-cli -c` following), MULTI/EXEC batch,
+  redis-py `RedisCluster()` probe (handshake + remote-band SET/GET the
+  SDK routes to the owner itself).
 - **mysql_orders**: mysql-wire DDL/DML, prepared-ish flows, BEGIN/
   COMMIT/ROLLBACK, cross-node 2PC commit and abort paths, fail-closed
   conflict behavior (`ts >= conflict_ts`), information_schema/SHOW
@@ -172,9 +194,30 @@ semantics):
 
 ## Known gaps (not exercised by this suite)
 
-- `RedisCluster()` (redis-py) cannot connect yet: its handshake issues
-  the `COMMAND` command, which rdb does not implement. The topology
-  call `CLUSTER SLOTS` itself parses fine; direct `Redis()` clients
-  are fully functional.
+- ~~`RedisCluster()` (redis-py) cannot connect yet~~ RESOLVED 2026-09-26:
+  `scenario_redis_session.sh` step (h) probes it against a live cluster
+  and PASSES (constructor flags: `password` + `protocol=2` +
+  `decode_responses`; see the dated note up top). Remaining redis-py
+  cluster surface (pipelines, pubsub, `CLUSTER SHARDS`) stays unprobed.
 - `config/conf_3268*.yaml` still carry plaintext raft tokens (pre-
-  existing P3 debt; the e2e harness does not use them).
+  existing P3 debt; the e2e harness does not use them). The formerly
+  embedded tokens in `scrtips/redis-py.py` / `redis-async-py.py` were
+  replaced by `RDB_TOKEN` env placeholders (cleaned 2026-09-26).
+
+2026-09-26 audit note: `run_all.sh` globs every `scenario_*.sh` -- the
+count grows with the suite (see `scrtips/e2e_scenarios/`): 6 scenarios
+(kafka_sdk + kafka_bench included) plus 3 added 2026-09-26
+(`scenario_ha_failover.sh`, `scenario_lite_mq.sh`,
+`scenario_migrate.sh`) = 9, and all 9 PASSED in the 2026-09-26 local
+run on this tree (`run_all.sh` summary: 9 pass, 0 fail; ha_failover
+kill->MOVED-to-backup ~4-5s, restart swap-back ~5s; lite_mq pins
+ORDERED/INFLIGHT + XAUTOCLAIM; migrate drives `migrate task` both
+directions). That run also validated the `XINFO GROUPS` wire fix
+(per-group array header 14->13, `src/lite/info.rs`) -- redis-cli no
+longer hangs and lite_mq asserts through it under a `timeout` guard. Doc drift fixed alongside: the 09-18 "kafka_bench NOT part
+of run_all.sh" claim above was stale (the glob does pick it up), the
+soak.yml header now uses count-agnostic glob wording, and soak.yml's
+pip line gained `confluent-kafka` so kafka_sdk exercises the real SDK
+nightly instead of self-skipping. This file's results table predates
+the kafka scenarios (counts for the other four are per their last
+logged runs). Full quantified gap register: `features/e2e-coverage.md`.

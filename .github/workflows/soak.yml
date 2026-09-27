@@ -6,8 +6,9 @@
 # reproduce in unit tests or the short-lived CI jobs; they only show up
 # under sustained load, and the kill -9 soak (soak_kill9.sh, 180s
 # default load window) is too slow to gate every push. That soak is run
-# by this workflow, not by run_all.sh (which only globs the 4 fast
-# scenario_*.sh cases). The soak's RDB_SOAK_P99_MAX_MS gate (default
+# by this workflow, not by run_all.sh (which globs every scenario_*.sh
+# -- the count grows with the suite, see scrtips/e2e_scenarios/). The
+# soak's RDB_SOAK_P99_MAX_MS gate (default
 # 1000ms, deliberately generous) is what actually catches them: clients
 # stay error-free while p99 balloons to multi-seconds.
 #
@@ -44,14 +45,16 @@ jobs:
       # REDISCLI_AUTH exported by env.sh). curl: /metrics probes.
       - name: Install rocksdb build + e2e deps
         # The scenario suite drives REAL clients: mysql + mycli (orders /
-        # starrocks), iredis (session), redis-py (vector). Versions pinned
-        # to the locally-validated matrix (mysql 8.0 line, iredis 1.16.1,
-        # mycli 1.31.2, redis-py 7.4.1). PEP 668 runner python needs
-        # --break-system-packages.
+        # starrocks), iredis (session), redis-py (vector, session cluster
+        # probe), confluent-kafka (kafka_sdk -- installed here so the
+        # scenario runs instead of self-skipping its SDK steps). Versions
+        # pinned to the locally-validated matrix (mysql 8.0 line, iredis
+        # 1.16.1, mycli 1.31.2, redis-py 7.4.1). PEP 668 runner python
+        # needs --break-system-packages.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev redis-tools curl default-mysql-client python3-pip
-          python3 -m pip install --break-system-packages "iredis==1.16.1" "redis==7.4.1" "mycli==1.31.2"
+          python3 -m pip install --break-system-packages "iredis==1.16.1" "redis==7.4.1" "mycli==1.31.2" "confluent-kafka"
 
       - uses: dtolnay/rust-toolchain@stable
 
