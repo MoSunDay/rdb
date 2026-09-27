@@ -336,6 +336,65 @@ fn blpop_got_does_not_swallow_next_notify() {
     assert_eq!(reply, arr(&["wk", "second"]), "parked blpop must be woken");
 }
 
+/// LPUSHX/RPUSHX (push_variant with create=false): a missing key replies
+/// :0 without creating anything, an existing list grows at the right end,
+/// any other type is WRONGTYPE, and the TTL never changes.
+#[test]
+fn lpushx_rpushx_no_create_wrongtype_arity() {
+    let shared = shared_for("44009");
+    let e = |n: &str, a: &[&str], w: &[u8]| expect(&shared, n, a, w);
+    e(
+        "lpushx",
+        &["{x}l"],
+        b"-ERR wrong number of arguments for 'lpushx' command\r\n",
+    );
+    e(
+        "rpushx",
+        &["{x}l"],
+        b"-ERR wrong number of arguments for 'rpushx' command\r\n",
+    );
+    // Missing key: :0 and no list is created.
+    e("lpushx", &["{x}l", "a"], b":0\r\n");
+    e("rpushx", &["{x}l", "b"], b":0\r\n");
+    e("exists", &["{x}l"], b":0\r\n");
+    e("llen", &["{x}l"], b":0\r\n");
+    // Existing list: LPUSHX prepends, RPUSHX appends (multi-element ok).
+    e("rpush", &["{x}l", "m", "n"], b":2\r\n");
+    e("lpushx", &["{x}l", "h"], b":3\r\n");
+    e("rpushx", &["{x}l", "t", "u"], b":5\r\n");
+    e(
+        "lrange",
+        &["{x}l", "0", "-1"],
+        &arr(&["h", "m", "n", "t", "u"]),
+    );
+    // WRONGTYPE: a string key is refused and survives untouched.
+    e("set", &["{x}s", "v"], b"+OK\r\n");
+    e(
+        "lpushx",
+        &["{x}s", "x"],
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+    e(
+        "rpushx",
+        &["{x}s", "x"],
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    );
+    e("get", &["{x}s"], b"$1\r\nv\r\n");
+    // A list that died from a past-deadline TTL no longer exists: :0.
+    e("rpush", &["{x}dead", "a"], b":1\r\n");
+    e("pexpireat", &["{x}dead", "1"], b":1\r\n");
+    e("lpushx", &["{x}dead", "b"], b":0\r\n");
+    e("rpushx", &["{x}dead", "b"], b":0\r\n");
+    e("exists", &["{x}dead"], b":0\r\n");
+    // A live TTL is carried over unchanged by an X-push.
+    e("rpush", &["{x}ttl", "a"], b":1\r\n");
+    e("expire", &["{x}ttl", "100"], b":1\r\n");
+    e("rpushx", &["{x}ttl", "b"], b":2\r\n");
+    let ttl = text(&call(&shared, "ttl", &["{x}ttl"]));
+    assert!(ttl == ":100\r\n" || ttl == ":99\r\n", "ttl {ttl}");
+    e("llen", &["{x}ttl"], b":2\r\n");
+}
+
 /// Over the wire: a parked BLPOP on connection A is woken by an LPUSH
 /// from connection B (modeled on lite's `block_wakes_on_xadd_over_wire`).
 #[tokio::test]
