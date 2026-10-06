@@ -40,8 +40,21 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
+- **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
+  - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
+    DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
+    MAXDELIVERY、n≥1）、kill -9 转移原子持久、`rdb_lite_dlq_depth` gauge、默认无重投。
+  - `lite_redeliver_e2e`（5）：sweep 只碰 idle 行（times+1+delivered_ms 刷新）、越
+    MAXDELIVERY 行直接 DLQ、已 ACK 行永不重投、与手动 XCLAIM 共存、ORDERED 只重投头。
+  - `lite_trim_minid_e2e`（5）：MINID `=`/`~` 同为精确删、`<ms>-0` 时间窗留存、语法/边界
+    错矩阵、与 MAXLEN 正交、kafka 账本守卫拒 XTRIM/XDEL。
+  - `kafka_headers_roundtrip_e2e`（4）：produce 形状还原真 record headers、tombstone
+    带 headers、无 headers 不变、exotic 形状回退 envelope + `rdb-envelope` 标记头。
+  - `kafka_rename_ledger_e2e`（2）：RENAME 随搬 0x20 账本（守卫跟新名）+ 旧名
+    OffsetCommit 回 3 `UNKNOWN_TOPIC_OR_PARTITION`；同 slot 配对形状单测。
 - **Shell 场景**：新增 `scenario_ha_failover.sh`（首次启用 `e2e_kill_node`，kill→MOVED-backup ~4-5s、
-  回切 ~5s）、`scenario_lite_mq.sh`（XADD/XREADGROUP/XPENDING/XACK/XAUTOCLAIM + ORDERED/INFLIGHT）、
+  回切 ~5s）、`scenario_lite_mq.sh`（XADD/XREADGROUP/XPENDING/XACK/XAUTOCLAIM + ORDERED/INFLIGHT，
+  2026-10-06 增 (g) DLQ/MAXDELIVERY 死信+DLQ 独立消费与 (h) XTRIM MINID/LIMIT/时间窗两段）、
   `scenario_migrate.sh`（`migrate task` 全流程 + 反向回迁）；`scenario_redis_session.sh` 增
   redis-py `RedisCluster()` 探针（**已连接成功**：protocol=2 跳过未实现的 HELLO；无 redis-py 自跳过）。
 - **漂移与卫生**：RESULTS.md/soak.yml 的“4 场景”漂移改为 glob 措辞；soak.yml 补装 confluent-kafka；

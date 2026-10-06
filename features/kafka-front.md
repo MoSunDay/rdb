@@ -81,8 +81,12 @@
   - offset 语义：`fetch_offset` = ordinal；`== len` → error 0 + **0 长度记录集**
     （不发空 batch）；`> len` → error 1 `OFFSET_OUT_OF_RANGE`（hwm=len）；
     未知 topic/分区 → error 3、hwm=-1。
-  - 记录取回：按字段对映射反向解码（0/1/2 对 → key/value 还原；带 headers 或
-    超长 → 通用 JSON envelope `{"fields":[[name,hex]]}`，key=None）；batch 的
+  - 记录取回：按字段对映射反向解码——0/1/2 对 → key/value 还原；**produce 形状
+    （恰一个 "h" 对 + 合法 headers JSON + 其余 "k"/"v"/`__null__` 各至多一次）还原为
+    真 record headers**（`parse_headers_json` 是 produce 侧 `headers_json` 的逆函数，
+    存储格式与存量数据零改动）；exotic 形状回退通用 JSON envelope
+    `{"fields":[[name,hex]]}`（key=None）并追加标记头 `("rdb-envelope", null)`，
+    客户端可据此区分兜底与真 headers；batch 的
     base_offset = 请求 ordinal、first_timestamp = 首条到达 ms。
   - 预算：全局 max_bytes 是**软上限**——每个存活分区保底 1 条（floor=1），
     partition_max_bytes 正常截断；扫描按 256 条/块分块。
@@ -220,7 +224,7 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
 | P0 | 骨架 + 帧编解码 + ApiVersions/Metadata + bind 接线 | 已落地 |
 | P1 | Produce(0) v0-v2 + ListOffsets(2) v0-v1 + topic/offset 映射层（无压缩） | 已落地 |
 | P2 | Fetch(1) v0-v10 读路径（offset=ordinal）+ OffsetCommit(8) v0-v2/OffsetFetch(9) v0-v7 + kind 0x20 提交偏移账本 | 已落地（ListOffsets v2+ 顺延至 P3） |
-| P3 | 组面：FindCoordinator/JoinGroup/SyncGroup/Heartbeat/LeaveGroup/DescribeGroups + eager rebalance + 世代 fencing；ListOffsets v2+ 与 XTRIM/XDEL 守卫顺延 | 已落地（membership 纯内存） |
+| P3 | 组面：FindCoordinator/JoinGroup/SyncGroup/Heartbeat/LeaveGroup/DescribeGroups + eager rebalance + 世代 fencing；ListOffsets v2+ 顺延（XTRIM/XDEL 账本守卫 2026-10-06 补齐，见偏差清单） | 已落地（membership 纯内存） |
 | P4 | rocksmq_bind：RocksMQ 风格 HTTP 前置（原 RocketMQ remoting 方案改为极简 HTTP，见 [rocksmq-http.md](./rocksmq-http.md)） | 已落地 |
 | P5a | 真实 SDK（confluent-kafka/librdkafka）实测 + 兼容性修复 + `scenario_kafka_sdk.sh` | 已落地 |
 | P5b | 压缩 produce 侧解压：gzip/snappy/lz4，cargo feature `kafka-codecs`（默认关）；fetch 恒未压缩 | 已落地 |
@@ -245,8 +249,9 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
 - **offset=ordinal 语义**：分区偏移是活跃（未 XDEL/XTRIM）条目集内的序数，trim 之后
   与物理条目不再一一对应；非 Kafka 的"不可变日志位移"。ListOffsets 的
   earliest/latest 已按 ordinal 语义实现（P1）；Fetch 的 offset 越界钳制 P2 细化。
-- **禁用 XTRIM/XDEL on kafka 流**：P2 起对 kafka 面创建的流拒绝 XTRIM/XDEL
-  （保护 ordinal 稳定性）；纯 Lite 流不受影响。
+- **有账本行的流禁 XTRIM/XDEL**：存在 kind-0x20 组提交账本行的流拒绝 XTRIM/XDEL
+  （保护 ordinal 稳定性；2026-10-06 起按账本行判定，文案见下方修复条目）；
+  无账本行的纯 Lite 流不受影响。
 - **无 ACL**：authorized_ops 字段恒为未置位哨兵（i32::MIN）。
 - **topic 枚举有界**：全量 Metadata 走全库有序扫描（上限 10 万物理键，超出则少报
   而不是阻塞连接）。
@@ -264,11 +269,19 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
   membership+generation 栅栏（member 先于 gen 检查）；仅组不在内存或已 Empty
   时降级为账本 generation 比较（v0 无字段跳过）。不校验 leader、不阻塞
   producer、无 txn/offset-metadata 存储（metadata 恒回 null）。
-- **账本回收缺口**：RENAME（`move_family`）不搬 0x20 账本行（STREAM_FAMILY 之外
-  的家族搬运本就未覆盖）；另外 0x1A 行首空格误读的老问题同样适用于 0x20
+- **RENAME 随搬 0x20 账本（2026-10-06 修复）**：`move_family` 对 STREAM_FAMILY 的
+  搬运现同时折叠 OFFSET_FAMILY 窗口——RENAME 后组账本随流迁到新名（守卫与账本行
+  一起跟过去）；旧名分区映射先解析再写入，故对旧名的 OffsetCommit 回
+  error 3 `UNKNOWN_TOPIC_OR_PARTITION`，不会落下悬空账本行。
+  历史注记（修复前缺口）：RENAME 曾不搬 0x20 账本行（STREAM_FAMILY 之外的家族
+  搬运本就未覆盖）；另 0x1A 行首空格误读的老问题同样适用于 0x20
   （`classify` 按 kind 字节判定，历史 0x1A 空格 bug 的窗口见 ds/codec 注记）。
-- **XTRIM/XDEL 守卫顺延 P3**：P2 交付时对 kafka 面流尚未拒绝 XTRIM/XDEL
-  （ordinal 稳定性风险仍在，偏差清单保留）。
+- **XTRIM/XDEL 账本守卫（2026-10-06 修复）**：流上存在任何 kind-0x20 组提交账本行
+  即拒绝 XTRIM/XDEL，文案
+  `ERR stream <name> has committed consumer-group offsets; delete the groups first`
+  （ordinal 稳定性：账本把 ordinal↔id 映射钉在活跃条目集上，删条目会使其漂移）；
+  无账本行的纯 Lite 流不受影响。历史注记（修复前缺口）：P2 交付时该守卫顺延 P3，
+  kafka 面流可被 XTRIM/XDEL 撕裂 ordinal 映射。
 
 ## 上线修复（2026-09-22，P0 三项）
 订阅/消费能力上线评估后修的阻断项（详见 `features/changelog/2026-09-22/kafka-launch-p0.md`）：
@@ -283,6 +296,21 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
    复用（稳态零分配）；e2e `connection_cap_closes_excess_sockets`。
 4. **指标修正**：Fetch 长轮询 park 时长不计入 `rdb_kafka_api_latency`（不再把
    客户端 max_wait 推向 +Inf 桶）；acks=0 无响应帧路径也打点。
+
+## 引擎批次修复（2026-10-06，MQ Batch 1 三项）
+kafka 面消费到的三处引擎级缺口（详见 `features/changelog/2026-10-06/mq-engine-batch1.md`
+与 `plans/2026-10-06-mq-gap/01`、`03`）：
+1. **headers 真回放**：Fetch 对 produce 形状的存储还原**真 record headers**
+   （"h" 对 JSON 反解，`parse_headers_json` = produce 侧写入的逆函数）；exotic
+   形状回退 JSON envelope 并加标记头 `("rdb-envelope", null)`，存量 envelope
+   数据照常兼容；存储格式零改动。e2e `tests/kafka_headers_roundtrip_e2e.rs`
+   （4 用例：真往返/tombstone/无 headers/exotic 兜底）。
+2. **RENAME 随搬 0x20 账本**：`move_family` 折叠 OFFSET_FAMILY 窗口，组账本随流
+   迁移；旧名 OffsetCommit 回 error 3 `UNKNOWN_TOPIC_OR_PARTITION`（映射解析先于
+   账本写入，无悬空行）。e2e `tests/kafka_rename_ledger_e2e.rs`（2 用例）。
+3. **XTRIM/XDEL 账本守卫**：有 0x20 账本行的流拒绝 XTRIM/XDEL
+   （`ERR stream <name> has committed consumer-group offsets; delete the groups
+   first`），ordinal↔id 映射不再被删条目撕裂（守卫同样保护 RESP 面的 Lite 流）。
 
 ## 风险注记（显式接受）
 - **单节点持久性是既知风险**：当年否决 Kafka front 的理由仍然成立——Kafka 客户端
@@ -326,6 +354,8 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
   Describe Stable→commit→Leave→rejoin→两层 fencing）；`tests/kafka_group_
   failover_e2e.rs`（session 超时 sweep 拉回 rebalance、重启丢 membership 但
   offsets 持久 + 跨重启 member id 不复用）；`tests/kafka_codec_e2e.rs`
-  （P5b 压缩 roundtrip，feature 门控）；场景脚本
+  （P5b 压缩 roundtrip，feature 门控）；`tests/kafka_headers_roundtrip_e2e.rs`
+  （headers 真回放 + envelope 兜底标记头）与 `tests/kafka_rename_ledger_e2e.rs`
+  （RENAME 随搬 0x20 账本 + 旧名 commit 回 3，MQ Batch 1）；场景脚本
   `scrtips/e2e_scenarios/scenario_kafka_sdk.sh`（P5a 真实 SDK，7/7）与
   `scenario_kafka_bench.sh`（P5c bench 工况）。

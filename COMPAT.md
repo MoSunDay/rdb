@@ -198,6 +198,23 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   - XINFO GROUPS replies 7 field/value pairs (14 elements): name, last-delivered-id,
     committed-id, ordered, inflight, owner (nil when unowned), epoch (0 for unordered
     groups). PEL rows carry the owning epoch for observability.
+  - XGROUP CREATE additionally accepts `MAXDELIVERY <n>=1` and `DLQ <name>` (orthogonal
+    to ORDERED; DLQ requires MAXDELIVERY): the delivery that would push times_delivered
+    past `n` dead-letters the row in ONE WAL batch — PEL row deleted, entry re-queued
+    into the DLQ stream (original fields + trace fields `__dlq_group`/`__dlq_consumer`/
+    `__dlq_times`/`__dlq_src`), watermark advanced as an XACK would; default target
+    `<stream>/dlq`; ordered groups transfer only the PEL head; metrics: `rdb_lite_dlq_depth` + `rdb_lite_messages{op="dlq"}`.
+  - Optional idle auto-redelivery via `lite.redelivery_idle_ms` (default 0 = sweep
+    OFF): a 200ms sweep re-hands idle PEL rows to their current consumer (times+1,
+    delivered_ms refreshed), over-MAXDELIVERY rows into the DLQ transfer; ordered
+    groups sweep only the head; `rdb_lite_messages{op="redeliver"}`.
+  - XTRIM accepts `MINID [<~|=>] <id> [LIMIT <n>]` (Redis-aligned, orthogonal to
+    MAXLEN): drops entries strictly below `<id>` (boundary survives); `~`/`=` behave
+    identically (exact victims), LIMIT after both; `<ms>-0` ids = time-window retention.
+  - XTRIM/XDEL ledger guard: a stream with ANY kind-0x20 committed-offset ledger row
+    rejects both commands with `ERR stream <name> has committed consumer-group
+    offsets; delete the groups first`; RENAME moves the rows with the stream family,
+    old-name OffsetCommit answers error 3 UNKNOWN_TOPIC_OR_PARTITION.
   - Explicit-id XREADGROUP (any id other than `>`) reads only that consumer's own PEL
     history from disk; consumer idle times derive from the PEL's delivered_ms (no
     per-activity tracking).
@@ -224,7 +241,12 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   committed offsets persist); assignment comes from the consumer leader (standard broker
   behavior). `kafka_advertised_host/port` override the advertised listener (wildcard
   binds would otherwise advertise localhost); `kafka_max_connections` caps front
-  connections (0 = 4096). Spec: [features/kafka-front.md](../features/kafka-front.md).
+  connections (0 = 4096). Fetch replays REAL record headers for produce-shaped stored
+  pairs (one "h" pair with valid headers JSON, others at most one "k"/"v"/`__null__`);
+  exotic shapes fall back to a JSON envelope value + marker header `("rdb-envelope",
+  null)` (storage unchanged, legacy envelope data readable); ledger rows refuse
+  XTRIM/XDEL and follow RENAME (error above). Spec:
+  [features/kafka-front.md](../features/kafka-front.md).
 - **JSON (P3, json.* verbs)**: single-record storage — one kind-0x10 record per key holds the
   whole document (LEB128 expire envelope + compact serde_json body, `preserve_order` keeps
   object key insertion order like Redis). Every mutation deserializes, mutates and re-serializes
