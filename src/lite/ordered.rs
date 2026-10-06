@@ -165,6 +165,84 @@ pub fn force_takeover(
     }
 }
 
+/// Outcome of a sweep-side ordered takeover ([`takeover_if_stale`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleAccess {
+    /// The queue is (re)owned by `consumer`: stamp the row with this
+    /// live epoch.
+    Own(u64),
+    /// A LIVE foreign holder owns the queue: hands off -- no depose, no
+    /// refresh; the row waits for the holder or a gated claim.
+    Held,
+}
+
+/// Lease-validating takeover for the idle sweep (the unattended twin of
+/// the claim path: XCLAIM/XAUTOCLAIM gate on `min-idle-time` before
+/// [`force_takeover`], the sweep has no such gate of its own, so the
+/// gate lives here). `consumer` (the PEL row's holder of record) may
+/// (re)take the queue ONLY when there is no owner or the CURRENT
+/// holder's lease is stale; a live holder is NEVER deposed and NEVER
+/// refreshed -- an unattended sweep refreshing a zombie holder's lease
+/// every round would keep `>` competitors `Busy` forever. The lease-age
+/// read and the takeover decision are ONE step under the ownership
+/// lock, so a consumer heart-beating concurrently (a `>` read
+/// refreshing its own lease through [`acquire`]) can never race the
+/// verdict.
+pub fn takeover_if_stale(
+    owners: &std::sync::Mutex<HashMap<OwnerKey, Owner>>,
+    stream: &[u8],
+    group: &[u8],
+    consumer: &[u8],
+    now_ms: u64,
+    lease_ms: u64,
+) -> StaleAccess {
+    let mut map = owners
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key: OwnerKey = (stream.to_vec(), group.to_vec());
+    match map.get(&key) {
+        // Free queue: take it exactly like `acquire` would.
+        None => {
+            map.insert(
+                key,
+                Owner {
+                    consumer: consumer.to_vec(),
+                    epoch: 1,
+                    active_ms: now_ms,
+                },
+            );
+            StaleAccess::Own(1)
+        }
+        // Self-holder: the row re-hands to its own consumer under the
+        // LIVE epoch. A live lease is left to decay untouched (the
+        // holder's own reads keep it fresh); a stale one is re-opened
+        // by the hand-out (same consumer, same epoch -- no fencing).
+        Some(o) if o.consumer == consumer => {
+            let epoch = o.epoch;
+            if !lease_live(o.active_ms, now_ms, lease_ms) {
+                map.get_mut(&key).unwrap().active_ms = now_ms;
+            }
+            StaleAccess::Own(epoch)
+        }
+        // Stale foreign holder (the zombie): depose it for the row's
+        // consumer; the epoch bump fences the zombie's later `>` reads.
+        Some(o) if !lease_live(o.active_ms, now_ms, lease_ms) => {
+            let epoch = o.epoch + 1;
+            map.insert(
+                key,
+                Owner {
+                    consumer: consumer.to_vec(),
+                    epoch,
+                    active_ms: now_ms,
+                },
+            );
+            StaleAccess::Own(epoch)
+        }
+        // Live foreign holder: the queue is legitimately theirs.
+        Some(_) => StaleAccess::Held,
+    }
+}
+
 /// XGROUP DELCONSUMER: release the queue if the departing consumer held
 /// it, so the next reader takes over without waiting out the lease.
 pub fn release_consumer(

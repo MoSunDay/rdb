@@ -511,6 +511,182 @@ fn fenced_block_reader_takes_over_on_lease_expiry() {
     reader.join().expect("reader thread");
 }
 
+// ---- sweep takeover (lease-validated) ------------------------------------
+
+/// A Shared whose config arms the idle sweep at `idle_ms`
+/// (`lite.redelivery_idle_ms`; 0 = off): the sweep is driven directly
+/// with an explicit "now", mirroring lite_redeliver_e2e.rs.
+fn shared_sweep_at(tag: &str, idle_ms: u64) -> state::Shared {
+    let c = conf::Config {
+        bind: format!("127.0.0.1:{tag}"),
+        store_path: "/tmp/".to_string(),
+        raft_tcp_address: format!("127.0.0.1:{}", tag.parse::<u16>().unwrap() + 100),
+        raft_token: "test-token".to_string(),
+        lite: conf::LiteConfig {
+            redelivery_idle_ms: idle_ms,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let dir = std::env::temp_dir().join(format!("rdb-lite-ord-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = rdb::store::data_path(dir.to_str().unwrap(), &c.bind);
+    open_shared(&c, &path)
+}
+
+/// One sweep round at "now".
+fn sweep(shared: &state::Shared, now: u64) {
+    let _ = rdb::lite::redeliver::sweep_once(shared, now);
+}
+
+/// (owner, epoch) out of `XINFO GROUPS o/q0 g` (positional flat array:
+/// the bulk after "owner" and the int after "epoch").
+fn owner_of(shared: &state::Shared, group: &[u8]) -> (String, u64) {
+    let info = text(&call(shared, "xinfo", &[b"groups", b"o/q0"]));
+    let toks: Vec<&str> = info.split("\r\n").collect();
+    let name = String::from_utf8_lossy(group).to_string();
+    let gi = toks.iter().position(|t| *t == name).unwrap_or(0);
+    let oi = toks.iter().position(|t| *t == "owner").unwrap();
+    let ei = toks.iter().position(|t| *t == "epoch").unwrap();
+    assert!(gi < oi, "group row found: {info}");
+    (
+        toks[oi + 2].to_string(),
+        // ints carry no length prefix: the value token is the next one.
+        toks[ei + 1].trim_start_matches(':').parse().unwrap_or(0),
+    )
+}
+
+/// The idle sweep takes an ordered queue only from a STALE holder.
+/// Zombie scenario: zB's head row is pending, zA took the queue after
+/// zB went silent, then zA itself goes stale -- the sweep's
+/// redelivery of zB's head row deposes the stale zA FOR zB (epoch
+/// bump); afterwards zA is fenced out and zB drains the queue.
+#[test]
+fn sweep_deposes_only_a_stale_holder() {
+    let shared = shared_sweep_at("44317", 1);
+    for i in 1..=3u8 {
+        call(
+            &shared,
+            "xadd",
+            &[
+                b"o/q0",
+                format!("1-{i}").as_bytes(),
+                b"f",
+                &[b'v', b'0' + i],
+            ],
+        );
+    }
+    call(
+        &shared,
+        "xgroup",
+        &[
+            b"create",
+            b"o/q0",
+            b"g",
+            b"0-0",
+            b"ordered",
+            b"inflight",
+            b"3",
+        ],
+    );
+    // zB delivers the head and owns the queue...
+    assert!(text(&read_one(&shared, b"g", b"zB")).contains("v1"));
+    // ...then goes silent; a shrunken lease lets zA take over and
+    // deliver 1-2 (zB's head row keeps naming zB).
+    shared.lite.set_lease_ms(1);
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(text(&read_one(&shared, b"g", b"zA")).contains("v2"));
+    let (pre_owner, pre_epoch) = owner_of(&shared, b"g");
+    assert_eq!(
+        (pre_owner.as_str(), pre_epoch),
+        ("zA", 2),
+        "zA holds epoch 2"
+    );
+    // zA goes stale too (lease still 1ms): the sweep redelivers the
+    // HEAD row (zB's) and takes the queue for zB.
+    std::thread::sleep(Duration::from_millis(5));
+    sweep(&shared, rdb::ds::expire::now_ms());
+    // A healthy lease again: the takeover must be observable and sticky.
+    shared.lite.set_lease_ms(30_000);
+    assert_eq!(
+        owner_of(&shared, b"g"),
+        ("zB".to_string(), 3),
+        "deposed for zB"
+    );
+    let rows = pel_rows(&call(
+        &shared,
+        "xpending",
+        &[b"o/q0", b"g", b"-", b"+", b"10"],
+    ));
+    let head = rows.iter().find(|r| r[1] == "1-1").expect("head row");
+    assert_eq!(head[3], "zB", "row keeps its consumer: {rows:?}");
+    assert_eq!(head[5], ":2", "sweep bumped the delivery count");
+    // The deposed zA is fenced out; the new owner drains the queue.
+    assert_eq!(read_one(&shared, b"g", b"zA"), b"*-1\r\n".to_vec());
+    assert!(text(&read_one(&shared, b"g", b"zB")).contains("v3"));
+}
+
+/// A live holder is NEVER deposed (nor lease-refreshed) by the sweep:
+/// zA holds a fresh lease while zB's idle head row comes due -- the
+/// row is left untouched (times frozen, consumer unchanged) and zA
+/// keeps the queue and keeps delivering.
+#[test]
+fn sweep_never_deposes_a_live_holder() {
+    let shared = shared_sweep_at("44318", 1);
+    for i in 1..=3u8 {
+        call(
+            &shared,
+            "xadd",
+            &[
+                b"o/q0",
+                format!("1-{i}").as_bytes(),
+                b"f",
+                &[b'v', b'0' + i],
+            ],
+        );
+    }
+    call(
+        &shared,
+        "xgroup",
+        &[
+            b"create",
+            b"o/q0",
+            b"g",
+            b"0-0",
+            b"ordered",
+            b"inflight",
+            b"3",
+        ],
+    );
+    assert!(text(&read_one(&shared, b"g", b"zB")).contains("v1"));
+    // zB silent -> zA takes the queue (epoch 2), then RESTORES a
+    // healthy lease: zA is live from here on.
+    shared.lite.set_lease_ms(1);
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(text(&read_one(&shared, b"g", b"zA")).contains("v2"));
+    shared.lite.set_lease_ms(30_000);
+    let before = owner_of(&shared, b"g");
+    assert_eq!(before, ("zA".to_string(), 2), "precondition: zA live");
+    // Two sweep rounds against the idle head row (it names zB): the
+    // live zA must keep ownership and the row must not be re-handed.
+    for _ in 0..2 {
+        sweep(&shared, rdb::ds::expire::now_ms());
+    }
+    assert_eq!(owner_of(&shared, b"g"), before, "no depose, no refresh");
+    let rows = pel_rows(&call(
+        &shared,
+        "xpending",
+        &[b"o/q0", b"g", b"-", b"+", b"10"],
+    ));
+    let head = rows.iter().find(|r| r[1] == "1-1").expect("head row");
+    assert_eq!(head[3], "zB", "consumer unchanged: {rows:?}");
+    assert_eq!(head[5], ":1", "times frozen while the holder is live");
+    // The healthy owner is undisturbed: still delivering, zB fenced.
+    assert_eq!(read_one(&shared, b"g", b"zB"), b"*-1\r\n".to_vec());
+    assert!(text(&read_one(&shared, b"g", b"zA")).contains("v3"));
+}
+
 // ---- helpers -------------------------------------------------------------
 
 /// `>` read capped at COUNT 1: one delivery per call.

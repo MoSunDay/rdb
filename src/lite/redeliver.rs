@@ -5,8 +5,9 @@
 //! latches the delivery paths take, every idle PEL row is re-handed to
 //! its CURRENT consumer (clock refresh + count bump -- the claim
 //! primitive), MAXDELIVERY rows folding into the dead-letter transfer.
-//! Ordered groups sweep only the head via `ordered::force_takeover`,
-//! like a claim. OFF by default. Rounds are SYNC and their latches
+//! Ordered groups sweep only the head via `ordered::takeover_if_stale`
+//! (a LEASE-VALIDATED claim: a live holder is never deposed or
+//! refreshed). OFF by default. Rounds are SYNC and their latches
 //! OPPORTUNISTIC (`latch::try_lock`): a mid-command stream is skipped
 //! one round, never parked on.
 
@@ -28,6 +29,16 @@ pub(crate) const GROUP_BUDGET: usize = 32;
 pub(crate) const ROW_BUDGET: usize = 16;
 /// Keys walked per discovery scan.
 const SCAN_LIMIT: usize = 4096;
+/// Per-group resume cursors kept at once; past the cap the map resets
+/// to head-scans for a round (degraded reachability, never a stall) --
+/// the alternative, never forgetting destroyed groups' cursors, grows
+/// without bound.
+const RESUME_CAP: usize = 4096;
+
+/// Last examined pending id per (stream, group): the sweep's rotation
+/// state for in-group fairness (a group whose head rows are always
+/// fresh still reaches its tail -- see `sweep_group`).
+pub type ResumeMap = std::collections::HashMap<(Vec<u8>, Vec<u8>), model::EntryId>;
 
 /// Verdict for one scanned PEL row (pure: clocks in, one fate out):
 /// Skip = below the threshold (keeps waiting with its consumer),
@@ -102,14 +113,24 @@ pub(crate) fn discover_groups(
 pub type RoundTally = (usize, usize, Vec<u8>);
 
 /// One full round from the head (the public round unit: tests, cold
-/// starts); the spawn loop uses [`sweep_from`] to rotate its cursor.
+/// starts); the spawn loop uses [`sweep_from`] to rotate its cursors.
 pub fn sweep_once(shared: &state::Shared, now_ms: u64) -> RoundTally {
-    sweep_from(shared, now_ms, &[])
+    let mut resumes = ResumeMap::new();
+    sweep_from(shared, now_ms, &[], &mut resumes)
 }
 
 /// One round resuming strictly after `from` (the previous round's
-/// returned cursor): (redelivered, dead-lettered, next cursor).
-pub(crate) fn sweep_from(shared: &state::Shared, now_ms: u64, from: &[u8]) -> RoundTally {
+/// returned group-discovery cursor) and, per group, strictly after that
+/// group's last examined pending id in `resumes` (in-group fairness:
+/// with a fresh head the next round looks PAST it instead of re-reading
+/// the same first rows forever): (redelivered, dead-lettered, next
+/// discovery cursor).
+pub fn sweep_from(
+    shared: &state::Shared,
+    now_ms: u64,
+    from: &[u8],
+    resumes: &mut ResumeMap,
+) -> RoundTally {
     let idle_ms = shared.conf.lite.redelivery_idle_ms;
     if idle_ms == 0 {
         return (0, 0, from.to_vec()); // disabled: never scheduled anyway
@@ -118,17 +139,26 @@ pub(crate) fn sweep_from(shared: &state::Shared, now_ms: u64, from: &[u8]) -> Ro
         return (0, 0, from.to_vec());
     };
     let tally = |(r, d): (usize, usize), g: &Discovered| {
-        let (gr, gd) = sweep_group(shared, idle_ms, now_ms, g);
+        let (gr, gd) = sweep_group(shared, idle_ms, now_ms, g, resumes);
         (r + gr, d + gd)
     };
     let (redelivered, dlqed) = groups.iter().fold((0, 0), tally);
+    if resumes.len() > RESUME_CAP {
+        resumes.clear(); // destroyed groups' stale cursors must not leak
+    }
     (redelivered, dlqed, cursor)
 }
 
 /// Sweep one group: try its latch set (stream + sorted DLQ target),
 /// then plan the PEL head window, ONE batch for rewrites + transfers,
 /// one synced write, wake readers. Contention contributes zero.
-fn sweep_group(shared: &state::Shared, idle: u64, now: u64, g: &Discovered) -> (usize, usize) {
+fn sweep_group(
+    shared: &state::Shared,
+    idle: u64,
+    now: u64,
+    g: &Discovered,
+    resumes: &mut ResumeMap,
+) -> (usize, usize) {
     let Some(prefix) = model::stream_prefix(&g.stream) else {
         return (0, 0);
     };
@@ -175,16 +205,34 @@ fn sweep_group(shared: &state::Shared, idle: u64, now: u64, g: &Discovered) -> (
     // flushed watermark can never name ids the store never resolved.
     let mark = offset::mark(&shared.lite.offsets, &g.stream, &g.group);
     let (stream, group) = (&g.stream, &g.group);
+    // In-group resume (starvation fix): a full ROW_BUDGET window may
+    // hide rows behind it, so the next round for this group starts
+    // STRICTLY AFTER the last id examined now; a short window proved
+    // the PEL tail was reached and the cursor wraps to the head, so
+    // fresh head rows are still revisited. Ordered groups only ever
+    // move the head, so they carry no cursor (always scan the head).
+    let scan_from = match resumes.get(&(stream.clone(), group.clone())) {
+        Some(last) => super::read::succ_id(*last).unwrap_or(model::MIN_ID),
+        None => model::MIN_ID,
+    };
     let Ok(rows) = pel::scan_pend(
         &shared.store,
         &prefix,
         stream,
         group,
-        model::MIN_ID,
+        scan_from,
         Some(ROW_BUDGET),
     ) else {
-        return (0, 0);
+        return (0, 0); // scan failed: window unexamined, cursor kept
     };
+    let resume_key = (stream.clone(), group.clone());
+    if st.ordered || rows.len() < ROW_BUDGET {
+        // Head-only (ordered) or a short scan reached the tail: the
+        // next round re-reads from the head.
+        resumes.remove(&resume_key);
+    } else {
+        resumes.insert(resume_key, rows[rows.len() - 1].id);
+    }
     if rows.is_empty() {
         return (0, 0); // acked rows are gone: nothing to sweep
     }
@@ -204,11 +252,26 @@ fn sweep_group(shared: &state::Shared, idle: u64, now: u64, g: &Discovered) -> (
         }
         if due == RowAction::Redeliver {
             // Claim primitive, consumer unchanged: clock refresh + count
-            // bump; an ordered head takes ownership (the generation bump
-            // fences a deposed owner, the lease refresh reopens it).
+            // bump. Ordered groups must also (re)acquire the queue for
+            // the row's consumer -- but ONLY from a stale holder
+            // (`takeover_if_stale`): a live holder is never deposed or
+            // refreshed, so the unattended sweep can neither fence out
+            // a healthy consumer nor keep `>` competitors `Busy` by
+            // endlessly refreshing a zombie's lease; against a live
+            // foreign holder the head simply waits a round.
             let owners = &shared.lite.owners;
             let epoch = if st.ordered {
-                ordered::force_takeover(owners, stream, group, &row.state.consumer, now)
+                match ordered::takeover_if_stale(
+                    owners,
+                    stream,
+                    group,
+                    &row.state.consumer,
+                    now,
+                    shared.lite.lease_ms(),
+                ) {
+                    ordered::StaleAccess::Own(e) => e,
+                    ordered::StaleAccess::Held => break, // live holder: no depose
+                }
             } else {
                 row.state.epoch
             };

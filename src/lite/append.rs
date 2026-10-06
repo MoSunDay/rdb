@@ -338,7 +338,8 @@ fn ledger_guarded(ctx: &mut Ctx<'_>, prefix: &[u8], stream: &[u8]) -> bool {
         resp::append_error(
             ctx.out,
             &format!(
-                "ERR stream {} has committed consumer-group offsets; delete the groups first",
+                "ERR stream {} has committed consumer-group offsets; \
+                 destroy the owning consumer groups (XGROUP DESTROY) first",
                 String::from_utf8_lossy(stream)
             ),
         );
