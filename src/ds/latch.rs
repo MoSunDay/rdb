@@ -135,6 +135,38 @@ async fn acquire(latch: &Latch, key: &[u8]) -> OwnedSemaphorePermit {
     sem.acquire_owned().await.expect("latch semaphore closed")
 }
 
+/// Opportunistic (non-awaiting) twin of [`lock`] for callers that
+/// cannot park a task -- the sync background sweeps parked on the
+/// blocking pool. `None` when another holder owns the key RIGHT NOW:
+/// such callers skip their round and retry later instead of blocking a
+/// thread, which keeps the one-permit FIFO semantics intact.
+pub fn try_lock(latch: &Latch, key: &[u8]) -> Option<KeyGuard> {
+    let sem = {
+        let mut shard = latch.shards[shard_of(key)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shard
+            .entry(key.to_vec())
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone()
+    };
+    let permit = sem.try_acquire_owned().ok()?;
+    match tracking_mode(key) {
+        Tracking::Reentrant => Some(KeyGuard {
+            permit: None,
+            tracked: None,
+        }),
+        Tracking::Owned => Some(KeyGuard {
+            permit: Some(permit),
+            tracked: Some(key.to_vec()),
+        }),
+        Tracking::Untracked => Some(KeyGuard {
+            permit: Some(permit),
+            tracked: None,
+        }),
+    }
+}
+
 /// How this acquisition participates in task-local EXEC tracking.
 enum Tracking {
     /// EXEC already holds the key: pure no-op guard.

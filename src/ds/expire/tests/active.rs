@@ -184,6 +184,7 @@ fn sampler_reap_of_stream_invalidates_offset_cache() {
             committed_seq: 0,
             ordered: false,
             inflight_max: 0,
+            ..Default::default()
         }),
     );
     ops::batch_write(&store, batch).unwrap();
@@ -199,6 +200,8 @@ fn sampler_reap_of_stream_invalidates_offset_cache() {
             pending: 0,
             ordered: false,
             inflight_max: 0,
+            maxdelivery: 0,
+            dlq: Vec::new(),
         },
     );
     crate::lite::offset::ack(

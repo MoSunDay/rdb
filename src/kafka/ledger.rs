@@ -170,6 +170,26 @@ pub fn scan_group(store: &Store, group: &[u8]) -> Result<Vec<LedgerRow>, String>
     Ok(out)
 }
 
+/// Does `stream` have ANY ledger row under `prefix`? Bounded probe for
+/// the XTRIM/XDEL guard: iterate from the stream's kind-0x20 window
+/// start and inspect ONE key -- the immediate successor of the window
+/// lower bound either carries the `"/" ++ group` suffix (rows exist) or
+/// belongs to a different key entirely (window empty). Ledger rows are
+/// the only keys shaped `data_key(0x20, stream) ++ ...`, so the
+/// `starts_with` test cannot false-positive on a neighbour.
+pub fn has_rows(store: &Store, prefix: &[u8], stream: &[u8]) -> Result<bool, String> {
+    let (lower, _) = codec::family_delete_ranges(prefix, codec::OFFSET_FAMILY, stream)
+        .into_iter()
+        .next()
+        .expect("OFFSET_FAMILY yields exactly one range");
+    let mut found = false;
+    ops::for_each_from(store, &lower, false, &mut |k, _| {
+        found = k.starts_with(&lower);
+        false // one key decides both ways
+    })?;
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +266,32 @@ mod tests {
         assert_eq!(all[0].stream, b"t/p0".to_vec());
         assert_eq!(all[0].committed_ordinal, 5);
         assert!(scan_group(&store, b"nogroup").unwrap().is_empty());
+    }
+
+    #[test]
+    fn has_rows_probe_true_only_with_rows() {
+        let shared = crate::state::testutil::shared_with(crate::state::testutil::test_config());
+        let store = shared.store.clone();
+        let pfx = prefix(b"t/p0");
+        // Empty window (also a never-created stream).
+        assert!(!has_rows(&store, &pfx, b"t/p0").unwrap());
+        // One row anywhere in the window flips the probe.
+        let mut batch = rocksdb::WriteBatch::default();
+        put_rows(
+            &mut batch,
+            &[LedgerRow {
+                stream: b"t/p0".to_vec(),
+                group: b"g1".to_vec(),
+                prefix: pfx.clone(),
+                committed_ordinal: 3,
+                generation: 1,
+                leader: "m-1".into(),
+            }],
+        );
+        ops::batch_write(&store, batch).unwrap();
+        assert!(has_rows(&store, &pfx, b"t/p0").unwrap());
+        // A neighbouring stream's rows never leak into the probe.
+        assert!(!has_rows(&store, &pfx, b"t/p1").unwrap());
+        assert!(!has_rows(&store, &prefix(b"other/p0"), b"other/p0").unwrap());
     }
 }

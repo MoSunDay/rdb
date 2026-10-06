@@ -16,6 +16,7 @@ pub mod ack;
 pub mod append;
 pub mod autoclaim;
 pub mod claim;
+pub mod dlq;
 pub mod entries;
 pub mod group;
 pub mod info;
@@ -27,7 +28,11 @@ pub mod pel;
 pub mod pending;
 pub mod range_rev;
 pub mod read;
+pub mod redeliver;
 pub mod select;
+
+#[cfg(test)]
+mod read_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -72,7 +77,13 @@ pub fn parse_topic_name(name: &[u8]) -> Result<TopicName, String> {
         }
         Some(i) => {
             let (parent, child) = (&name[..i], &name[i + 1..]);
-            if valid_part(parent) && valid_part(child) {
+            // The child may itself carry '/'-separated parts (nested
+            // stream names: the engine-derived `<stream>/dlq` dead-letter
+            // targets, DLQ 01 §3): every SEGMENT is validated, the slot
+            // stays the PARENT's (first-slash prefix, model::
+            // stream_prefix) and queue discovery (select::discover_
+            // children) already excludes nested names from XADD picks.
+            if valid_part(parent) && child.split(|&b| b == b'/').all(valid_part) {
                 Ok(TopicName::Stream(parent.to_vec(), child.to_vec()))
             } else {
                 Err(format!("ERR invalid stream name '{text}'"))
@@ -342,6 +353,8 @@ pub fn spawn_background(shared: Arc<state::Shared>) {
                 &shared.monitor,
                 offset::total_pending(&shared.lite.offsets) as f64,
             );
+            // DLQ stream depths (point reads over the configured set).
+            dlq::refresh_dlq_depth(&shared);
             // Deferred orphan sweeps queued by non-command delete paths
             // (XIDLE reaps, lazy idle purges) since the last tick.
             drain_reaps(&shared).await;

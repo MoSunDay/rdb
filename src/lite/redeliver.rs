@@ -1,0 +1,399 @@
+//! Idle auto-redelivery sweep (design two, `lite.redelivery_idle_ms`):
+//! the unattended twin of XAUTOCLAIM. A rotating bounded scan discovers
+//! groups straight from the kind-0x0E window (a group never touched
+//! since boot is still found); per group, under the same per-stream
+//! latches the delivery paths take, every idle PEL row is re-handed to
+//! its CURRENT consumer (clock refresh + count bump -- the claim
+//! primitive), MAXDELIVERY rows folding into the dead-letter transfer.
+//! Ordered groups sweep only the head via `ordered::force_takeover`,
+//! like a claim. OFF by default. Rounds are SYNC and their latches
+//! OPPORTUNISTIC (`latch::try_lock`): a mid-command stream is skipped
+//! one round, never parked on.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use rocksdb::WriteBatch;
+
+use crate::ds::{codec, expire, latch, wait};
+use crate::monitor;
+use crate::state;
+use crate::store::ops;
+
+use super::offset;
+use super::ordered;
+use super::pel;
+use super::{dlq, model};
+
+/// Groups examined per round (rotation keeps every group reachable).
+pub(crate) const GROUP_BUDGET: usize = 32;
+/// PEL rows examined per group per round (a big PEL rides later rounds).
+pub(crate) const ROW_BUDGET: usize = 16;
+/// Keys walked per discovery scan / sweep rhythm, ms (flusher cadence).
+const SCAN_LIMIT: usize = 4096;
+const PERIOD_MS: u64 = 200;
+
+/// Verdict for one scanned PEL row (pure: clocks in, one fate out):
+/// Skip = below the threshold (keeps waiting with its consumer),
+/// Redeliver = re-hand to the row's consumer (clock + count bump),
+/// DeadLetter = the next hand-out would pass MAXDELIVERY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowAction {
+    Skip,
+    Redeliver,
+    DeadLetter,
+}
+
+pub(crate) fn row_action(now: u64, idle: u64, delivered: u64, times: u64, cap: u64) -> RowAction {
+    if now.saturating_sub(delivered) < idle {
+        RowAction::Skip
+    } else if dlq::should_dead_letter(times, cap) {
+        RowAction::DeadLetter
+    } else {
+        RowAction::Redeliver
+    }
+}
+
+/// One (stream, group) located by the rotating group-record scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Discovered {
+    pub stream: Vec<u8>,
+    pub group: Vec<u8>,
+}
+
+/// Bounded rotating discovery of group records (kind 0x0E), strictly
+/// after `from` (empty = head), at most [`GROUP_BUDGET`] groups within
+/// [`SCAN_LIMIT`] keys (the expire sampler's pattern: high keys never
+/// starve). Returns the groups plus the resume cursor -- EMPTY when
+/// the scan ran to the tail. Values are not decoded: the sweep
+/// re-validates each group under its latches.
+pub(crate) fn discover_groups(
+    store: &crate::store::Store,
+    from: &[u8],
+) -> Result<(Vec<Discovered>, Vec<u8>), String> {
+    let mut out: Vec<Discovered> = Vec::new();
+    let mut cursor = from.to_vec();
+    let mut examined = 0usize;
+    let mut wrapped = true;
+    ops::for_each_from(store, from, true, &mut |k, _| {
+        if out.len() >= GROUP_BUDGET || examined >= SCAN_LIMIT {
+            wrapped = false; // resume strictly after the last examined key
+            return false;
+        }
+        examined += 1;
+        cursor = k.to_vec();
+        let group_rec = expire::slot_prefix_len(k)
+            .filter(|plen| k.get(*plen) == Some(&codec::KIND_STREAM_GROUP))
+            .and_then(|plen| codec::decode_data_key(k, plen));
+        if let Some((_, stream, group)) = group_rec {
+            if !stream.is_empty() && !group.is_empty() {
+                out.push(Discovered {
+                    stream: stream.to_vec(),
+                    group: group.to_vec(),
+                });
+            }
+        }
+        true
+    })?;
+    if wrapped {
+        cursor.clear();
+    }
+    Ok((out, cursor))
+}
+
+/// One round's outcome: (redelivered, dead-lettered, resume cursor;
+/// an empty cursor restarts the next round at the head).
+pub type RoundTally = (usize, usize, Vec<u8>);
+
+/// One full round from the head (the public round unit: tests, cold
+/// starts); the spawn loop uses [`sweep_from`] to rotate its cursor.
+pub fn sweep_once(shared: &state::Shared, now_ms: u64) -> RoundTally {
+    sweep_from(shared, now_ms, &[])
+}
+
+/// One round resuming strictly after `from` (the previous round's
+/// returned cursor): (redelivered, dead-lettered, next cursor).
+pub(crate) fn sweep_from(shared: &state::Shared, now_ms: u64, from: &[u8]) -> RoundTally {
+    let idle_ms = shared.conf.lite.redelivery_idle_ms;
+    if idle_ms == 0 {
+        return (0, 0, from.to_vec()); // disabled: never scheduled anyway
+    }
+    let Ok((groups, cursor)) = discover_groups(&shared.store, from) else {
+        return (0, 0, from.to_vec());
+    };
+    let tally = |(r, d): (usize, usize), g: &Discovered| {
+        let (gr, gd) = sweep_group(shared, idle_ms, now_ms, g);
+        (r + gr, d + gd)
+    };
+    let (redelivered, dlqed) = groups.iter().fold((0, 0), tally);
+    (redelivered, dlqed, cursor)
+}
+
+/// Sweep one group: try its latch set (stream + sorted DLQ target),
+/// then plan the PEL head window, ONE batch for rewrites + transfers,
+/// one synced write, wake readers. Contention contributes zero.
+fn sweep_group(shared: &state::Shared, idle: u64, now: u64, g: &Discovered) -> (usize, usize) {
+    let Some(prefix) = model::stream_prefix(&g.stream) else {
+        return (0, 0);
+    };
+    // Pre-lock state load (read-only, warms the cache): only the
+    // immutable CREATE config (maxdelivery/dlq) decides the key set.
+    let dlq_stream = offset::load(
+        &shared.lite.offsets,
+        &shared.store,
+        &prefix,
+        &g.stream,
+        &g.group,
+    )
+    .ok()
+    .flatten()
+    .filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
+    .map(|st| st.dlq);
+    let keys = dlq::latch_keys(model::meta_key(&prefix, &g.stream), dlq_stream.as_deref());
+    let mut guards = Vec::with_capacity(keys.len());
+    for k in &keys {
+        // Sorted order; RAII drops the partial set on a miss.
+        match latch::try_lock(&shared.latch, k) {
+            Some(guard) => guards.push(guard),
+            None => return (0, 0), // mid-command: next round
+        }
+    }
+    // Re-load under the latch: command paths kept the cache current.
+    let Ok(Some(st)) = offset::load(
+        &shared.lite.offsets,
+        &shared.store,
+        &prefix,
+        &g.stream,
+        &g.group,
+    ) else {
+        return (0, 0);
+    };
+    let (stream, group) = (&g.stream, &g.group);
+    let Ok(rows) = pel::scan_pend(
+        &shared.store,
+        &prefix,
+        stream,
+        group,
+        model::MIN_ID,
+        Some(ROW_BUDGET),
+    ) else {
+        return (0, 0);
+    };
+    if rows.is_empty() {
+        return (0, 0); // acked rows are gone: nothing to sweep
+    }
+    let mut batch = WriteBatch::default();
+    let mut dead: Vec<dlq::DeadRow> = Vec::new();
+    let mut redelivered = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        // Ordered groups deliver (and claim) the head only, so the sweep
+        // moves the head only; deeper rows wait until they ARE the head.
+        if st.ordered && i > 0 {
+            break;
+        }
+        let (delivered, times) = (row.state.delivered_ms, row.state.times_delivered);
+        let due = row_action(now, idle, delivered, times, st.maxdelivery);
+        if due == RowAction::Skip {
+            continue;
+        }
+        if due == RowAction::Redeliver {
+            // Claim primitive, consumer unchanged: clock refresh + count
+            // bump; an ordered head takes ownership (the generation bump
+            // fences a deposed owner, the lease refresh reopens it).
+            let owners = &shared.lite.owners;
+            let epoch = if st.ordered {
+                ordered::force_takeover(owners, stream, group, &row.state.consumer, now)
+            } else {
+                row.state.epoch
+            };
+            batch.put(
+                pel::pend_key(&prefix, stream, group, row.id),
+                pel::encode_pend(&pel::PendState {
+                    consumer: row.state.consumer.clone(),
+                    delivered_ms: now,
+                    times_delivered: times.saturating_add(1),
+                    epoch,
+                }),
+            );
+            redelivered += 1;
+        } else {
+            dead.push(dlq::DeadRow {
+                id: row.id,
+                times,
+                consumer: row.state.consumer.clone(),
+            });
+        }
+        if st.ordered {
+            break; // the head alone moves (either fate)
+        }
+    }
+    if redelivered == 0 && dead.is_empty() {
+        return (0, 0); // nothing due: no batch, no write
+    }
+    let mut dlqed = 0usize;
+    if !dead.is_empty() {
+        let t = dlq::transfer_ctx(shared, &mut batch, &prefix, stream, group, &st);
+        if let Ok(k) = dlq::transfer_entries(t, &dead, now) {
+            dlqed = k;
+            offset::bump_pending(&shared.lite.offsets, stream, group, -(k as i64));
+        }
+    }
+    if ops::batch_write(&shared.store, batch).is_err() {
+        return (0, 0); // the batch never landed: next round re-plans
+    }
+    // Zero counts are observable no-ops, so both fire unconditionally.
+    monitor::observe_lite_message(&shared.monitor, "redeliver", redelivered as u64);
+    monitor::observe_lite_message(&shared.monitor, "dlq", dlqed as u64);
+    // Clocks moved, window slots freed, the DLQ grew: wake readers.
+    wait::notify(&shared.wait_hub, &model::meta_key(&prefix, stream));
+    if dlqed > 0 {
+        dlq::notify_transfer(shared, &prefix, stream, &st.dlq);
+    }
+    (redelivered, dlqed)
+}
+
+/// Background sweep task: one [`sweep_from`] round every 200ms on the
+/// blocking pool, cursor rotating; no task at all unless configured.
+pub fn spawn_redelivery_sweep(shared: Arc<state::Shared>) {
+    if shared.conf.lite.redelivery_idle_ms == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(PERIOD_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // consume the immediate first tick
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            ticker.tick().await;
+            let (sh, from) = (Arc::clone(&shared), cursor.clone());
+            // Sync scans + one synced write: blocking pool, never a
+            // tokio worker; a JoinError keeps the cursor, next tick.
+            if let Ok((_, _, next)) =
+                tokio::task::spawn_blocking(move || sweep_from(&sh, expire::now_ms(), &from)).await
+            {
+                cursor = next;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::model::EntryId;
+    use super::*;
+    use crate::state::testutil;
+
+    /// Encoded PEL row of consumer c1 (tests stamp fixed clocks).
+    fn pend(delivered: u64, times: u64) -> Vec<u8> {
+        pel::encode_pend(&pel::PendState {
+            consumer: b"c1".to_vec(),
+            delivered_ms: delivered,
+            times_delivered: times,
+            epoch: 0,
+        })
+    }
+
+    #[test]
+    fn row_action_boundaries() {
+        // Below the threshold: wait; exactly AT it sweeps (>=).
+        assert_eq!(row_action(500, 100, 450, 1, 0), RowAction::Skip);
+        assert_eq!(row_action(500, 100, 400, 1, 0), RowAction::Redeliver);
+        // Idle rows: times+1 <= max redelivers; past it, dead-letter.
+        assert_eq!(row_action(500, 100, 100, 2, 2), RowAction::DeadLetter);
+        assert_eq!(row_action(500, 100, 100, 9, 0), RowAction::Redeliver);
+        assert_eq!(row_action(500, 100, 100, 1, 2), RowAction::Redeliver);
+    }
+
+    /// Discovery decodes KEYS only: records come back ordered and
+    /// bounded, the cursor resuming strictly after the last key.
+    #[test]
+    fn discover_groups_rotates_with_budget() {
+        let shared = testutil::shared_with(testutil::test_config());
+        let prefix = crate::hash::slot_with_prefix(b"t").1;
+        let mut batch = WriteBatch::default();
+        let graw = model::encode_group(&model::GroupPayload::default());
+        for (stream, group) in [("t/q0", "g1"), ("t/q0", "g2"), ("t/q1", "g3")] {
+            let gkey = model::group_key(&prefix, stream.as_bytes(), group.as_bytes());
+            batch.put(gkey, graw.clone());
+        }
+        ops::batch_write(&shared.store, batch).unwrap();
+        let (all, cursor) = discover_groups(&shared.store, &[]).unwrap();
+        assert_eq!(all.len(), 3, "every group of both streams");
+        assert!(cursor.is_empty(), "ran to the tail: wrap next round");
+        assert!(all
+            .iter()
+            .any(|g| &g.stream == b"t/q1" && &g.group == b"g3"));
+        // (Resume-strictly-after mirrors the expire sampler's cursor
+        // contract; the wrap case is asserted above.)
+    }
+
+    /// Full rounds over a seeded store: an idle row re-hands to its own
+    /// consumer (clock + count), then the MAXDELIVERY round folds into
+    /// the dead-letter transfer (PEL drained, DLQ entry landed).
+    #[test]
+    fn sweep_once_redelivers_then_dead_letters() {
+        let mut conf = testutil::test_config();
+        conf.lite.redelivery_idle_ms = 100;
+        let shared = testutil::shared_with(conf);
+        let (stream, group, e1) = (b"t/q0".to_vec(), b"g".to_vec(), EntryId { ms: 1, seq: 0 });
+        let prefix = crate::hash::slot_with_prefix(b"t").1;
+        let mut seed = WriteBatch::default();
+        seed.put(
+            model::meta_key(&prefix, &stream),
+            model::encode_meta(&model::MetaPayload {
+                created_ms: 1,
+                last_ms: 1,
+                len: 1,
+                ..Default::default()
+            }),
+        );
+        seed.put(
+            model::entry_key(&prefix, &stream, e1),
+            model::encode_entry(&[(b"f", b"v1")]),
+        );
+        let dlq_target = dlq::default_dlq_stream(&stream);
+        let g = model::GroupPayload {
+            maxdelivery: 2,
+            dlq: dlq_target.clone(),
+            ..Default::default()
+        };
+        seed.put(
+            model::group_key(&prefix, &stream, &group),
+            model::encode_group(&g),
+        );
+        seed.put(pel::pend_key(&prefix, &stream, &group, e1), pend(100, 1));
+        ops::batch_write(&shared.store, seed).unwrap();
+        // Round 1 (now=600): idle; 1 -> 2 stays within the cap.
+        assert_eq!(sweep_once(&shared, 600), (1, 0, Vec::new()));
+        let st = pel::get_pend(&shared.store, &prefix, &stream, &group, e1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (st.times_delivered, st.delivered_ms, st.consumer),
+            (2, 600, b"c1".to_vec())
+        );
+        // Round 2 (now=800): 2 -> 3 > 2 -> the DLQ hand-off.
+        assert_eq!(sweep_once(&shared, 800), (0, 1, Vec::new()));
+        assert!(
+            pel::get_pend(&shared.store, &prefix, &stream, &group, e1)
+                .unwrap()
+                .is_none(),
+            "PEL row drained"
+        );
+        let dp = model::stream_prefix(&dlq_target).unwrap();
+        assert!(
+            ops::get_physical(&shared.store, &model::entry_key(&dp, &dlq_target, e1))
+                .unwrap()
+                .is_some(),
+            "DLQ entry landed"
+        );
+        let graw = ops::get_physical(&shared.store, &model::group_key(&prefix, &stream, &group))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            model::decode_group(&graw).unwrap().committed_ms,
+            1,
+            "watermark crossed"
+        );
+    }
+}

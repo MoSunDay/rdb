@@ -50,9 +50,13 @@ async fn run(shared: &Shared, argv: &[&[u8]]) -> Vec<u8> {
 /// `channel` query value -> full Lite stream name. A bare name maps to
 /// its `q0` queue (the same default queue RESP XADD auto-pick and the
 /// Kafka front's partition 0 use); `parent/child` passes through.
-/// Invalid names (charset of `lite::valid_part`, at most one `/`)
-/// fail -> 400.
+/// Invalid names (charset of `lite::valid_part`) fail -> 400. Channel
+/// names stay TWO-part at most: nested names are an engine-internal
+/// form (the `<stream>/dlq` dead-letter targets), not this surface.
 pub(crate) fn channel_stream(channel: &str) -> Result<String, String> {
+    if channel.bytes().filter(|&b| b == b'/').count() > 1 {
+        return Err(format!("ERR invalid channel name '{channel}'"));
+    }
     match lite::parse_topic_name(channel.as_bytes()) {
         Ok(TopicName::Stream(..)) => Ok(channel.to_string()),
         Ok(TopicName::Parent(p)) => Ok(format!("{}/q0", String::from_utf8_lossy(&p))),

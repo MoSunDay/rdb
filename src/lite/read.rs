@@ -13,6 +13,7 @@ use crate::command::Ctx;
 use crate::resp::codec as resp;
 use crate::store::ops;
 
+use super::dlq;
 use super::entries::{self, Entry};
 use super::model::{self, EntryId, MetaRead};
 use super::offset;
@@ -35,22 +36,14 @@ fn parse_opts(args: &[Vec<u8>], mut i: usize) -> Option<(ReadOpts, usize)> {
     };
     while i < args.len() {
         if args[i].eq_ignore_ascii_case(b"COUNT") {
-            let n = std::str::from_utf8(args.get(i + 1)?)
-                .ok()?
-                .parse::<usize>()
-                .ok()?;
+            let n = super::claim::parse_u64(args.get(i + 1)?)? as usize;
             if n == 0 {
                 return None;
             }
             opts.count = n;
             i += 2;
         } else if args[i].eq_ignore_ascii_case(b"BLOCK") {
-            opts.block_ms = Some(
-                std::str::from_utf8(args.get(i + 1)?)
-                    .ok()?
-                    .parse::<u64>()
-                    .ok()?,
-            );
+            opts.block_ms = Some(super::claim::parse_u64(args.get(i + 1)?)?);
             i += 2;
         } else {
             break;
@@ -101,7 +94,7 @@ fn spec_after(s: &StreamSpec) -> EntryId {
 /// the first half of the remaining args names streams, the second half
 /// holds one id per stream; an odd or empty tail is "Unbalanced" (the
 /// parser cannot tell which stream lost its id).
-fn split_streams_tail(args: &[Vec<u8>], i: usize) -> Option<(usize, usize)> {
+pub(crate) fn split_streams_tail(args: &[Vec<u8>], i: usize) -> Option<(usize, usize)> {
     let n = args.len().checked_sub(i)?;
     if n == 0 || n % 2 != 0 {
         return None;
@@ -378,7 +371,7 @@ enum DeliverErr {
 
 /// Smallest id strictly greater than `id`; `None` at the id ceiling
 /// (`<u64::MAX, u64::MAX>` -- nothing can ever follow it).
-fn succ_id(id: EntryId) -> Option<EntryId> {
+pub(crate) fn succ_id(id: EntryId) -> Option<EntryId> {
     match (id.seq < u64::MAX, id.ms < u64::MAX) {
         // Intra-millisecond: seq bumps; an exhausted seq rolls the ms.
         (true, _) => Some(EntryId {
@@ -463,6 +456,17 @@ async fn deliver_new(
         .iter()
         .map(|s| model::meta_key(&s.prefix, &s.stream))
         .collect();
+    // MAXDELIVERY groups join the latch set with their DLQ target
+    // (offset-cache peeks; the up-front validation warmed the cache).
+    let dlq_names: Vec<Vec<u8>> = fresh
+        .iter()
+        .filter_map(|s| {
+            offset::peek_cached(&ctx.shared.lite.offsets, &s.stream, group)
+                .filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
+                .map(|st| st.dlq)
+        })
+        .collect();
+    keys.extend(dlq_names.iter().filter_map(|n| dlq::dlq_latch_key(n)));
     keys.sort();
     keys.dedup();
     let mut guards = Vec::with_capacity(keys.len());
@@ -472,6 +476,8 @@ async fn deliver_new(
     let mut batch = rocksdb::WriteBatch::default();
     let mut results = Vec::new();
     let mut total: u64 = 0;
+    let mut dlq_count: u64 = 0;
+    let mut transferred: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
     let now_ms = crate::ds::expire::now_ms();
     for s in fresh {
         let Some(st) = group_state(ctx, s, group) else {
@@ -536,8 +542,8 @@ async fn deliver_new(
         // Rows already pending (a rewind re-delivery: restart to the
         // committed watermark, XGROUP SETID back) are re-OWNED by this
         // reader with their delivery count carried over and bumped --
-        // XCLAIM-accumulated history survives a crash redelivery -- but
-        // only brand-new ids grow the backlog counter.
+        // XCLAIM history survives a crash redelivery; only brand-new
+        // ids grow the backlog counter.
         let already_pending: std::collections::HashMap<EntryId, u64> = pel::scan_pend(
             &ctx.shared.store,
             &s.prefix,
@@ -550,16 +556,20 @@ async fn deliver_new(
         .into_iter()
         .map(|row| (row.id, row.state.times_delivered))
         .collect();
-        let fresh_rows = v
-            .iter()
-            .filter(|e| !already_pending.contains_key(&e.id))
-            .count() as u64;
-        offset::bump_pending(
-            &ctx.shared.lite.offsets,
-            &s.stream,
-            group,
-            fresh_rows as i64,
-        );
+        // MAXDELIVERY gate (dlq): over-cap re-deliveries transfer to the
+        // DLQ instead of being served; fresh rows can never trip one.
+        let (v, moved) = dlq::gate_delivery(
+            dlq::transfer_ctx(ctx.shared, &mut batch, &s.prefix, &s.stream, group, &st),
+            v,
+            &already_pending,
+            consumer,
+            now_ms,
+        )
+        .map_err(DeliverErr::Store)?;
+        if moved > 0 {
+            dlq_count += moved as u64;
+            transferred.push((s.prefix.clone(), s.stream.clone(), st.dlq.clone()));
+        }
         for e in &v {
             let times = already_pending
                 .get(&e.id)
@@ -584,11 +594,16 @@ async fn deliver_new(
         total += v.len() as u64;
         results.push((s.stream.clone(), v));
     }
-    if !results.is_empty() {
+    // A dead-letter-only round still commits: the transfers are it.
+    if !results.is_empty() || dlq_count > 0 {
         ctx.commit(batch).await.map_err(DeliverErr::Store)?;
-        // One observation per command: delivered entries only (history
-        // reads are local views, not deliveries).
+        // One observation per command; a zero count is a no-op.
         monitor::observe_lite_message(&ctx.shared.monitor, "read", total);
+        monitor::observe_lite_message(&ctx.shared.monitor, "dlq", dlq_count);
+        // Transfers free window slots and grow the DLQ: wake readers.
+        for (p, s, d) in &transferred {
+            dlq::notify_transfer(ctx.shared, p, s, d);
+        }
     }
     Ok(results)
 }
@@ -753,34 +768,5 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
             // rewind -> replay): the loop head re-validates both.
             Some(Ok(_)) => continue,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_streams_tail_pairs_each_name_with_one_id() {
-        let arg = |s: &str| s.as_bytes().to_vec();
-        // Two streams, two ids: the id half starts after the name half.
-        let args = vec![arg("orders/q0"), arg("orders/q1"), arg("$"), arg("5-0")];
-        assert_eq!(split_streams_tail(&args, 0), Some((2, 2)));
-        let with_opts = vec![arg("COUNT"), arg("10"), arg("a/b"), arg("0-0")];
-        assert_eq!(split_streams_tail(&with_opts, 2), Some((3, 1)));
-        // Odd tail (a stream lost its id) and an empty tail are both
-        // "Unbalanced": the caller cannot pair names to ids.
-        assert_eq!(split_streams_tail(&args[..3], 0), None);
-        assert_eq!(split_streams_tail(&args[..0], 0), None);
-    }
-
-    #[test]
-    fn succ_id_steps_seq_then_ms() {
-        let id = |ms: u64, seq: u64| model::EntryId { ms, seq };
-        // Intra-millisecond: seq bumps; seq exhausted rolls into the
-        // next millisecond; the id ceiling has no successor.
-        assert_eq!(succ_id(id(5, 1)), Some(id(5, 2)));
-        assert_eq!(succ_id(id(5, u64::MAX)), Some(id(6, 0)));
-        assert_eq!(succ_id(id(u64::MAX, u64::MAX)), None);
     }
 }

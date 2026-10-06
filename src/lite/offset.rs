@@ -16,10 +16,10 @@ use std::sync::RwLock;
 
 use rocksdb::WriteBatch;
 
-use super::model::{self, EntryId, GroupPayload};
+use super::model::{self, EntryId};
 
 /// Cached state of one (stream, group).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GroupState {
     pub created_ms: u64,
     pub delivered: EntryId,
@@ -35,6 +35,12 @@ pub struct GroupState {
     /// Per-queue unacked-entry cap; normalized to >= 1 for ordered
     /// groups (0 only on unordered ones).
     pub inflight_max: u64,
+    /// Dead-letter cap (0 = never) and resolved target stream name of
+    /// the group (empty = none; default `<stream>/dlq`). The Vec makes
+    /// the state Clone-only (not Copy): delivery paths peek the target
+    /// ONCE before taking latches.
+    pub maxdelivery: u64,
+    pub dlq: Vec<u8>,
 }
 
 /// Cache keys are RAW BYTES `(stream, group)`, never lossy-decoded
@@ -75,14 +81,14 @@ pub fn load(
     {
         let read = cache.inner.read().unwrap();
         if let Some(st) = read.map.get(&key) {
-            return Ok(Some(*st));
+            return Ok(Some(st.clone()));
         }
     }
     let loaded = model::read_group(store, prefix, stream, group)?;
     let mut write = cache.inner.write().unwrap();
     // Double-check: a concurrent loader may have won the race.
     if let Some(st) = write.map.get(&key) {
-        return Ok(Some(*st));
+        return Ok(Some(st.clone()));
     }
     let Some(p) = loaded else { return Ok(None) };
     // Exact pending backlog after a restart: one PEL scan per group per
@@ -101,8 +107,10 @@ pub fn load(
         pending,
         ordered: p.ordered,
         inflight_max: super::model::normalize_inflight(p.ordered, p.inflight_max),
+        maxdelivery: p.maxdelivery,
+        dlq: p.dlq,
     };
-    write.map.insert(key, st);
+    write.map.insert(key.clone(), st.clone());
     Ok(Some(st))
 }
 
@@ -128,7 +136,7 @@ pub fn peek_cached(cache: &OffsetCache, stream: &[u8], group: &[u8]) -> Option<G
         .unwrap()
         .map
         .get(&(stream.to_vec(), group.to_vec()))
-        .copied()
+        .cloned()
 }
 
 /// XREADGROUP `>`: advance the memory-only delivery watermark.
@@ -198,6 +206,53 @@ pub fn ack(
     Some(count)
 }
 
+/// Dead-letter resolve (see `dlq::transfer_entries`): the resolved
+/// ids leave the group like an ack, but the committed watermark may
+/// advance PAST the batch's own ids -- up to `bound` (the delivery
+/// watermark) -- when no surviving pending row stands between: ids
+/// resolved by EARLIER batches no longer cap the contiguous prefix,
+/// so draining a group's last gap lands the watermark on the stream
+/// position, not on the last transferred id. `head_after` is the
+/// first survivor probe (`pel::head_after_ack` walked to `bound`).
+pub fn resolve(
+    cache: &OffsetCache,
+    stream: &[u8],
+    group: &[u8],
+    ids: &[EntryId],
+    head_after: Option<EntryId>,
+    bound: EntryId,
+) -> usize {
+    let mut write = cache.inner.write().unwrap();
+    let key = (stream.to_vec(), group.to_vec());
+    let Some(st) = write.map.get_mut(&key) else {
+        return 0;
+    };
+    let old = st.committed;
+    let count = ids.iter().filter(|id| **id > old).count();
+    let candidate = match head_after {
+        // Solid prefix to the bound: land on the stream position.
+        None => ids.iter().copied().max().unwrap_or(old).max(bound),
+        // A survivor caps the advance at the batch's ids below it.
+        Some(h) => ids
+            .iter()
+            .copied()
+            .filter(|id| *id < h)
+            .max()
+            .unwrap_or(old),
+    }
+    .max(old);
+    if candidate > st.committed {
+        st.committed = candidate;
+    }
+    if st.committed > old {
+        if st.committed > st.delivered {
+            st.delivered = st.committed;
+        }
+        write.dirty.insert(key);
+    }
+    count
+}
+
 /// Adjust the cached pending backlog of one group (delivery +n, ack
 /// / DELCONSUMER purges -n). Signed so one call site covers both; the
 /// value is a counter, never a watermark -- it must NOT clamp delivery.
@@ -223,6 +278,25 @@ pub fn total_pending(cache: &OffsetCache) -> u64 {
         .values()
         .map(|st| st.pending)
         .sum()
+}
+
+/// Distinct dead-letter target stream names of every cached group that
+/// is actually configured for transfers (maxdelivery > 0 and a resolved
+/// target): the feed of the `rdb_lite_dlq_depth` gauge. Read-only, no
+/// lazy loads -- groups never touched this process are simply absent
+/// (they cannot have pending rows to transfer either).
+pub fn dlq_streams(cache: &OffsetCache) -> Vec<Vec<u8>> {
+    let read = cache.inner.read().unwrap();
+    let mut names: Vec<Vec<u8>> = read
+        .map
+        .values()
+        .filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
+        .map(|st| st.dlq.clone())
+        .collect();
+    drop(read);
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// XGROUP SETID: reset the whole resume position (operator action),
@@ -260,7 +334,7 @@ pub fn flush_dirty(cache: &OffsetCache) -> DirtySnapshot {
     let mut write = cache.inner.write().unwrap();
     let keys: Vec<(Vec<u8>, Vec<u8>)> = write.dirty.drain().collect();
     keys.into_iter()
-        .filter_map(|k| write.map.get(&k).map(|st| (k, *st)))
+        .filter_map(|k| write.map.get(&k).map(|st| (k, st.clone())))
         .collect()
 }
 
@@ -312,18 +386,9 @@ pub fn build_flush_batch(dirty: &DirtySnapshot) -> Option<WriteBatch> {
         let Some(prefix) = model::stream_prefix(stream) else {
             continue;
         };
-        let payload = GroupPayload {
-            created_ms: st.created_ms,
-            delivered_ms: st.delivered.ms,
-            delivered_seq: st.delivered.seq,
-            committed_ms: st.committed.ms,
-            committed_seq: st.committed.seq,
-            ordered: st.ordered,
-            inflight_max: st.inflight_max,
-        };
         batch.put(
             model::group_key(&prefix, stream, group),
-            model::encode_group(&payload),
+            model::encode_group(&super::dlq::payload_of(st)),
         );
     }
     Some(batch)
@@ -347,6 +412,8 @@ mod tests {
             pending: 0,
             ordered: false,
             inflight_max: 0,
+            maxdelivery: 0,
+            dlq: Vec::new(),
         }
     }
 
