@@ -17,7 +17,6 @@ use std::sync::atomic::Ordering;
 use rocksdb::WriteBatch;
 
 use crate::ds::{codec, wait};
-use crate::monitor;
 use crate::state;
 use crate::store::ops;
 
@@ -88,6 +87,50 @@ pub(crate) fn latch_keys(stream_key: Vec<u8>, dlq_stream: Option<&[u8]>) -> Vec<
     keys
 }
 
+/// The group's DLQ target iff its immutable CREATE config asks for
+/// transfers (maxdelivery > 0, target resolved): `None` otherwise.
+pub(crate) fn group_dlq_target(st: Option<&GroupState>) -> Option<Vec<u8>> {
+    st.filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
+        .map(|st| st.dlq.clone())
+}
+
+/// Latch acquisition with drift re-validation for ONE group: peek the
+/// CREATE config, lock [`latch_keys`] (byte-sorted), then re-peek
+/// UNDER the latches -- a DESTROY + re-CREATE with a DIFFERENT DLQ can
+/// commit between peek and lock, and writing the new target's window
+/// without its latch would race every DLQ writer on it. A drifted set
+/// is dropped and re-taken; the loop converges because the config is
+/// frozen while the stream latch is held (CREATE/DESTROY take it).
+pub(crate) async fn lock_group_latches(
+    hub: &crate::ds::latch::Latch,
+    cache: &super::offset::OffsetCache,
+    store: &crate::store::Store,
+    prefix: &[u8],
+    stream: &[u8],
+    group: &[u8],
+) -> (
+    Vec<crate::ds::latch::KeyGuard>,
+    Option<super::offset::GroupState>,
+) {
+    loop {
+        let gst = offset::load(cache, store, prefix, stream, group)
+            .ok()
+            .flatten();
+        let target = group_dlq_target(gst.as_ref());
+        let set = latch_keys(model::meta_key(prefix, stream), target.as_deref());
+        let mut guards = Vec::with_capacity(set.len());
+        for k in &set {
+            guards.push(crate::ds::latch::lock(hub, k).await);
+        }
+        // Re-validation under the lock: a still-matching target means
+        // the held set is exactly the config's own.
+        if group_dlq_target(offset::peek_cached(cache, stream, group).as_ref()) == target {
+            return (guards, gst);
+        }
+        drop(guards); // stale set: re-peek and re-lock
+    }
+}
+
 /// One dead-letter candidate: the pending row id, its CURRENT delivery
 /// count (pre-bump, goes into `__dlq_times`) and the consumer the hand-
 /// out would have gone to (`__dlq_consumer`: the claiming reader, or
@@ -130,16 +173,28 @@ pub(crate) fn transfer_ctx<'a>(
 /// XREADGROUP `>` delivery gate: entries whose NEXT re-delivery would
 /// pass the group's cap are transferred on the caller's batch and
 /// dropped from the served set; the cached pending backlog moves with
-/// them (+fresh kept, -transferred). Returns kept entries + resolved
-/// rows. Fresh rows (count 0) never trip a cap >= 1; ordered groups
-/// only re-deliver the head, and a head transfer frees the queue.
+/// them (+fresh kept, -transferred). Returns kept entries, the
+/// [`TransferTally`] (accounted by the caller after its commit) and
+/// the [`offset::RollbackMark`] captured before any mutation -- the
+/// caller restores it when the commit FAILS, so the watermark never
+/// names ids the store never resolved. Fresh rows (count 0) never
+/// trip a cap >= 1; ordered groups only re-deliver the head, and a
+/// head transfer frees the queue.
 pub(crate) fn gate_delivery(
     ctx: TransferCtx<'_>,
     entries: Vec<super::entries::Entry>,
     pending: &HashMap<EntryId, u64>,
     consumer: &[u8],
     now_ms: u64,
-) -> Result<(Vec<super::entries::Entry>, usize), String> {
+) -> Result<
+    (
+        Vec<super::entries::Entry>,
+        TransferTally,
+        Option<offset::RollbackMark>,
+    ),
+    String,
+> {
+    let mark = offset::mark(&ctx.shared.lite.offsets, ctx.stream, ctx.group);
     let dead = if ctx.st.maxdelivery == 0 || pending.is_empty() {
         Vec::new()
     } else {
@@ -157,13 +212,18 @@ pub(crate) fn gate_delivery(
         .collect();
     let fresh = kept.iter().filter(|e| !pending.contains_key(&e.id)).count() as i64;
     let (shared, stream, group) = (ctx.shared, ctx.stream, ctx.group);
-    let moved = if dead.is_empty() {
-        0
+    let tally = if dead.is_empty() {
+        TransferTally::default()
     } else {
-        transfer_entries(ctx, &dead, now_ms)? as i64
+        transfer_entries(ctx, &dead, now_ms)?
     };
-    offset::bump_pending(&shared.lite.offsets, stream, group, fresh - moved);
-    Ok((kept, moved as usize))
+    offset::bump_pending(
+        &shared.lite.offsets,
+        stream,
+        group,
+        fresh - tally.resolved as i64,
+    );
+    Ok((kept, tally, mark))
 }
 
 /// GroupPayload snapshot of a cached state (the shared ack-path shape).
@@ -202,7 +262,7 @@ pub(crate) fn append_trace(
 }
 
 /// Point meta read without read_meta's lazy purge (transfers are latched); corrupt = missing.
-fn read_dlq_meta(
+pub(crate) fn read_dlq_meta(
     shared: &state::Shared,
     prefix: &[u8],
     stream: &[u8],
@@ -224,16 +284,17 @@ fn read_dlq_meta(
 /// watermark folds the ids in as acked (`offset::resolve` +
 /// `pel::head_after_ack`) and, when it moved, the group record rides
 /// the same batch (the crash resume point must never sit before a
-/// transferred id). Returns PEL rows removed.
+/// transferred id). Returns the [`TransferTally`] the caller applies
+/// only AFTER its commit SUCCEEDS (accounting, never the batch).
 pub(crate) fn transfer_entries(
     ctx: TransferCtx<'_>,
     dead: &[DeadRow],
     now_ms: u64,
-) -> Result<usize, String> {
+) -> Result<TransferTally, String> {
     let (shared, batch, st) = (ctx.shared, ctx.batch, ctx.st);
     let (prefix, stream, group) = (ctx.prefix, ctx.stream, ctx.group);
     if dead.is_empty() {
-        return Ok(0);
+        return Ok(TransferTally::default());
     }
     let dlq_stream = st.dlq.clone();
     let dlq_prefix =
@@ -248,18 +309,26 @@ pub(crate) fn transfer_entries(
             ops::get_physical(&shared.store, &model::entry_key(prefix, stream, row.id))?
                 .and_then(|raw| model::decode_entry(&raw))
         {
+            let dkey = model::entry_key(&dlq_prefix, &dlq_stream, row.id);
+            // Shared-DLQ probe: a SECOND group re-queueing the same id
+            // overwrites the target entry (one key), so it must not
+            // inflate `len` a second time; a probe error keeps the
+            // count-it behavior rather than failing the transfer.
+            let known = ops::get_physical(&shared.store, &dkey)
+                .ok()
+                .flatten()
+                .is_some();
             let mut pairs = fields;
             append_trace(&mut pairs, group, &row.consumer, row.times, stream);
             let refs: Vec<(&[u8], &[u8])> = pairs
                 .iter()
                 .map(|(f, v)| (f.as_slice(), v.as_slice()))
                 .collect();
-            batch.put(
-                model::entry_key(&dlq_prefix, &dlq_stream, row.id),
-                model::encode_entry(&refs),
-            );
+            batch.put(&dkey, model::encode_entry(&refs));
             last_id = last_id.max(row.id);
-            meta.len += 1;
+            if !known {
+                meta.len += 1;
+            }
             appended += 1;
         }
         batch.delete(pel::pend_key(prefix, stream, group, row.id));
@@ -267,11 +336,6 @@ pub(crate) fn transfer_entries(
     if appended > 0 {
         if fresh {
             meta.created_ms = now_ms;
-            shared
-                .lite
-                .stats
-                .streams_live
-                .fetch_add(1, Ordering::Relaxed);
         }
         meta.last_ms = last_id.ms;
         meta.last_seq = last_id.seq;
@@ -286,7 +350,6 @@ pub(crate) fn transfer_entries(
             model::meta_key(&dlq_prefix, &dlq_stream),
             model::encode_meta_at(&meta, expire),
         );
-        super::stat_bump(&shared.lite.stats.messages, appended as u64);
     }
     // Resolved ids count as acked, and the watermark may continue over
     // ids resolved by EARLIER batches (rows already gone): the walk
@@ -322,7 +385,39 @@ pub(crate) fn transfer_entries(
             model::encode_group(&payload_of(&st_now)),
         );
     }
-    Ok(dead.len())
+    Ok(TransferTally {
+        resolved: dead.len(),
+        moved: appended,
+        dlq_created: usize::from(fresh && appended > 0),
+    })
+}
+
+/// What one transfer batch did, for the caller to account only after
+/// its commit SUCCEEDS: `resolved` PEL rows left the group, `moved`
+/// entries actually re-queued into the DLQ (trimmed/orphans transfer
+/// nothing), and `dlq_created` counts DLQ stream metas being
+/// lazily created by this batch (the live-streams gauge must not see a
+/// stream whose creation write never landed).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct TransferTally {
+    pub resolved: usize,
+    pub moved: usize,
+    pub dlq_created: usize,
+}
+
+/// Apply a committed batch's [`TransferTally`]: message counter and,
+/// for a lazily created DLQ stream, the live-streams gauge.
+pub(crate) fn account_tally(shared: &state::Shared, tally: TransferTally) {
+    if tally.dlq_created > 0 {
+        shared
+            .lite
+            .stats
+            .streams_live
+            .fetch_add(tally.dlq_created as i64, Ordering::Relaxed);
+    }
+    if tally.moved > 0 {
+        super::stat_bump(&shared.lite.stats.messages, tally.moved as u64);
+    }
 }
 
 /// Wake the readers a transfer concerns: source stream (slots freed) and DLQ stream (new entry).
@@ -336,19 +431,6 @@ pub(crate) fn notify_transfer(
     if let Some(k) = dlq_latch_key(dlq_stream) {
         wait::notify(&shared.wait_hub, &k);
     }
-}
-
-/// Sum entry depth of configured DLQ targets (cached groups; point reads): `rdb_lite_dlq_depth`.
-pub(crate) fn refresh_dlq_depth(shared: &state::Shared) {
-    let mut total = 0u64;
-    for name in offset::dlq_streams(&shared.lite.offsets) {
-        if let Some(p) = model::stream_prefix(&name) {
-            if let Ok(Some(meta)) = read_dlq_meta(shared, &p, &name) {
-                total += meta.len;
-            }
-        }
-    }
-    monitor::set_lite_dlq_depth(&shared.monitor, total as f64);
 }
 
 #[cfg(test)]

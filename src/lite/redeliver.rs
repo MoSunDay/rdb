@@ -10,9 +10,6 @@
 //! OPPORTUNISTIC (`latch::try_lock`): a mid-command stream is skipped
 //! one round, never parked on.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use rocksdb::WriteBatch;
 
 use crate::ds::{codec, expire, latch, wait};
@@ -29,9 +26,8 @@ use super::{dlq, model};
 pub(crate) const GROUP_BUDGET: usize = 32;
 /// PEL rows examined per group per round (a big PEL rides later rounds).
 pub(crate) const ROW_BUDGET: usize = 16;
-/// Keys walked per discovery scan / sweep rhythm, ms (flusher cadence).
+/// Keys walked per discovery scan.
 const SCAN_LIMIT: usize = 4096;
-const PERIOD_MS: u64 = 200;
 
 /// Verdict for one scanned PEL row (pure: clocks in, one fate out):
 /// Skip = below the threshold (keeps waiting with its consumer),
@@ -168,6 +164,16 @@ fn sweep_group(shared: &state::Shared, idle: u64, now: u64, g: &Discovered) -> (
     ) else {
         return (0, 0);
     };
+    // Latch-set drift re-validation: a DESTROY + re-CREATE with a
+    // DIFFERENT DLQ can commit between the pre-lock peek and the locks;
+    // a drifted set is skipped one round (never parked on, never
+    // written through) -- the next round re-peeks the fresh config.
+    if dlq::group_dlq_target(Some(&st)) != dlq_stream {
+        return (0, 0);
+    }
+    // Pre-transfer cache snapshot: restored when the batch fails, so a
+    // flushed watermark can never name ids the store never resolved.
+    let mark = offset::mark(&shared.lite.offsets, &g.stream, &g.group);
     let (stream, group) = (&g.stream, &g.group);
     let Ok(rows) = pel::scan_pend(
         &shared.store,
@@ -231,16 +237,35 @@ fn sweep_group(shared: &state::Shared, idle: u64, now: u64, g: &Discovered) -> (
         return (0, 0); // nothing due: no batch, no write
     }
     let mut dlqed = 0usize;
+    let mut tally = dlq::TransferTally::default();
     if !dead.is_empty() {
         let t = dlq::transfer_ctx(shared, &mut batch, &prefix, stream, group, &st);
-        if let Ok(k) = dlq::transfer_entries(t, &dead, now) {
-            dlqed = k;
-            offset::bump_pending(&shared.lite.offsets, stream, group, -(k as i64));
+        match dlq::transfer_entries(t, &dead, now) {
+            Ok(k) => {
+                dlqed = k.resolved;
+                tally = k;
+                offset::bump_pending(&shared.lite.offsets, stream, group, -(k.resolved as i64));
+            }
+            Err(e) => {
+                // A failed transfer VOIDS the whole batch: committing
+                // the redeliver half alone would re-hand rows whose
+                // dead-letter twins never landed (double delivery), and
+                // the watermark the transfer advanced must not survive.
+                offset::restore(&shared.lite.offsets, &g.stream, &g.group, mark);
+                sweep_failed(shared, stream, e);
+                return (0, 0); // next round re-plans from the snapshot
+            }
         }
     }
     if ops::batch_write(&shared.store, batch).is_err() {
-        return (0, 0); // the batch never landed: next round re-plans
+        // The cache watermark must never name ids the store never
+        // resolved: rewind, then let the next round re-plan the rows
+        // (still pending, still redeliverable -- never silently lost).
+        offset::restore(&shared.lite.offsets, &g.stream, &g.group, mark);
+        sweep_failed(shared, stream, "batch write failed".to_string());
+        return (0, 0);
     }
+    dlq::account_tally(shared, tally);
     // Zero counts are observable no-ops, so both fire unconditionally.
     monitor::observe_lite_message(&shared.monitor, "redeliver", redelivered as u64);
     monitor::observe_lite_message(&shared.monitor, "dlq", dlqed as u64);
@@ -252,29 +277,14 @@ fn sweep_group(shared: &state::Shared, idle: u64, now: u64, g: &Discovered) -> (
     (redelivered, dlqed)
 }
 
-/// Background sweep task: one [`sweep_from`] round every 200ms on the
-/// blocking pool, cursor rotating; no task at all unless configured.
-pub fn spawn_redelivery_sweep(shared: Arc<state::Shared>) {
-    if shared.conf.lite.redelivery_idle_ms == 0 {
-        return;
-    }
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(PERIOD_MS));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // consume the immediate first tick
-        let mut cursor: Vec<u8> = Vec::new();
-        loop {
-            ticker.tick().await;
-            let (sh, from) = (Arc::clone(&shared), cursor.clone());
-            // Sync scans + one synced write: blocking pool, never a
-            // tokio worker; a JoinError keeps the cursor, next tick.
-            if let Ok((_, _, next)) =
-                tokio::task::spawn_blocking(move || sweep_from(&sh, expire::now_ms(), &from)).await
-            {
-                cursor = next;
-            }
-        }
-    });
+/// A voided sweep round: log the reason (the sweep is unattended, so
+/// stderr is the only witness) and count it on the `dlq_fail` counter.
+fn sweep_failed(shared: &state::Shared, stream: &[u8], err: String) {
+    eprintln!(
+        "[lite] redelivery sweep batch voided for {}: {err}",
+        String::from_utf8_lossy(stream)
+    );
+    monitor::observe_lite_message(&shared.monitor, "dlq_fail", 1);
 }
 
 #[cfg(test)]

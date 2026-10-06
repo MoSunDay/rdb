@@ -253,6 +253,50 @@ pub fn resolve(
     count
 }
 
+/// Rollback mark of one cached group: its state plus its dirty-set
+/// membership, captured under the stream latch right before a transfer
+/// batch is planned. [`restore`] rewinds BOTH when the store commit
+/// FAILS: the flusher would otherwise persist a watermark naming ids
+/// the store never resolved -- the poison entries neither in the DLQ
+/// nor redeliverable, silently lost.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RollbackMark {
+    st: GroupState,
+    dirty: bool,
+}
+
+/// Capture a group's [`RollbackMark`] (`None` = not cached; a transfer
+/// against a missing entry mutates nothing, see [`resolve`]).
+pub(crate) fn mark(cache: &OffsetCache, stream: &[u8], group: &[u8]) -> Option<RollbackMark> {
+    let read = cache.inner.read().unwrap();
+    let key = (stream.to_vec(), group.to_vec());
+    Some(RollbackMark {
+        st: read.map.get(&key)?.clone(),
+        dirty: read.dirty.contains(&key),
+    })
+}
+
+/// Rewind to a [`mark`] snapshot (no-op for `None`). Safe under the
+/// caller's stream latch: every cache mutator of one group holds it,
+/// so the restore cannot clobber a concurrent ack, and the dirty
+/// membership it restores is exactly the one the snapshot observed.
+pub(crate) fn restore(
+    cache: &OffsetCache,
+    stream: &[u8],
+    group: &[u8],
+    mark: Option<RollbackMark>,
+) {
+    let Some(mark) = mark else { return };
+    let mut write = cache.inner.write().unwrap();
+    let key = (stream.to_vec(), group.to_vec());
+    write.map.insert(key.clone(), mark.st);
+    if mark.dirty {
+        write.dirty.insert(key);
+    } else {
+        write.dirty.remove(&key);
+    }
+}
+
 /// Adjust the cached pending backlog of one group (delivery +n, ack
 /// / DELCONSUMER purges -n). Signed so one call site covers both; the
 /// value is a counter, never a watermark -- it must NOT clamp delivery.

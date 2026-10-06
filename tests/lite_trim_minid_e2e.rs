@@ -92,6 +92,23 @@ fn minid_exact_and_approx_forms() {
     assert_eq!(xtrim(&shared, s4, &[b"MINID", b"=", b"1-1"]), ":0");
     assert_eq!(xtrim(&shared, s4, &[b"MINID", b"~", b"0-1"]), ":0");
     assert_eq!(xlen(&shared, s4), 5);
+
+    // LIMIT 0 is a ZERO budget, not "one": it must delete nothing and
+    // reply 0 (the old walk pushed the first victim before checking
+    // the cap -- an off-by-one that ate one entry).
+    let s5 = b"s5/q0".as_slice();
+    seed_five(&shared, s5);
+    assert_eq!(
+        xtrim(&shared, s5, &[b"MINID", b"~", b"3-1", b"LIMIT", b"0"]),
+        ":0"
+    );
+    assert_eq!(xlen(&shared, s5), 5, "LIMIT 0 deletes nothing");
+    assert_eq!(first_id(&shared, s5), "1-1");
+    assert_eq!(
+        xtrim(&shared, s5, &[b"MINID", b"=", b"3-1", b"LIMIT", b"0"]),
+        ":0"
+    );
+    assert_eq!(xlen(&shared, s5), 5);
 }
 
 #[test]

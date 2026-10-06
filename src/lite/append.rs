@@ -310,12 +310,30 @@ fn parse_trim(args: &[Vec<u8>]) -> Result<TrimPlan, &'static str> {
 /// XTRIM/XDEL guard against the kafka committed-offset ledger: a
 /// stream with ANY kind-0x20 row has group commits pinning ordinals to
 /// the active entry set, and trimming/deleting entries would shift the
-/// ordinal<->id map under those readers. A store error also rejects
-/// (conservative: never trim through a blind spot). Appends the
-/// dedicated error text so operators can tell the guard apart from
-/// plain argument failures.
+/// ordinal<->id map under those readers. A STORE error is not a ledger
+/// verdict -- it also rejects (conservative: never trim through a
+/// blind spot) but with its own message plus a log line, so operators
+/// can tell a guard trip from a store fault. Appends the dedicated
+/// error text so operators can tell the guard apart from plain
+/// argument failures.
 fn ledger_guarded(ctx: &mut Ctx<'_>, prefix: &[u8], stream: &[u8]) -> bool {
-    let guarded = crate::kafka::ledger::has_rows(&ctx.shared.store, prefix, stream).unwrap_or(true);
+    let guarded = match crate::kafka::ledger::has_rows(&ctx.shared.store, prefix, stream) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "[lite] ledger guard read failed on {}: {e}",
+                String::from_utf8_lossy(stream)
+            );
+            resp::append_error(
+                ctx.out,
+                &format!(
+                    "ERR ledger guard read failed for stream {}: {e}",
+                    String::from_utf8_lossy(stream)
+                ),
+            );
+            return true;
+        }
+    };
     if guarded {
         resp::append_error(
             ctx.out,
@@ -378,10 +396,14 @@ pub async fn xtrim(ctx: &mut Ctx<'_>) {
             // Entry keys are laid out in id order, so the walk ends at
             // the FIRST id >= minid -- everything before it is a victim
             // by construction (and LIMIT simply stops the batch early,
-            // leaving the rest for a later call).
+            // leaving the rest for a later call; the budget is checked
+            // BEFORE a victim is taken, so LIMIT 0 trims NOTHING).
             let mut victims = Vec::new();
             let _ = ops::for_each_from(&ctx.shared.store, &base, false, &mut |k, _| {
                 if !k.starts_with(&base) {
+                    return false;
+                }
+                if limit.is_some_and(|n| victims.len() as u64 >= n) {
                     return false;
                 }
                 match id_from_key(&base, k) {
@@ -389,10 +411,7 @@ pub async fn xtrim(ctx: &mut Ctx<'_>) {
                     Some(_) => return false, // reached the keep boundary
                     None => {}               // foreign suffix inside the window: skip
                 }
-                match limit {
-                    Some(n) => (victims.len() as u64) < n,
-                    None => true,
-                }
+                true
             });
             victims
         }

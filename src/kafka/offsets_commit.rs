@@ -67,9 +67,9 @@ pub async fn handle_offset_commit(
     let n_topics = body.array_len().ok_or_else(bad)?.unwrap_or(0);
     let mut topics_out: Vec<(String, Vec<(i32, i16)>)> = Vec::with_capacity(n_topics.min(1024));
     let mut rows: Vec<LedgerRow> = Vec::new();
-    // Distinct ledger keys this request may rewrite, sorted: guards are
-    // acquired in one global order so two multi-partition commits never
-    // deadlock against each other.
+    // Distinct latch keys this request takes (ledger rows + stream meta
+    // keys): guards are acquired in one global order so two
+    // multi-partition commits never deadlock against each other.
     let mut latch_keys: Vec<Vec<u8>> = Vec::new();
     for _ in 0..n_topics {
         let name = body.string().ok_or_else(bad)?;
@@ -98,6 +98,11 @@ pub async fn handle_offset_commit(
         topics_out.push((name, parts_out));
     }
     if !rows.is_empty() {
+        // Byte-sorted (the repo's multi-latch deadlock convention): the
+        // set spans BOTH the ledger rows this request rewrites AND the
+        // streams' meta keys (see `commit_one`).
+        latch_keys.sort();
+        latch_keys.dedup();
         let mut guards = Vec::new();
         for k in &latch_keys {
             guards.push(crate::ds::latch::lock(&shared.latch, k).await);
@@ -157,6 +162,14 @@ fn commit_one(
     let key = ledger::ledger_key(&prefix, &stream, group.as_bytes());
     if !latch_keys.contains(&key) {
         latch_keys.push(key);
+    }
+    // The stream's meta key joins the set: XTRIM/XDEL take THAT latch
+    // before their kind-0x20 guard probe, so a first-ever commit and a
+    // concurrent trim serialize instead of racing the guard read
+    // (commit-vs-trim TOCTOU).
+    let mkey = crate::lite::model::meta_key(&prefix, &stream);
+    if !latch_keys.contains(&mkey) {
+        latch_keys.push(mkey);
     }
     rows.push(LedgerRow {
         stream,
