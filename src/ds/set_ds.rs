@@ -80,7 +80,7 @@ pub fn write_meta(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], expire_ms: 
 
 /// Batch entries wiping the whole set family and its TTL index entry.
 pub fn delete_family(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], expire_ms: u64) {
-    expire::family_delete_entries(batch, prefix, SET_FAMILY, key, expire_ms);
+    expire::family_delete_entries(batch, None, prefix, SET_FAMILY, key, expire_ms);
 }
 
 /// Membership check; store errors read as "absent" (best-effort).

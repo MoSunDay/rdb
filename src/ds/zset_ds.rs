@@ -87,7 +87,7 @@ pub fn write_meta(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], meta: &ZSet
 
 /// Batch entries wiping the whole zset family and its TTL index entry.
 pub fn delete_family(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], expire_ms: u64) {
-    expire::family_delete_entries(batch, prefix, ZSET_FAMILY, key, expire_ms);
+    expire::family_delete_entries(batch, None, prefix, ZSET_FAMILY, key, expire_ms);
 }
 
 /// Score sort key (Redis trick): map an f64 onto u64 byte order so

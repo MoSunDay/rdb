@@ -168,7 +168,7 @@ pub fn write_meta(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], meta: &List
 
 /// Batch entries wiping the whole list family and its TTL index entry.
 pub fn delete_family(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], expire_ms: u64) {
-    expire::family_delete_entries(batch, prefix, LIST_FAMILY, key, expire_ms);
+    expire::family_delete_entries(batch, None, prefix, LIST_FAMILY, key, expire_ms);
 }
 
 /// Physical key of the left entry at index `l`.

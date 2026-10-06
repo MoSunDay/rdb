@@ -180,7 +180,14 @@ pub async fn delete_records(
             let family = codec::family_of(kind).unwrap_or(codec::STRING_FAMILY);
             let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
             let mut batch = WriteBatch::default();
-            expire::family_delete_entries(&mut batch, prefix, family, key, expire_ms);
+            expire::family_delete_entries(
+                &mut batch,
+                Some(&shared.store),
+                prefix,
+                family,
+                key,
+                expire_ms,
+            );
             ops::batch_write_async(Arc::clone(&shared.store), batch)
                 .await
                 .map(|_| {
@@ -222,7 +229,7 @@ pub async fn apply_ttl(
     let mut batch = WriteBatch::default();
     let mut stream_deleted = false;
     if new_ms <= now {
-        delete_batch(&mut batch, prefix, key, &state);
+        delete_batch(&mut batch, Some(&shared.store), prefix, key, &state);
         stream_deleted = matches!(&state, KeyState::Enveloped { kind, .. }
             if codec::family_of(*kind) == Some(codec::STREAM_FAMILY));
     } else {
@@ -288,7 +295,13 @@ pub async fn persist_key(
 }
 
 /// Batch entries removing `state`'s records (DEL and past-deadline EXPIRE).
-fn delete_batch(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], state: &KeyState) {
+fn delete_batch(
+    batch: &mut WriteBatch,
+    store: Option<&Store>,
+    prefix: &[u8],
+    key: &[u8],
+    state: &KeyState,
+) {
     match state {
         KeyState::RawString { .. } => {
             batch.delete(codec::string_key(prefix, key));
@@ -297,7 +310,7 @@ fn delete_batch(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], state: &KeySt
             kind, expire_ms, ..
         } => {
             let family = codec::family_of(*kind).unwrap_or(codec::STRING_FAMILY);
-            expire::family_delete_entries(batch, prefix, family, key, *expire_ms);
+            expire::family_delete_entries(batch, store, prefix, family, key, *expire_ms);
         }
         KeyState::Missing => {}
     }
@@ -365,7 +378,7 @@ pub async fn rename_key(
         return Ok(RenameOutcome::DstBlocked);
     }
     let mut batch = WriteBatch::default();
-    delete_batch(&mut batch, prefix, dst, &dst_state);
+    delete_batch(&mut batch, Some(&shared.store), prefix, dst, &dst_state);
     match &src_state {
         KeyState::RawString { value } => {
             batch.put(codec::string_key(prefix, dst), value);
@@ -459,6 +472,27 @@ fn move_family(
         for (lower, upper) in ledger_ranges {
             batch.delete_range(lower, upper);
         }
+        // Streams own a THIRD window the family span misses: staged
+        // delay rows (kind 0x1D, WP2). They are keyed due-major
+        // (`codec::delay_row_key`: due ++ stream ++ locked id), so the
+        // stream name is NOT the data-key body -- the rows are located
+        // by walking the 0x1D window and matching the decoded stream,
+        // then re-keyed at `dst` verbatim (due and locked id carry
+        // over; the due sweep exchanges them at the NEW name). Delay
+        // rows carry no TTL, so the expire index below is untouched.
+        let (d_lower, d_upper) = codec::delay_window(prefix);
+        ops::for_each_from(store, &d_lower, false, &mut |k, v| {
+            if k >= d_upper.as_slice() {
+                return false; // left the 0x1D window
+            }
+            if let Some((due, stream, locked)) = codec::decode_delay_row_key(k, prefix.len()) {
+                if stream == src {
+                    batch.put(codec::delay_row_key(prefix, due, dst, locked), v);
+                    batch.delete(k);
+                }
+            }
+            true
+        })?;
     }
     let src_root = codec::data_key(prefix, family.0, src);
     let dst_root = codec::data_key(prefix, family.0, dst);

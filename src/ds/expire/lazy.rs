@@ -97,7 +97,7 @@ fn lazy_purge_batch(
         return None;
     }
     let mut batch = WriteBatch::default();
-    family_delete_entries(&mut batch, prefix, family, key, expire);
+    family_delete_entries(&mut batch, Some(store), prefix, family, key, expire);
     Some((expire, batch))
 }
 

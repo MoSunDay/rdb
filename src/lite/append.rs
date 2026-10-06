@@ -34,6 +34,15 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     if pairs.len() < 2 || pairs.len() % 2 != 0 {
         return resp::append_error(ctx.out, "ERR wrong number of arguments for 'xadd' command");
     }
+    // Leading `DELAY <ms>` option (WP2): threading only -- the parse and
+    // the staging write live in `super::delay`.
+    let (delay_ms, pairs) = match super::delay::split_delay(pairs) {
+        Ok(split) => split,
+        Err(e) => return resp::append_error(ctx.out, e),
+    };
+    if pairs.len() < 2 || pairs.len() % 2 != 0 {
+        return resp::append_error(ctx.out, "ERR wrong number of arguments for 'xadd' command");
+    }
     let name = match super::parse_topic_name(&args[0]) {
         Ok(n) => n,
         Err(e) => return resp::append_error(ctx.out, &e),
@@ -114,7 +123,12 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     let mut next = meta.clone();
     next.last_ms = id.ms;
     next.last_seq = id.seq;
-    next.len += 1;
+    // A staged (delayed) row is not an entry yet: last_id advances (the
+    // reservation blocks id collisions) but len does not (XLEN keeps
+    // excluding staged rows until the due exchange bumps it).
+    if delay_ms == 0 {
+        next.len += 1;
+    }
     let mkey = model::meta_key(&prefix, &stream);
     let old_expire = if fresh {
         0
@@ -140,10 +154,19 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
         .chunks(2)
         .map(|c| (c[0].as_slice(), c[1].as_slice()))
         .collect();
-    batch.put(
-        model::entry_key(&prefix, &stream, id),
-        model::encode_entry(&fpairs),
-    );
+    if delay_ms == 0 {
+        batch.put(
+            model::entry_key(&prefix, &stream, id),
+            model::encode_entry(&fpairs),
+        );
+    } else {
+        // Due = serve time + DELAY; an overflowing deadline is refused
+        // rather than wrapped (a wrapped due would exchange instantly).
+        match now.checked_add(delay_ms) {
+            Some(due) => super::delay::stage_row(&mut batch, &prefix, &stream, id, due, &fpairs),
+            None => return resp::append_error(ctx.out, "ERR delay deadline overflow"),
+        }
+    }
     expire::set_ttl_entries(&mut batch, &prefix, mkey.clone(), old_expire, new_expire);
 
     if let Err(e) = ctx.commit(batch).await {
@@ -166,8 +189,12 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     // topic's key. Notifying only the child key left anything parked at
     // the parent level asleep until its BLOCK timeout even though data
     // had landed. notify on a key with no waiter is a no-op.
-    wait::notify(&ctx.shared.wait_hub, &mkey);
-    wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &parent));
+    // A DELAYed add stages an invisible row: no reader may wake (the
+    // due exchange does the notifying, see lite::delay).
+    if delay_ms == 0 {
+        wait::notify(&ctx.shared.wait_hub, &mkey);
+        wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &parent));
+    }
 
     let id_str = model::format_id(id);
     if auto {

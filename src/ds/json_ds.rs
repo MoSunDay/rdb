@@ -86,7 +86,7 @@ pub fn write_doc(
 /// Batch entries wiping the JSON record (one range over the single-kind
 /// family) plus its TTL index entry.
 pub fn delete_family(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], expire_ms: u64) {
-    expire::family_delete_entries(batch, prefix, JSON_FAMILY, key, expire_ms);
+    expire::family_delete_entries(batch, None, prefix, JSON_FAMILY, key, expire_ms);
 }
 
 #[cfg(test)]

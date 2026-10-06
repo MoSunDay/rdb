@@ -66,8 +66,19 @@ pub fn set_ttl_entries(
 }
 
 /// Batch entries that fully remove one key's family and its index entry.
+///
+/// `store` (pass it whenever the caller holds one): stream-family
+/// deletes ALSO fold in the staged delay rows (kind 0x1D) targeting the
+/// stream -- they are keyed due-major (due sorts ahead of the stream
+/// name), so they cannot be range-deleted by stream; the fold scans the
+/// slot's 0x1D window and deletes the stream's rows individually.
+/// Skipping the fold would let a deleted stream's delayed messages
+/// exchange later and REVIVE the dead stream (P0 leak: XIDLE reaps,
+/// FLUSHDB-style family wipes, RENAME overwrites). Callers that can
+/// never see a STREAM family (set/json element writers) pass `None`.
 pub fn family_delete_entries(
     batch: &mut WriteBatch,
+    store: Option<&crate::store::Store>,
     prefix: &[u8],
     family: CodecFamily,
     key: &[u8],
@@ -86,11 +97,42 @@ pub fn family_delete_entries(
         for (lower, upper) in codec::family_delete_ranges(prefix, codec::OFFSET_FAMILY, key) {
             batch.delete_range(lower, upper);
         }
+        // ...and the staged delay rows (same folding rationale, WP2
+        // §5's mandatory acceptance item: a leaked row exchanges into a
+        // deleted stream later). See the doc comment for why this is a
+        // scan, not a range.
+        if let Some(store) = store {
+            fold_delay_rows(batch, store, prefix, key);
+        }
     }
     if expire > 0 {
         let root = codec::data_key(prefix, family.0, key);
         batch.delete(codec::expire_index_key(prefix, expire, &root));
     }
+}
+
+/// Delete every staged delay row (kind 0x1D) whose target stream is
+/// `stream`: a bounded walk of the slot's 0x1D window (the window holds
+/// only outstanding delayed messages), matching on the decoded stream.
+fn fold_delay_rows(
+    batch: &mut WriteBatch,
+    store: &crate::store::Store,
+    prefix: &[u8],
+    stream: &[u8],
+) {
+    let (lower, upper) = codec::delay_window(prefix);
+    let _ = crate::store::ops::for_each_from(store, &lower, false, &mut |k, _| {
+        if k >= upper.as_slice() {
+            return false; // left the 0x1D window
+        }
+        if codec::decode_delay_row_key(k, prefix.len())
+            .map(|(_, s, _)| s == stream)
+            .unwrap_or(false)
+        {
+            batch.delete(k);
+        }
+        true
+    });
 }
 
 /// Length of a leading `"<decimal slot>/"` prefix, if `k` starts with one.

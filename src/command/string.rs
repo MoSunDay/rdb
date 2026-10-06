@@ -74,7 +74,15 @@ pub(crate) fn clear_key_family(
             kind, expire_ms, ..
         } => {
             let family = codec::family_of(*kind).unwrap_or(codec::STRING_FAMILY);
-            expire::family_delete_entries(batch, prefix, family, key, *expire_ms);
+            // No store here (string overwrite helpers are batch-only),
+            // so the 0x1D delay-row fold is skipped. Streams are
+            // unreachable through this path today (lite records live
+            // under the PARENT-derived slot prefix, the routing prefix
+            // comes from the full key name -- see delete_records); if
+            // that ever changes, thread `Some(store)` through, and the
+            // due sweep's meta-missing guard drops any leaked row
+            // instead of reviving the deleted stream.
+            expire::family_delete_entries(batch, None, prefix, family, key, *expire_ms);
         }
     }
 }

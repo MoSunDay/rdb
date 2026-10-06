@@ -134,7 +134,7 @@ fn purge_indexed(
                 let Some((_, key, _)) = codec::decode_data_key(&data_key, prefix.len()) else {
                     return false;
                 };
-                family_delete_entries(&mut batch, prefix, family, &key, expire);
+                family_delete_entries(&mut batch, Some(store), prefix, family, &key, expire);
                 // A reaped Lite stream family must also drop its cached
                 // group offsets and queue the latched orphan sweep, or
                 // the 200ms offset flusher writes orphan group records

@@ -54,6 +54,30 @@ pub const KIND_SEARCH_TERMSTAT: u8 = 0x16;
 pub const KIND_ANN_CENTROID: u8 = 0x17;
 pub const KIND_ANN_POSTING: u8 = 0x18;
 pub const KIND_SEARCH_NUMVAL: u8 = 0x19;
+/// Staged delayed-message row (`lite::delay`, WP2): one row per
+/// XADD ... DELAY, physically NOT a stream entry so every read path
+/// (XREAD/XREADGROUP/XRANGE/XLEN) is blind to it until the due sweep
+/// exchanges it. Layout (due-major ON PURPOSE -- the due scan is a
+/// bounded early-stopping prefix scan of the whole 0x1D window, key
+/// order IS due order across every stream):
+///
+/// ```text
+/// delay row key = <slot_prefix> ++ 0x1D ++ <due_ms:u64 BE>
+///                              ++ <stream_len:u32 BE> ++ <stream>
+///                              ++ <locked_id: ms u64 BE ++ seq u64 BE>
+/// delay row val = envelope(0) ++ model::encode_entry body (the pairs)
+/// ```
+///
+/// Deviation from the WP2 sketch (documented): the plan drew the key as
+/// `data_key(0x1D, stream) ++ due ++ id`, but that orders stream-major
+/// and would force the sweep to walk the whole window per tick; the
+/// plan's own "key order = due order" requirement wins, so `due` leads.
+/// Consequence: delay rows are NOT data_key-shaped -- the stream is at
+/// a variable offset behind `due`, so stream-keyed folds (family
+/// delete / RENAME move) SCAN the window instead of range-deleting
+/// (`codec::family_delete_ranges` must never be fed DELAY_FAMILY), and
+/// [`decode_data_key`] rejects the kind outright.
+pub const KIND_STREAM_DELAY: u8 = 0x1D;
 /// Kafka committed-offset ledger row (`kafka::ledger`, P2): one record
 /// per (partition stream, consumer group) carrying the JSON payload
 /// {"committed_ordinal","generation","leader"}. Its own single-kind
@@ -74,6 +98,12 @@ pub const LIST_FAMILY: CodecFamily = (KIND_LIST_META, KIND_LIST_R);
 pub const SET_FAMILY: CodecFamily = (KIND_SET_META, KIND_SET_MEMBER);
 pub const ZSET_FAMILY: CodecFamily = (KIND_ZSET_META, KIND_ZSET_SCORE);
 pub const STREAM_FAMILY: CodecFamily = (KIND_STREAM_META, KIND_STREAM_PEND);
+/// Staged delayed-message rows (see [`KIND_STREAM_DELAY`]): registered
+/// so `classify`/`record_role` treat them as typed family members
+/// (FLUSHDB wipes them, DBSIZE skips them). The family tuple is NEVER
+/// usable with `family_delete_ranges` -- the rows are not data_key
+/// shaped (due sorts first); stream-keyed folds scan the window.
+pub const DELAY_FAMILY: CodecFamily = (KIND_STREAM_DELAY, KIND_STREAM_DELAY);
 /// Committed-offset ledger (kafka front): single-kind family so its
 /// window deletes/reclaims exactly like the other families.
 pub const OFFSET_FAMILY: CodecFamily = (KIND_STREAM_OFFSET, KIND_STREAM_OFFSET);
@@ -116,6 +146,7 @@ pub fn family_of(kind: u8) -> Option<CodecFamily> {
             STREAM_FAMILY
         }
         KIND_STREAM_OFFSET => OFFSET_FAMILY,
+        KIND_STREAM_DELAY => DELAY_FAMILY,
         KIND_JSON => JSON_FAMILY,
         KIND_VECTORSET_META | KIND_VECTORSET_ELEM => VECTORSET_FAMILY,
         KIND_SEARCH_META | KIND_SEARCH_DOC | KIND_SEARCH_POSTING | KIND_SEARCH_TERMSTAT
@@ -154,6 +185,13 @@ pub fn elem_key(prefix: &[u8], kind: u8, key: &[u8], suffix: &[u8]) -> Vec<u8> {
 pub fn decode_data_key(physical: &[u8], prefix_len: usize) -> Option<(u8, Vec<u8>, &[u8])> {
     let body = physical.get(prefix_len..)?;
     let kind = *body.first()?;
+    // Delay rows are NOT data_key-shaped (due_ms sorts ahead of the
+    // stream name, see KIND_STREAM_DELAY): the generic inverse would
+    // misread `due`'s top bytes as the key length. Reject explicitly;
+    // the only valid reader is decode_delay_row_key.
+    if kind == KIND_STREAM_DELAY {
+        return None;
+    }
     family_of(kind)?; // reject 0x00 raw, 0xFD index and unknown bytes
     let len = u32::from_be_bytes(body.get(1..5)?.try_into().ok()?) as usize;
     let key = body.get(5..5 + len)?;
@@ -271,9 +309,10 @@ pub fn decode_count(payload: &[u8]) -> u64 {
 
 /// How a physical key (after the slot prefix) reads during iteration.
 ///
-/// Rule: bytes `<= 0x19`, `== 0x20` (stream-offset ledger) or `== 0xFD`
-/// are typed records (kind header); anything else is a raw string whose
-/// user key is the whole remainder.
+/// Rule: bytes `<= 0x19`, `== 0x1D` (staged delay row), `== 0x20`
+/// (stream-offset ledger) or `== 0xFD` are typed records (kind
+/// header); anything else is a raw string whose user key is the whole
+/// remainder.
 ///
 /// COLLISION CAVEAT (accepted breaking change, documented for COMPAT.md):
 /// a legacy raw string whose first byte is `<= 0x12` (e.g. a control
@@ -292,10 +331,62 @@ pub enum Classification {
 pub fn classify(after_prefix: &[u8]) -> Classification {
     match after_prefix.first() {
         Some(&b)
-            if b <= KIND_SEARCH_NUMVAL || b == KIND_EXPIRE_INDEX || b == KIND_STREAM_OFFSET =>
+            if b <= KIND_SEARCH_NUMVAL
+                || b == KIND_STREAM_DELAY
+                || b == KIND_EXPIRE_INDEX
+                || b == KIND_STREAM_OFFSET =>
         {
             Classification::Typed(b)
         }
         _ => Classification::Raw,
     }
+}
+
+// ---- staged delay rows (kind 0x1D) ---------------------------------------
+
+/// Whole-0x1D-window scan bounds under `prefix`:
+/// `[prefix ++ 0x1D, prefix ++ 0x1E)` -- every delay row of every
+/// stream in this slot sorts inside it, in due order.
+pub fn delay_window(prefix: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut lower = prefix.to_vec();
+    lower.push(KIND_STREAM_DELAY);
+    let mut upper = prefix.to_vec();
+    upper.push(KIND_STREAM_DELAY + 1);
+    (lower, upper)
+}
+
+/// Delay-row physical key (layout documented on [`KIND_STREAM_DELAY`]).
+/// `locked` is the id XADD reserved at write time -- it only has to
+/// make the key unique (the id is allocated under the stream latch and
+/// last_id is advanced in the same batch, so it cannot collide).
+pub fn delay_row_key(prefix: &[u8], due_ms: u64, stream: &[u8], locked: (u64, u64)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + 29 + stream.len());
+    out.extend_from_slice(prefix);
+    out.push(KIND_STREAM_DELAY);
+    out.extend_from_slice(&due_ms.to_be_bytes());
+    out.extend_from_slice(&(stream.len() as u32).to_be_bytes());
+    out.extend_from_slice(stream);
+    out.extend_from_slice(&locked.0.to_be_bytes());
+    out.extend_from_slice(&locked.1.to_be_bytes());
+    out
+}
+
+/// Inverse of [`delay_row_key`] -> `(due_ms, stream, locked id)`;
+/// `None` for anything that is not a well-formed delay-row key.
+pub fn decode_delay_row_key(
+    physical: &[u8],
+    prefix_len: usize,
+) -> Option<(u64, Vec<u8>, (u64, u64))> {
+    let body = physical.get(prefix_len..)?;
+    if body.first() != Some(&KIND_STREAM_DELAY) {
+        return None;
+    }
+    let due_ms = u64::from_be_bytes(body.get(1..9)?.try_into().ok()?);
+    let slen = u32::from_be_bytes(body.get(9..13)?.try_into().ok()?) as usize;
+    let stream = body.get(13..13 + slen)?;
+    let locked = (
+        u64::from_be_bytes(body.get(13 + slen..21 + slen)?.try_into().ok()?),
+        u64::from_be_bytes(body.get(21 + slen..29 + slen)?.try_into().ok()?),
+    );
+    Some((due_ms, stream.to_vec(), locked))
 }

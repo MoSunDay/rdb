@@ -157,6 +157,37 @@
   **零客户端消费**的情况下被 sweep 一路推过 MAXDELIVERY 进 DLQ。要客户端接管有效，
   取 `min-idle-time < redelivery_idle_ms`（sweep 门槛更宽，客户端先到先得）。
 
+### 延迟消息（XADD DELAY，kind 0x1D 暂存行）
+- **语法**：`XADD <stream> [<id|*>] DELAY <ms> <f> <v> [...]`——`DELAY <ms>` 为
+  **前置选项**（位于 id 之后、首对 field-value 之前，大小写不敏感）；不带 `DELAY`
+  的 XADD 行为完全不变。`ms` 为**相对延迟**；`DELAY 0` 等价于不延迟（同步可见）；
+  非正整数/非整数报 `ERR value is not an integer or out of range`，`now+ms` 溢出报
+  `ERR delay deadline overflow`。
+- **到期前不可见**：暂存行是独立 kind `0x1D` 记录（键 = `<slot>/ 0x1D <due_ms u64BE>
+  <stream_len u32BE> <stream> <预留 id 16B>`，值 = entry 体；**due 在键首**使到期扫描
+  是有界早停前缀扫描，键序即 due 序），物理上不是流 entry——XREAD/XREADGROUP/XRANGE/
+  XLEN 到期前全部不可见、XLEN 不计；读路径零改动。
+- **到期投递**：后台 sweep（`lite: delay_sweep_ms: <ms>`，默认 **0 = 不启用**、无任务；
+  对齐 redeliver_loop 的 spawn 模式）逐 slot 扫 0x1D 窗口，`due <= now` 的行在目标流
+  latch 下**单批**完成"删暂存行 + 写 entry + meta 维护（len+1/last_id/idle retouch）"，
+  随后唤醒该流的 BLOCK 读者（XADD 同款 notify，流 meta key + 父 topic key）。崩溃两态
+  归一：行在 = 未投（重启后重扫再投，不丢）；行不在 = entry 已落（不双投）。
+- **id 语义（对计划草案的有记录偏差）**：XADD 时刻在 latch 下预留 id 并**推进
+  last_id**（防后续 XADD 撞号），回复该 id；但到期写入时**重新分配新 id**（恰如普通
+  append）——预留 id 可能落后于延迟窗口内新写入并被消费的水位（组 delivered/
+  XREAD `$`），沿用会永远不可见（静默丢投）；新 id 同时保证"乱序提交按 due 升序投递、
+  消费者看到的顺序 = 到期顺序"。回复 id 是预约凭证，不承诺最终 entry 恰为该 id。
+- **P0 键族登记**：暂存行不属 STREAM_FAMILY 连续段（0x0C..=0x0F），且 due 在键首使
+  按 stream 的范围删除不可行——`family_delete_entries`（XIDLE 到期/惰性清除/RENAME
+  覆盖目标）显式**扫描折叠**该 slot 0x1D 窗口中目标流的行；`move_family`（RENAME）
+  同法把 0x1D 段搬到新名；FLUSHDB 经 `classify`（0x1D 记为 typed family member）
+  随全库清除。漏登记 = 已删流被暂存行复活投递（P0）——`lite_delay_e2e` 三连回归
+  （XIDLE/RENAME/FLUSHDB）逐一断言。
+- **兜底守卫**：sweep 交换前在 latch 下重读流 meta——meta 缺失（族已被删/搬走）时
+  **只删暂存行、不投递**，任何竞态漏出的孤儿行不可能复活已删流。
+- **kafka 面不暴露**：Produce 面无延迟参数；Fetch 只见到期后的普通 entry（延迟语义
+  仅 RESP 动词面）。
+
 ### XTRIM MINID
 - **语法**：`XTRIM <stream> MINID [~|=] <id> [LIMIT <n>]`（对齐 Redis 6.2+）；与
   `MAXLEN` 正交（可交替使用）。删除所有 **id 严格小于** `<id>` 的条目，边界 id 本身

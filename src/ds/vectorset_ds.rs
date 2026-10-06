@@ -141,7 +141,7 @@ pub fn write_meta(
 
 /// Batch entries wiping the whole vector-set family and its TTL index.
 pub fn delete_family(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], expire_ms: u64) {
-    expire::family_delete_entries(batch, prefix, VECTORSET_FAMILY, key, expire_ms);
+    expire::family_delete_entries(batch, None, prefix, VECTORSET_FAMILY, key, expire_ms);
 }
 
 /// Encode one elem value: `dim * LE f64 ++ LEB128(attr_len) ++ attr`.
