@@ -1,4 +1,4 @@
-Commit: 90e8c9b
+Commit: 59ed6eb
 # rust（Rust 重写实现）
 
 ## 职责

@@ -1,6 +1,6 @@
 # WP3 — Kafka 面能力对齐：headers 回放、组管理 API、SASL token
 
-状态：proposed
+状态：landed（Batch 1.5 + Batch 2 收口；状态板见 `README.md`）
 日期：2026-10-06
 工作包：WP3（headers 回放缺陷修复随 Batch 1 执行；其余随 Batch 2）
 
