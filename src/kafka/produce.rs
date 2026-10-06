@@ -243,6 +243,7 @@ pub(super) fn record_fields(rec: &Record) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// Headers as `[{"n":name,"v":null},{"n":name,"v":"<hex>"}]` (byte
 /// values hex-encoded; names are UTF-8 strings per the wire format).
+/// Inverse: [`parse_headers_json`].
 fn headers_json(headers: &[(String, Option<Vec<u8>>)]) -> String {
     let mut out = String::from("[");
     for (i, (name, val)) in headers.iter().enumerate() {
@@ -257,6 +258,36 @@ fn headers_json(headers: &[(String, Option<Vec<u8>>)]) -> String {
     }
     out.push(']');
     out
+}
+
+/// Inverse of [`headers_json`]: the stored `"h"` pair bytes back to
+/// record headers (`[{"n":..,"v":null},..]` / `{"n":..,"v":"<hex>"}`).
+/// Anything malformed or shape-mismatched -- not JSON, not an array,
+/// items without exactly the `n`/`v` keys, a non-string name, a bad
+/// hex value -- yields None; the caller (fetch replay) then keeps the
+/// generic envelope fallback. An empty array is Some(vec![]) -- whether
+/// that differs from "no h pair at all" is the caller's call.
+/// Storage format itself is untouched (existing data stays readable).
+pub(crate) fn parse_headers_json(bytes: &[u8]) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+    let items = serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()?
+        .as_array()?
+        .clone();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let obj = item.as_object()?;
+        if obj.len() != 2 || !obj.contains_key("n") || !obj.contains_key("v") {
+            return None;
+        }
+        let name = obj.get("n")?.as_str()?.to_string();
+        let val = match obj.get("v")? {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(h) => Some(hex::decode(h).ok()?),
+            _ => return None,
+        };
+        out.push((name, val));
+    }
+    Some(out)
 }
 
 fn parse_produce_req(body: &mut Reader<'_>, version: i16) -> Result<ProduceReq, String> {

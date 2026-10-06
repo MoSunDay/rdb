@@ -10,7 +10,7 @@ mod kafka_front_common;
 use common::contains_bytes;
 use kafka_front_common::{kafka_req, kafka_round, resp_one_shot, spawn_kafka_node, wait_accepting};
 use rdb::kafka::frame::{put_array_len, put_i16, put_i32, put_i64, put_string, Reader};
-use rdb::kafka::record::{build_batch, crc32c, BatchRecord};
+use rdb::kafka::record::{build_batch, crc32c, parse_batch, BatchRecord};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -85,6 +85,54 @@ fn produce_out(body: &[u8]) -> (i32, i16, i64, i64) {
         r.i64().unwrap(),
         r.i64().unwrap(),
     )
+}
+
+/// Fetch v4 request body (classic encoding) for one topic/partition.
+fn fetch_body_v4(topic: &str, partition: i32, offset: i64) -> Vec<u8> {
+    let mut b = Vec::new();
+    put_i32(&mut b, -1); // replica_id
+    put_i32(&mut b, 0); // max_wait_ms
+    put_i32(&mut b, 1); // min_bytes
+    put_i32(&mut b, 1 << 20); // max_bytes (v3+)
+    b.push(0); // isolation_level (v4+)
+    put_array_len(&mut b, 1);
+    put_string(&mut b, topic);
+    put_array_len(&mut b, 1);
+    put_i32(&mut b, partition);
+    put_i64(&mut b, offset);
+    put_i32(&mut b, 1 << 20); // partition_max_bytes
+    b
+}
+
+/// Fetch v4 one partition: (error, hwm, records blob) off the socket.
+async fn fetch_records_v4(
+    sock: &mut TcpStream,
+    corr: i32,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> (i16, i64, Vec<u8>) {
+    let payload = kafka_round(
+        sock,
+        &kafka_req(1, 4, corr, false, &fetch_body_v4(topic, partition, offset)),
+    )
+    .await;
+    let mut r = Reader::new(&payload);
+    assert_eq!(r.i32(), Some(corr), "correlation id echo");
+    let hdr = r.pos();
+    let mut row = Reader::new(&payload[hdr..]);
+    assert_eq!(row.i32(), Some(0), "throttle_time_ms");
+    assert_eq!(row.array_len(), Some(Some(1)), "one topic");
+    row.string();
+    assert_eq!(row.array_len(), Some(Some(1)), "one partition");
+    assert_eq!(row.i32(), Some(partition), "partition echo");
+    let error = row.i16().unwrap();
+    let hwm = row.i64().unwrap();
+    row.i64(); // last_stable_offset (v4+)
+    assert_eq!(row.array_len(), Some(None), "aborted_transactions null");
+    let records = row.bytes().unwrap().unwrap().to_vec();
+    assert_eq!(row.remaining(), 0, "response fully drained");
+    (error, hwm, records)
 }
 
 /// ListOffsets v1 for one topic; returns (partition, error, ts, offset)
@@ -233,6 +281,37 @@ async fn produce_appends_and_listoffsets_answer() {
     assert!(
         contains_bytes(&xlen, b":4\r\n"),
         "1 xadd + 3 produced: {xlen:?}"
+    );
+
+    // ---- Fetch v4 replays the stored headers/tombstone for real ----
+    let (error, hwm, records) = fetch_records_v4(&mut sock, 10, "t1", 0, 0).await;
+    assert_eq!((error, hwm), (0, 4));
+    let batch = parse_batch(&records).expect("fetched batch parses");
+    assert_eq!(batch.base_offset, 0);
+    assert_eq!(batch.records.len(), 4);
+    // offset 3 = the headers + tombstone record produced above.
+    let rec = &batch.records[3];
+    assert_eq!(rec.offset_delta, 3);
+    assert_eq!(rec.key.as_deref(), Some(b"k2".as_slice()));
+    assert_eq!(rec.value, None, "tombstone stays null, not empty bytes");
+    assert_eq!(
+        rec.headers,
+        vec![
+            ("h1".to_string(), None),
+            ("h2".to_string(), Some(vec![0x00, 0xff]))
+        ],
+        "headers replay as record headers, not a value envelope"
+    );
+    // The plainer records keep their exact key/value bytes.
+    assert_eq!(batch.records[0].value.as_deref(), Some(b"world".as_slice()));
+    assert_eq!(batch.records[1].key.as_deref(), Some(b"k1".as_slice()));
+    assert_eq!(batch.records[1].value.as_deref(), Some(b"v1".as_slice()));
+    assert_eq!(
+        (
+            batch.records[2].key.as_deref(),
+            batch.records[2].value.as_deref()
+        ),
+        (None, Some(b"v2".as_slice()))
     );
 
     // ---- p<N> precedence over q<N> for partition 0 ----
