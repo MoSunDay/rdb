@@ -11,8 +11,9 @@ use rocksdb::WriteBatch;
 use crate::hash;
 use crate::kafka::errors;
 use crate::kafka::fetch::handle_fetch;
-use crate::kafka::fetch_records::to_key_value;
+use crate::kafka::fetch_records::{decode_fields, ENVELOPE_MARKER};
 use crate::kafka::frame::{put_array_len, put_i32, put_i64, put_string, Reader};
+use crate::kafka::produce::parse_headers_json;
 use crate::kafka::record::parse_batch;
 use crate::lite::model;
 use crate::state::testutil;
@@ -128,29 +129,136 @@ async fn one_partition(sh: &Shared, version: i16, request: &[u8]) -> (Vec<u8>, i
 
 #[test]
 fn inverse_field_map() {
-    assert_eq!(to_key_value(&pairs(&[])), (None, None));
+    // Unchanged shapes (regression anchors): 0/1/2 pairs, no "h".
+    assert_eq!(decode_fields(&pairs(&[])), (None, None, vec![]));
     // value-only + null-null tombstone (1-pair shapes)
     assert_eq!(
-        to_key_value(&pairs(&[(b"v", b"x")])),
-        (None, Some(b"x".to_vec()))
+        decode_fields(&pairs(&[(b"v", b"x")])),
+        (None, Some(b"x".to_vec()), vec![])
     );
-    assert_eq!(to_key_value(&pairs(&[(b"__null__", b"")])), (None, None));
+    assert_eq!(
+        decode_fields(&pairs(&[(b"__null__", b"")])),
+        (None, None, vec![])
+    );
     // 2-pair shapes: k+v and k+null-value
     assert_eq!(
-        to_key_value(&pairs(&[(b"k", b"K"), (b"v", b"V")])),
-        (Some(b"K".to_vec()), Some(b"V".to_vec()))
+        decode_fields(&pairs(&[(b"k", b"K"), (b"v", b"V")])),
+        (Some(b"K".to_vec()), Some(b"V".to_vec()), vec![])
     );
     assert_eq!(
-        to_key_value(&pairs(&[(b"k", b"K"), (b"__null__", b"")])),
-        (Some(b"K".to_vec()), None)
+        decode_fields(&pairs(&[(b"k", b"K"), (b"__null__", b"")])),
+        (Some(b"K".to_vec()), None, vec![])
     );
-    // 3 pairs (or any "h") collapse to the generic JSON envelope.
-    let (k, v) = to_key_value(&pairs(&[(b"a", b"\x01"), (b"b", b""), (b"c", b"zz")]));
+}
+
+/// The exact `headers_json` shape `produce::record_fields` writes.
+const HDRS_JSON: &[u8] = br#"[{"n":"h1","v":null},{"n":"h2","v":"00ff"}]"#;
+
+fn hdrs() -> Vec<(String, Option<Vec<u8>>)> {
+    vec![
+        ("h1".to_string(), None),
+        ("h2".to_string(), Some(vec![0x00, 0xff])),
+    ]
+}
+
+#[test]
+fn inverse_field_map_restores_real_headers() {
+    // [v, h]: null-key produce shape.
+    assert_eq!(
+        decode_fields(&pairs(&[(b"v", b"V"), (b"h", HDRS_JSON)])),
+        (None, Some(b"V".to_vec()), hdrs())
+    );
+    // [k, v, h]
+    assert_eq!(
+        decode_fields(&pairs(&[(b"k", b"K"), (b"v", b"V"), (b"h", HDRS_JSON)])),
+        (Some(b"K".to_vec()), Some(b"V".to_vec()), hdrs())
+    );
+    // [__null__, h]: tombstone value keeps its headers.
+    assert_eq!(
+        decode_fields(&pairs(&[(b"__null__", b""), (b"h", HDRS_JSON)])),
+        (None, None, hdrs())
+    );
+    // [k, __null__, h]
+    assert_eq!(
+        decode_fields(&pairs(&[
+            (b"k", b"K"),
+            (b"__null__", b""),
+            (b"h", HDRS_JSON)
+        ])),
+        (Some(b"K".to_vec()), None, hdrs())
+    );
+    // An empty headers array is a legal (if hand-written) shape.
+    assert_eq!(
+        decode_fields(&pairs(&[(b"v", b"V"), (b"h", b"[]")])),
+        (None, Some(b"V".to_vec()), vec![])
+    );
+}
+
+#[test]
+fn inverse_field_map_exotic_falls_back_to_envelope() {
+    fn marker() -> Vec<(String, Option<Vec<u8>>)> {
+        vec![(ENVELOPE_MARKER.to_string(), None)]
+    }
+    // 3 pairs without any "h": generic JSON envelope + marker header.
+    let (k, v, h) = decode_fields(&pairs(&[(b"a", b"\x01"), (b"b", b""), (b"c", b"zz")]));
     assert_eq!(k, None);
+    assert_eq!(h, marker());
     let v = String::from_utf8(v.unwrap()).unwrap();
     assert_eq!(v, r#"{"fields":[["a","01"],["b",""],["c","7a7a"]]}"#);
-    let (k2, _) = to_key_value(&pairs(&[(b"h", b"[{}]"), (b"v", b"V")]));
-    assert_eq!(k2, None, "a header pair forces the envelope");
+    // "h" whose value is not a legal headers JSON: envelope + marker.
+    let (k, v, h) = decode_fields(&pairs(&[(b"h", b"[{}]"), (b"v", b"V")]));
+    assert_eq!((k.as_deref(), h), (None, marker()));
+    assert!(String::from_utf8(v.unwrap())
+        .unwrap()
+        .contains(r#""fields""#));
+    // Unknown extra name beside a legal "h": envelope + marker.
+    let (k, _, h) = decode_fields(&pairs(&[(b"k", b"K"), (b"x", b"?"), (b"h", HDRS_JSON)]));
+    assert_eq!((k.as_deref(), h), (None, marker()));
+    // 4 pairs (XADD-shaped): envelope + marker.
+    let (k, _, h) = decode_fields(&pairs(&[
+        (b"k", b"K"),
+        (b"v", b"V"),
+        (b"h", HDRS_JSON),
+        (b"x", b"?"),
+    ]));
+    assert_eq!((k.as_deref(), h), (None, marker()));
+    // Duplicated slots ("v" twice, "v" beside "__null__"): envelope.
+    let (_, _, h) = decode_fields(&pairs(&[(b"v", b"V"), (b"v", b"W"), (b"h", HDRS_JSON)]));
+    assert_eq!(h, marker());
+    let (_, _, h) = decode_fields(&pairs(&[
+        (b"v", b"V"),
+        (b"__null__", b""),
+        (b"h", HDRS_JSON),
+    ]));
+    assert_eq!(h, marker());
+}
+
+#[test]
+fn headers_json_inverse_roundtrip() {
+    assert_eq!(parse_headers_json(HDRS_JSON), Some(hdrs()));
+    assert_eq!(parse_headers_json(b"[]"), Some(vec![]));
+    // Duplicate names stay in order (the wire format allows them).
+    assert_eq!(
+        parse_headers_json(br#"[{"n":"a","v":"ff"},{"n":"a","v":null}]"#),
+        Some(vec![
+            ("a".to_string(), Some(vec![0xff])),
+            ("a".to_string(), None)
+        ])
+    );
+    // Anything else is None: bad JSON, bad hex, wrong shapes/types.
+    for bad in [
+        &b"[{"[..],
+        &br#"[{"n":"a","v":"zz"}]"#[..], // odd-length hex
+        &br#"[{"n":"a","v":"XY"}]"#[..], // non-hex digits
+        &br#"[{"n":1,"v":null}]"#[..],
+        &br#"[{"n":"a"}]"#[..],                // missing v
+        &br#"[{"n":"a","v":null,"x":1}]"#[..], // extra key
+        &br#"{"n":"a","v":null}"#[..],         // not an array
+        &br#"[{"n":"a","v":true}]"#[..],
+        &b""[..],
+    ] {
+        assert_eq!(parse_headers_json(bad), None, "{bad:?}");
+    }
 }
 
 #[tokio::test]
