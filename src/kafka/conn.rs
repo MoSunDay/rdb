@@ -20,11 +20,13 @@ use crate::kafka::errors;
 use crate::kafka::fetch;
 use crate::kafka::frame::{parse_req_header, put_i32, put_resp_header, Reader};
 use crate::kafka::handshake;
+use crate::kafka::{admin, sasl};
 use crate::kafka::{
-    api_flexible, api_name, api_supported, API_KEY_API_VERSIONS, API_KEY_DESCRIBE_GROUPS,
-    API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP,
-    API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT,
-    API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
+    api_flexible, api_name, api_supported, API_KEY_API_VERSIONS, API_KEY_DELETE_GROUPS,
+    API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT,
+    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS,
+    API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE,
+    API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, API_KEY_SYNC_GROUP,
 };
 use crate::kafka::{offsets_commit, offsets_query, produce};
 use crate::monitor;
@@ -89,6 +91,11 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<Shared>, coord: Arc<CoordR
         .unwrap_or_else(|_| "unknown".to_string());
     let (mut rd, mut wr) = sock.into_split();
     let mut payload: Vec<u8> = Vec::new();
+    // SASL PLAIN gate (per connection): a non-empty `kafka_token`
+    // holds every non-handshake api behind one successful
+    // SaslAuthenticate; an empty token starts authenticated (zero
+    // behavior change, all existing e2e run without a token).
+    let mut auth = sasl::new_conn_auth(shared.conf.kafka_token.clone());
     loop {
         let mut len_buf = [0u8; 4];
         match tokio::time::timeout(IDLE_TIMEOUT, rd.read_exact(&mut len_buf)).await {
@@ -117,7 +124,7 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<Shared>, coord: Arc<CoordR
             }
             Err(_) => return, // idle cutoff mid-frame
         }
-        let reply = match process(&payload, &shared, &ad, &coord, &peer_host).await {
+        let reply = match process(&payload, &shared, &ad, &coord, &peer_host, &mut auth).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[kafka] closing connection: {e}");
@@ -140,17 +147,28 @@ pub async fn handle_conn(sock: TcpStream, shared: Arc<Shared>, coord: Arc<CoordR
             eprintln!("[kafka] flush reply failed: {e}");
             return;
         }
+        // A SASL failure answered its error frame and is done: close
+        // after the flush (the broker behavior for a broken handshake).
+        if auth.close_after {
+            return;
+        }
     }
 }
 
 /// One request frame -> one response frame (header + body); `Ok(None)`
 /// = no response frame at all (Produce with acks=0, the spec behavior).
+///
+/// `auth` is the connection's SASL state: with a configured
+/// `kafka_token` every api outside the pre-auth whitelist (ApiVersions
+/// and the SASL pair) closes the connection until SaslAuthenticate
+/// succeeds and flips `auth.authed`.
 async fn process(
     payload: &[u8],
     shared: &Shared,
     ad: &(String, i32),
     coord: &Arc<CoordRuntime>,
     peer_host: &str,
+    auth: &mut sasl::ConnAuth,
 ) -> Result<Option<Vec<u8>>, String> {
     let started = Instant::now();
     // The header's own shape depends on the requested api version, so
@@ -162,6 +180,12 @@ async fn process(
     let (header, mut body) =
         parse_req_header(payload, flexible).ok_or("malformed request header")?;
     let api_label = api_name(api_key);
+    // Pre-auth gate (only ever engaged with a configured token):
+    // drop unauthenticated traffic outside the whitelist without a
+    // reply, so nothing about the API surface leaks pre-auth.
+    if !sasl::allowed(auth, api_key) {
+        return Err(format!("{api_label} before authentication: closing"));
+    }
     // Long-poll time the FETCH handler spent parked (0 for every
     // other api): subtracted from the latency observation so the
     // histogram measures handler work, not the client's max_wait.
@@ -169,12 +193,37 @@ async fn process(
     let body_opt = match api_key {
         API_KEY_API_VERSIONS => {
             if api_supported(api_key, api_version) {
-                Some(handshake::api_versions_body(api_version, errors::NONE))
+                Some(handshake::api_versions_body(
+                    api_version,
+                    errors::NONE,
+                    sasl::enabled(&auth.token),
+                ))
             } else {
                 // Spec fallback: v0 body + the full supported list, so
                 // the client can renegotiate from the error reply.
-                Some(handshake::api_versions_body(0, errors::UNSUPPORTED_VERSION))
+                Some(handshake::api_versions_body(
+                    0,
+                    errors::UNSUPPORTED_VERSION,
+                    sasl::enabled(&auth.token),
+                ))
             }
+        }
+        API_KEY_SASL_HANDSHAKE if sasl::enabled(&auth.token) => {
+            if !sasl::api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            let out = sasl::handle_handshake(&mut body, api_version)?;
+            auth.close_after |= out.close;
+            Some(out.body)
+        }
+        API_KEY_SASL_AUTHENTICATE if sasl::enabled(&auth.token) => {
+            if !sasl::api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            let out = sasl::handle_authenticate(&mut body, api_version, &auth.token)?;
+            auth.close_after |= out.close;
+            auth.authed |= out.authed;
+            Some(out.body)
         }
         API_KEY_METADATA => {
             if !api_supported(api_key, api_version) {
@@ -286,7 +335,23 @@ async fn process(
                 coord,
             )?)
         }
-        _ => Some(handshake::api_versions_body(0, errors::UNSUPPORTED_VERSION)),
+        API_KEY_LIST_GROUPS => {
+            if !api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            Some(admin::handle_list_groups(&mut body, api_version, shared, coord).await?)
+        }
+        API_KEY_DELETE_GROUPS => {
+            if !api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            Some(admin::handle_delete_groups(&mut body, api_version, shared, coord).await?)
+        }
+        _ => Some(handshake::api_versions_body(
+            0,
+            errors::UNSUPPORTED_VERSION,
+            sasl::enabled(&auth.token),
+        )),
     };
     let Some(body_bytes) = body_opt else {
         // acks=0 Produce promised NO response frame -- still observed

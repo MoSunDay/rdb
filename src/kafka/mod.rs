@@ -12,6 +12,7 @@
 //! connection (`conn::handle_conn` owns the frame loop). Empty
 //! `kafka_bind` disables the front; the backup listener never wires it.
 
+pub mod admin;
 pub mod catalog;
 #[cfg(feature = "kafka-codecs")]
 pub mod codec;
@@ -40,6 +41,7 @@ pub mod produce;
 #[path = "produce_tests.rs"]
 mod produce_tests;
 pub mod record;
+pub mod sasl;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,10 +64,17 @@ pub const API_KEY_HEARTBEAT: i16 = 12; // P3
 pub const API_KEY_LEAVE_GROUP: i16 = 13; // P3
 pub const API_KEY_SYNC_GROUP: i16 = 14; // P3
 pub const API_KEY_DESCRIBE_GROUPS: i16 = 15; // P3
+pub const API_KEY_LIST_GROUPS: i16 = 16; // admin (Batch 2)
+pub const API_KEY_SASL_HANDSHAKE: i16 = 17; // SASL PLAIN (Batch 2)
 pub const API_KEY_API_VERSIONS: i16 = 18; // P0
+pub const API_KEY_SASL_AUTHENTICATE: i16 = 36; // SASL PLAIN (Batch 2)
+pub const API_KEY_DELETE_GROUPS: i16 = 42; // admin (Batch 2)
 
 /// Implemented api keys with their supported version ranges, sorted by
-/// key (the ApiVersions body order).
+/// key (the ApiVersions body order). The SASL pair (17/36) is NOT in
+/// this table: it is advertised and dispatched only when `kafka_token`
+/// is configured (see [`advertised_apis`]) -- with an empty token the
+/// wire surface is byte-identical to the pre-SASL broker.
 pub fn implemented_apis() -> Vec<(i16, i16, i16)> {
     vec![
         (API_KEY_PRODUCE, 0, 3),
@@ -80,8 +89,23 @@ pub fn implemented_apis() -> Vec<(i16, i16, i16)> {
         (API_KEY_LEAVE_GROUP, 0, 2),
         (API_KEY_SYNC_GROUP, 0, 4),
         (API_KEY_DESCRIBE_GROUPS, 0, 3),
+        (API_KEY_LIST_GROUPS, 0, 1),
         (API_KEY_API_VERSIONS, 0, 3),
+        (API_KEY_DELETE_GROUPS, 0, 1),
     ]
+}
+
+/// The ApiVersions answer for a broker whose SASL face is on
+/// (`kafka_token` non-empty): the implemented table plus SaslHandshake
+/// and SaslAuthenticate, key-sorted like the rest of the body.
+pub fn advertised_apis(sasl_enabled: bool) -> Vec<(i16, i16, i16)> {
+    let mut apis = implemented_apis();
+    if sasl_enabled {
+        apis.push((API_KEY_SASL_HANDSHAKE, 0, 1));
+        apis.push((API_KEY_SASL_AUTHENTICATE, 0, 1));
+        apis.sort_by_key(|(k, _, _)| *k);
+    }
+    apis
 }
 
 /// Version range of an implemented api; `None` = unknown api key.
@@ -128,7 +152,11 @@ pub fn api_name(key: i16) -> &'static str {
         API_KEY_LEAVE_GROUP => "LeaveGroup",
         API_KEY_SYNC_GROUP => "SyncGroup",
         API_KEY_DESCRIBE_GROUPS => "DescribeGroups",
+        API_KEY_LIST_GROUPS => "ListGroups",
+        API_KEY_SASL_HANDSHAKE => "SaslHandshake",
         API_KEY_API_VERSIONS => "ApiVersions",
+        API_KEY_SASL_AUTHENTICATE => "SaslAuthenticate",
+        API_KEY_DELETE_GROUPS => "DeleteGroups",
         _ => "UnknownApi",
     }
 }
@@ -215,6 +243,25 @@ mod tests {
         assert!(!api_flexible(API_KEY_HEARTBEAT, 3), "v4 is flexible");
         assert!(!api_flexible(API_KEY_LEAVE_GROUP, 2));
         assert!(!api_flexible(API_KEY_DESCRIBE_GROUPS, 3));
+        // Admin (Batch 2): ListGroups 16 / DeleteGroups 42, v0-v1 both
+        // (v2+ of either is flexible/tagged -- above the caps).
+        assert_eq!(api_range(API_KEY_LIST_GROUPS), Some((0, 1)));
+        assert_eq!(api_range(API_KEY_DELETE_GROUPS), Some((0, 1)));
+        assert!(!api_flexible(API_KEY_LIST_GROUPS, 1));
+        assert!(!api_flexible(API_KEY_DELETE_GROUPS, 1));
+        // SASL pair: dispatched/advertised only with kafka_token set,
+        // so it never enters the base registry/api_range.
+        assert_eq!(api_range(API_KEY_SASL_HANDSHAKE), None);
+        assert_eq!(api_range(API_KEY_SASL_AUTHENTICATE), None);
+        assert_eq!(advertised_apis(false).len(), 15);
+        let with_sasl = advertised_apis(true);
+        assert_eq!(with_sasl.len(), 17);
+        assert!(
+            with_sasl.contains(&(API_KEY_SASL_HANDSHAKE, 0, 1))
+                && with_sasl.contains(&(API_KEY_SASL_AUTHENTICATE, 0, 1)),
+            "sasl rows advertised when the token is set"
+        );
+        assert!(with_sasl.windows(2).all(|w| w[0].0 < w[1].0));
         // Body order is sorted by key.
         let apis = implemented_apis();
         assert!(apis.windows(2).all(|w| w[0].0 < w[1].0));

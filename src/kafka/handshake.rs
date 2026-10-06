@@ -47,12 +47,14 @@ pub fn advertise(bind: &str, host_override: &str, port_override: i32) -> (String
     (host.to_string(), port)
 }
 
-/// ApiVersions response body (0..=3). Entries come from the registry so
-/// the advertised set can never drift from dispatch.
-pub fn api_versions_body(version: i16, error: i16) -> Vec<u8> {
+/// ApiVersions response body (0..=3). Entries come from the registry
+/// so the advertised set can never drift from dispatch; the SASL pair
+/// (17/36) joins the table only when the broker runs with a configured
+/// `kafka_token` (empty token = the pre-SASL advertised surface).
+pub fn api_versions_body(version: i16, error: i16, sasl_enabled: bool) -> Vec<u8> {
     let mut out = Vec::new();
     put_i16(&mut out, error);
-    let ranges = super::implemented_apis();
+    let ranges = super::advertised_apis(sasl_enabled);
     if version >= 3 {
         // v3 layout (Kafka protocol page): error_code, [api_versions]
         // compact array, throttle_time_ms, body TAG_BUFFER -- the
@@ -249,12 +251,13 @@ mod tests {
 
     #[test]
     fn api_versions_v0_and_v3_shapes() {
-        // The advertised table = implemented_apis() in order (13 rows
-        // after P3 added the six coordinator apis).
+        // The advertised table = implemented_apis() in order (15 rows
+        // after P3 added the six coordinator apis and Batch 2 added
+        // ListGroups/DeleteGroups).
         let want = super::super::implemented_apis();
-        assert_eq!(want.len(), 13);
+        assert_eq!(want.len(), 15);
 
-        let v0 = api_versions_body(0, 0);
+        let v0 = api_versions_body(0, 0, false);
         let mut r = Reader::new(&v0);
         assert_eq!(r.i16(), Some(0));
         assert_eq!(r.array_len(), Some(Some(want.len())));
@@ -266,7 +269,7 @@ mod tests {
         }
         assert_eq!(r.remaining(), 0, "no throttle on v0");
 
-        let v3 = api_versions_body(3, 0);
+        let v3 = api_versions_body(3, 0, false);
         let mut r = Reader::new(&v3);
         assert_eq!(r.i16(), Some(0));
         assert_eq!(r.compact_array_len(), Some(Some(want.len())));
@@ -279,6 +282,28 @@ mod tests {
         }
         assert_eq!(r.i32(), Some(0), "throttle AFTER the array on v3");
         assert_eq!(r.skip_tagged_fields(), Some(()), "trailing tagged section");
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn api_versions_sasl_rows_only_when_enabled() {
+        // Token on: 17 rows, key-sorted -- SaslHandshake(17) between
+        // ListGroups(16) and ApiVersions(18), SaslAuthenticate(36)
+        // between ApiVersions(18) and DeleteGroups(42).
+        let sasl_on = api_versions_body(0, 0, true);
+        let mut r = Reader::new(&sasl_on);
+        assert_eq!(r.i16(), Some(0));
+        assert_eq!(r.array_len(), Some(Some(17)));
+        let mut keys = Vec::new();
+        for _ in 0..17 {
+            keys.push(r.i16().unwrap());
+            r.i16();
+            r.i16();
+        }
+        assert_eq!(
+            keys,
+            vec![0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 36, 42]
+        );
         assert_eq!(r.remaining(), 0);
     }
 

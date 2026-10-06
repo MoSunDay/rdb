@@ -45,7 +45,10 @@ async fn api_versions_and_metadata_over_the_wire() {
     let mut r = Reader::new(&payload);
     assert_eq!(r.i32(), Some(100), "correlation id echo");
     assert_eq!(r.i16(), Some(0), "error NONE");
-    assert_eq!(r.array_len(), Some(Some(13)));
+    // 15 rows after Batch 2 added ListGroups(16)/DeleteGroups(42); the
+    // SASL pair (17/36) joins only when kafka_token is configured
+    // (pinned on the token-on node in tests/kafka_admin_e2e.rs).
+    assert_eq!(r.array_len(), Some(Some(15)));
     assert_eq!(
         [r.i16(), r.i16(), r.i16()],
         [Some(0), Some(0), Some(3)],
@@ -108,8 +111,18 @@ async fn api_versions_and_metadata_over_the_wire() {
     );
     assert_eq!(
         [r.i16(), r.i16(), r.i16()],
+        [Some(16), Some(0), Some(1)],
+        "ListGroups v0-v1"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
         [Some(18), Some(0), Some(3)],
         "ApiVersions"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(42), Some(0), Some(1)],
+        "DeleteGroups v0-v1"
     );
     assert_eq!(r.remaining(), 0, "v0 has no throttle tail");
 
@@ -120,7 +133,7 @@ async fn api_versions_and_metadata_over_the_wire() {
     // ApiVersions pins its response header to v0/classic (Kafka's
     // ApiKeys.responseHeaderVersion: no tagged byte even for flexible).
     assert_eq!(r.i16(), Some(0));
-    assert_eq!(r.compact_array_len(), Some(Some(13)));
+    assert_eq!(r.compact_array_len(), Some(Some(15)));
     for (key, lo, hi) in [
         (0, 0, 3),
         (1, 0, 10),
@@ -134,7 +147,9 @@ async fn api_versions_and_metadata_over_the_wire() {
         (13, 0, 2),
         (14, 0, 4),
         (15, 0, 3),
+        (16, 0, 1),
         (18, 0, 3),
+        (42, 0, 1),
     ] {
         assert_eq!(
             [r.i16(), r.i16(), r.i16()],
@@ -154,14 +169,16 @@ async fn api_versions_and_metadata_over_the_wire() {
     let mut r = Reader::new(&payload);
     assert_eq!(r.i32(), Some(102));
     assert_eq!(r.i16(), Some(35), "UNSUPPORTED_VERSION");
-    assert_eq!(r.array_len(), Some(Some(13)), "v0 body still lists apis");
-    let apis: Vec<[Option<i16>; 3]> = (0..13).map(|_| [r.i16(), r.i16(), r.i16()]).collect();
-    // Spot-check the P3 additions made the fallback table too.
+    assert_eq!(r.array_len(), Some(Some(15)), "v0 body still lists apis");
+    let apis: Vec<[Option<i16>; 3]> = (0..15).map(|_| [r.i16(), r.i16(), r.i16()]).collect();
+    // Spot-check the P3 + Batch 2 additions made the fallback table too.
     assert!(apis.contains(&[Some(11), Some(0), Some(4)]), "JoinGroup");
     assert!(
         apis.contains(&[Some(15), Some(0), Some(3)]),
         "DescribeGroups"
     );
+    assert!(apis.contains(&[Some(16), Some(0), Some(1)]), "ListGroups");
+    assert!(apis.contains(&[Some(42), Some(0), Some(1)]), "DeleteGroups");
     assert_eq!(r.remaining(), 0);
 
     // ---- Metadata v0, null topics (list all): sees the Lite stream ----
