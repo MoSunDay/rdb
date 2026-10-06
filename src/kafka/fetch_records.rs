@@ -14,7 +14,7 @@
 //! store pass so a huge partition is walked incrementally.
 
 use crate::kafka::produce::parse_headers_json;
-use crate::kafka::record::{build_batch, BatchRecord};
+use crate::kafka::record::{build_batch, BatchRecord, RecordHeaders};
 use crate::lite::entries::scan_entries;
 use crate::lite::model;
 use crate::store::Store;
@@ -25,24 +25,30 @@ pub(super) const WALK_CHUNK: usize = 256;
 /// Marker header (null value) replayed on envelope-fallback records:
 /// the stored pairs were not a produce shape, so the exact bytes ride
 /// in the value JSON instead of the key/value/header slots.
+///
+/// Collision semantics (user header WINS): a produce-shaped record
+/// carrying a genuine header literally named `rdb-envelope` is
+/// replayed verbatim -- no marker is added -- while only the fallback
+/// synthesizes this header (always null-valued and always the ONLY
+/// header on the record). The two therefore never mix on one record,
+/// but a client cannot tell a lone null `rdb-envelope` user header
+/// from a fallback marker: the marker is advisory, and clients that
+/// rely on it should not produce headers under this reserved name
+/// (documented in features/kafka-front.md).
 pub(super) const ENVELOPE_MARKER: &str = "rdb-envelope";
 
 /// One entry flattened to its Kafka record shape (arrival ms +
-/// key/value/headers).
+/// key/value/headers; header names are raw bytes).
 struct RawRec {
     ms: u64,
     key: Option<Vec<u8>>,
     value: Option<Vec<u8>>,
-    headers: Vec<(String, Option<Vec<u8>>)>,
+    headers: RecordHeaders,
 }
 
 /// Decoded record shape shared by the decode paths: key bytes, value
-/// bytes and headers.
-type DecodedFields = (
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Vec<(String, Option<Vec<u8>>)>,
-);
+/// bytes and headers (names as raw bytes).
+type DecodedFields = (Option<Vec<u8>>, Option<Vec<u8>>, RecordHeaders);
 
 /// Walk entries from `from_ordinal`, capped by a byte budget; at least
 /// one record survives whenever the budget is positive (the Kafka
@@ -115,7 +121,7 @@ pub(super) fn collect_records(
             headers: r
                 .headers
                 .iter()
-                .map(|(n, v)| (n.as_str(), v.as_deref()))
+                .map(|(n, v)| (n.as_slice(), v.as_deref()))
                 .collect(),
         })
         .collect();
@@ -132,9 +138,10 @@ pub(super) fn collect_records(
 /// - header-bearing produce shapes -> REAL headers restored from the
 ///   "h" pair's JSON (see [`restore_headers`])
 /// - anything else -> generic envelope: value = JSON
-///   `{"fields":[[name,hex(value)]...]}`, key None, plus the
-///   [`ENVELOPE_MARKER`] header (the exact bytes still round-trip; a
-///   plain Kafka client never produces exotic shapes).
+///   `{"fields":[[hex(name),hex(value)]...]}`, key None, plus the
+///   [`ENVELOPE_MARKER`] header (names are hex too, so even a
+///   non-UTF-8 field name round-trips byte-exact; a plain Kafka
+///   client never produces exotic shapes).
 pub(super) fn decode_fields(fields: &[(Vec<u8>, Vec<u8>)]) -> DecodedFields {
     fn name(p: &(Vec<u8>, Vec<u8>)) -> &[u8] {
         p.0.as_slice()
@@ -165,16 +172,21 @@ pub(super) fn decode_fields(fields: &[(Vec<u8>, Vec<u8>)]) -> DecodedFields {
 
 /// Produce-shaped restore: exactly one "h" pair whose bytes parse as
 /// the headers JSON, every other pair (at most one each) named "k",
-/// "v" or `__null__` -- the only shapes `record_fields` can write.
-/// Anything else (broken JSON, unknown or duplicated names, more than
-/// 3 pairs, "v" beside `__null__`) -> None = exotic fallback.
+/// "v" or `__null__`. Deliberately a SUPERSET of what
+/// `record_fields` writes: the check is order-insensitive and allows
+/// an "h" pair with no value slot beside it -- shapes the writer
+/// never produces but that still decode losslessly. Hand-written or
+/// externally-written entries inside that superset restore as real
+/// headers instead of degrading to the envelope; anything else
+/// (broken JSON, unknown or duplicated names, more than 3 pairs, "v"
+/// beside `__null__`) -> None = exotic fallback.
 fn restore_headers(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<DecodedFields> {
     if fields.len() > 3 {
         return None;
     }
     let mut key: Option<Vec<u8>> = None;
     let mut value: Option<Option<Vec<u8>>> = None; // outer None = no slot written
-    let mut headers: Option<Vec<(String, Option<Vec<u8>>)>> = None;
+    let mut headers: Option<RecordHeaders> = None; // None = no "h" pair
     for (f, v) in fields {
         match f.as_slice() {
             b"h" if headers.is_none() => headers = Some(parse_headers_json(v)?),
@@ -187,26 +199,29 @@ fn restore_headers(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<DecodedFields> {
     Some((key, value.unwrap_or(None), headers?))
 }
 
-/// Exotic fallback: value = JSON `{"fields":[[name,hex(value)]...]}`
-/// (the exact bytes still round-trip), key None, one null-valued
-/// [`ENVELOPE_MARKER`] header so a client can tell the fallback from a
-/// produce-shaped record.
+/// Exotic fallback: value = JSON `{"fields":[[hex(name),hex(value)]...]}`
+/// -- BOTH sides hex-encoded, so a field name of arbitrary
+/// (non-UTF-8) bytes round-trips exactly and distinct names can never
+/// collapse onto one lossy string (the previous JSON-escaped
+/// `String::from_utf8_lossy` name was irreversible and
+/// collision-prone; plans/2026-10-06-mq-gap 03: bytes are never
+/// lost). key None, one null-valued [`ENVELOPE_MARKER`] header so a
+/// client can tell the fallback from a produce-shaped record. There
+/// is no compatibility surface to honor: the envelope is synthesized
+/// per fetch response and never persisted, so no old-format envelope
+/// can be encountered once this code runs.
 fn envelope_record(fields: &[(Vec<u8>, Vec<u8>)]) -> DecodedFields {
     let mut json = String::from("{\"fields\":[");
     for (i, (f, v)) in fields.iter().enumerate() {
         if i > 0 {
             json.push(',');
         }
-        json.push_str(&format!(
-            "[{},\"{}\"]",
-            serde_json::to_string(&String::from_utf8_lossy(f)).unwrap_or_default(),
-            hex::encode(v)
-        ));
+        json.push_str(&format!("[\"{}\",\"{}\"]", hex::encode(f), hex::encode(v)));
     }
     json.push_str("]}");
     (
         None,
         Some(json.into_bytes()),
-        vec![(ENVELOPE_MARKER.to_string(), None)],
+        vec![(ENVELOPE_MARKER.as_bytes().to_vec(), None)],
     )
 }

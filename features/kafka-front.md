@@ -66,8 +66,10 @@
   - headers 非空 → key 对（key 非 null 时）+ v 对 + `("h",headers JSON)`；
   - null key/value 槽写哨兵对 `("__null__", b"")`（空 bytes 值仍是 `("v",b"")`，
     tombstone 可区分）；
-  - headers JSON = `[{"n":"name","v":null},{"n":"name2","v":"<hex>"}]`（字节值
-    hex 编码）。
+  - headers JSON = `[{"x":"<hex(name)>","v":null},{"x":"<hex(name2)>","v":"<hex>"}]`
+    ——**名字与值都 hex 编码**（Kafka wire 的 header name 是任意字节，hex 保字节
+    精确往返，不丢字节、不碰撞）；名字挂在 `"x"` 键下，存量的 `"n"`（裸字符串
+    名）条目照常可读（读侧两种形式都接受，写侧只发 `"x"`）。
 - 解析错误分类（`classify_parse_err`，按 parse_batch 错误文本前缀）：含 `magic`
   → 35 `UNSUPPORTED_VERSION`；含 `compressed` → 76
   `UNSUPPORTED_COMPRESSION_TYPE`；其余（CRC 失配等）→ 2 `CORRUPT_MESSAGE`。
@@ -82,11 +84,16 @@
     （不发空 batch）；`> len` → error 1 `OFFSET_OUT_OF_RANGE`（hwm=len）；
     未知 topic/分区 → error 3、hwm=-1。
   - 记录取回：按字段对映射反向解码——0/1/2 对 → key/value 还原；**produce 形状
-    （恰一个 "h" 对 + 合法 headers JSON + 其余 "k"/"v"/`__null__` 各至多一次）还原为
-    真 record headers**（`parse_headers_json` 是 produce 侧 `headers_json` 的逆函数，
-    存储格式与存量数据零改动）；exotic 形状回退通用 JSON envelope
-    `{"fields":[[name,hex]]}`（key=None）并追加标记头 `("rdb-envelope", null)`，
-    客户端可据此区分兜底与真 headers；batch 的
+    （恰一个 "h" 对 + 合法 headers JSON + 其余 "k"/"v"/`__null__` 各至多一次，判定
+    为写入形状的超集：顺序无关、允许无值槽的 "h"）还原为真 record headers**
+    （`parse_headers_json` 是 produce 侧 `headers_json` 的逆函数，兼读存量 `"n"`
+    裸串名条目）；exotic 形状回退通用 JSON envelope
+    `{"fields":[[hex(name),hex(value)]]}`（key=None，**名字也 hex 编码**：非 UTF-8
+    字段名字节精确往返、不碰撞）并追加标记头 `("rdb-envelope", null)`，客户端可
+    据此区分兜底与真 headers；**标记头碰撞语义：用户头优先**——用户真发一条名为
+    `rdb-envelope` 的 header 时按原文回放、绝不附加标记头（标记头只在兜底记录上
+    合成，且恒为该记录唯一的 null 值头；客户端无法把"用户单发 null 值
+    `rdb-envelope` 头"与兜底标记区分开，标记头仅为提示性信号）；batch 的
     base_offset = 请求 ordinal、first_timestamp = 首条到达 ms。
   - 预算：全局 max_bytes 是**软上限**——每个存活分区保底 1 条（floor=1），
     partition_max_bytes 正常截断；扫描按 256 条/块分块。
@@ -311,6 +318,24 @@ kafka 面消费到的三处引擎级缺口（详见 `features/changelog/2026-10-
 3. **XTRIM/XDEL 账本守卫**：有 0x20 账本行的流拒绝 XTRIM/XDEL
    （`ERR stream <name> has committed consumer-group offsets; delete the groups
    first`），ordinal↔id 映射不再被删条目撕裂（守卫同样保护 RESP 面的 Lite 流）。
+
+## header 名字节保真（2026-10-06 复审修复）
+复审发现 Batch 1 的两处 header **名字**通道经 `String::from_utf8_lossy` 转写：
+非 UTF-8 名字被不可逆损坏，且不同名字可能塌缩成同一替换串（违反
+plans/2026-10-06-mq-gap/03 的"字节永不丢失"规则；e2e 此前只用 ASCII 名字故未暴露）。
+1. **native 通道**：wire 解析保留原始名字节（`Record.headers` 名字类型
+   String→字节）；存储 `"h"` JSON 的名字改 hex 编码并挂 `"x"` 键（见上文字段对
+   映射）——存量为 `"n"` 裸串名的条目照常可读（那时名字已是合法 UTF-8 串，
+   读回无损失），写侧只发 `"x"`，两种形式永不歧义。
+2. **envelope 兜底**：兜底 JSON 的字段名同样改 hex
+   （`{"fields":[[hex(name),hex(value)]]}`）；envelope 仅在 Fetch 应答时合成、
+   从不落盘，故无任何持久/在途兼容面需要照顾。
+3. **`rdb-envelope` 碰撞语义（用户头优先）**：用户真发名为 `rdb-envelope` 的
+   header 时原样回放、不附加标记头；标记头只由兜底合成（恒 null 值且为该记录
+   唯一头）。客户端无法区分"用户单发 null 值 `rdb-envelope` 头"与兜底标记，
+   标记头为提示性信号，依赖它的客户端应避免使用该保留名。
+   e2e：`tests/kafka_headers_fidelity_e2e.rs`（3 用例：native 名字节往返/
+   envelope 名字节往返/碰撞用户头优先）。
 
 ## 风险注记（显式接受）
 - **单节点持久性是既知风险**：当年否决 Kafka front 的理由仍然成立——Kafka 客户端

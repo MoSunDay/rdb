@@ -241,7 +241,7 @@ async fn produce_appends_and_listoffsets_answer() {
             timestamp_delta: 0,
             key: Some(b"k2"),
             value: None,
-            headers: vec![("h1", None), ("h2", Some(b"\x00\xff"))],
+            headers: vec![(&b"h1"[..], None), (&b"h2"[..], Some(b"\x00\xff"))],
         }],
     );
     let body = produce_round(&mut sock, 2, 1, "t1", 0, &batch).await;
@@ -269,7 +269,7 @@ async fn produce_appends_and_listoffsets_answer() {
         contains_bytes(&xrange, b"$8\r\n__null__\r\n$0\r\n\r\n"),
         "null value -> __null__ sentinel"
     );
-    let json = r#"[{"n":"h1","v":null},{"n":"h2","v":"00ff"}]"#;
+    let json = r#"[{"x":"6831","v":null},{"x":"6832","v":"00ff"}]"#;
     assert!(
         contains_bytes(
             &xrange,
@@ -297,8 +297,8 @@ async fn produce_appends_and_listoffsets_answer() {
     assert_eq!(
         rec.headers,
         vec![
-            ("h1".to_string(), None),
-            ("h2".to_string(), Some(vec![0x00, 0xff]))
+            (b"h1".to_vec(), None),
+            (b"h2".to_vec(), Some(vec![0x00, 0xff]))
         ],
         "headers replay as record headers, not a value envelope"
     );

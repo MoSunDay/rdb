@@ -32,7 +32,7 @@ use crate::hash;
 use crate::kafka::errors;
 use crate::kafka::frame::{put_array_len, put_i16, put_i32, put_i64, put_string, Reader};
 use crate::kafka::mapping;
-use crate::kafka::record::{parse_batch, Record};
+use crate::kafka::record::{parse_batch, Record, RecordHeaders};
 use crate::lite::{model, offset, stat_bump};
 use crate::monitor;
 use crate::state::Shared;
@@ -241,19 +241,28 @@ pub(super) fn record_fields(rec: &Record) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
-/// Headers as `[{"n":name,"v":null},{"n":name,"v":"<hex>"}]` (byte
-/// values hex-encoded; names are UTF-8 strings per the wire format).
+/// Headers as `[{"x":hex(name),"v":null},{"x":hex(name),"v":"<hex>"}]`
+/// -- BOTH the name and the value hex-encoded: a Kafka header name is
+/// raw wire bytes the protocol never validates as UTF-8, so it is
+/// stored byte-exact (a lossy name transcoding would be irreversible
+/// and could collapse distinct names onto one string). The name rides
+/// under a distinct `"x"` key so legacy entries (`"n"` holding the
+/// raw string) stay unambiguously readable -- an `"n"` string is
+/// never reinterpreted as hex.
 /// Inverse: [`parse_headers_json`].
-fn headers_json(headers: &[(String, Option<Vec<u8>>)]) -> String {
+fn headers_json(headers: &[(Vec<u8>, Option<Vec<u8>>)]) -> String {
     let mut out = String::from("[");
     for (i, (name, val)) in headers.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        let name = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+        let name = hex::encode(name);
         match val {
-            None => out.push_str(&format!("{{\"n\":{name},\"v\":null}}")),
-            Some(v) => out.push_str(&format!("{{\"n\":{name},\"v\":\"{}\"}}", hex::encode(v))),
+            None => out.push_str(&format!("{{\"x\":\"{name}\",\"v\":null}}")),
+            Some(v) => out.push_str(&format!(
+                "{{\"x\":\"{name}\",\"v\":\"{}\"}}",
+                hex::encode(v)
+            )),
         }
     }
     out.push(']');
@@ -261,14 +270,20 @@ fn headers_json(headers: &[(String, Option<Vec<u8>>)]) -> String {
 }
 
 /// Inverse of [`headers_json`]: the stored `"h"` pair bytes back to
-/// record headers (`[{"n":..,"v":null},..]` / `{"n":..,"v":"<hex>"}`).
+/// record headers. Per item BOTH forms decode (each must carry `"v"`):
+/// - current `{"x":"<hex>","v":null|"hex"}` (byte-exact names);
+/// - legacy `{"n":"<utf8>","v":null|"hex"}` (entries written before
+///   name fidelity; the stored name was a UTF-8 string already, so
+///   reading it back as bytes loses nothing).
+///
 /// Anything malformed or shape-mismatched -- not JSON, not an array,
-/// items without exactly the `n`/`v` keys, a non-string name, a bad
-/// hex value -- yields None; the caller (fetch replay) then keeps the
-/// generic envelope fallback. An empty array is Some(vec![]) -- whether
-/// that differs from "no h pair at all" is the caller's call.
-/// Storage format itself is untouched (existing data stays readable).
-pub(crate) fn parse_headers_json(bytes: &[u8]) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+/// items without exactly two recognized keys, a bad hex name/value --
+/// yields None; the caller (fetch replay) then keeps the generic
+/// envelope fallback. An empty array is Some(vec![]) -- whether that
+/// differs from "no h pair at all" is the caller's call.
+/// Storage format itself is forward-compatible (legacy data stays
+/// readable; the writer only emits the `"x"` form).
+pub(crate) fn parse_headers_json(bytes: &[u8]) -> Option<RecordHeaders> {
     let items = serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()?
         .as_array()?
@@ -276,10 +291,14 @@ pub(crate) fn parse_headers_json(bytes: &[u8]) -> Option<Vec<(String, Option<Vec
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let obj = item.as_object()?;
-        if obj.len() != 2 || !obj.contains_key("n") || !obj.contains_key("v") {
+        if obj.len() != 2 || !obj.contains_key("v") {
             return None;
         }
-        let name = obj.get("n")?.as_str()?.to_string();
+        let name = match (obj.get("x"), obj.get("n")) {
+            (Some(serde_json::Value::String(h)), None) => hex::decode(h).ok()?,
+            (None, Some(serde_json::Value::String(s))) => s.clone().into_bytes(),
+            _ => return None,
+        };
         let val = match obj.get("v")? {
             serde_json::Value::Null => None,
             serde_json::Value::String(h) => Some(hex::decode(h).ok()?),
