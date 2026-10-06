@@ -130,3 +130,134 @@ pub async fn cmd_full_reply(addr: &str, token: &str, args: &[&[u8]], quiet_ms: u
         buf
     }
 }
+
+// ---- proc-level boots (real binary; shared by the DLQ/sweep suites) ----
+
+use std::path::{Path, PathBuf};
+
+use super::{cmd_one_shot, spawn_node_yaml, wait_resp_ready, ProcNode, TOKEN};
+
+/// Per-process root of the proc-level lite boots: `<tmp>/rdb-lite-boot-<pid>`
+/// -- one per running test binary, so parallel cargo invocations never share
+/// a tree while repeat runs (whose pid is often recycled) land on the exact
+/// path an earlier crashed run left behind.
+const BOOT_ROOT_PREFIX: &str = "rdb-lite-boot";
+/// Marker stamped into a freshly wiped boot root: present = this process
+/// already owns the tree, so later boots only claim their own tag below it.
+const BOOT_ROOT_STAMP: &str = ".owned-by-this-process";
+
+/// Opportunistic prune of sibling boot roots whose owning process is gone
+/// (`/proc/<pid>` disappeared): hundreds of suite runs otherwise leave a
+/// few hundred KB each in /tmp. Never touches a live process's tree (its
+/// /proc entry exists) and silently no-ops where /proc is unavailable.
+fn prune_dead_roots(mine: &Path) {
+    let proc = std::path::Path::new("/proc");
+    if !proc.join("self").exists() {
+        return; // no /proc (non-Linux): leave siblings alone
+    }
+    let Some(parent) = mine.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let Some(pid) = name
+            .strip_prefix(&format!("{BOOT_ROOT_PREFIX}-"))
+            .and_then(|rest| rest.parse::<u32>().ok())
+        else {
+            continue; // not one of ours: never touch foreign temp dirs
+        };
+        if pid != std::process::id() && !proc.join(pid.to_string()).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Own the boot root exactly once per process, then hand out the caller's
+/// tag dir, remove-then-created: (1) the first boot wipes the whole root
+/// (stale node dirs a recycled pid inherited from a crashed run) under the
+/// init mutex, so no sibling boot's dir can be created before the wipe;
+/// (2) the tag dir itself is cleared, so a re-run always starts on an
+/// empty store instead of colliding with leftover RocksDB data.
+fn fresh_boot_dir(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("{BOOT_ROOT_PREFIX}-{}", std::process::id()));
+    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = INIT.lock().unwrap_or_else(|e| e.into_inner());
+    prune_dead_roots(&root);
+    if !root.join(BOOT_ROOT_STAMP).exists() {
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create lite boot root");
+        std::fs::write(root.join(BOOT_ROOT_STAMP), b"").expect("stamp lite boot root");
+    }
+    drop(_held);
+    let dir = root.join(format!("{tag}-{}", nanos()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create lite boot dir");
+    dir
+}
+
+/// Monotonic-enough uniqueness suffix (two boots may share a tag across
+/// sequential tests of one binary; the wall clock keeps them apart).
+fn nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Fresh single bootstrap node on a self-cleaning tempdir (see
+/// [`fresh_boot_dir`]) -> (node, resp addr). The node must stay bound
+/// (`_node`: Drop kills it).
+pub async fn boot(tag: &str) -> (ProcNode, String) {
+    boot_yaml(tag, "").await
+}
+
+/// [`boot`] plus verbatim top-level yaml lines in the node's conf.yaml
+/// (e.g. `lite:\n  redelivery_idle_ms: 500\n` to arm the background
+/// sweep in the spawned process).
+pub async fn boot_yaml(tag: &str, extra_yaml: &str) -> (ProcNode, String) {
+    let dir = fresh_boot_dir(tag);
+    let mut node = spawn_node_yaml(&dir, 0, true, None, extra_yaml);
+    wait_resp_ready(&mut node, 30).await;
+    let resp = node.resp.clone();
+    (node, resp)
+}
+
+/// One-shot command reply as text (single-line replies resolve line-wise).
+pub async fn resp_text(a: &str, args: &[&[u8]]) -> String {
+    text(&cmd_one_shot(a, TOKEN, args).await)
+}
+
+/// Full-drain command reply as text (arrays-of-arrays need the quiet-gap
+/// reader, not the line reader).
+pub async fn resp_full(a: &str, args: &[&[u8]]) -> String {
+    text(&cmd_full_reply(a, TOKEN, args, 200).await)
+}
+
+/// (id, consumer, deliveries) of `XPENDING <s> <g> - + <n>` range rows,
+/// sorted by id (the `>5` token filter drops the trailing CRLF artifact).
+pub async fn pending_rows(a: &str, s: &[u8], g: &[u8], n: usize) -> Vec<(String, String, u64)> {
+    let n_arg = n.to_string();
+    let reply = cmd_full_reply(
+        a,
+        TOKEN,
+        &[b"xpending", s, g, b"-", b"+", n_arg.as_bytes()],
+        200,
+    )
+    .await;
+    let mut rows: Vec<(String, String, u64)> = pel_rows(&reply)
+        .into_iter()
+        .filter(|r| r.len() > 5)
+        .map(|r| {
+            (
+                r[1].clone(),
+                r[3].clone(),
+                r[5].trim_start_matches(':').parse::<u64>().unwrap_or(0),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
