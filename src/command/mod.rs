@@ -198,7 +198,7 @@ pub fn lookup(name: &str) -> Option<Handler> {
         "xtrim" => Some(|ctx| Box::pin(crate::lite::append::xtrim(ctx))),
         "xdel" => Some(|ctx| Box::pin(crate::lite::append::xdel(ctx))),
         "xidle" => Some(|ctx| Box::pin(crate::lite::append::xidle(ctx))),
-        "xread" => Some(|ctx| Box::pin(crate::lite::read::xread(ctx))),
+        "xread" => Some(|ctx| Box::pin(crate::lite::read_xread::xread(ctx))),
         "xreadgroup" => Some(|ctx| Box::pin(crate::lite::read::xreadgroup(ctx))),
         "xack" => Some(|ctx| Box::pin(crate::lite::ack::xack(ctx))),
         "xgroup" => Some(|ctx| Box::pin(crate::lite::group::xgroup(ctx))),

@@ -581,7 +581,7 @@ async fn do_main() {
     // Lite Mode: periodic group-offset flush + stream gauges.
     rdb::lite::spawn_background(Arc::clone(&shared));
     // Lite Mode: idle auto-redelivery sweep (no-op unless configured).
-    rdb::lite::redeliver::spawn_redelivery_sweep(Arc::clone(&shared));
+    rdb::lite::redeliver_loop::spawn_redelivery_sweep(Arc::clone(&shared));
     // M2: periodic MVCC version GC below the snapshot watermark.
     sql::storage::gc::spawn_gc(Arc::clone(&shared));
     // M5: periodic columnar segment orphan/garbage sweep.

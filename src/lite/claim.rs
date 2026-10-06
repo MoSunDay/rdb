@@ -13,7 +13,6 @@
 
 use crate::command::Ctx;
 use crate::ds::expire;
-use crate::ds::latch;
 use crate::monitor;
 use crate::resp::codec as resp;
 use crate::store::ops;
@@ -173,25 +172,23 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
     // A MAXDELIVERY group's DLQ target joins the latch set (sorted by
     // dlq::latch_keys): the dead-letter branch below writes both
     // windows inside this one critical section. The first group_absent
-    // check warmed the offset cache, so the config peek is exact.
-    let gst = offset::load(
+    // check warmed the offset cache, and lock_group_latches re-validates
+    // the peeked set UNDER the locks (a DESTROY + re-CREATE with a
+    // different DLQ must not race the latch choice). It returns the
+    // config state of the final, validated acquisition.
+    let (guards, gst) = dlq::lock_group_latches(
+        &ctx.shared.latch,
         &ctx.shared.lite.offsets,
         &ctx.shared.store,
         &prefix,
         &stream,
         &group,
     )
-    .ok()
-    .flatten();
-    let dlq_target = gst
-        .as_ref()
-        .filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
-        .map(|st| st.dlq.clone());
-    let latch_set = dlq::latch_keys(model::meta_key(&prefix, &stream), dlq_target.as_deref());
-    let mut guards = Vec::with_capacity(latch_set.len());
-    for k in &latch_set {
-        guards.push(latch::lock(&ctx.shared.latch, k).await);
-    }
+    .await;
+    let _guards = guards;
+    // Pre-transfer cache snapshot: restored on every failed commit
+    // below so the watermark never names ids the store never resolved.
+    let mark = offset::mark(&ctx.shared.lite.offsets, &stream, &group);
     // Re-validate under the latch: a racing XGROUP DESTROY may have
     // removed the group between the first check and the latch.
     if group_absent(ctx, &prefix, &stream, &group) {
@@ -246,14 +243,19 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
     // FORCE can MINT a PEL row for an id that was never delivered: the
     // backlog counter only grows for those (rewrites are count-neutral).
     let mut force_created: u64 = 0;
-    // PEL rows resolved by dead-letter transfers (not in the reply).
+    // PEL rows resolved by dead-letter transfers (not in the reply) and
+    // the batch's post-commit accounting (dlq::account_tally).
     let mut dlq_count: u64 = 0;
+    let mut tally_sum = dlq::TransferTally::default();
     for id in ids {
         let old = match pel::get_pend(&ctx.shared.store, &prefix, &stream, &group, id) {
             // Not idle enough yet: stays with its current owner.
             Ok(Some(st)) if now.saturating_sub(st.delivered_ms) < min_idle => continue,
             Ok(st) => st,
-            Err(e) => return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}")),
+            Err(e) => {
+                offset::restore(&ctx.shared.lite.offsets, &stream, &group, mark.clone());
+                return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}"));
+            }
         };
         let fresh = old.is_none();
         if fresh && !force {
@@ -267,7 +269,10 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
         } else {
             match read_entry(&ctx.shared.store, &prefix, &stream, id) {
                 Ok(v) => v,
-                Err(e) => return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}")),
+                Err(e) => {
+                    offset::restore(&ctx.shared.lite.offsets, &stream, &group, mark.clone());
+                    return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}"));
+                }
             }
         };
         if fresh && fields.is_none() {
@@ -297,9 +302,14 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
                     std::slice::from_ref(&row),
                     now,
                 ) {
-                    Ok(k) => dlq_count += k as u64,
+                    Ok(t) => {
+                        dlq_count += t.resolved as u64;
+                        tally_sum.dlq_created += t.dlq_created;
+                        tally_sum.moved += t.moved;
+                    }
                     Err(e) => {
-                        return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}"))
+                        offset::restore(&ctx.shared.lite.offsets, &stream, &group, mark.clone());
+                        return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}"));
                     }
                 }
                 continue;
@@ -325,8 +335,12 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
         }
     }
     if let Err(e) = ctx.commit(batch).await {
+        // Void batch: rewind the watermark moves the transfers made, so
+        // the dead-lettered rows stay pending and claimable.
+        offset::restore(&ctx.shared.lite.offsets, &stream, &group, mark);
         return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}"));
     }
+    dlq::account_tally(ctx.shared, tally_sum);
     if ordered && !(frames.is_empty() && claimed_ids.is_empty()) {
         // Takeover happened: wake blocked readers so a fenced-out former
         // owner (and any contender) re-checks immediately.

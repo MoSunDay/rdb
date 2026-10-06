@@ -394,3 +394,28 @@ async fn redelivery_disabled_by_default() {
         "no sweep without lite.redelivery_idle_ms"
     );
 }
+
+/// A `>` round whose every candidate dead-letters (the full-drain
+/// shape: MAXDELIVERY 1 + a SETID rewind re-offers the already-delivered
+/// id) must reply NIL, not `[[stream, *0]]` -- the inner empty-array
+/// marker broke the nil-for-empty-stream contract and woke BLOCK
+/// readers with an empty response. The transfer itself still commits
+/// atomically (PEL drained, DLQ entry landed, watermark crossed).
+#[tokio::test]
+async fn full_drain_round_replies_nil_not_empty_marker() {
+    let (_node, a) = boot("t8").await;
+    gcreate(&a, b"d/q19", b"g", &[b"MAXDELIVERY", b"1"]).await;
+    xadd(&a, b"d/q19", "1-1", "v").await;
+    assert!(read_new(&a, b"d/q19", b"g", b"c1").await.contains("1-1"));
+    assert_eq!(
+        t(&a, &[b"xgroup", b"setid", b"d/q19", b"g", b"0-0"]).await,
+        "+OK"
+    );
+    // The rewind re-offers 1-1, whose next delivery (2) exceeds the cap
+    // of 1: the whole served set transfers and the reply is a bare nil.
+    let drained = read_new(&a, b"d/q19", b"g", b"c2").await;
+    assert_eq!(drained, "*-1\r\n", "nil, never [[stream, *0]]");
+    pel_empty(&a, b"d/q19", b"g").await;
+    xrange_has(&a, b"d/q19/dlq", &["1-1", "__dlq_times"]).await;
+    assert_eq!(t(&a, &[b"xlen", b"d/q19/dlq"]).await, ":1");
+}

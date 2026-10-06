@@ -17,6 +17,7 @@ pub mod append;
 pub mod autoclaim;
 pub mod claim;
 pub mod dlq;
+pub mod dlq_depth;
 pub mod entries;
 pub mod group;
 pub mod info;
@@ -28,7 +29,9 @@ pub mod pel;
 pub mod pending;
 pub mod range_rev;
 pub mod read;
+pub mod read_xread;
 pub mod redeliver;
+pub mod redeliver_loop;
 pub mod select;
 
 #[cfg(test)]
@@ -354,7 +357,7 @@ pub fn spawn_background(shared: Arc<state::Shared>) {
                 offset::total_pending(&shared.lite.offsets) as f64,
             );
             // DLQ stream depths (point reads over the configured set).
-            dlq::refresh_dlq_depth(&shared);
+            dlq_depth::refresh_dlq_depth(&shared);
             // Deferred orphan sweeps queued by non-command delete paths
             // (XIDLE reaps, lazy idle purges) since the last tick.
             drain_reaps(&shared).await;

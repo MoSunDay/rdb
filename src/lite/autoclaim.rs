@@ -4,7 +4,6 @@
 
 use crate::command::Ctx;
 use crate::ds::expire;
-use crate::ds::latch;
 use crate::resp::codec as resp;
 
 use super::claim::{
@@ -73,31 +72,32 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
     }
     // A MAXDELIVERY group's DLQ target joins the latch set (sorted):
     // dead-letter transfers below write both windows in this critical
-    // section. The first group_absent check warmed the offset cache.
-    let gst = super::offset::load(
+    // section. The first group_absent check warmed the offset cache, and
+    // lock_group_latches re-validates the peeked set UNDER the locks (a
+    // DESTROY + re-CREATE with a different DLQ must not race the latch
+    // choice); it returns the config state of the final acquisition.
+    let (guards, gst) = dlq::lock_group_latches(
+        &ctx.shared.latch,
         &ctx.shared.lite.offsets,
         &ctx.shared.store,
         &prefix,
         &stream,
         &group,
     )
-    .ok()
-    .flatten();
-    let dlq_target = gst
-        .as_ref()
-        .filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
-        .map(|st| st.dlq.clone());
-    let latch_set = dlq::latch_keys(model::meta_key(&prefix, &stream), dlq_target.as_deref());
-    let mut guards = Vec::with_capacity(latch_set.len());
-    for k in &latch_set {
-        guards.push(latch::lock(&ctx.shared.latch, k).await);
-    }
+    .await;
+    let _guards = guards;
+    // Pre-transfer cache snapshot: restored on every failed commit
+    // below so the watermark never names ids the store never resolved.
+    let mark = super::offset::mark(&ctx.shared.lite.offsets, &stream, &group);
     if group_absent(ctx, &prefix, &stream, &group) {
         return nogroup(ctx.out, &stream, &group);
     }
     let rows = match pel::scan_pend(&ctx.shared.store, &prefix, &stream, &group, start, None) {
         Ok(rows) => rows,
-        Err(e) => return resp::append_error(ctx.out, &format!("ERR: xautoclaim failed: {e}")),
+        Err(e) => {
+            super::offset::restore(&ctx.shared.lite.offsets, &stream, &group, mark.clone());
+            return resp::append_error(ctx.out, &format!("ERR: xautoclaim failed: {e}"));
+        }
     };
     let now = expire::now_ms();
     // Ordered groups: queue-granularity takeover -- only the PEL HEAD is
@@ -127,6 +127,7 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
     let (mut scanned, mut claimed) = (0u64, 0u64);
     let (mut last_scanned, mut stopped_early) = (None::<EntryId>, false);
     let mut dlq_count: u64 = 0;
+    let mut tally_sum = dlq::TransferTally::default();
     let mut frames: Vec<entries::Entry> = Vec::new();
     let mut claimed_ids: Vec<EntryId> = Vec::new();
     let mut deleted: Vec<EntryId> = Vec::new();
@@ -149,7 +150,10 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
             continue; // not idle enough: keeps waiting with its owner
         }
         match read_entry(&ctx.shared.store, &prefix, &stream, row.id) {
-            Err(e) => return resp::append_error(ctx.out, &format!("ERR: xautoclaim failed: {e}")),
+            Err(e) => {
+                super::offset::restore(&ctx.shared.lite.offsets, &stream, &group, mark.clone());
+                return resp::append_error(ctx.out, &format!("ERR: xautoclaim failed: {e}"));
+            }
             // Payload trimmed away: reap the orphan PEL row (reaped rows
             // do not count toward the claim target).
             Ok(None) => {
@@ -174,12 +178,22 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
                             std::slice::from_ref(&dead),
                             now,
                         ) {
-                            Ok(k) => dlq_count += k as u64,
+                            Ok(t) => {
+                                dlq_count += t.resolved as u64;
+                                tally_sum.dlq_created += t.dlq_created;
+                                tally_sum.moved += t.moved;
+                            }
                             Err(e) => {
+                                super::offset::restore(
+                                    &ctx.shared.lite.offsets,
+                                    &stream,
+                                    &group,
+                                    mark.clone(),
+                                );
                                 return resp::append_error(
                                     ctx.out,
                                     &format!("ERR: xautoclaim failed: {e}"),
-                                )
+                                );
                             }
                         }
                         deleted.push(row.id);
@@ -218,8 +232,12 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
         }
     }
     if let Err(e) = ctx.commit(batch).await {
+        // Void batch: rewind the watermark moves the transfers made, so
+        // the dead-lettered rows stay pending and claimable.
+        super::offset::restore(&ctx.shared.lite.offsets, &stream, &group, mark);
         return resp::append_error(ctx.out, &format!("ERR: xautoclaim failed: {e}"));
     }
+    dlq::account_tally(ctx.shared, tally_sum);
     if ordered && epoch > 0 {
         // Takeover happened: wake blocked readers (the fenced former
         // owner and any contender) to re-check immediately.

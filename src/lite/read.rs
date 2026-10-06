@@ -23,13 +23,13 @@ use super::pel;
 use crate::monitor;
 use crate::state;
 
-struct ReadOpts {
-    count: usize,
-    block_ms: Option<u64>,
+pub(crate) struct ReadOpts {
+    pub(crate) count: usize,
+    pub(crate) block_ms: Option<u64>,
 }
 
 /// Parse `[COUNT n] [BLOCK ms]` starting at `i`; returns opts + next index.
-fn parse_opts(args: &[Vec<u8>], mut i: usize) -> Option<(ReadOpts, usize)> {
+pub(crate) fn parse_opts(args: &[Vec<u8>], mut i: usize) -> Option<(ReadOpts, usize)> {
     let mut opts = ReadOpts {
         count: 1000,
         block_ms: None,
@@ -52,7 +52,7 @@ fn parse_opts(args: &[Vec<u8>], mut i: usize) -> Option<(ReadOpts, usize)> {
     Some((opts, i))
 }
 
-fn nil_array(out: &mut Vec<u8>) {
+pub(crate) fn nil_array(out: &mut Vec<u8>) {
     resp::append_raw(out, b"*-1\r\n");
 }
 
@@ -65,7 +65,7 @@ pub(crate) type StreamEntries = (Vec<u8>, Vec<Entry>);
 
 /// Per-stream read point of one STREAMS-list element.
 #[derive(Clone, Copy, PartialEq)]
-enum ReadId {
+pub(crate) enum ReadId {
     /// `>`: deliver entries past the group's delivered watermark.
     New,
     /// A fixed exclusive start: XREAD's read position (a resolved `$`
@@ -78,12 +78,12 @@ enum ReadId {
 pub(crate) struct StreamSpec {
     pub(crate) stream: Vec<u8>,
     pub(crate) prefix: Vec<u8>,
-    id: ReadId,
+    pub(crate) id: ReadId,
 }
 
 /// The fixed read position of a spec (XREAD specs and history specs are
 /// always `After`; a stray `New` reads from the beginning).
-fn spec_after(s: &StreamSpec) -> EntryId {
+pub(crate) fn spec_after(s: &StreamSpec) -> EntryId {
     match s.id {
         ReadId::After(a) => a,
         ReadId::New => model::MIN_ID,
@@ -102,25 +102,7 @@ pub(crate) fn split_streams_tail(args: &[Vec<u8>], i: usize) -> Option<(usize, u
     Some((i + n / 2, n / 2))
 }
 
-/// Scan every spec once, COUNT per stream; streams that produced
-/// nothing are left out of the result (an across-the-board miss is the
-/// caller's nil array). The first store error aborts the command.
-fn scan_specs(
-    store: &crate::store::Store,
-    specs: &[StreamSpec],
-    count: usize,
-) -> Result<Vec<StreamEntries>, String> {
-    let mut out = Vec::new();
-    for s in specs {
-        let v = entries::scan_entries(store, &s.prefix, &s.stream, spec_after(s), count)?;
-        if !v.is_empty() {
-            out.push((s.stream.clone(), v));
-        }
-    }
-    Ok(out)
-}
-
-fn append_streams_reply(out: &mut Vec<u8>, results: &[StreamEntries]) {
+pub(crate) fn append_streams_reply(out: &mut Vec<u8>, results: &[StreamEntries]) {
     resp::append_array(out, results.len());
     for (name, entries) in results {
         resp::append_array(out, 2);
@@ -130,121 +112,6 @@ fn append_streams_reply(out: &mut Vec<u8>, results: &[StreamEntries]) {
             entries::append_entry_frame(out, e);
         }
     }
-}
-
-// ---- XREAD -------------------------------------------------------------
-
-/// Per-stream id of an XREAD STREAMS list: `$` resolves to the named
-/// stream's last_id snapshotted NOW (a later BLOCK waits only for
-/// entries added after the command started); anything else must parse.
-/// `None` = malformed id argument.
-fn parse_read_id(ctx: &Ctx<'_>, id_arg: &[u8], prefix: &[u8], stream: &[u8]) -> Option<EntryId> {
-    if id_arg == b"$" {
-        match model::read_meta(
-            &ctx.shared.store,
-            prefix,
-            stream,
-            Some(ctx.shared.lite.as_ref()),
-        ) {
-            Ok(MetaRead::Live(m)) => Some(m.last_id()),
-            _ => Some(model::MIN_ID),
-        }
-    } else {
-        model::parse_id(id_arg)
-    }
-}
-
-/// `XREAD [COUNT n] [BLOCK ms] STREAMS s1 s2... id1 id2...` -- read up
-/// to COUNT entries per stream strictly past each stream's position
-/// (`$` = that stream's last_id). Blocking parks one waiter under every
-/// stream's meta key: the first XADD on any of them wins.
-pub async fn xread(ctx: &mut Ctx<'_>) {
-    let Some((opts, mut i)) = parse_opts(&ctx.args, 0) else {
-        return resp::append_error(ctx.out, "ERR syntax error");
-    };
-    if i >= ctx.args.len() || !ctx.args[i].eq_ignore_ascii_case(b"STREAMS") {
-        return resp::append_error(ctx.out, "ERR syntax error");
-    }
-    i += 1;
-    let Some((id_start, n)) = split_streams_tail(&ctx.args, i) else {
-        return resp::append_error(
-            ctx.out,
-            "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.",
-        );
-    };
-    // Resolve names first (a bad name replies its own error); then ids.
-    let mut specs = Vec::with_capacity(n);
-    for j in 0..n {
-        let Some((stream, prefix)) = entries::stream_of(ctx, i + j) else {
-            return;
-        };
-        let id_arg = ctx.args[id_start + j].clone();
-        let Some(after) = parse_read_id(ctx, &id_arg, &prefix, &stream) else {
-            return resp::append_error(
-                ctx.out,
-                "ERR Invalid stream ID specified as stream command argument",
-            );
-        };
-        specs.push(StreamSpec {
-            stream,
-            prefix,
-            id: ReadId::After(after),
-        });
-    }
-    match opts.block_ms {
-        None => match scan_specs(&ctx.shared.store, &specs, opts.count) {
-            Err(e) => resp::append_error(ctx.out, &format!("ERR: xread failed: {e}")),
-            Ok(results) => finish_xread(ctx, results),
-        },
-        Some(ms) => {
-            // Absolute deadline computed once so a signaled re-park
-            // cannot reset the caller's BLOCK budget.
-            let end = if ms == 0 {
-                None
-            } else {
-                Instant::now().checked_add(Duration::from_millis(ms))
-            };
-            let targets: Vec<ParkTarget> = specs
-                .iter()
-                .map(|s| park_target(s, spec_after(s), opts.count, false))
-                .collect();
-            loop {
-                let Some(budget) = remaining_ms(end, ms) else {
-                    nil_array(ctx.out);
-                    break;
-                };
-                match wait_targets(ctx, &targets, budget, &never_gated).await {
-                    None => {
-                        nil_array(ctx.out);
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        resp::append_error(ctx.out, &format!("ERR: xread failed: {e}"));
-                        break;
-                    }
-                    // An empty signaled wake (e.g. a group op notified
-                    // a stream's meta key): nothing new for a plain
-                    // XREAD, keep waiting for the remaining budget.
-                    Some(Ok(v)) if v.is_empty() => continue,
-                    Some(Ok(v)) => {
-                        finish_xread(ctx, v);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// XREAD reply tail: nothing found on any stream -> nil array;
-/// otherwise one observation for the total served + the nested pairs.
-fn finish_xread(ctx: &mut Ctx<'_>, results: Vec<StreamEntries>) {
-    if results.is_empty() {
-        return nil_array(ctx.out);
-    }
-    let total: u64 = results.iter().map(|(_, v)| v.len() as u64).sum();
-    monitor::observe_lite_message(&ctx.shared.monitor, "read", total);
-    append_streams_reply(ctx.out, &results);
 }
 
 /// `XLEN <stream>`: retained entry count (0 for unknown streams).
@@ -343,7 +210,7 @@ fn gate_open_cached(shared: &state::Shared, s: &StreamSpec, group: &[u8], consum
 
 /// Plain XREAD's park re-check: no group, no window, no owner -- its
 /// targets are never gated, so the probe can never open.
-fn never_gated(_: &StreamSpec) -> bool {
+pub(crate) fn never_gated(_: &StreamSpec) -> bool {
     false
 }
 
@@ -452,35 +319,48 @@ async fn deliver_new(
     consumer: &[u8],
     count: usize,
 ) -> Result<Vec<StreamEntries>, DeliverErr> {
-    let mut keys: Vec<Vec<u8>> = fresh
-        .iter()
-        .map(|s| model::meta_key(&s.prefix, &s.stream))
-        .collect();
     // MAXDELIVERY groups join the latch set with their DLQ target
     // (offset-cache peeks; the up-front validation warmed the cache).
-    let dlq_names: Vec<Vec<u8>> = fresh
-        .iter()
-        .filter_map(|s| {
-            offset::peek_cached(&ctx.shared.lite.offsets, &s.stream, group)
-                .filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
-                .map(|st| st.dlq)
-        })
-        .collect();
-    keys.extend(dlq_names.iter().filter_map(|n| dlq::dlq_latch_key(n)));
-    keys.sort();
-    keys.dedup();
-    let mut guards = Vec::with_capacity(keys.len());
-    for k in &keys {
-        guards.push(crate::ds::latch::lock(&ctx.shared.latch, k).await);
+    // DRIFT RE-VALIDATION: the DLQ names are peeked before the locks,
+    // and a DESTROY + re-CREATE with a DIFFERENT DLQ can commit in
+    // between -- writing the new target's window without its latch
+    // would race every DLQ writer on it. A set that still covers the
+    // re-peek under the lock is final (group config is frozen under
+    // the stream latches); a drifted one is dropped and re-taken.
+    let shared = ctx.shared;
+    let dlq_of = |s: &StreamSpec| {
+        dlq::group_dlq_target(offset::peek_cached(&shared.lite.offsets, &s.stream, group).as_ref())
+    };
+    let mut guards;
+    loop {
+        let dlq_names: Vec<Vec<u8>> = fresh.iter().filter_map(&dlq_of).collect();
+        let mut keys: Vec<Vec<u8>> = fresh
+            .iter()
+            .map(|s| model::meta_key(&s.prefix, &s.stream))
+            .collect();
+        keys.extend(dlq_names.iter().filter_map(|n| dlq::dlq_latch_key(n)));
+        keys.sort();
+        keys.dedup();
+        guards = Vec::with_capacity(keys.len());
+        for k in &keys {
+            guards.push(crate::ds::latch::lock(&shared.latch, k).await);
+        }
+        if fresh.iter().filter_map(&dlq_of).collect::<Vec<_>>() == dlq_names {
+            break;
+        }
+        drop(guards); // stale set: re-peek and re-lock
     }
     let mut batch = rocksdb::WriteBatch::default();
     let mut results = Vec::new();
     let mut total: u64 = 0;
     let mut dlq_count: u64 = 0;
+    let mut tally_sum = dlq::TransferTally::default();
+    let mut marks: Vec<(Vec<u8>, Option<offset::RollbackMark>)> = Vec::new();
     let mut transferred: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
     let now_ms = crate::ds::expire::now_ms();
     for s in fresh {
         let Some(st) = group_state(ctx, s, group) else {
+            rollback_marks(ctx.shared, group, &mut marks);
             return Err(DeliverErr::NoGroup(s.stream.clone()));
         };
         // Ordered groups: queue-exclusive ownership + in-flight cap.
@@ -558,18 +438,28 @@ async fn deliver_new(
         .collect();
         // MAXDELIVERY gate (dlq): over-cap re-deliveries transfer to the
         // DLQ instead of being served; fresh rows can never trip one.
-        let (v, moved) = dlq::gate_delivery(
+        let (v, moved, mark) = match dlq::gate_delivery(
             dlq::transfer_ctx(ctx.shared, &mut batch, &s.prefix, &s.stream, group, &st),
             v,
             &already_pending,
             consumer,
             now_ms,
-        )
-        .map_err(DeliverErr::Store)?;
-        if moved > 0 {
-            dlq_count += moved as u64;
+        ) {
+            Ok(gated) => gated,
+            Err(e) => {
+                rollback_marks(ctx.shared, group, &mut marks);
+                return Err(DeliverErr::Store(e));
+            }
+        };
+        if moved.resolved > 0 {
+            dlq_count += moved.resolved as u64;
             transferred.push((s.prefix.clone(), s.stream.clone(), st.dlq.clone()));
         }
+        tally_sum.dlq_created += moved.dlq_created;
+        tally_sum.moved += moved.moved;
+        // Always snapshotted: even a keep-only round bumped the cached
+        // pending backlog, which a failed commit must rewind too.
+        marks.push((s.stream.clone(), mark));
         for e in &v {
             let times = already_pending
                 .get(&e.id)
@@ -592,11 +482,27 @@ async fn deliver_new(
             );
         }
         total += v.len() as u64;
-        results.push((s.stream.clone(), v));
+        // A dead-letter-only round delivers nothing: an empty entry
+        // list would reply `[[stream, *0]]` -- an inner empty-array
+        // marker that breaks the nil-for-empty-stream contract and
+        // wakes BLOCK readers with an empty response. Drop it; the
+        // transfers still commit (dlq_count) and the caller replies
+        // nil or re-parks.
+        if !v.is_empty() {
+            results.push((s.stream.clone(), v));
+        }
     }
     // A dead-letter-only round still commits: the transfers are it.
     if !results.is_empty() || dlq_count > 0 {
-        ctx.commit(batch).await.map_err(DeliverErr::Store)?;
+        if let Err(e) = ctx.commit(batch).await {
+            // The watermark must never name ids the store never
+            // resolved: rewind the mutated groups to their pre-batch
+            // snapshots, so the entries stay pending/redeliverable.
+            rollback_marks(ctx.shared, group, &mut marks);
+            return Err(DeliverErr::Store(e));
+        }
+        // Accounting follows the commit (a void batch counts nothing).
+        dlq::account_tally(ctx.shared, tally_sum);
         // One observation per command; a zero count is a no-op.
         monitor::observe_lite_message(&ctx.shared.monitor, "read", total);
         monitor::observe_lite_message(&ctx.shared.monitor, "dlq", dlq_count);
@@ -606,6 +512,21 @@ async fn deliver_new(
         }
     }
     Ok(results)
+}
+
+/// Rewind every group a planned (partially planned or failed) delivery
+/// batch touched back to its [`offset::RollbackMark`] snapshot: the
+/// cached watermark/pending moves of a transfer must never survive a
+/// store commit failure (the flusher would persist them; the poison
+/// entries would be neither in the DLQ nor redeliverable).
+fn rollback_marks(
+    shared: &state::Shared,
+    group: &[u8],
+    marks: &mut Vec<(Vec<u8>, Option<offset::RollbackMark>)>,
+) {
+    for (stream, mark) in marks.drain(..) {
+        offset::restore(&shared.lite.offsets, &stream, group, mark);
+    }
 }
 
 /// Weave per-stream results back into the caller's STREAMS-list order
