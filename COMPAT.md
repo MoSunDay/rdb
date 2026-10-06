@@ -242,10 +242,13 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   behavior). `kafka_advertised_host/port` override the advertised listener (wildcard
   binds would otherwise advertise localhost); `kafka_max_connections` caps front
   connections (0 = 4096). Fetch replays REAL record headers for produce-shaped stored
-  pairs (one "h" pair with valid headers JSON, others at most one "k"/"v"/`__null__`);
-  exotic shapes fall back to a JSON envelope value + marker header `("rdb-envelope",
-  null)` (storage unchanged, legacy envelope data readable); ledger rows refuse
-  XTRIM/XDEL and follow RENAME (error above). Spec:
+  pairs (one "h" pair with valid headers JSON — header NAMES hex-encoded under the `"x"`
+  key so arbitrary wire bytes round-trip byte-exact, legacy `"n"` string-name entries
+  still readable; others at most one "k"/"v"/`__null__`); exotic shapes fall back to a
+  JSON envelope value `{"fields":[[hex(name),hex(value)]]}` + marker header
+  `("rdb-envelope", null)` — a genuine user header with that literal name wins and is
+  replayed verbatim, never marked (storage forward-compatible, legacy data readable);
+  ledger rows refuse XTRIM/XDEL and follow RENAME (error above). Spec:
   [features/kafka-front.md](../features/kafka-front.md).
 - **JSON (P3, json.* verbs)**: single-record storage — one kind-0x10 record per key holds the
   whole document (LEB128 expire envelope + compact serde_json body, `preserve_order` keeps
