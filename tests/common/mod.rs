@@ -118,7 +118,10 @@ pub fn all_ctx(nodes: &[ProcNode]) -> String {
         .join("\n----\n")
 }
 
-/// Write the node's conf.yaml (only the keys the binary needs).
+/// Write the node's conf.yaml (only the keys the binary needs) plus
+/// `extra` verbatim top-level yaml lines at the end (e.g. a `lite:`
+/// section for the MQ sweep knobs; empty for every stock node).
+#[allow(clippy::too_many_arguments)] // a flat key list beats a struct here
 fn write_config(
     path: &Path,
     node_dir: &Path,
@@ -127,6 +130,7 @@ fn write_config(
     http: &str,
     monitor: &str,
     mysql: &str,
+    extra: &str,
 ) {
     let sql_keys = if mysql.is_empty() {
         String::new()
@@ -135,7 +139,7 @@ fn write_config(
     };
     let yaml = format!(
         "bind: \"{resp}\"\nstore_path: \"{}\"\nraft_bind_address: \"{raft}\"\n\
-         raft_http_bind_address: \"{http}\"\nmonitor_addr: \"{monitor}\"\nraft_token: \"{TOKEN}\"\n{sql_keys}",
+         raft_http_bind_address: \"{http}\"\nmonitor_addr: \"{monitor}\"\nraft_token: \"{TOKEN}\"\n{sql_keys}{extra}",
         node_dir.display()
     );
     std::fs::write(path, yaml).expect("write conf.yaml");
@@ -197,12 +201,34 @@ fn early_exit_kind(child: &mut std::process::Child, stderr_path: &std::path::Pat
 /// Spawn node `id` below the per-test `dir`: node dir + conf.yaml + 4 fresh
 /// ports, child launched per `bootstrap`/`join_http`.
 pub fn spawn_node(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str>) -> ProcNode {
+    spawn_node_yaml(dir, id, bootstrap, join_http, "")
+}
+
+/// [`spawn_node`] with extra top-level yaml lines appended to the node's
+/// conf.yaml (e.g. a `lite:` section arming the idle redelivery sweep);
+/// ports, respawn retries and the stderr log are identical.
+pub fn spawn_node_yaml(
+    dir: &Path,
+    id: usize,
+    bootstrap: bool,
+    join_http: Option<&str>,
+    extra_yaml: &str,
+) -> ProcNode {
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
     for _ in 0..SPAWN_ATTEMPTS {
         let (resp, raft, http, monitor) = (free_addr(), free_addr(), free_addr(), free_addr());
         let config_path = node_dir.join("conf.yaml");
-        write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor, "");
+        write_config(
+            &config_path,
+            &node_dir,
+            &resp,
+            &raft,
+            &http,
+            &monitor,
+            "",
+            extra_yaml,
+        );
         let stderr_path = node_dir.join("stderr.log");
         let mut child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
         if !matches!(early_exit_kind(&mut child, &stderr_path), Some(true)) {
@@ -251,6 +277,7 @@ pub fn spawn_node_mysql(
             &http,
             &monitor,
             &mysql,
+            "",
         );
         let stderr_path = node_dir.join("stderr.log");
         let mut child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
@@ -276,8 +303,8 @@ pub fn spawn_node_mysql(
 /// Spawn a node with BOTH SQL planes enabled on fresh ports: the MySQL
 /// frontend (login root/e2e-sql-pass, same as `spawn_node_mysql`) and
 /// the M3 2PC node-to-node transport (`sql_rpc_bind`). The base yaml
-/// comes from `write_config` (unchanged signature); the 2PC bind is
-/// appended as one extra top-level key.
+/// comes from stock [`write_config`]; the 2PC bind is appended as one
+/// extra top-level key.
 pub fn spawn_node_sql(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str>) -> ProcNode {
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
@@ -299,6 +326,7 @@ pub fn spawn_node_sql(dir: &Path, id: usize, bootstrap: bool, join_http: Option<
             &http,
             &monitor,
             &mysql,
+            "",
         );
         std::fs::write(
             &config_path,
@@ -346,7 +374,16 @@ pub fn spawn_node_es(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&
             free_addr(),
         );
         let config_path = node_dir.join("conf.yaml");
-        write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor, "");
+        write_config(
+            &config_path,
+            &node_dir,
+            &resp,
+            &raft,
+            &http,
+            &monitor,
+            "",
+            "",
+        );
         std::fs::write(
             &config_path,
             format!(
@@ -399,7 +436,16 @@ pub fn spawn_node_backup(
             free_addr(),
         );
         let config_path = node_dir.join("conf.yaml");
-        write_config(&config_path, &node_dir, &resp, &raft, &http, &monitor, "");
+        write_config(
+            &config_path,
+            &node_dir,
+            &resp,
+            &raft,
+            &http,
+            &monitor,
+            "",
+            "",
+        );
         std::fs::write(
             &config_path,
             format!(

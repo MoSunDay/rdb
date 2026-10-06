@@ -3,25 +3,19 @@
 //! 01-engine-reliability.md §3 vs checklist 06-e2e-matrix.md §2.1 --
 //! over-limit transfer + atomic trio + repeat claims + ordered head +
 //! DLQ-as-plain-stream + syntax gates + kill -9 + gauge + 默认无重投;
-//! in-process sweeps live in lite_redeliver_e2e.rs (400-line gate 06 §1).
+//! in-process sweeps live in lite_redeliver_e2e.rs (400-line gate 06 §1),
+//! the `>`-redelivery and XAUTOCLAIM trigger surfaces in
+//! lite_dlq_triggers_e2e.rs, the spawned sweep loop in
+//! lite_redeliver_proc_e2e.rs. Nodes boot via the self-cleaning shared
+//! `common::lite::boot`.
 
 mod common;
 
-use common::lite::{cmd_full_reply, pel_rows, text};
-use common::{cmd_one_shot, spawn_node, wait_resp_ready, ProcNode, TOKEN};
+use common::lite::{boot, cmd_full_reply, pel_rows, text};
+use common::{cmd_one_shot, wait_resp_ready, ProcNode, TOKEN};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-
-/// Fresh node on a unique temp dir -> (node, resp addr). The node must
-/// stay bound (`_node`: Drop kills it).
-async fn boot(tag: &str) -> (ProcNode, String) {
-    let dir = std::env::temp_dir().join(format!("rdb-lite-dlq-{tag}-{}", std::process::id()));
-    let mut node = spawn_node(&dir, 0, true, None);
-    wait_resp_ready(&mut node, 30).await;
-    let resp = node.resp.clone();
-    (node, resp)
-}
 
 async fn t(a: &str, args: &[&[u8]]) -> String {
     text(&cmd_one_shot(a, TOKEN, args).await)
