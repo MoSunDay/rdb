@@ -130,7 +130,8 @@
   投递路径（XREADGROUP 重投 / XCLAIM / XAUTOCLAIM / 空闲 sweep）持有的流 latch 内，
   并发 claim 不可能双转；重复 claim 已转移的 id 既不投递也不追加 DLQ 副本。
   溯源字段名与业务字段撞名时业务值原样保留。
-- **触发面**：转移判定只在投递时刻发生（无后台扫描器）；未配 MAXDELIVERY 的组
+- **触发面**：转移判定只在投递时刻发生（默认无后台任务；启用 `lite.redelivery_idle_ms`
+  后由空闲 sweep 在同一投递路径的 latch 内触发，见下节）；未配 MAXDELIVERY 的组
   行为与之前完全一致（零开销）。
 - **ORDERED 组限制**：有序组只允许 **PEL 头**（最小 pending id）被转移——与
   XCLAIM/XAUTOCLAIM 只认头的接管语义一致，越过头部的转移被抑制。
@@ -149,6 +150,12 @@
 - **实现姿态**：每轮 SYNC、流 latch 走 `try_lock`——正在执行命令的流本轮跳过，
   绝不 park 在后台任务上；重投计数进 `rdb_lite_messages{op="redeliver"}`，
   死信进 `{op="dlq"}`。
+- **sweep × min-idle 交互**：sweep 对判定为 due 的行执行 claim 原语时**会刷新
+  `delivered_ms`**——客户端若用 `min-idle-time >= redelivery_idle_ms` 的
+  XAUTOCLAIM/XCLAIM 去接手，行刚爬到客户端的 idle 门槛，下一轮 sweep（200ms 节奏、
+  同一门槛）就先把它重投并刷新了时钟，客户端**几乎永远观察不到**这些行；它们可以在
+  **零客户端消费**的情况下被 sweep 一路推过 MAXDELIVERY 进 DLQ。要客户端接管有效，
+  取 `min-idle-time < redelivery_idle_ms`（sweep 门槛更宽，客户端先到先得）。
 
 ### XTRIM MINID
 - **语法**：`XTRIM <stream> MINID [~|=] <id> [LIMIT <n>]`（对齐 Redis 6.2+）；与

@@ -1,6 +1,6 @@
 # MQ Batch 1：DLQ+MAXDELIVERY、自动重投、XTRIM MINID、kafka headers 真回放、RENAME 账本随搬
 
-Commit: 9fbf118（基线；Batch 1 代码与 e2e 在待提交工作区，落地提交后以其 sha 为准）
+Commit: 4259d92（DLQ/自动重投/MINID+账本守卫）、8b23b56（RENAME 随搬 0x20 账本）、370e654（kafka headers 真回放）、90e8c9b（场景用例+文档）；Batch 1.5 评审修复：fda8098（DLQ 水位提交后结算、sweep 批作废）、80a3bc2（headers 存储形态字节精确）、d043311（组语义：DLQ 校验/有序接管/续读游标/DESTROY 折叠账本）
 
 ## 背景
 MQ 能力差距计划（`plans/2026-10-06-mq-gap/`，见 `00-gap-matrix.md` 复核结论）把
