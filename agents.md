@@ -1,4 +1,4 @@
-Commit: 98e17a5
+Commit: 90e8c9b
 # rdb Overview
 
 ## Overview
@@ -27,3 +27,6 @@ Commit: 98e17a5
 
 ## Features 索引
 - [features/index.md](./features/index.md)
+
+## Plans 索引
+- [plans/index.md](./plans/index.md) — 前瞻计划目录（proposed→accepted→landed/archived，落地后摘要归档 features/changelog/）；在案：`2026-10-06-mq-gap`（MQ 能力差距与分批实施计划；Batch 1 引擎可靠性已落地，见 `features/changelog/2026-10-06/mq-engine-batch1.md`；Batch 2/P3 未开工）
