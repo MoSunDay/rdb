@@ -1,8 +1,9 @@
-//! RocksMQ-style minimal HTTP API (P4): `/produce`, `/consume`,
-//! `/ack` over a hand-rolled HTTP/1.1 listener (the `rcache/http.rs` /
-//! `es/http.rs` school; no hyper, no new crates). An independent
-//! front, not an rcache import: it talks to the Lite engine through
-//! `command::dispatch` (see `api.rs` for why).
+//! RocksMQ-style minimal HTTP API (P4+WP4): `/produce`, `/consume`
+//! (long-poll capable), `/ack`, `/pending` over a hand-rolled
+//! HTTP/1.1 listener (the `rcache/http.rs` / `es/http.rs` school; no
+//! hyper, no new crates). An independent front, not an rcache import:
+//! it talks to the Lite engine through `command::dispatch` (see
+//! `api.rs` for why).
 //!
 //! Transport contract:
 //! - keep-alive is the default (HTTP/1.1); `Connection: close` or
@@ -14,8 +15,9 @@
 //!   send Content-Length;
 //! - unknown paths 404; known paths with a non-POST method 405;
 //!   malformed heads close with a 400;
-//! - no auth (same posture as the Kafka front): bind to a
-//!   loopback/port-restricted address in untrusted networks;
+//! - auth: `rocksmq_token` (empty = off, the default; non-empty =
+//!   every route requires `Authorization: Bearer <token>`, 401
+//!   otherwise -- the es/s3 token posture, see `auth.rs`);
 //! - wiring: `rocksmq_bind` (empty = disabled; the backup listener
 //!   never wires this front).
 //!
@@ -23,6 +25,9 @@
 //! `features/rocksmq-http.md`.
 
 pub mod api;
+pub mod auth;
+pub mod consume_wait;
+pub mod pending;
 pub mod query;
 pub mod respv;
 
@@ -171,10 +176,17 @@ async fn read_some(rd: &mut tokio::net::tcp::OwnedReadHalf, buf: &mut Vec<u8>) -
 }
 
 /// Path (known paths answer; anything else 404) then method (non-POST
-/// on a known path 405) -- the order the interface doc promises.
+/// on a known path 405) -- the order the interface doc promises. The
+/// bearer gate (`rocksmq_token`) sits at the single point every route
+/// passes through, BEFORE path/method classification (the es/s3
+/// posture), so new routes are gated by default; only the constant
+/// `auth::PUBLIC_PATHS` list (empty today) can exempt one.
 async fn route(shared: &Shared, head: &Head, body: &[u8]) -> HttpReply {
     let (path, raw_query) = split_target(&head.target);
-    if !matches!(path, "/produce" | "/consume" | "/ack") {
+    if !auth::is_public(path) && !auth::authorized(&head.headers, &shared.conf.rocksmq_token) {
+        return auth::deny();
+    }
+    if !matches!(path, "/produce" | "/consume" | "/ack" | "/pending") {
         return HttpReply::text(404, "not found");
     }
     if head.method != "POST" {
@@ -191,7 +203,8 @@ async fn route(shared: &Shared, head: &Head, body: &[u8]) -> HttpReply {
     };
     match path {
         "/produce" => api::produce(shared, &query, body).await,
-        "/consume" => api::consume(shared, &query).await,
+        "/consume" => consume_wait::consume(shared, &query).await,
+        "/pending" => pending::pending(shared, &query).await,
         _ => api::ack(shared, &query).await,
     }
 }
@@ -329,6 +342,7 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",

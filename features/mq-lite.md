@@ -185,8 +185,8 @@
   （XIDLE/RENAME/FLUSHDB）逐一断言。
 - **兜底守卫**：sweep 交换前在 latch 下重读流 meta——meta 缺失（族已被删/搬走）时
   **只删暂存行、不投递**，任何竞态漏出的孤儿行不可能复活已删流。
-- **kafka 面不暴露**：Produce 面无延迟参数；Fetch 只见到期后的普通 entry（延迟语义
-  仅 RESP 动词面）。
+- **kafka 面不暴露**：Produce 面无延迟参数；Fetch 只见到期后的普通 entry。RESP
+  动词面之外，RocksMQ HTTP 前置的 `/produce?delay_ms=` 是**纯透传**（见下节）。
 
 ### XTRIM MINID
 - **语法**：`XTRIM <stream> MINID [~|=] <id> [LIMIT <n>]`（对齐 Redis 6.2+）；与
@@ -200,6 +200,19 @@
   （`ERR stream <name> has committed consumer-group offsets; delete the groups first`），
   防止 ordinal↔id 映射在 kafka 面读者脚下漂移；XDEL 同守卫。
 
+
+### HTTP 面（rocksmq front，WP4）
+RocksMQ HTTP 前置（[rocksmq-http.md](./rocksmq-http.md)）在本批对齐四接口，
+全部经 `command::dispatch` 复用上面的引擎语义，**零旁路**：
+- **`wait_ms` 长轮询**：`/consume` 可选参数，映射为 XREADGROUP/XREAD 的 `BLOCK`
+  （同一 `park_wait` 循环）；空通道 park 至到期回 200 空列表，非阻塞错误。
+  延迟消息的**到期交换**会唤醒 park 中的读者（暂存行写入不唤醒）。
+- **`POST /pending`**：XPENDING 概要只读透传（总数/min/max id/按消费者分布），
+  与 RESP 面同口径；不建组、不动 PEL。
+- **`delay_ms`**：`/produce` 可选参数，纯透传 XADD `DELAY`（`0`/缺省 = 不带）；
+  到期前一切消费路径不可见，到期交换分配新 id（回复 id 是预约凭证）。
+- **`rocksmq_token` Bearer**：空（默认）= 开放；非空 = 全路由 401/通过矩阵，
+  es/s3 同款姿态。
 
 ## 有序消费组与 Kafka 校准语义（P0/P1/P2）
 
