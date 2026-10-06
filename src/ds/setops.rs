@@ -128,7 +128,7 @@ pub fn store_clear(batch: &mut WriteBatch, store: &Store, prefix: &[u8], key: &[
             kind, expire_ms, ..
         } => {
             let family = codec::family_of(kind).unwrap_or(codec::SET_FAMILY);
-            expire::family_delete_entries(batch, prefix, family, key, expire_ms);
+            expire::family_delete_entries(batch, Some(store), prefix, family, key, expire_ms);
         }
     }
 }

@@ -16,6 +16,7 @@ pub mod ack;
 pub mod append;
 pub mod autoclaim;
 pub mod claim;
+pub mod delay;
 pub mod dlq;
 pub mod dlq_depth;
 pub mod entries;

@@ -83,7 +83,7 @@ pub fn write_meta(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], expire_ms: 
 
 /// Batch entries wiping the whole hash family and its TTL index entry.
 pub fn delete_family(batch: &mut WriteBatch, prefix: &[u8], key: &[u8], expire_ms: u64) {
-    expire::family_delete_entries(batch, prefix, HASH_FAMILY, key, expire_ms);
+    expire::family_delete_entries(batch, None, prefix, HASH_FAMILY, key, expire_ms);
 }
 
 /// One field's value; `Ok(None)` = field absent.
