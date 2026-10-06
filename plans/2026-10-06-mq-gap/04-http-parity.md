@@ -1,6 +1,6 @@
 # WP4 — RocksMQ HTTP 面对齐：长轮询、pending 可见性、Bearer token
 
-状态：proposed
+状态：landed（状态板见 `README.md`）
 日期：2026-10-06
 工作包：WP4（随 Batch 2 执行）
 

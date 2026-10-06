@@ -1,6 +1,6 @@
 # MQ 能力完备差距矩阵（常用 MQ 功能 × Lite/Kafka/HTTP 三面 × 处置）
 
-> 状态：proposed
+> 状态：landed（状态板见 `README.md`）
 > 日期：2026-10-06
 > 关联：01–06 各工作包文档
 

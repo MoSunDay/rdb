@@ -208,6 +208,16 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     OFF): a 200ms sweep re-hands idle PEL rows to their current consumer (times+1,
     delivered_ms refreshed), over-MAXDELIVERY rows into the DLQ transfer; ordered
     groups sweep only the head; `rdb_lite_messages{op="redeliver"}`.
+  - Delayed messages (rdb extension, Batch 2): `XADD <stream> [<id>] DELAY <ms>
+    <field> <value>...` stages the body in a due-ordered kind-0x1D row invisible to
+    every read path (XLEN keeps excluding it) until the due sweep
+    (`lite.delay_sweep_ms`, default 0 = the scanner is not spawned at all) exchanges
+    it into the stream in one latched WAL batch. The exchange appends a FRESH id — the
+    XADD reply id is a reservation token only (a locked id below a group's delivered
+    watermark would be invisible to `>` readers forever) — and wakes parked BLOCK
+    readers (XADD-parity notify). Staged rows fold into family deletes and ride RENAME
+    with the stream family; a purged/renamed-away stream is never revived by its
+    leftovers (orphaned rows drop, never exchange).
   - XTRIM accepts `MINID [<~|=>] <id> [LIMIT <n>]` (Redis-aligned, orthogonal to
     MAXLEN): drops entries strictly below `<id>` (boundary survives); `~`/`=` behave
     identically (exact victims), LIMIT after both; `<ms>-0` ids = time-window retention.
@@ -231,7 +241,7 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     stages as a protocol adapter mapping parent/child to topic/partition exactly the way
     a sql/front does for MySQL — see the next bullet. Decision record and living Lite-MQ
     spec: [features/mq-lite.md](../features/mq-lite.md).
-- **Kafka wire frontend (`kafka_bind`, rdb extension)**: 13 wire APIs over the same Lite
+- **Kafka wire frontend (`kafka_bind`, rdb extension)**: 15 wire APIs over the same Lite
   engine — topic=parent stream, partition=child `p<N>`/`q<N>` queue, offset=ACTIVE-entry
   ordinal (not a physical offset), committed offsets in a separate kind-0x20 ledger.
   Single broker: Metadata always returns one node; acks=all = one synchronous fsync (no
@@ -239,7 +249,17 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   `kafka-codecs` feature enables produce-side gzip/snappy/lz4 (fetch is never compressed;
   zstd unsupported). The group coordinator is in-memory (restart = clients rejoin,
   committed offsets persist); assignment comes from the consumer leader (standard broker
-  behavior). `kafka_advertised_host/port` override the advertised listener (wildcard
+  behavior). Admin APIs (Batch 2): ListGroups(16) answers the union of coordinator
+  runtime and ledger-only groups (an OffsetCommit-only group exists as kind-0x20 rows
+  alone, reported state "Empty"); DeleteGroups(42) runs a group through the same public
+  lite teardown `XGROUP DESTROY` uses (folding its 0x20 ledger rows — the wire-side
+  release for the XTRIM/XDEL ledger guard) and evicts runtime state; a group with
+  neither runtime entry nor ledger rows answers 69 while the rest of the batch proceeds.
+  Optional SASL PLAIN via `kafka_token` (empty = off, the default; when set, ApiVersions
+  additionally advertises 17/36): SaslHandshake/SaslAuthenticate once per connection,
+  constant-time password compare, wrong password = fixed-message 58 + close (no token
+  fragments); pre-auth traffic is dropped without a reply except the ApiVersions +
+  SASL-pair whitelist. `kafka_advertised_host/port` override the advertised listener (wildcard
   binds would otherwise advertise localhost); `kafka_max_connections` caps front
   connections (0 = 4096). Fetch replays REAL record headers for produce-shaped stored
   pairs (one "h" pair with valid headers JSON — header NAMES hex-encoded under the `"x"`
@@ -767,12 +787,17 @@ adapter, not an ES clone; the deviations below are the contract.
 
 ## RocksMQ-compatible HTTP frontend (Rust-only)
 
-A minimal RocksMQ-style HTTP/1.1 message frontend (`rocksmq_bind`, unauthenticated, reuses
-the hand-rolled HTTP of the ES front) over the same Lite engine as the Kafka front — three
-POST endpoints: `/produce` (XADD; replies the Lite `<ms>-<seq>` id), `/consume` (grouped
-XREADGROUP `>`; group-less tail pull via XREVRANGE keeps no cursor — duplicates/skips are
-documented), `/ack` (XACK, idempotent 200; unknown group 404). A bare channel name maps to
-`NAME/q0`; the body is the `v` field pair, byte-identical with the Kafka front's
+A minimal RocksMQ-style HTTP/1.1 message frontend (`rocksmq_bind`, reuses the hand-rolled
+HTTP of the ES front) over the same Lite engine as the Kafka front — four POST endpoints:
+`/produce` (XADD; optional `delay_ms` query stages a delayed message, replies the Lite
+`<ms>-<seq>` id — with `delay_ms>0` that id is the XADD-time reservation token, the due
+exchange appends a fresh id), `/consume` (grouped XREADGROUP `>`; group-less tail pull
+via XREVRANGE keeps no cursor — duplicates/skips are documented; optional `wait_ms` parks
+the request until a message lands or the budget expires — long-poll semantics), `/ack`
+(XACK, idempotent 200; unknown group 404), `/pending` (XPENDING summary shape for one
+channel/group). Optional `rocksmq_token` (empty = off, the default) requires
+`Authorization: Bearer <token>` on every route (401 otherwise). A bare channel name maps
+to `NAME/q0`; the body is the `v` field pair, byte-identical with the Kafka front's
 keyless/headerless records, so the two fronts read each other's messages. Remaining
 deviations vs real RocksMQ (`<ms>-<seq>` ids not integer offsets, no topic create/delete/
 seek): [features/rocksmq-http.md](../features/rocksmq-http.md).

@@ -9,7 +9,9 @@
 # group + INFLIGHT knob, (f) XINFO STREAM / XINFO GROUPS, (g) XGROUP
 # MAXDELIVERY dead-lettering into the default <stream>/dlq + consuming
 # the DLQ as a plain stream, (h) XTRIM MINID threshold trim (exact id,
-# LIMIT cap, <ms>-0 time-window form).
+# LIMIT cap, <ms>-0 time-window form), (i) delayed messages (XADD DELAY
+# staging invisible before due, due exchange with a FRESH id, a parked
+# BLOCK reader woken by the exchange, RENAME carrying the staged row).
 # Semantics verified against source/tests BEFORE writing this script:
 # - Every X-command is cluster-whitelisted => NODE-LOCAL (src/router.rs:96
 #   is_whitelisted; src/command/mod.rs:437 skips slot routing). The
@@ -54,6 +56,16 @@
 #   used to declare *14 with only 13 following, which hung strict RESP
 #   clients (redis-cli) forever -- the `timeout` wrapper below turns a
 #   regression of that into a hard failure instead of a hang.
+# - XADD accepts a leading `DELAY <ms>` option right after the id
+#   (src/lite/append.rs -> lite::delay): the message is staged in a
+#   kind-0x1D row that NO read path can see (XLEN keeps excluding it)
+#   until the spawned due sweep exchanges it into the stream; the XADD
+#   reply id is a RESERVATION token only -- the exchange appends a FRESH
+#   id (a locked id below a delivered watermark would be lost forever,
+#   src/lite/delay.rs ID POLICY) and wakes parked BLOCK readers
+#   (XADD-parity notify on the stream + parent keys). The sweep exists
+#   only when `lite.delay_sweep_ms` > 0 (default 0 = OFF); family
+#   delete/RENAME fold/carry the staged rows (tests/lite_delay_e2e.rs).
 
 # env.sh installs `set -uo pipefail` and the assertion helpers. Deliberately
 # NO `set -e`: assertion failures count into E2E_FAILS so the scenario
@@ -62,6 +74,22 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
 # rdb gates every pre-AUTH command behind AUTH (env.sh exports this too).
 export REDISCLI_AUTH="${RDB_E2E_TOKEN}"
+
+# Batch 2 (i): arm the staged-delay due sweep. e2e_start_cluster has
+# already generated every node yaml when it calls _e2e_spawn, so
+# wrapping the spawner appends the knob to the deterministic yaml path
+# just before first boot -- no env.sh edit, no restart dance (the
+# declare -f copy below is how bash wraps a sourced function). Adding
+# it globally is safe for segments (a)-(h): the sweep ONLY walks
+# kind-0x1D staging rows and no other segment stages any (plain XADD
+# never writes 0x1D), and production default is 0 = the scanner is not
+# spawned at all (src/lite/delay.rs::spawn_delay_sweep).
+eval "_e2e_spawn_plain () $(declare -f _e2e_spawn | tail -n +2)"
+_e2e_spawn () {
+    printf 'lite:\n  delay_sweep_ms: 200\n' \
+        >>"$E2E_WORKDIR/conf_node$1.yaml"
+    _e2e_spawn_plain "$@"
+}
 
 RC="redis-cli -h $E2E_HOST -p"
 
@@ -75,6 +103,20 @@ nth () { printf '%s\n' "$2" | sed -n "$1p"; } # 1-based line of a reply
 
 count_line () { # how many reply lines equal $1 exactly
     printf '%s\n' "$2" | grep -cxF "$1" || true
+}
+
+# Poll `$2...` (a command) until its output contains $1, at most $3
+# seconds (0.2s rhythm): the (i) segment's due-exchange waits. Bounded
+# so a broken sweep surfaces as failed asserts below, never a hang.
+until_grep () { # needle timeout_s cmd...
+    local needle=$1 budget=$2 out=""
+    local deadline=$((SECONDS + budget))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        out="$("${@:3}" 2>/dev/null)"
+        [ -n "$out" ] && printf '%s\n' "$out" | grep -qF "$needle" && break
+        sleep 0.2
+    done
+    printf '%s\n' "$out"
 }
 
 # RAW RESP one-shot probe: AUTH + one command over bash /dev/tcp, printing
@@ -334,6 +376,60 @@ main () {
     tr="$(rc "$mq" XRANGE "$t3" - +)"
     assert_eq "the window boundary entry survives" "2000-0" "$(nth 1 "$tr")"
     assert_not_contains "pre-window entries are reaped" "old" "$tr"
+
+    # ---- (i) delayed messages: DELAY staging -> due exchange ----------
+    # DELAY 0 is the plain path: nothing staged, synchronously visible.
+    local dly=dm/q0 rid rng blk fresh
+    rc "$mq" XADD "$dly" '*' DELAY 0 sku now >/dev/null
+    assert_eq "DELAY 0 = no delay: visible immediately" "1" \
+        "$(rc "$mq" XLEN "$dly")"
+    # A 4s message: absent from every read path before due...
+    rid="$(rc "$mq" XADD "$dly" '*' DELAY 4000 sku later)"
+    assert_eq "XLEN excludes the staged row before due" "1" \
+        "$(rc "$mq" XLEN "$dly")"
+    assert_not_contains "XRANGE is blind to the staged row before due" \
+        "later" "$(rc "$mq" XRANGE "$dly" - +)"
+    # ...and a BLOCK reader parked on `$` BEFORE due must be WOKEN by the
+    # exchange (not by its own timeout: a timed-out BLOCK prints nothing,
+    # so seeing the payload below proves the notify).
+    blk="$E2E_WORKDIR/block_wake.out"
+    ( timeout 20 redis-cli -h "$E2E_HOST" -p "$(node_resp "$mq")" --raw \
+        XREAD BLOCK 9000 STREAMS "$dly" '$' >"$blk" 2>/dev/null ) &
+    blkpid=$!
+    rng="$(until_grep later 12 rc "$mq" XRANGE "$dly" - +)"
+    assert_contains "the staged row exchanges into the stream after due" \
+        "later" "$rng"
+    assert_eq "the exchange is a real entry (XLEN counts it)" "2" \
+        "$(rc "$mq" XLEN "$dly")"
+    # XRANGE --raw prints 3 lines per entry: [id sku now][id sku later].
+    fresh="$(nth 4 "$rng")"
+    assert_not_contains "the XADD reply id was a reservation token only" \
+        "$rid" "$rng"
+    # Wait ONLY for the parked reader's job: a bare `wait` would also
+    # block on the never-exiting rdb cluster nodes and hang the scenario.
+    wait "$blkpid" 2>/dev/null || true # the woken reader exits on its own
+    assert_contains "the parked BLOCK reader was woken by the exchange" \
+        "$dly" "$(cat "$blk" 2>/dev/null)"
+    assert_contains "the woken reader received the delayed payload" \
+        "later" "$(cat "$blk" 2>/dev/null)"
+    assert_contains "the woken reader got the FRESH exchange id" "$fresh" \
+        "$(cat "$blk" 2>/dev/null)"
+    # RENAME carries staged rows with the stream family (same-slot pair
+    # from tests/lite_delay_e2e.rs): the row exchanges at the NEW name.
+    local rsrc=t3107/q5 rdst=t43847/q5
+    rc "$mq" XADD "$rsrc" '*' DELAY 2500 evt moved >/dev/null
+    assert_eq "RENAME carries the staged 0x1D row with the family" "OK" \
+        "$(rc "$mq" RENAME "$rsrc" "$rdst")"
+    rng="$(until_grep moved 10 rc "$mq" XRANGE "$rdst" - +)"
+    assert_contains "the carried row exchanges at the new name" "moved" "$rng"
+    assert_eq "the old name no longer exists" "0" "$(rc "$mq" XLEN "$rsrc")"
+    # Option negatives (src/lite/delay.rs::split_delay / deadline check).
+    assert_eq "DELAY refuses a non-numeric argument" \
+        "ERR value is not an integer or out of range" \
+        "$(rc "$mq" XADD "$dly" '*' DELAY soon sku x)"
+    assert_eq "a DELAY past the u64 deadline is refused, not wrapped" \
+        "ERR delay deadline overflow" \
+        "$(rc "$mq" XADD "$dly" '*' DELAY 18446744073709551615 sku x)"
 
     e2e_finish "$scenario"
 }

@@ -1,6 +1,6 @@
 # WP1 — 引擎可靠性：DLQ + MAXDELIVERY、自动重投、XTRIM MINID、两缺陷修复
 
-> 状态：proposed
+> 状态：landed（状态板见 `README.md`）
 > 日期：2026-10-06
 > 工作包：WP1（执行批次 Batch 1）
 > 关联：`00`（总纲与差距矩阵）、`02`（延迟消息，WP2/Batch 2）、`03`（kafka parity，

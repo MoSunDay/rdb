@@ -1,6 +1,6 @@
 # WP2 — 延迟消息（引擎级）
 
-> 状态：proposed
+> 状态：landed（状态板见 `README.md`）
 > 日期：2026-10-06
 > 工作包：WP2（执行批次 Batch 2）
 > 关联：`01`（前置：键族删除 / RENAME 搬运路径改造，Batch 1）、`04`（HTTP
