@@ -63,10 +63,16 @@ pub struct Config {
     /// connections beyond the cap are closed immediately.
     #[serde(default, rename = "kafka_max_connections")]
     pub kafka_max_connections: i64,
+    /// Shared-secret for kafka SASL PLAIN auth (empty = auth disabled).
+    #[serde(default, rename = "kafka_token")]
+    pub kafka_token: String,
     /// RocksMQ-style HTTP front (P4; empty = disabled), see
     /// `src/rocksmq/` + features/rocksmq-http.md.
     #[serde(default, rename = "rocksmq_bind")]
     pub rocksmq_bind: String,
+    /// Bearer token for the RocksMQ HTTP API (empty = auth disabled).
+    #[serde(default, rename = "rocksmq_token")]
+    pub rocksmq_token: String,
     /// Elasticsearch-compatible HTTP frontend on the search kernel
     /// (empty = disabled).
     #[serde(default, rename = "es_bind")]
@@ -142,6 +148,10 @@ pub struct LiteConfig {
     /// (0 = sweep disabled, the upgrade default: zero behavior change).
     #[serde(default, rename = "redelivery_idle_ms")]
     pub redelivery_idle_ms: u64,
+    /// Interval, ms, for the background delayed-message due-scan
+    /// (0 = scan disabled, the upgrade default: zero behavior change).
+    #[serde(default, rename = "delay_sweep_ms")]
+    pub delay_sweep_ms: u64,
 }
 
 /// Read and parse the YAML config file at `path`.
@@ -216,14 +226,36 @@ backup_target_map:
         // change on upgrade, and Config::default() agrees.
         let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1").unwrap();
         assert_eq!(cfg.lite.redelivery_idle_ms, 0);
+        assert_eq!(cfg.lite.delay_sweep_ms, 0);
         assert_eq!(cfg.lite, Config::default().lite);
         // Section present, key omitted -> still off; explicit value
         // parses under the section's own name.
         let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1\nlite: {}\n").unwrap();
         assert_eq!(cfg.lite.redelivery_idle_ms, 0);
+        assert_eq!(cfg.lite.delay_sweep_ms, 0);
         let cfg: Config =
             serde_yaml::from_str("bind: 1.2.3.4:1\nlite:\n  redelivery_idle_ms: 30000\n").unwrap();
         assert_eq!(cfg.lite.redelivery_idle_ms, 30000);
+        assert_eq!(cfg.lite.delay_sweep_ms, 0);
+        let cfg: Config =
+            serde_yaml::from_str("bind: 1.2.3.4:1\nlite:\n  delay_sweep_ms: 5000\n").unwrap();
+        assert_eq!(cfg.lite.redelivery_idle_ms, 0);
+        assert_eq!(cfg.lite.delay_sweep_ms, 5000);
+    }
+
+    /// Batch 2 MQ auth tokens: absent -> empty (auth disabled); present
+    /// -> round-trip with FAKE tokens (never copy real secrets).
+    #[test]
+    fn mq_token_defaults_and_parse() {
+        let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1").unwrap();
+        assert_eq!(cfg.kafka_token, "");
+        assert_eq!(cfg.rocksmq_token, "");
+        let cfg: Config = serde_yaml::from_str(
+            "bind: 1.2.3.4:1\nkafka_token: \"fake-kafka-token-000\"\nrocksmq_token: \"fake-rocksmq-token-000\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.kafka_token, "fake-kafka-token-000");
+        assert_eq!(cfg.rocksmq_token, "fake-rocksmq-token-000");
     }
 
     #[test]

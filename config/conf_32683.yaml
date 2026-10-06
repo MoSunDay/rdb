@@ -13,3 +13,10 @@ tx:
 # Elasticsearch-compatible HTTP frontend on the search kernel (empty = disabled; e.g. es_bind: "127.0.0.1:9200")
 es_bind: ""
 es_token: ""
+
+# MQ 前端鉴权 token（空 = 不鉴权）
+#kafka_token: ""        # kafka SASL PLAIN 共享密钥（空 = 不鉴权）
+#rocksmq_token: ""      # RocksMQ HTTP API Bearer token（空 = 不鉴权）
+#lite:
+#  redelivery_idle_ms: 0  # idle 自动重投阈值 ms（0=关，默认）
+#  delay_sweep_ms: 0      # 延迟消息到期扫描周期 ms（0=关，默认）
