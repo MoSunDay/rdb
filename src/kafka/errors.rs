@@ -34,6 +34,14 @@ pub const INVALID_COMMIT_OFFSET_SIZE: i16 = 28;
 pub const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 pub const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
 pub const INVALID_TIMESTAMP: i16 = 32;
+/// SASL mechanism not among the broker's enabled mechanisms.
+pub const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+/// SASL PLAIN: password/token mismatch (fixed message, never echoes
+/// any token fragment).
+pub const SASL_AUTHENTICATION_FAILED: i16 = 58;
+/// DeleteGroups: the group id has no runtime membership, no ledger
+/// (0x20) rows -- nothing to delete.
+pub const GROUP_ID_NOT_FOUND: i16 = 69;
 pub const UNSUPPORTED_VERSION: i16 = 35;
 pub const INVALID_REQUEST: i16 = 42;
 /// Registry anchor (a common off-by-one): 76, NOT 29 (that is
@@ -70,6 +78,9 @@ pub fn error_name(code: i16) -> &'static str {
         TOPIC_AUTHORIZATION_FAILED => "TOPIC_AUTHORIZATION_FAILED",
         CLUSTER_AUTHORIZATION_FAILED => "CLUSTER_AUTHORIZATION_FAILED",
         INVALID_TIMESTAMP => "INVALID_TIMESTAMP",
+        UNSUPPORTED_SASL_MECHANISM => "UNSUPPORTED_SASL_MECHANISM",
+        SASL_AUTHENTICATION_FAILED => "SASL_AUTHENTICATION_FAILED",
+        GROUP_ID_NOT_FOUND => "GROUP_ID_NOT_FOUND",
         UNSUPPORTED_VERSION => "UNSUPPORTED_VERSION",
         INVALID_REQUEST => "INVALID_REQUEST",
         UNSUPPORTED_COMPRESSION_TYPE => "UNSUPPORTED_COMPRESSION_TYPE",
@@ -105,5 +116,10 @@ mod tests {
         assert_eq!(INVALID_SESSION_TIMEOUT, 26);
         assert_eq!(FENCED_INSTANCE_ID, 82);
         assert_eq!(INVALID_REQUEST, 42);
+        // Admin/SASL batch anchors: 33/58 (SASL) and 69 (group not
+        // found -- DeleteGroups answers it per group).
+        assert_eq!(UNSUPPORTED_SASL_MECHANISM, 33);
+        assert_eq!(SASL_AUTHENTICATION_FAILED, 58);
+        assert_eq!(GROUP_ID_NOT_FOUND, 69);
     }
 }

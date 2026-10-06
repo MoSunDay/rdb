@@ -170,6 +170,27 @@ pub fn scan_group(store: &Store, group: &[u8]) -> Result<Vec<LedgerRow>, String>
     Ok(out)
 }
 
+/// Every DISTINCT group id across the whole kind-0x20 ledger, sorted:
+/// the ledger-only half of the ListGroups union (the runtime holds no
+/// entry for a group that only ever committed offsets). One bounded
+/// walk exactly like [`scan_group`], capped by [`GROUP_SCAN_LIMIT`];
+/// the walk matches on `parse_key` succeeding (kind + shape), never on
+/// raw suffix bytes, so foreign keys cannot smuggle a group in.
+pub fn scan_groups(store: &Store) -> Result<Vec<Vec<u8>>, String> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut examined = 0usize;
+    ops::for_each_from(store, b"", false, &mut |k, _| {
+        examined += 1;
+        if let Some((_, group)) = parse_key(k) {
+            if let Err(i) = out.binary_search(&group) {
+                out.insert(i, group);
+            }
+        }
+        examined < GROUP_SCAN_LIMIT
+    })?;
+    Ok(out)
+}
+
 /// Does `stream` have ANY ledger row under `prefix`? Bounded probe for
 /// the XTRIM/XDEL guard: iterate from the stream's kind-0x20 window
 /// start and inspect ONE key -- the immediate successor of the window

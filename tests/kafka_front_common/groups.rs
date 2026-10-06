@@ -13,6 +13,7 @@ use rdb::kafka::frame::Reader;
 use rdb::kafka::frame::{
     put_array_len, put_bytes, put_i32, put_i64, put_nullable_string, put_string,
 };
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 use super::{kafka_req, kafka_round};
@@ -231,4 +232,145 @@ pub async fn fetch_offset_v0(
     assert_eq!(r.nullable_string(), Some(None), "metadata null");
     assert_eq!(r.i16(), Some(0), "partition error");
     off
+}
+
+// ---- Batch 2 admin + SASL helpers (tests/kafka_admin_e2e.rs) ---------
+
+/// OffsetCommit v0 (no generation/member rows) for one partition:
+/// creates the pure ledger-only group shape (0x20 rows, no runtime
+/// membership, no lite 0x0E group record).
+pub async fn commit_v0(
+    sock: &mut TcpStream,
+    corr: i32,
+    group: &str,
+    topic: &str,
+    offset: i64,
+) -> i16 {
+    let mut b = Vec::new();
+    put_string(&mut b, group);
+    put_array_len(&mut b, 1);
+    put_string(&mut b, topic);
+    put_array_len(&mut b, 1);
+    put_i32(&mut b, 0);
+    put_i64(&mut b, offset);
+    put_string(&mut b, ""); // metadata (unused)
+    let payload = kafka_round(sock, &kafka_req(8, 0, corr, false, &b)).await;
+    let mut r = Reader::new(&payload);
+    assert_eq!(r.i32(), Some(corr));
+    let mut r = Reader::new(&payload[r.pos()..]);
+    assert_eq!(r.array_len(), Some(Some(1)));
+    r.string();
+    assert_eq!(r.array_len(), Some(Some(1)));
+    r.i32();
+    r.i16().unwrap()
+}
+
+/// ListGroups v0/v1: [(id, protocol_type, state)] -- state is only on
+/// the wire for v1+; `states` is the v1 states filter (KIP-518).
+pub async fn list_groups(
+    sock: &mut TcpStream,
+    corr: i32,
+    version: i16,
+    states: &[&str],
+) -> Vec<(String, String, String)> {
+    let mut b = Vec::new();
+    if version >= 1 {
+        put_array_len(&mut b, states.len());
+        for s in states {
+            put_string(&mut b, s);
+        }
+    }
+    let payload = kafka_round(sock, &kafka_req(16, version, corr, false, &b)).await;
+    let mut r = Reader::new(&payload);
+    assert_eq!(r.i32(), Some(corr));
+    let mut r = Reader::new(&payload[r.pos()..]);
+    if version >= 1 {
+        assert_eq!(r.i32(), Some(0), "throttle leads on v1");
+    }
+    assert_eq!(r.i16(), Some(0), "error NONE");
+    let n = r.array_len().unwrap().unwrap_or(0);
+    (0..n)
+        .map(|_| {
+            let id = r.string().unwrap();
+            let ty = r.string().unwrap();
+            let state = if version >= 1 {
+                r.string().unwrap()
+            } else {
+                String::new()
+            };
+            (id, ty, state)
+        })
+        .collect()
+}
+
+/// DeleteGroups v0/v1: per-group error codes in request order.
+pub async fn delete_groups(
+    sock: &mut TcpStream,
+    corr: i32,
+    version: i16,
+    groups: &[&str],
+) -> Vec<(String, i16)> {
+    let mut b = Vec::new();
+    put_array_len(&mut b, groups.len());
+    for g in groups {
+        put_string(&mut b, g);
+    }
+    let payload = kafka_round(sock, &kafka_req(42, version, corr, false, &b)).await;
+    let mut r = Reader::new(&payload);
+    assert_eq!(r.i32(), Some(corr));
+    let mut r = Reader::new(&payload[r.pos()..]);
+    if version >= 1 {
+        assert_eq!(r.i32(), Some(0), "throttle leads on v1");
+    }
+    let n = r.array_len().unwrap().unwrap_or(0);
+    (0..n)
+        .map(|_| (r.string().unwrap(), r.i16().unwrap()))
+        .collect()
+}
+
+/// SaslHandshake v1: the error code (mechanisms always [PLAIN]).
+pub async fn sasl_handshake(sock: &mut TcpStream, corr: i32, mechanism: &str) -> i16 {
+    let mut b = Vec::new();
+    put_string(&mut b, mechanism);
+    let payload = kafka_round(sock, &kafka_req(17, 1, corr, false, &b)).await;
+    let mut r = Reader::new(&payload);
+    assert_eq!(r.i32(), Some(corr));
+    let mut r = Reader::new(&payload[r.pos()..]);
+    let code = r.i16().unwrap();
+    let n = r.array_len().unwrap().unwrap_or(0);
+    for _ in 0..n {
+        assert_eq!(
+            r.string().as_deref(),
+            Some("PLAIN"),
+            "only PLAIN is enabled"
+        );
+    }
+    assert_eq!(r.i32(), Some(0), "throttle tail on v1");
+    code
+}
+
+/// SaslAuthenticate v1 with `authz\0user\0<password>`: (error, message).
+pub async fn sasl_auth(sock: &mut TcpStream, corr: i32, password: &str) -> (i16, Option<String>) {
+    let mut b = Vec::new();
+    let plain = format!("authz\0user\0{password}");
+    put_bytes(&mut b, plain.as_bytes());
+    let payload = kafka_round(sock, &kafka_req(36, 1, corr, false, &b)).await;
+    let mut r = Reader::new(&payload);
+    assert_eq!(r.i32(), Some(corr));
+    let mut r = Reader::new(&payload[r.pos()..]);
+    let code = r.i16().unwrap();
+    let msg = r.nullable_string().unwrap();
+    assert_eq!(r.bytes().unwrap(), Some(&b""[..]), "empty auth bytes");
+    assert_eq!(r.i64(), Some(0), "session lifetime 0");
+    (code, msg)
+}
+
+/// Expect the peer to have closed: any read fails/eof within 2s.
+pub async fn expect_closed(sock: &mut TcpStream, what: &str) {
+    let mut b = [0u8; 16];
+    match tokio::time::timeout(std::time::Duration::from_secs(2), sock.read(&mut b)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("{what}: expected close, got {} bytes {b:?}", n),
+        Err(_) => panic!("{what}: expected close, timed out still open"),
+    }
 }

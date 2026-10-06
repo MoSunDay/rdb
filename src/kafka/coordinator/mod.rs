@@ -104,6 +104,25 @@ fn active(st: &state::GroupState) -> bool {
     !st.members.is_empty()
 }
 
+/// Evict a group's runtime entry outright (DeleteGroups): membership,
+/// generation and protocol state all go; the kind-0x20 ledger rows are
+/// NOT touched here -- the caller folds those through the lite
+/// group-teardown path. Returns whether an entry existed. The group is
+/// notified so a JoinGroup/SyncGroup parked on it re-checks (and sees
+/// itself fenced) instead of parking out its deadline.
+pub fn remove_group(rt: &CoordRuntime, group: &str) -> bool {
+    let existed = rt
+        .groups
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(group)
+        .is_some();
+    if existed {
+        session::notify_group(rt, group);
+    }
+    existed
+}
+
 /// Generation/member fencing for OffsetCommit v1+ (the FIRST fence
 /// layer; the ledger's stored generation is the second). Returns the
 /// error code to answer EVERY partition with, or `None` to proceed:

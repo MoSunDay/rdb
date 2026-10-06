@@ -128,11 +128,15 @@
     （微秒级，`now_seed`），跨重启不复用 id——旧进程的僵尸 id 撞名会绕过
     membership 栅栏（failover e2e 场景 b 实测捕获）。JoinGroup v1+ 空
     member_id 两段式（回 79 MEMBER_ID_REQUIRED+candidate id，KIP-394），v0 直接分配。
-- **13 API 版本矩阵**（`implemented_apis()`，key 升序广播）：Produce 0-**3**、
-  Fetch 0-10、ListOffsets 0-1、Metadata 0-8、OffsetCommit 0-2、OffsetFetch 0-7、
-  **FindCoordinator(10) 0-1、JoinGroup(11) 0-4、Heartbeat(12) 0-4、
-  LeaveGroup(13) 0-2、SyncGroup(14) 0-4、DescribeGroups(15) 0-3**、ApiVersions
-  0-3。classic v0-v4（JoinGroup/SyncGroup v4 及以下不 flexible；v5+ 不开放）。
+- **13→15 API 版本矩阵**（`implemented_apis()`，key 升序广播；Batch 2 起 15 行）：
+  Produce 0-**3**、Fetch 0-10、ListOffsets 0-1、Metadata 0-8、OffsetCommit 0-2、
+  OffsetFetch 0-7、**FindCoordinator(10) 0-1、JoinGroup(11) 0-4、Heartbeat(12) 0-4、
+  LeaveGroup(13) 0-2、SyncGroup(14) 0-4、DescribeGroups(15) 0-3、
+  ListGroups(16) 0-1**、ApiVersions 0-3、**DeleteGroups(42) 0-1**。
+  classic v0-v4（JoinGroup/SyncGroup v4 及以下不 flexible；v5+ 不开放）。
+  配置 `kafka_token` 后另加 **SaslHandshake(17) 0-1、SaslAuthenticate(36) 0-1**
+  （17 行，`advertised_apis(true)`）；未配置时 SASL 面不存在，广告面与旧版
+  逐字节一致（key 17/36 走未知 API 回退，见 SASL 节）。
 - **世代 fencing 两层**（`commit_fence`，member 检查先于 generation，同 broker）：
   - 层1 协调器 runtime：组不在内存或成员不在册 → 25 `UNKNOWN_MEMBER_ID`；
     在册但 generation 过期 → 22 `ILLEGAL_GENERATION`；组 PreparingRebalance →
@@ -237,6 +241,7 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
 | P5b | 压缩 produce 侧解压：gzip/snappy/lz4，cargo feature `kafka-codecs`（默认关）；fetch 恒未压缩 | 已落地 |
 | P5c | rdb-bench 工况 `kafka-prod`/`kafka-fetch`（手写 Produce v2/Fetch v4 客户端压 front）+ `scenario_kafka_bench.sh` | 已落地 |
 | P5 | ~~压缩 codec~~（zstd 刻意排除，见偏差清单）、性能打磨 | 已落地（经 P5a/P5b/P5c 收口） |
+| B2 | 组管理 API：ListGroups(16)/DeleteGroups(42)（runtime ∪ ledger-only，复用 lite 拆除）+ SASL PLAIN（`kafka_token`，空=关闭）；MQ Batch 2 | 已落地（2026-10-06） |
 
 ## 偏差清单（对标准 Kafka）
 - **单 broker，无 ISR**：Metadata 恒报 node 1；replicas=isr={1}，offline 恒空，
@@ -287,7 +292,9 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
   即拒绝 XTRIM/XDEL，文案
   `ERR stream <name> has committed consumer-group offsets; delete the groups first`
   （ordinal 稳定性：账本把 ordinal↔id 映射钉在活跃条目集上，删条目会使其漂移）；
-  无账本行的纯 Lite 流不受影响。历史注记（修复前缺口）：P2 交付时该守卫顺延 P3，
+  无账本行的纯 Lite 流不受影响。**释放出口有两面**：RESP 面 `XGROUP DESTROY`
+  与 kafka 面 `DeleteGroups(42)`（Batch 2）走同一条 lite 拆除路径（含 0x20 折叠）。
+  历史注记（修复前缺口）：P2 交付时该守卫顺延 P3，
   kafka 面流可被 XTRIM/XDEL 撕裂 ordinal 映射。
 
 ## 上线修复（2026-09-22，P0 三项）
@@ -337,6 +344,60 @@ plans/2026-10-06-mq-gap/03 的"字节永不丢失"规则；e2e 此前只用 ASCI
    e2e：`tests/kafka_headers_fidelity_e2e.rs`（3 用例：native 名字节往返/
    envelope 名字节往返/碰撞用户头优先）。
 
+## 组管理 API 与 SASL（MQ Batch 2，2026-10-06）
+
+### ListGroups(16) v0-v1 / DeleteGroups(42) v0-v1（`admin.rs`）
+
+组的**全集 = 协调器 runtime 中的组 ∪ 0x20 账本行中的组**：进程重启后 runtime 清空、
+账本仍在，ListGroups 必须仍能看到只有 committed offset 的组（ledger-only 组：仅走
+OffsetCommit、从未 JoinGroup，无 lite 0x0E 组记录）。两端语义：
+
+- **ListGroups**：`merge_groups` 纯合并去重，按 id 升序；runtime 行的
+  protocol_type/state 取实时值（Stable/PreparingRebalance/CompletingSync/Empty），
+  **ledger-only 组报稳定占位 state `Empty` + protocol_type `consumer`**（账本行不带
+  类型，commit 路径只产 consumer 组；"Dead" 保留给 DescribeGroups 的未知组词汇，
+  ListGroups 永不回报 Dead）。v1 支持 states_filter（KIP-518）按 state 过滤；
+  v1 应答 throttle 首位、组行含 state 字段。全账本枚举有界（`GROUP_SCAN_LIMIT`，
+  与 `scan_group`/`list_topics` 同界，超出静默截断不卡顿）。
+- **DeleteGroups**：逐组执行，**复用 `XGROUP DESTROY` 的公共 lite 拆除路径**
+  （`lite::group::xgroup`，kafka 侧合成 command ctx 调用，不复制删除逻辑）：
+  对该组账本行所在的每个流，折叠 kind 0x20 账本行 + 删 lite 组记录（如有）+ 删
+  PEL 窗口 + 清 offset/ordered/consumer 缓存并唤醒等待者；随后**逐出 runtime**
+  （`coordinator::remove_group`：成员/世代/协议状态清空并通知 parked join/sync）。
+  **这就是 XTRIM/XDEL 账本守卫的 wire 侧出口**——删除 owning 组后守卫即释放。
+- **存在性判定 = runtime 有组 ∨ 账本有行**；两者皆无 → 69 `GROUP_ID_NOT_FOUND`
+  （批内其余组照常处理，结果按请求顺序逐组回错误码）。0x20 账本删除**不可逆**；
+  删除后重建（再 commit / 再 JoinGroup）从干净状态起步（无残留成员/世代）。
+  扫描/拆除失败 → 该组回 -1 `UNKNOWN_SERVER_ERROR`，批内其余组继续。
+- 错误码矩阵：0 NONE（已删）/ 69 GROUP_ID_NOT_FOUND（不存在）/ -1（store 故障）。
+- 与 DescribeGroups 一致性：DeleteGroups 后 runtime 组立即变 "Dead"、OffsetFetch
+  回 -1、ListGroups 不再列出；账本行消失可直接 RESP 查 0x20 前缀佐证。
+
+### SASL PLAIN（`sasl.rs`，`kafka_token` 门控）
+
+与 es/s3 前置的 `es_token`/`s3_token` 姿态对齐的轻量鉴权，**`kafka_token` 空字符串
+（默认）= SASL 面不存在，行为零变化**（广告面 15 行不含 17/36，key 17/36 请求走
+未知 API 的 ApiVersions-UNSUPPORTED_VERSION 回退；既有 e2e 全部无 token 通过）。
+
+- **SaslHandshake(17) v0-v1**：mechanism 恒只报 `[PLAIN]`；非 PLAIN → 33
+  `UNSUPPORTED_SASL_MECHANISM`（应答仍列 PLAIN 供客户端重试）+ 回帧后断连。
+- **SaslAuthenticate(36) v0-v1**：auth_bytes 为 PLAIN 串 `authzid\0authcid\0passwd`
+  （三段；畸形即失败）。**passwd 段与 `kafka_token` 常量时间比对**（无早退、长度
+  折入同一累加器；authzid/authcid 任意忽略）。失败 → 58 `SASL_AUTHENTICATION_FAILED`
+  + **固定文案**（不含 token 任何片段/长度）+ 回帧后断连；成功 → 连接标记已认证，
+  此后全 API 面不再重复校验（每连接一次）。resp：error/error_message/auth_bytes(空)
+  /v1+ session_lifetime_ms=0。
+- **认证前白名单**：ApiVersions(18)（任何客户端 bootstrap 先于认证，实测 librdkafka
+  SASL_PLAINTEXT 模式下也先发 ApiVersions v3）+ SaslHandshake/SaslAuthenticate
+  本身；其余 API 在未认证连接上**直接断连不回帧**（不泄露 API 面细节）。
+- 广告面条件化：`advertised_apis(token 非空)` = 15 行 + 17/36（共 17 行，key 升序）。
+- api key 实证（confluent-kafka 2.15.1 / librdkafka 2.15.1 线上抓帧）：Handshake=17
+  v1、Authenticate=36 v1、DeleteGroups=42 v1（与 plans/2026-10-06-mq-gap/03 一致；
+  42 之外的编号会直接让 SDK 端 `UNSUPPORTED_FEATURE` 拒发）。
+- e2e：`tests/kafka_admin_e2e.rs`（4 用例：ListGroups 并集/守卫释放+69 重建/SASL
+  全矩阵——预认证 ApiVersions、未认证断连、错机制 33、错密码 58+断连、正确 token
+  后 produce+fetch+commit+ListGroups 全通）。
+
 ## 风险注记（显式接受）
 - **单节点持久性是既知风险**：当年否决 Kafka front 的理由仍然成立——Kafka 客户端
   默认预期 acks=all/ISR/幂等，而 rdb 数据面（含 Lite 元数据）不经 raft 复制。接受
@@ -357,16 +418,20 @@ plans/2026-10-06-mq-gap/03 的"字节永不丢失"规则；e2e 此前只用 ASCI
   `offsets_query.rs`（ListOffsets v0-v1）、`fetch.rs`+`fetch_records.rs`
   （Fetch v0-v10，解析/预算/长轮询与记录反解码分文件）、`ledger.rs`
   （kind 0x20 提交偏移账本）、`offsets_commit.rs`（OffsetCommit/OffsetFetch）、
-  `conn.rs`（连接循环 + 13 API 分发）；内嵌单测 `*_tests.rs`
-  （codec/produce/fetch/offsets_commit）。
+  `conn.rs`（连接循环 + 15 API 分发与 SASL 门）；内嵌单测 `*_tests.rs`
+  （codec/produce/fetch/offsets_commit）。Batch 2 增 `admin.rs`
+  （ListGroups/DeleteGroups：纯合并/编码 + lite 拆除复用）与 `sasl.rs`
+  （PLAIN 握手/认证、常量时间比对、连接级门 `ConnAuth`）。
 - P3 组协调器 `src/kafka/coordinator/`：`mod.rs`（runtime、member id、
-  `commit_fence`）、`state.rs`（纯状态机）、`session.rs`（锁+sweep+Notify 唤醒）、
+  `commit_fence`、`remove_group`（DeleteGroups 逐出））、`state.rs`（纯状态机）、
+  `session.rs`（锁+sweep+Notify 唤醒）、
   `join.rs`（JoinGroup/SyncGroup 长等待）、`api.rs`（FindCoordinator/Heartbeat/
   LeaveGroup/DescribeGroups wire）、`group_api.rs`（JoinGroup/SyncGroup wire）；
   单测 `state_tests.rs`/`api_tests.rs`/`group_api_tests.rs`（状态机转移表 +
   逐版本 roundtrip）。
 - 配置：`kafka_bind`、`kafka_advertised_host/port`（Metadata/FindCoordinator 广告
   覆盖，空/0=由 bind 推导）、`kafka_max_connections`（0=默认 4096）、
+  `kafka_token`（非空启用 SASL PLAIN，见 Batch 2 节）、
   `rocksmq_bind`（`conf.rs`，空=关闭）。
 - 指标：`rdb_kafka_api_latency`（`monitor.rs`；conn 侧观测排除 Fetch park 时长、
   覆盖 acks=0 无响应路径）。
@@ -381,6 +446,8 @@ plans/2026-10-06-mq-gap/03 的"字节永不丢失"规则；e2e 此前只用 ASCI
   offsets 持久 + 跨重启 member id 不复用）；`tests/kafka_codec_e2e.rs`
   （P5b 压缩 roundtrip，feature 门控）；`tests/kafka_headers_roundtrip_e2e.rs`
   （headers 真回放 + envelope 兜底标记头）与 `tests/kafka_rename_ledger_e2e.rs`
-  （RENAME 随搬 0x20 账本 + 旧名 commit 回 3，MQ Batch 1）；场景脚本
+  （RENAME 随搬 0x20 账本 + 旧名 commit 回 3，MQ Batch 1）；
+  `tests/kafka_admin_e2e.rs`（Batch 2：ListGroups 并集/守卫释放/69+重建/
+  SASL 矩阵，admin+SASL wire helpers 在 `kafka_front_common/groups.rs`）；场景脚本
   `scrtips/e2e_scenarios/scenario_kafka_sdk.sh`（P5a 真实 SDK，7/7）与
   `scenario_kafka_bench.sh`（P5c bench 工况）。
