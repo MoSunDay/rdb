@@ -184,3 +184,119 @@ async fn rename_moves_ledger_guard_and_offset() {
     let reply = xtrim_reply(&resp, SRC, &[b"MINID", b"=", b"3-1"]).await;
     assert_eq!(reply, b":2\r\n", "no guard, plain trim of both entries");
 }
+
+/// RENAME onto a destination that already carries ITS OWN ledger rows
+/// is REPLACE semantics: dst's rows must not survive (a stale dst
+/// watermark would loosen -- or double-pin -- the XTRIM MINID guard
+/// under the new name). After the move dst serves exactly the carried
+/// src state: gsrc's offset at dst, gdst's row gone, guard armed by
+/// gsrc alone, the vacated old name unguarded.
+#[tokio::test]
+async fn rename_replaces_dst_preexisting_ledger_rows() {
+    rename_pairs_hash_to_one_slot();
+    let dir = std::env::temp_dir().join(format!("rdb-kafka-rename-dst-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut node = spawn_kafka_node(&dir);
+    let (resp, kafka) = (node.resp.clone(), node.kafka.clone());
+    wait_accepting(&resp, &mut node, "resp").await;
+    // BOTH sides of the future rename are live streams with ledger
+    // rows of their own (different groups, different ordinals).
+    xadd_ids(&resp, SRC, &["1-1", "2-1", "3-1"]).await;
+    xadd_ids(&resp, DST, &["1-1", "2-1", "3-1"]).await;
+    wait_accepting(&kafka, &mut node, "kafka").await;
+    let mut sock = TcpStream::connect(&kafka).await.expect("connect kafka");
+    let (topic_src, topic_dst) = (
+        SRC.split_once('/').unwrap().0,
+        DST.split_once('/').unwrap().0,
+    );
+    // Handshake + commit per group: gsrc@SRC ordinal 2, gdst@DST 1.
+    let mut corr = 1;
+    for (group, topic, offset) in [("gsrc", topic_src, 2i64), ("gdst", topic_dst, 1i64)] {
+        let r = join_v1(&mut sock, corr, group, SESSION_MS, 60_000, "", b"sub").await;
+        assert_eq!(r.error, errors::MEMBER_ID_REQUIRED);
+        let member = r.member_id;
+        let r = join_v1(
+            &mut sock,
+            corr + 1,
+            group,
+            SESSION_MS,
+            60_000,
+            &member,
+            b"sub",
+        )
+        .await;
+        assert_eq!(r.error, errors::NONE);
+        let (err, _) = sync_v1(
+            &mut sock,
+            corr + 2,
+            group,
+            &member,
+            1,
+            &[(member.as_str(), b"[a]")],
+        )
+        .await;
+        assert_eq!(err, errors::NONE);
+        assert_eq!(
+            commit_v2(&mut sock, corr + 3, group, 1, &member, topic, 5, offset).await,
+            errors::NONE
+        );
+        corr += 4;
+    }
+    assert_eq!(
+        fetch_offset_v0(&mut sock, corr, "gsrc", topic_src, 5).await,
+        2
+    );
+    assert_eq!(
+        fetch_offset_v0(&mut sock, corr + 1, "gdst", topic_dst, 5).await,
+        1
+    );
+
+    // Both names are guard-armed before the move.
+    for name in [SRC, DST] {
+        let reply = xtrim_reply(&resp, name, &[b"MINID", b"=", b"3-1"]).await;
+        assert!(
+            contains_bytes(&reply, GUARD_TEXT),
+            "{name} armed: {reply:?}"
+        );
+    }
+
+    // The rename itself.
+    let raw = resp_one_shot(&resp, &[b"RENAME", SRC.as_bytes(), DST.as_bytes()]).await;
+    assert_eq!(strip_auth(&raw), b"+OK\r\n", "rename over a ledged dst");
+
+    // dst's ledger is EXACTLY the carried src state: gsrc's row (offset
+    // 2) is there, gdst's row is GONE (no stale watermark under the new
+    // name), and the guard fires on gsrc's row alone.
+    assert_eq!(
+        fetch_offset_v0(&mut sock, corr + 2, "gsrc", topic_dst, 5).await,
+        2
+    );
+    assert_eq!(
+        fetch_offset_v0(&mut sock, corr + 3, "gdst", topic_dst, 5).await,
+        -1,
+        "dst's own rows were replaced, not merged"
+    );
+    let reply = xtrim_reply(&resp, DST, &[b"MINID", b"=", b"3-1"]).await;
+    assert!(
+        contains_bytes(&reply, GUARD_TEXT),
+        "carried row pins dst: {reply:?}"
+    );
+    let reply = xtrim_reply(&resp, SRC, &[b"MINID", b"=", b"3-1"]).await;
+    assert_eq!(reply, b":0\r\n", "old name vacated");
+
+    // And the replacement is durable: kill -9 + respawn keeps exactly
+    // the carried state (guard at dst, -1 for the replaced group).
+    node.kill_now();
+    node.respawn();
+    wait_accepting(&resp, &mut node, "resp").await;
+    wait_accepting(&kafka, &mut node, "kafka").await;
+    let mut sock = TcpStream::connect(&kafka).await.expect("reconnect kafka");
+    assert_eq!(
+        fetch_offset_v0(&mut sock, corr + 4, "gsrc", topic_dst, 5).await,
+        2
+    );
+    assert_eq!(
+        fetch_offset_v0(&mut sock, corr + 5, "gdst", topic_dst, 5).await,
+        -1
+    );
+}

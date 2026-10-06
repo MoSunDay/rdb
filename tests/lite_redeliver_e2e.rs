@@ -311,3 +311,142 @@ fn ordered_group_only_head_redelivered() {
         "tail never swept: {r:?}"
     );
 }
+
+// ---- per-group resume cursor (in-group starvation fix) --------------------
+
+/// Like `rows` but with a caller-chosen row cap (the shared helper
+/// fixes 10, too small for the 17-row starvation ladders below).
+fn rows_capped(shared: &Shared, stream: &[u8], g: &[u8], cap: usize) -> Vec<(String, u64)> {
+    let cap_arg = format!("{cap}");
+    let reply = call(
+        shared,
+        "xpending",
+        &[stream, g, b"-", b"+", cap_arg.as_bytes()],
+    );
+    pel_rows(&reply)
+        .into_iter()
+        .filter(|r| r.len() > 5)
+        .map(|r| {
+            (
+                r[1].clone(),
+                r[5].trim_start_matches(':').parse::<u64>().unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+/// Seed `n` entries `1-1 ..= 1-<n>` and deliver them all to c1 in one
+/// `>` read (17 > ROW_BUDGET 16: the row past the budget is the
+/// starved one).
+fn seed_and_deliver(shared: &Shared, stream: &[u8], n: u64) {
+    for k in 1..=n {
+        add(shared, stream, &format!("1-{k}"));
+    }
+    deliver(shared, stream, b"g", b"c1", &format!("1-{n}"));
+}
+
+/// Refresh rows `1-1 ..= 1-16` the way a live consumer holding them
+/// would (XCLAIM min-idle 0 resets the delivery clock and bumps times).
+fn refresh_head_rows(shared: &Shared, stream: &[u8]) {
+    for k in 1..=16u64 {
+        let id = format!("1-{k}");
+        let r = text(&call(
+            shared,
+            "xclaim",
+            &[stream, b"g", b"c1", b"0", id.as_bytes()],
+        ));
+        assert!(r.contains(&id), "claim {id}: {r}");
+    }
+}
+
+/// The starvation bug: with the first 16 pending rows perpetually
+/// fresh (a live consumer keeps re-claiming them), the old always-from-
+/// MIN_ID scan re-read the SAME 16 rows every round -- row 17 was
+/// never examined, so it could be neither redelivered nor
+/// dead-lettered. The per-group resume cursor continues STRICTLY AFTER
+/// the last examined id, so the starved row comes up by round two.
+#[test]
+fn resume_cursor_reaches_rows_past_a_fresh_head() {
+    let (shared, _p) = shared_idle("45415", 400);
+    let s = b"rd/q5";
+    group(&shared, s, b"g", &[]);
+    seed_and_deliver(&shared, s, 17);
+    // Row 17's delivery clock is now idle-old; rows 1-16 are refreshed
+    // right before every round, so they are always fresh.
+    sleep(Duration::from_millis(450));
+    let mut resumes = rdb::lite::redeliver::ResumeMap::new();
+    for round in 0..4 {
+        refresh_head_rows(&shared, s);
+        let (r, d, _) = rdb::lite::redeliver::sweep_from(&shared, now_ms(), b"", &mut resumes);
+        assert_eq!(d, 0, "no maxdelivery configured");
+        if round == 0 {
+            // Budget window only: 16 fresh rows examined, nothing due,
+            // the starved row still unseen.
+            assert_eq!(r, 0, "fresh head rows contribute nothing");
+            assert_eq!(times(&rows_capped(&shared, s, b"g", 20), "1-17"), 1);
+        } else if round == 1 {
+            // STRICTLY AFTER the cursor: the starved row is examined
+            // (and is due) -- the bug never reached it.
+            assert_eq!(r, 1, "round {round} reaches past the fresh head");
+        } else {
+            // Later rounds: the head is revisited after the wrap and
+            // the (now fresh) starved row is left alone.
+            assert_eq!(r, 0, "round {round}: nothing more is due");
+        }
+    }
+    let tail = rows_capped(&shared, s, b"g", 20);
+    assert_eq!(
+        times(&tail, "1-17"),
+        2,
+        "starved row redelivered exactly once"
+    );
+    assert!(
+        times(&tail, "1-16") >= 2,
+        "head rows kept being refreshed: {tail:?}"
+    );
+}
+
+/// The cursor lifecycle under explicit clocks: advance (full budget
+/// window), strictly-after (due rows behind the cursor are NOT
+/// re-examined -- progress is monotonic), wrap on a short window, head
+/// revisit on the next round.
+#[test]
+fn resume_cursor_is_strictly_after_then_wraps() {
+    let (shared, _p) = shared_idle("45416", 400);
+    let s = b"rd/q6";
+    group(&shared, s, b"g", &[]);
+    seed_and_deliver(&shared, s, 17);
+    let t0 = now_ms();
+    let key = (s.to_vec(), b"g".to_vec());
+    let id16 = rdb::lite::model::EntryId { ms: 1, seq: 16 };
+    let mut resumes = rdb::lite::redeliver::ResumeMap::new();
+
+    // Round 1 (all rows idle-due): budget window 1-1..1-16 examined
+    // and redelivered; the cursor arms at 1-16; row 1-17 unseen.
+    let (r, d, _) = rdb::lite::redeliver::sweep_from(&shared, t0 + 450, b"", &mut resumes);
+    assert_eq!((r, d), (16, 0), "budget window redelivered");
+    assert_eq!(
+        resumes.get(&key),
+        Some(&id16),
+        "cursor at the last examined id"
+    );
+    assert_eq!(times(&rows_capped(&shared, s, b"g", 20), "1-17"), 1);
+
+    // Round 2 (rows 1-16 are idle-AGAIN, 500ms later): strictly-after
+    // means they are NOT re-examined -- only 1-17 is scanned, so the
+    // tally is 1, not 17. The short window wraps the cursor.
+    let (r, d, _) = rdb::lite::redeliver::sweep_from(&shared, t0 + 950, b"", &mut resumes);
+    assert_eq!((r, d), (1, 0), "strictly-after: no duplicate examination");
+    assert!(
+        !resumes.contains_key(&key),
+        "short window wraps to the head"
+    );
+    let mid = rows_capped(&shared, s, b"g", 20);
+    assert_eq!((times(&mid, "1-1"), times(&mid, "1-17")), (2, 2), "{mid:?}");
+
+    // Round 3 (rows 1-16 still due): the head is revisited after the
+    // wrap and the cursor re-arms -- fresh head rows stay under watch.
+    let (r, d, _) = rdb::lite::redeliver::sweep_from(&shared, t0 + 950, b"", &mut resumes);
+    assert_eq!((r, d), (16, 0), "head revisited after the wrap");
+    assert_eq!(resumes.get(&key), Some(&id16), "cursor re-armed");
+}

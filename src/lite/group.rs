@@ -84,7 +84,7 @@ async fn create(ctx: &mut Ctx<'_>) {
         );
     }
     let (mut mkstream, mut ordered, mut inflight) = (false, false, 0u64);
-    let (mut maxdelivery, mut dlq) = (0u64, Vec::new());
+    let (mut maxdelivery, mut dlq, mut dlq_seen) = (0u64, Vec::new(), false);
     let mut i = 4;
     while i < ctx.args.len() {
         let a = &ctx.args[i];
@@ -123,7 +123,8 @@ async fn create(ctx: &mut Ctx<'_>) {
                 }
             }
             i += 1;
-        } else if a.eq_ignore_ascii_case(b"DLQ") && dlq.is_empty() && i + 1 < ctx.args.len() {
+        } else if a.eq_ignore_ascii_case(b"DLQ") && !dlq_seen && i + 1 < ctx.args.len() {
+            dlq_seen = true;
             dlq = ctx.args[i + 1].clone();
             i += 1;
         } else {
@@ -135,8 +136,10 @@ async fn create(ctx: &mut Ctx<'_>) {
         return resp::append_error(ctx.out, "ERR syntax error");
     }
     // DLQ rides a MAXDELIVERY cap (the INFLIGHT-must-follow-ORDERED
-    // precedent): a target without a cap would never transfer.
-    if !dlq.is_empty() && maxdelivery == 0 {
+    // precedent): a target without a cap would never transfer. An
+    // EXPLICIT option counts as configured even when the name is empty
+    // (the empty name gets its own dedicated refusal below).
+    if dlq_seen && maxdelivery == 0 {
         return resp::append_error(ctx.out, "ERR syntax error");
     }
     let Some((stream, prefix)) = super::entries::stream_of(ctx, 1) else {
@@ -148,6 +151,13 @@ async fn create(ctx: &mut Ctx<'_>) {
     // normal, independently consumable stream.
     if maxdelivery > 0 {
         if dlq.is_empty() {
+            if dlq_seen {
+                // `DLQ ""` is an explicit EMPTY name, not an omitted
+                // option: silently falling back to the default would
+                // retarget the group's dead letters somewhere the
+                // caller never named -- refuse instead of guessing.
+                return resp::append_error(ctx.out, "ERR empty DLQ target name");
+            }
             dlq = super::dlq::default_dlq_stream(&stream);
         }
         match super::parse_topic_name(&dlq) {
@@ -158,6 +168,22 @@ async fn create(ctx: &mut Ctx<'_>) {
                 dlq = canon;
             }
             _ => return resp::append_error(ctx.out, "ERR invalid DLQ stream name"),
+        }
+        // The dead-letter transfer XADDs into the target, so a target
+        // that IS the source would overwrite the business payload in
+        // place and permanently inflate the stream's len.
+        if dlq == stream {
+            return resp::append_error(ctx.out, "ERR DLQ target must not be the source stream");
+        }
+        // Cluster-form safety: physical storage is `<slot>/`-prefixed
+        // (the PARENT-derived CRC16 slot), so an explicit target in a
+        // DIFFERENT slot would land on another node's window -- only
+        // same-slot targets are accepted.
+        if model::stream_prefix(&dlq) != Some(prefix.clone()) {
+            return resp::append_error(
+                ctx.out,
+                "ERR DLQ target must hash to the same slot as the source stream",
+            );
         }
     }
     let group = ctx.args[2].clone();
@@ -270,12 +296,26 @@ async fn destroy(ctx: &mut Ctx<'_>) {
         .ok()
         .flatten()
         .is_some();
-    if existed {
-        let mut batch = WriteBatch::default();
-        batch.delete(&gkey);
-        // The group's whole pending window (PEL rows + consumer
-        // registry) goes with it: one range delete, no enumeration.
-        super::pel::delete_group_pend(&mut batch, &prefix, &stream, &group);
+    // The group's kafka committed-offset ledger rows (kind 0x20) fold
+    // with it: the XTRIM/XDEL ledger guard trips on ANY 0x20 row of
+    // the stream, so rows surviving the teardown would lock the
+    // stream's retention forever. A kafka-only group (ledger rows but
+    // no lite group record) is destroyable the same way -- and counts
+    // as having existed, so the reply tells the operator it did
+    // something.
+    let mut batch = WriteBatch::default();
+    let ledger_rows =
+        match fold_group_ledger(&mut batch, &ctx.shared.store, &prefix, &stream, &group) {
+            Ok(n) => n,
+            Err(e) => return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}")),
+        };
+    if existed || ledger_rows > 0 {
+        if existed {
+            batch.delete(&gkey);
+            // The group's whole pending window (PEL rows + consumer
+            // registry) goes with it: one range delete, no enumeration.
+            super::pel::delete_group_pend(&mut batch, &prefix, &stream, &group);
+        }
         if let Err(e) = ctx.commit(batch).await {
             return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
         }
@@ -287,7 +327,39 @@ async fn destroy(ctx: &mut Ctx<'_>) {
     offset::remove_group(&ctx.shared.lite.offsets, &stream, &group);
     super::ordered::drop_group(&ctx.shared.lite.owners, &stream, &group);
     ctx.shared.lite.forget_group(&stream, &group);
-    resp::append_int(ctx.out, i64::from(existed));
+    resp::append_int(ctx.out, i64::from(existed || ledger_rows > 0));
+}
+
+/// Enumerate this `(stream, group)`'s kafka committed-offset ledger
+/// rows (kind 0x20) and queue their deletes into `batch`; returns the
+/// row count (`Err` = the scan failed: a partial fold must never
+/// commit). Bounded to the stream's own 0x20 window (the
+/// length-prefixed `data_key` cannot bleed into a neighbouring
+/// stream's window); `ledger::parse_key` decodes the full (stream,
+/// group) identity, so a group whose name prefixes another (`g1` vs
+/// `g10`) never swallows the longer one's rows. Safe against
+/// concurrent kafka commits without extra latching: commits take the
+/// SAME stream meta latch the caller already holds.
+fn fold_group_ledger(
+    batch: &mut WriteBatch,
+    store: &crate::store::Store,
+    prefix: &[u8],
+    stream: &[u8],
+    group: &[u8],
+) -> Result<usize, String> {
+    let window = crate::ds::codec::data_key(prefix, crate::ds::codec::KIND_STREAM_OFFSET, stream);
+    let mut count = 0usize;
+    ops::for_each_from(store, &window, false, &mut |k, _| {
+        if !k.starts_with(&window) {
+            return false; // left the stream's kind-0x20 window
+        }
+        if crate::kafka::ledger::parse_key(k) == Some((stream.to_vec(), group.to_vec())) {
+            batch.delete(k);
+            count += 1;
+        }
+        true
+    })?;
+    Ok(count)
 }
 
 /// `XGROUP CREATECONSUMER <stream> <group> <consumer>`: register the

@@ -230,3 +230,108 @@ fn kafka_ledger_guard_blocks_xtrim_and_xdel() {
     assert_eq!(text(&call(&shared, "xdel", &[s, b"3-1"])).trim_end(), ":1");
     assert_eq!(xlen(&shared, s), 0);
 }
+
+/// Lay one committed-offset ledger row (kind 0x20) under the stream's
+/// PARENT-derived slot prefix, exactly like the kafka front does.
+fn ledger_row(shared: &Shared, stream: &[u8], group: &[u8], ordinal: u64) {
+    let parent = stream.split(|&b| b == b'/').next().unwrap_or_default();
+    let prefix = rdb::hash::slot_with_prefix(parent).1;
+    let mut batch = rocksdb::WriteBatch::default();
+    rdb::kafka::ledger::put_rows(
+        &mut batch,
+        &[rdb::kafka::ledger::LedgerRow {
+            stream: stream.to_vec(),
+            group: group.to_vec(),
+            prefix,
+            committed_ordinal: ordinal,
+            generation: 1,
+            leader: "m-1".into(),
+        }],
+    );
+    rdb::store::ops::batch_write(&shared.store, batch).expect("ledger row");
+}
+
+/// XGROUP DESTROY is the ledger guard's NAMED exit: the destroy folds
+/// the group's kind-0x20 rows (bounded to stream+group) so XTRIM MINID
+/// goes through afterwards. Covers a lite group carrying a ledger row,
+/// a kafka-ONLY group (ledger rows, no lite group record -- still
+/// destroyable, still replies 1), and the g1-vs-g10 name-prefix hazard
+/// (destroying g1 must leave g10's rows pinning the guard).
+#[test]
+fn xgroup_destroy_folds_ledger_rows_and_releases_the_guard() {
+    let (shared, _dir) = shared_at("44325");
+
+    // (1) A lite group whose name also carries a kafka ledger row: the
+    // destroy tears down group + PEL + ledger in one batch.
+    let s1 = b"gz/q0".as_slice();
+    seed_five(&shared, s1);
+    assert_eq!(
+        text(&call(&shared, "xgroup", &[b"create", s1, b"gl", b"0-0"])),
+        "+OK\r\n"
+    );
+    assert!(text(&call(
+        &shared,
+        "xreadgroup",
+        &[b"group", b"gl", b"c1", b"streams", s1, b">"]
+    ))
+    .contains("1-1"));
+    ledger_row(&shared, s1, b"gl", 2);
+    let reply = xtrim(&shared, s1, &[b"MINID", b"=", b"0-1"]);
+    assert!(
+        reply.contains("consumer-group offsets"),
+        "guard armed: {reply}"
+    );
+    assert!(
+        reply.contains("XGROUP DESTROY"),
+        "guard names the exit: {reply}"
+    );
+    assert_eq!(
+        text(&call(&shared, "xgroup", &[b"destroy", s1, b"gl"])).trim_end(),
+        ":1"
+    );
+    // The group is gone (XPENDING answers NOGROUP) and so is its PEL.
+    assert!(text(&call(&shared, "xpending", &[s1, b"gl"])).contains("NOGROUP"));
+    assert_eq!(
+        xtrim(&shared, s1, &[b"MINID", b"=", b"3-1"]),
+        ":2",
+        "guard released"
+    );
+
+    // (2) A kafka-ONLY group: ledger rows but no lite group record.
+    let s2 = b"ko/q0".as_slice();
+    seed_five(&shared, s2);
+    ledger_row(&shared, s2, b"kg", 4);
+    assert!(xtrim(&shared, s2, &[b"MINID", b"=", b"0-1"]).starts_with("-ERR"));
+    assert_eq!(
+        text(&call(&shared, "xgroup", &[b"destroy", s2, b"kg"])).trim_end(),
+        ":1",
+        "kafka-only group existed (its rows did)"
+    );
+    assert_eq!(xtrim(&shared, s2, &[b"MINID", b"=", b"3-1"]), ":2");
+
+    // (3) The destroy stays bounded to stream+group: g1's rows fold,
+    // g10's survive (no prefix swallow), the guard stays armed until
+    // g10 itself is destroyed. A group with nothing anywhere is :0.
+    let s3 = b"pf/q0".as_slice();
+    seed_five(&shared, s3);
+    ledger_row(&shared, s3, b"g1", 1);
+    ledger_row(&shared, s3, b"g10", 1);
+    assert_eq!(
+        text(&call(&shared, "xgroup", &[b"destroy", s3, b"g1"])).trim_end(),
+        ":1"
+    );
+    assert!(
+        xtrim(&shared, s3, &[b"MINID", b"=", b"0-1"]).starts_with("-ERR"),
+        "g10's rows still pin the stream"
+    );
+    assert_eq!(
+        text(&call(&shared, "xgroup", &[b"destroy", s3, b"nope"])).trim_end(),
+        ":0",
+        "nothing existed under that name"
+    );
+    assert_eq!(
+        text(&call(&shared, "xgroup", &[b"destroy", s3, b"g10"])).trim_end(),
+        ":1"
+    );
+    assert_eq!(xtrim(&shared, s3, &[b"MINID", b"=", b"3-1"]), ":2");
+}
