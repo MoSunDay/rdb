@@ -621,3 +621,74 @@ fn scan_type_filter_and_syntax_errors() {
         b"-ERR syntax error\r\n".to_vec()
     );
 }
+
+#[test]
+fn rename_stream_moves_offset_ledger() {
+    // Lite streams live under the PARENT-derived slot prefix with the
+    // full `parent/child` name as the user key; RENAME's dispatch-level
+    // slot routing is a separate concern (e2e), so the storage-level
+    // move is driven directly with the stream's real prefix.
+    let (_g, s) = shared_for("127.0.0.1:40234");
+    let prefix = crate::hash::slot_with_prefix(b"t").1;
+    let (src, dst, group) = (b"t/q0".as_slice(), b"t/q9".as_slice(), b"g1".as_slice());
+    let mut batch = rocksdb::WriteBatch::default();
+    batch.put(
+        crate::lite::model::meta_key(&prefix, src),
+        crate::lite::model::encode_meta_at(
+            &crate::lite::model::MetaPayload {
+                len: 1,
+                ..Default::default()
+            },
+            0,
+        ),
+    );
+    batch.put(
+        crate::lite::model::entry_key(&prefix, src, crate::lite::model::EntryId { ms: 1, seq: 0 }),
+        crate::lite::model::encode_entry(&[(b"f", b"v")]),
+    );
+    // A kafka committed-offset ledger row (kind 0x20) keyed by the full
+    // stream name -- the family span 0x0C..=0x0F misses it, so
+    // `move_family` must fold the window explicitly.
+    crate::kafka::ledger::put_rows(
+        &mut batch,
+        &[crate::kafka::ledger::LedgerRow {
+            stream: src.to_vec(),
+            group: group.to_vec(),
+            prefix: prefix.clone(),
+            committed_ordinal: 7,
+            generation: 3,
+            leader: "m-1".into(),
+        }],
+    );
+    crate::store::ops::batch_write(&s.store, batch).expect("seed stream + ledger");
+
+    let moved = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime")
+        .block_on(keys_core::rename_key(&s, &prefix, src, dst, false, 0));
+    assert_eq!(moved, Ok(RenameOutcome::Moved));
+
+    // The ledger row travelled with the stream family, value intact.
+    let row = crate::kafka::ledger::load(&s.store, &prefix, dst, group)
+        .expect("load dst ledger")
+        .expect("ledger row moved to dst");
+    assert_eq!(row.committed_ordinal, 7);
+    // Nothing stays behind at the old name: no ledger row, no meta,
+    // no entry (the stream family itself keeps moving as before).
+    assert_eq!(
+        crate::kafka::ledger::load(&s.store, &prefix, src, group).expect("load src ledger"),
+        None
+    );
+    let gone = |k: Vec<u8>| {
+        crate::store::ops::get_physical(&s.store, &k)
+            .unwrap()
+            .is_none()
+    };
+    assert!(gone(crate::lite::model::meta_key(&prefix, src)));
+    assert!(gone(crate::lite::model::entry_key(
+        &prefix,
+        src,
+        crate::lite::model::EntryId { ms: 1, seq: 0 }
+    )));
+    assert!(!gone(crate::lite::model::meta_key(&prefix, dst)));
+}

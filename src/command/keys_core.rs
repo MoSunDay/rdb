@@ -430,6 +430,36 @@ fn move_family(
     for (lower, upper) in ranges {
         batch.delete_range(lower, upper);
     }
+    // Streams own a SECOND window the family span misses: the kafka
+    // committed-offset ledger (OFFSET_FAMILY, kind 0x20) rows keyed by
+    // the full stream name. Folding them here mirrors the delete side
+    // (`expire::family_delete_entries` already folds 0x20 on a stream
+    // overwrite) -- skipping it would leave the rows orphaned at the
+    // old name. Ledger rows carry no TTL (envelope 0), so the expire
+    // index below is untouched by this leg.
+    if family == codec::STREAM_FAMILY {
+        let src_root = codec::data_key(prefix, codec::KIND_STREAM_OFFSET, src);
+        let ledger_ranges = codec::family_delete_ranges(prefix, codec::OFFSET_FAMILY, src);
+        for (lower, upper) in &ledger_ranges {
+            // Keys in [lower, upper) all start with `lower` (see
+            // `family_delete_ranges`'s key-confined ranges), so the
+            // remaining bytes are exactly the `"/" ++ group` suffix.
+            ops::for_each_from(store, lower, false, &mut |k, v| {
+                if k >= upper.as_slice() {
+                    return false;
+                }
+                let suffix = k.get(src_root.len()..).unwrap_or(&[]);
+                batch.put(
+                    codec::elem_key(prefix, codec::KIND_STREAM_OFFSET, dst, suffix),
+                    v,
+                );
+                true
+            })?;
+        }
+        for (lower, upper) in ledger_ranges {
+            batch.delete_range(lower, upper);
+        }
+    }
     let src_root = codec::data_key(prefix, family.0, src);
     let dst_root = codec::data_key(prefix, family.0, dst);
     expire::set_ttl_entries(batch, prefix, dst_root, 0, expire_ms);
