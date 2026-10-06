@@ -26,6 +26,8 @@ pub struct Collector {
     /// Lite Mode: group offsets awaiting the 200ms flush.
     pub lite_offset_dirty: Gauge,
     pub lite_backlog: Gauge,
+    /// Lite Mode: summed entry depth of every configured DLQ stream.
+    pub lite_dlq_depth: Gauge,
     /// SQL data plane: statement latency (labels: kind = ddl|select|insert|
     /// update|delete|explain|other).
     pub sql_query_latency: HistogramVec,
@@ -68,6 +70,11 @@ pub fn new_collector() -> Collector {
     let lite_backlog = Gauge::new(
         "rdb_lite_backlog",
         "lite unacked pending stream entries (PEL) across consumer groups",
+    )
+    .expect("gauge");
+    let lite_dlq_depth = Gauge::new(
+        "rdb_lite_dlq_depth",
+        "lite dead-letter stream entry depth (summed)",
     )
     .expect("gauge");
     let tx_events = CounterVec::new(
@@ -133,6 +140,9 @@ pub fn new_collector() -> Collector {
         .register(Box::new(lite_backlog.clone()))
         .expect("reg lite_backlog");
     registry
+        .register(Box::new(lite_dlq_depth.clone()))
+        .expect("reg lite_dlq_depth");
+    registry
         .register(Box::new(tx_events.clone()))
         .expect("reg tx_events");
     registry
@@ -166,6 +176,7 @@ pub fn new_collector() -> Collector {
         lite_streams,
         lite_offset_dirty,
         lite_backlog,
+        lite_dlq_depth,
         tx_events,
         tx_commit_latency,
         sql_query_latency,
@@ -227,6 +238,11 @@ pub fn set_lite_offset_dirty(c: &Collector, n: f64) {
 /// Unacked-pending (PEL) backlog, refreshed by the lite background loop.
 pub fn set_lite_backlog(c: &Collector, n: f64) {
     c.lite_backlog.set(n);
+}
+
+/// Summed DLQ stream depth, refreshed by the lite background loop.
+pub fn set_lite_dlq_depth(c: &Collector, n: f64) {
+    c.lite_dlq_depth.set(n);
 }
 
 /// Go label order is (mode, firstCmd, isMoved) mapping onto (type, mode, ack):

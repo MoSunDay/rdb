@@ -192,6 +192,15 @@ pub struct GroupPayload {
     /// normalized to 1 on load; unordered groups keep 0.
     #[serde(default)]
     pub inflight_max: u64,
+    /// Max deliveries per pending row before it is dead-lettered to
+    /// `dlq` (0 = never transfer, the pre-DLQ behavior).
+    #[serde(default)]
+    pub maxdelivery: u64,
+    /// Dead-letter target stream name (empty = none). Resolved once at
+    /// XGROUP CREATE: an explicit `DLQ <stream>` verbatim, else the
+    /// same-slot default `<stream>/dlq` (see `lite::dlq`).
+    #[serde(default)]
+    pub dlq: Vec<u8>,
 }
 
 fn encode_json<T: Serialize>(payload: &T) -> Vec<u8> {

@@ -36,3 +36,5 @@ es_token: ""
 #s3_token: ""           # Bearer 鉴权 token（空 = 无鉴权；非 SigV4）
 #s3_checkpoint_interval_ms: 0  # RocksDB checkpoint 发布周期毫秒（0 = 不发布）
 #s3_checkpoint_retention: 0    # 保留最近 N 份 checkpoint（0 = 内建默认 2）
+#lite:
+#  redelivery_idle_ms: 0  # idle 自动重投阈值 ms（0=关，默认）

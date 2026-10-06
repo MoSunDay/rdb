@@ -10,6 +10,7 @@ use crate::resp::codec as resp;
 use super::claim::{
     claimed_state, group_absent, nogroup, parse_u64, read_entry, register_consumer, succ_id,
 };
+use super::dlq;
 use super::entries;
 use super::model::{self, EntryId};
 use super::pel;
@@ -70,7 +71,27 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
     if group_absent(ctx, &prefix, &stream, &group) {
         return nogroup(ctx.out, &stream, &group);
     }
-    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
+    // A MAXDELIVERY group's DLQ target joins the latch set (sorted):
+    // dead-letter transfers below write both windows in this critical
+    // section. The first group_absent check warmed the offset cache.
+    let gst = super::offset::load(
+        &ctx.shared.lite.offsets,
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        &group,
+    )
+    .ok()
+    .flatten();
+    let dlq_target = gst
+        .as_ref()
+        .filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
+        .map(|st| st.dlq.clone());
+    let latch_set = dlq::latch_keys(model::meta_key(&prefix, &stream), dlq_target.as_deref());
+    let mut guards = Vec::with_capacity(latch_set.len());
+    for k in &latch_set {
+        guards.push(latch::lock(&ctx.shared.latch, k).await);
+    }
     if group_absent(ctx, &prefix, &stream, &group) {
         return nogroup(ctx.out, &stream, &group);
     }
@@ -83,16 +104,7 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
     // claimable (deeper rows stay with the owner until the new owner
     // works down to them). A successful head claim flips ownership and
     // bumps the fencing epoch; an empty result leaves ownership alone.
-    let ordered = super::offset::load(
-        &ctx.shared.lite.offsets,
-        &ctx.shared.store,
-        &prefix,
-        &stream,
-        &group,
-    )
-    .ok()
-    .flatten()
-    .is_some_and(|st| st.ordered);
+    let ordered = gst.as_ref().is_some_and(|st| st.ordered);
     let head = if ordered {
         pel::scan_pend(
             &ctx.shared.store,
@@ -114,6 +126,7 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
     let budget = count.saturating_mul(SCAN_BUDGET_FACTOR);
     let (mut scanned, mut claimed) = (0u64, 0u64);
     let (mut last_scanned, mut stopped_early) = (None::<EntryId>, false);
+    let mut dlq_count: u64 = 0;
     let mut frames: Vec<entries::Entry> = Vec::new();
     let mut claimed_ids: Vec<EntryId> = Vec::new();
     let mut deleted: Vec<EntryId> = Vec::new();
@@ -144,6 +157,35 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
                 deleted.push(row.id);
             }
             Ok(Some(fields)) => {
+                // MAXDELIVERY gate (delivery claims only; JUSTID is an
+                // ownership move, not a delivery): the row dead-letters
+                // instead of being handed out and reports in the reply's
+                // deleted-ids segment -- the three-segment shape stays.
+                if let Some(g) = gst.as_ref() {
+                    if !justid && dlq::should_dead_letter(row.state.times_delivered, g.maxdelivery)
+                    {
+                        let dead = dlq::DeadRow {
+                            id: row.id,
+                            times: row.state.times_delivered,
+                            consumer: consumer.to_vec(),
+                        };
+                        match dlq::transfer_entries(
+                            dlq::transfer_ctx(ctx.shared, &mut batch, &prefix, &stream, &group, g),
+                            std::slice::from_ref(&dead),
+                            now,
+                        ) {
+                            Ok(k) => dlq_count += k as u64,
+                            Err(e) => {
+                                return resp::append_error(
+                                    ctx.out,
+                                    &format!("ERR: xautoclaim failed: {e}"),
+                                )
+                            }
+                        }
+                        deleted.push(row.id);
+                        continue;
+                    }
+                }
                 if ordered && epoch == 0 {
                     // A successful head claim takes the queue: bump the
                     // fencing epoch over the deposed owner.
@@ -182,6 +224,18 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
         // Takeover happened: wake blocked readers (the fenced former
         // owner and any contender) to re-check immediately.
         crate::ds::wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));
+    }
+    if dlq_count > 0 {
+        super::offset::bump_pending(
+            &ctx.shared.lite.offsets,
+            &stream,
+            &group,
+            -(dlq_count as i64),
+        );
+        crate::monitor::observe_lite_message(&ctx.shared.monitor, "dlq", dlq_count);
+        if let Some(g) = &gst {
+            dlq::notify_transfer(ctx.shared, &prefix, &stream, &g.dlq);
+        }
     }
     // Redis >= 7 shape: [next-cursor, claimed entries (or ids), deleted ids].
     // The cursor is the SUCCESSOR of the last scanned row: scanning is

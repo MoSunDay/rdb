@@ -14,9 +14,11 @@
 use crate::command::Ctx;
 use crate::ds::expire;
 use crate::ds::latch;
+use crate::monitor;
 use crate::resp::codec as resp;
 use crate::store::ops;
 
+use super::dlq;
 use super::entries;
 use super::model::{self, EntryId};
 use super::offset;
@@ -168,7 +170,28 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
     if group_absent(ctx, &prefix, &stream, &group) {
         return nogroup(ctx.out, &stream, &group);
     }
-    let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
+    // A MAXDELIVERY group's DLQ target joins the latch set (sorted by
+    // dlq::latch_keys): the dead-letter branch below writes both
+    // windows inside this one critical section. The first group_absent
+    // check warmed the offset cache, so the config peek is exact.
+    let gst = offset::load(
+        &ctx.shared.lite.offsets,
+        &ctx.shared.store,
+        &prefix,
+        &stream,
+        &group,
+    )
+    .ok()
+    .flatten();
+    let dlq_target = gst
+        .as_ref()
+        .filter(|st| st.maxdelivery > 0 && !st.dlq.is_empty())
+        .map(|st| st.dlq.clone());
+    let latch_set = dlq::latch_keys(model::meta_key(&prefix, &stream), dlq_target.as_deref());
+    let mut guards = Vec::with_capacity(latch_set.len());
+    for k in &latch_set {
+        guards.push(latch::lock(&ctx.shared.latch, k).await);
+    }
     // Re-validate under the latch: a racing XGROUP DESTROY may have
     // removed the group between the first check and the latch.
     if group_absent(ctx, &prefix, &stream, &group) {
@@ -182,16 +205,7 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
     // too (non-head ids are silently ignored, like Redis's non-pending
     // ones).
     let mut epoch = 0u64;
-    let ordered = offset::load(
-        &ctx.shared.lite.offsets,
-        &ctx.shared.store,
-        &prefix,
-        &stream,
-        &group,
-    )
-    .ok()
-    .flatten()
-    .is_some_and(|st| st.ordered);
+    let ordered = gst.as_ref().is_some_and(|st| st.ordered);
     if ordered {
         // The head row must exist, be the claimed id, and be idle
         // enough (FORCE does not bypass a pending row's idle gate);
@@ -232,6 +246,8 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
     // FORCE can MINT a PEL row for an id that was never delivered: the
     // backlog counter only grows for those (rewrites are count-neutral).
     let mut force_created: u64 = 0;
+    // PEL rows resolved by dead-letter transfers (not in the reply).
+    let mut dlq_count: u64 = 0;
     for id in ids {
         let old = match pel::get_pend(&ctx.shared.store, &prefix, &stream, &group, id) {
             // Not idle enough yet: stays with its current owner.
@@ -262,6 +278,32 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
             // row instead of redelivering a missing payload.
             batch.delete(pel::pend_key(&prefix, &stream, &group, id));
             continue;
+        }
+        // The delivery that would pass MAXDELIVERY never happens: the
+        // row dead-letters instead (the ONLY claim result that omits an
+        // otherwise-legal id). JUSTID never triggers -- an ownership
+        // move is not a delivery. Ordered groups only ever claim the
+        // head, and a head transfer frees the queue, so no special case.
+        let old_times = old.as_ref().map_or(0, |st| st.times_delivered);
+        if let Some(g) = gst.as_ref() {
+            if !justid && dlq::should_dead_letter(old_times, g.maxdelivery) {
+                let row = dlq::DeadRow {
+                    id,
+                    times: old_times,
+                    consumer: consumer.to_vec(),
+                };
+                match dlq::transfer_entries(
+                    dlq::transfer_ctx(ctx.shared, &mut batch, &prefix, &stream, &group, g),
+                    std::slice::from_ref(&row),
+                    now,
+                ) {
+                    Ok(k) => dlq_count += k as u64,
+                    Err(e) => {
+                        return resp::append_error(ctx.out, &format!("ERR: xclaim failed: {e}"))
+                    }
+                }
+                continue;
+            }
         }
         if fresh {
             force_created += 1;
@@ -297,6 +339,18 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
             &group,
             force_created as i64,
         );
+    }
+    if dlq_count > 0 {
+        offset::bump_pending(
+            &ctx.shared.lite.offsets,
+            &stream,
+            &group,
+            -(dlq_count as i64),
+        );
+        monitor::observe_lite_message(&ctx.shared.monitor, "dlq", dlq_count);
+        if let Some(g) = &gst {
+            dlq::notify_transfer(ctx.shared, &prefix, &stream, &g.dlq);
+        }
     }
     // Only entries actually claimed, in argument order; none -> *0.
     if justid {

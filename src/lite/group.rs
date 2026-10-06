@@ -84,6 +84,7 @@ async fn create(ctx: &mut Ctx<'_>) {
         );
     }
     let (mut mkstream, mut ordered, mut inflight) = (false, false, 0u64);
+    let (mut maxdelivery, mut dlq) = (0u64, Vec::new());
     let mut i = 4;
     while i < ctx.args.len() {
         let a = &ctx.args[i];
@@ -105,6 +106,26 @@ async fn create(ctx: &mut Ctx<'_>) {
                 }
             }
             i += 1;
+        } else if a.eq_ignore_ascii_case(b"MAXDELIVERY")
+            && maxdelivery == 0
+            && i + 1 < ctx.args.len()
+        {
+            match std::str::from_utf8(&ctx.args[i + 1])
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+            {
+                Some(n) if n >= 1 => maxdelivery = n,
+                _ => {
+                    return resp::append_error(
+                        ctx.out,
+                        "ERR value is not an integer or out of range",
+                    )
+                }
+            }
+            i += 1;
+        } else if a.eq_ignore_ascii_case(b"DLQ") && dlq.is_empty() && i + 1 < ctx.args.len() {
+            dlq = ctx.args[i + 1].clone();
+            i += 1;
         } else {
             return resp::append_error(ctx.out, "ERR syntax error");
         }
@@ -113,9 +134,32 @@ async fn create(ctx: &mut Ctx<'_>) {
     if inflight > 0 && !ordered {
         return resp::append_error(ctx.out, "ERR syntax error");
     }
+    // DLQ rides a MAXDELIVERY cap (the INFLIGHT-must-follow-ORDERED
+    // precedent): a target without a cap would never transfer.
+    if !dlq.is_empty() && maxdelivery == 0 {
+        return resp::append_error(ctx.out, "ERR syntax error");
+    }
     let Some((stream, prefix)) = super::entries::stream_of(ctx, 1) else {
         return;
     };
+    // Resolve the final target once, here: an explicit name verbatim
+    // (any topic/slot), else the literal same-slot default `<stream>/
+    // dlq`. Both must survive topic-name validation so the DLQ stays a
+    // normal, independently consumable stream.
+    if maxdelivery > 0 {
+        if dlq.is_empty() {
+            dlq = super::dlq::default_dlq_stream(&stream);
+        }
+        match super::parse_topic_name(&dlq) {
+            Ok(super::TopicName::Stream(p, c)) => {
+                let mut canon = p;
+                canon.push(b'/');
+                canon.extend_from_slice(&c);
+                dlq = canon;
+            }
+            _ => return resp::append_error(ctx.out, "ERR invalid DLQ stream name"),
+        }
+    }
     let group = ctx.args[2].clone();
     let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
     let read = model::read_meta(
@@ -173,6 +217,8 @@ async fn create(ctx: &mut Ctx<'_>) {
             committed_seq: start.seq,
             ordered,
             inflight_max,
+            maxdelivery,
+            dlq: dlq.clone(),
         }),
     );
     if let Err(e) = ctx.commit(batch).await {
@@ -199,6 +245,8 @@ async fn create(ctx: &mut Ctx<'_>) {
             pending: 0,
             ordered,
             inflight_max,
+            maxdelivery,
+            dlq,
         },
     );
     wait::notify(&ctx.shared.wait_hub, &model::meta_key(&prefix, &stream));

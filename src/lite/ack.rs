@@ -136,15 +136,7 @@ pub async fn xack(ctx: &mut Ctx<'_>) {
                 if advanced {
                     batch.put(
                         model::group_key(&prefix, &stream, group.as_slice()),
-                        model::encode_group(&model::GroupPayload {
-                            created_ms: st.created_ms,
-                            delivered_ms: st.committed.ms,
-                            delivered_seq: st.committed.seq,
-                            committed_ms: st.committed.ms,
-                            committed_seq: st.committed.seq,
-                            ordered: st.ordered,
-                            inflight_max: st.inflight_max,
-                        }),
+                        model::encode_group(&super::dlq::payload_of(&st)),
                     );
                 }
                 for id in &pend_hits {

@@ -107,6 +107,9 @@ pub struct Config {
     /// Redis MULTI/EXEC transactions; disabled -> MULTI errors.
     #[serde(default, rename = "tx")]
     pub tx: TxConfig,
+    /// Lite Mode engine knobs (dead-letter sweeps, delayed scans).
+    #[serde(default, rename = "lite")]
+    pub lite: LiteConfig,
 }
 
 /// `[tx]` section. Serde's `default` calls [`Default::default`] (NOT the
@@ -128,6 +131,17 @@ impl Default for TxConfig {
             enabled: tx_enabled_default(),
         }
     }
+}
+
+/// `lite:` section (engine-side Lite Mode knobs). The derive Default is
+/// the correct zero-value default (every knob treats 0 = off), unlike
+/// `tx` -- no manual impl needed.
+#[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
+pub struct LiteConfig {
+    /// Idle threshold, ms, for the background auto-redelivery sweep
+    /// (0 = sweep disabled, the upgrade default: zero behavior change).
+    #[serde(default, rename = "redelivery_idle_ms")]
+    pub redelivery_idle_ms: u64,
 }
 
 /// Read and parse the YAML config file at `path`.
@@ -194,6 +208,22 @@ backup_target_map:
         // section present, flag omitted -> still enabled
         let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1\ntx: {}\n").unwrap();
         assert!(cfg.tx.enabled);
+    }
+
+    #[test]
+    fn lite_section_defaults_and_overrides() {
+        // Absent section -> derive Default (sweep OFF): zero behavior
+        // change on upgrade, and Config::default() agrees.
+        let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1").unwrap();
+        assert_eq!(cfg.lite.redelivery_idle_ms, 0);
+        assert_eq!(cfg.lite, Config::default().lite);
+        // Section present, key omitted -> still off; explicit value
+        // parses under the section's own name.
+        let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1\nlite: {}\n").unwrap();
+        assert_eq!(cfg.lite.redelivery_idle_ms, 0);
+        let cfg: Config =
+            serde_yaml::from_str("bind: 1.2.3.4:1\nlite:\n  redelivery_idle_ms: 30000\n").unwrap();
+        assert_eq!(cfg.lite.redelivery_idle_ms, 30000);
     }
 
     #[test]
