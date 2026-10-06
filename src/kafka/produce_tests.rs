@@ -13,7 +13,7 @@ use crate::kafka::record::Record;
 use crate::lite::model;
 use crate::store::ops;
 
-fn rec(key: Option<&[u8]>, value: Option<&[u8]>, headers: Vec<(&str, Option<&[u8]>)>) -> Record {
+fn rec(key: Option<&[u8]>, value: Option<&[u8]>, headers: Vec<(&[u8], Option<&[u8]>)>) -> Record {
     Record {
         timestamp_delta: 0,
         offset_delta: 0,
@@ -21,7 +21,7 @@ fn rec(key: Option<&[u8]>, value: Option<&[u8]>, headers: Vec<(&str, Option<&[u8
         value: value.map(|v| v.to_vec()),
         headers: headers
             .into_iter()
-            .map(|(n, v)| (n.to_string(), v.map(|b| b.to_vec())))
+            .map(|(n, v)| (n.to_vec(), v.map(|b| b.to_vec())))
             .collect(),
     }
 }
@@ -59,23 +59,34 @@ fn field_pair_map() {
             (b"__null__".to_vec(), Vec::new())
         ]
     );
-    // headers: k + v + h (2 pairs when the key is null)
+    // headers: k + v + h (2 pairs when the key is null); names are
+    // hex-encoded in the stored JSON so arbitrary bytes round-trip.
     let h = record_fields(&rec(
         Some(b"k"),
         Some(b"v"),
-        vec![("h1", Some(b"x")), ("h2", None)],
+        vec![(&b"h1"[..], Some(&b"x"[..])), (&b"h2"[..], None)],
     ));
     assert_eq!(h.len(), 3);
     assert_eq!(h[2].0, b"h".to_vec());
     assert_eq!(
         String::from_utf8_lossy(&h[2].1),
-        r#"[{"n":"h1","v":"78"},{"n":"h2","v":null}]"#
+        r#"[{"x":"6831","v":"78"},{"x":"6832","v":null}]"#
     );
-    let h2 = record_fields(&rec(None, Some(b"v"), vec![("only", None)]));
+    let h2 = record_fields(&rec(None, Some(b"v"), vec![(&b"only"[..], None)]));
     assert_eq!(h2.len(), 2);
     assert_eq!(
         String::from_utf8_lossy(&h2[1].1),
-        r#"[{"n":"only","v":null}]"#
+        r#"[{"x":"6f6e6c79","v":null}]"#
+    );
+    // A non-UTF-8 name survives storage byte-exact (hex-encoded).
+    let h3 = record_fields(&rec(
+        None,
+        Some(b"v"),
+        vec![(&b"a\xffb"[..], Some(&b"\x00"[..]))],
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&h3[1].1),
+        r#"[{"x":"61ff62","v":"00"}]"#
     );
 }
 

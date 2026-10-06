@@ -140,9 +140,9 @@ async fn real_headers_roundtrip() {
                 key: None,
                 value: Some(b"v0"),
                 headers: vec![
-                    ("null-hdr", None),
-                    ("trace", Some(&b"\x00\x01\xff"[..])),
-                    ("z-last", Some(&b"tail"[..])),
+                    (&b"null-hdr"[..], None),
+                    (&b"trace"[..], Some(&b"\x00\x01\xff"[..])),
+                    (&b"z-last"[..], Some(&b"tail"[..])),
                 ],
             },
             BatchRecord {
@@ -150,9 +150,9 @@ async fn real_headers_roundtrip() {
                 key: Some(b"K1"),
                 value: Some(&[0xde, 0xad, 0xbe, 0xef]),
                 headers: vec![
-                    ("bin", Some(&b"\xc3\x28"[..])),
-                    ("dup", None),
-                    ("dup", Some(&b"2"[..])),
+                    (&b"bin"[..], Some(&b"\xc3\x28"[..])),
+                    (&b"dup"[..], None),
+                    (&b"dup"[..], Some(&b"2"[..])),
                 ],
             },
         ],
@@ -181,9 +181,9 @@ async fn real_headers_roundtrip() {
     assert_eq!(
         b.records[0].headers,
         vec![
-            ("null-hdr".to_string(), None),
-            ("trace".to_string(), Some(vec![0x00, 0x01, 0xff])),
-            ("z-last".to_string(), Some(b"tail".to_vec())),
+            (b"null-hdr".to_vec(), None),
+            (b"trace".to_vec(), Some(vec![0x00, 0x01, 0xff])),
+            (b"z-last".to_vec(), Some(b"tail".to_vec())),
         ],
         "headers echo in order, no value envelope"
     );
@@ -193,9 +193,9 @@ async fn real_headers_roundtrip() {
     assert_eq!(
         b.records[1].headers,
         vec![
-            ("bin".to_string(), Some(vec![0xc3, 0x28])),
-            ("dup".to_string(), None),
-            ("dup".to_string(), Some(b"2".to_vec())),
+            (b"bin".to_vec(), Some(vec![0xc3, 0x28])),
+            (b"dup".to_vec(), None),
+            (b"dup".to_vec(), Some(b"2".to_vec())),
         ]
     );
 }
@@ -212,13 +212,13 @@ async fn tombstone_with_headers() {
                 timestamp_delta: 0,
                 key: Some(b"tk"),
                 value: None,
-                headers: vec![("th", None)],
+                headers: vec![(&b"th"[..], None)],
             },
             BatchRecord {
                 timestamp_delta: 1,
                 key: None,
                 value: None,
-                headers: vec![("nh", Some(&b"\x00"[..]))],
+                headers: vec![(&b"nh"[..], Some(&b"\x00"[..]))],
             },
         ],
     );
@@ -229,13 +229,13 @@ async fn tombstone_with_headers() {
     // key'd tombstone: value null (not empty bytes), headers intact.
     assert_eq!(b.records[0].key.as_deref(), Some(b"tk".as_slice()));
     assert_eq!(b.records[0].value, None, "tombstone stays null");
-    assert_eq!(b.records[0].headers, vec![("th".to_string(), None)]);
+    assert_eq!(b.records[0].headers, vec![(b"th".to_vec(), None)]);
     // null-null + headers: same rule via the __null__ sentinel pair.
     assert_eq!(b.records[1].key, None);
     assert_eq!(b.records[1].value, None);
     assert_eq!(
         b.records[1].headers,
-        vec![("nh".to_string(), Some(vec![0x00]))]
+        vec![(b"nh".to_vec(), Some(vec![0x00]))]
     );
 }
 
@@ -321,7 +321,7 @@ async fn exotic_shapes_fall_back_to_envelope() {
             timestamp_delta: 0,
             key: Some(b"pk"),
             value: Some(b"pv"),
-            headers: vec![("ph", Some(&b"\x01"[..]))],
+            headers: vec![(&b"ph"[..], Some(&b"\x01"[..]))],
         }],
     );
     let base = produce(&mut f, "t1", 0, &batch).await;
@@ -329,7 +329,7 @@ async fn exotic_shapes_fall_back_to_envelope() {
 
     let b = fetch_records(&mut f, "t1", 0, 0).await;
     assert_eq!(b.records.len(), 4);
-    let marker = vec![(ENVELOPE_MARKER.to_string(), None)];
+    let marker = vec![(ENVELOPE_MARKER.as_bytes().to_vec(), None)];
     for (i, rec) in b.records[..3].iter().enumerate() {
         assert_eq!(rec.headers, marker, "exotic {i} carries the marker");
         assert_eq!(rec.key, None, "exotic {i} key rides in the envelope");
@@ -339,20 +339,20 @@ async fn exotic_shapes_fall_back_to_envelope() {
     // Every stored field name/value byte survives inside the envelope.
     assert!(contains_bytes(
         b.records[0].value.as_deref().unwrap(),
-        &br#"{"fields":[["a","31"],["b",""],["c","33"]]}"#[..]
+        &br#"{"fields":[["61","31"],["62",""],["63","33"]]}"#[..]
     ));
     assert!(contains_bytes(
         b.records[1].value.as_deref().unwrap(),
-        &br#"[["h","6e6f742d6a736f6e"],["v","56"]]"#[..]
+        &br#"[["68","6e6f742d6a736f6e"],["76","56"]]"#[..]
     ));
     assert!(contains_bytes(
         b.records[2].value.as_deref().unwrap(),
-        &br#"[["k","4b"],["v","56"],["h","5b7b226e223a2265222c2276223a6e756c6c7d5d"],["x","3f"]]"#
+        &br#"[["6b","4b"],["76","56"],["68","5b7b226e223a2265222c2276223a6e756c6c7d5d"],["78","3f"]]"#
             [..]
     ));
     // The mixed-in produced record is NOT degraded.
     let p = &b.records[3];
     assert_eq!(p.key.as_deref(), Some(b"pk".as_slice()));
     assert_eq!(p.value.as_deref(), Some(b"pv".as_slice()));
-    assert_eq!(p.headers, vec![("ph".to_string(), Some(vec![0x01]))]);
+    assert_eq!(p.headers, vec![(b"ph".to_vec(), Some(vec![0x01]))]);
 }

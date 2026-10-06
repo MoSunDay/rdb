@@ -50,14 +50,21 @@ pub fn compression_of(attributes: i16) -> u8 {
 }
 
 /// One decoded record (varint deltas already resolved to their values).
+/// Header names stay RAW WIRE BYTES: the protocol calls them UTF-8
+/// strings but never enforces it, so no transcoding happens and even a
+/// non-UTF-8 name round-trips byte-exact (bytes are never lost).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     pub timestamp_delta: i64,
     pub offset_delta: i32,
     pub key: Option<Vec<u8>>,
     pub value: Option<Vec<u8>>,
-    pub headers: Vec<(String, Option<Vec<u8>>)>,
+    pub headers: RecordHeaders,
 }
+
+/// Record headers as (raw name bytes, optional value bytes); the name
+/// is never transcoded (see [`Record`]).
+pub type RecordHeaders = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
 /// One decoded RecordBatch v2 (CRC verified on parse).
 #[derive(Debug, Clone, PartialEq)]
@@ -180,13 +187,16 @@ pub(crate) fn parse_record(r: &mut crate::kafka::frame::Reader<'_>) -> Result<Re
     let header_count = r.varint().ok_or("truncated header count")?;
     let mut headers = Vec::new();
     for _ in 0..header_count {
+        // Name kept as raw bytes (see `Record`): the wire never
+        // validates UTF-8 here, and a lossy transcoding would be
+        // irreversible.
         let name = r
             .varint()
             .and_then(|len| {
                 if len < 0 {
                     None
                 } else {
-                    Some(String::from_utf8_lossy(r.take(len as usize)?).into_owned())
+                    Some(r.take(len as usize)?.to_vec())
                 }
             })
             .ok_or("truncated header key")?;
@@ -224,7 +234,7 @@ pub struct BatchRecord<'a> {
     pub timestamp_delta: i64,
     pub key: Option<&'a [u8]>,
     pub value: Option<&'a [u8]>,
-    pub headers: Vec<(&'a str, Option<&'a [u8]>)>,
+    pub headers: Vec<(&'a [u8], Option<&'a [u8]>)>,
 }
 
 /// Encode a LEGAL RecordBatch v2: attributes 0 (never compressed), CRC
@@ -252,7 +262,7 @@ pub fn build_batch(base_offset: i64, first_timestamp: i64, records: &[BatchRecor
         put_varint(&mut rec, r.headers.len() as i64);
         for (name, val) in &r.headers {
             put_varint(&mut rec, name.len() as i64);
-            rec.extend_from_slice(name.as_bytes());
+            rec.extend_from_slice(name);
             put_varint_bytes(&mut rec, val.as_deref());
         }
         put_varint(&mut body, rec.len() as i64);
@@ -352,7 +362,7 @@ mod tests {
                     timestamp_delta: 7,
                     key: None,
                     value: None,
-                    headers: vec![("h1", Some(&b"x"[..])), ("h2", None)],
+                    headers: vec![(&b"h1"[..], Some(&b"x"[..])), (&b"h2"[..], None)],
                 },
             ],
         );
@@ -368,12 +378,56 @@ mod tests {
         assert_eq!(
             b.records[1].headers,
             vec![
-                ("h1".to_string(), Some(b"x".to_vec())),
-                ("h2".to_string(), None)
+                (b"h1".to_vec(), Some(b"x".to_vec())),
+                (b"h2".to_vec(), None)
             ]
         );
         // An empty batch is legal on the wire.
         let empty = build_batch(0, 1, &[]);
         assert_eq!(parse_batch(&empty).unwrap().records.len(), 0);
+    }
+
+    #[test]
+    fn header_names_round_trip_as_raw_bytes() {
+        // A name the protocol calls UTF-8 but the wire never checks:
+        // invalid-UTF-8 bytes must survive encode -> parse exactly
+        // (no lossy transcoding, no U+FFFD substitution). The third
+        // name is a valid multi-byte UTF-8 sequence (kept as bytes).
+        let names: Vec<Vec<u8>> = vec![
+            b"\xffname".to_vec(),
+            b"a\xffb".to_vec(),
+            b"\xe8\xb7\x9f".to_vec(),
+        ];
+        let headers: Vec<(&[u8], Option<&[u8]>)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    n.as_slice(),
+                    if i == 1 { None } else { Some(&b"\x00\xff"[..]) },
+                )
+            })
+            .collect();
+        let buf = build_batch(
+            0,
+            1,
+            &[BatchRecord {
+                timestamp_delta: 0,
+                key: None,
+                value: Some(b"v"),
+                headers: headers.clone(),
+            }],
+        );
+        let b = parse_batch(&buf).expect("batch parses");
+        let back: Vec<(Vec<u8>, Option<Vec<u8>>)> = b.records[0]
+            .headers
+            .iter()
+            .map(|(n, v)| (n.clone(), v.clone()))
+            .collect();
+        let want: Vec<(Vec<u8>, Option<Vec<u8>>)> = headers
+            .into_iter()
+            .map(|(n, v)| (n.to_vec(), v.map(|b| b.to_vec())))
+            .collect();
+        assert_eq!(back, want, "header names byte-exact, order kept");
     }
 }

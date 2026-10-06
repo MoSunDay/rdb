@@ -151,13 +151,18 @@ fn inverse_field_map() {
     );
 }
 
-/// The exact `headers_json` shape `produce::record_fields` writes.
-const HDRS_JSON: &[u8] = br#"[{"n":"h1","v":null},{"n":"h2","v":"00ff"}]"#;
+/// The exact `headers_json` shape `produce::record_fields` writes
+/// today: hex-encoded names under the `"x"` key (byte fidelity).
+const HDRS_JSON: &[u8] = br#"[{"x":"6831","v":null},{"x":"6832","v":"00ff"}]"#;
 
-fn hdrs() -> Vec<(String, Option<Vec<u8>>)> {
+/// Legacy stored form (pre-fidelity entries: raw string name under
+/// `"n"`); still readable by `parse_headers_json`.
+const HDRS_JSON_LEGACY: &[u8] = br#"[{"n":"h1","v":null},{"n":"h2","v":"00ff"}]"#;
+
+fn hdrs() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     vec![
-        ("h1".to_string(), None),
-        ("h2".to_string(), Some(vec![0x00, 0xff])),
+        (b"h1".to_vec(), None),
+        (b"h2".to_vec(), Some(vec![0x00, 0xff])),
     ]
 }
 
@@ -196,15 +201,26 @@ fn inverse_field_map_restores_real_headers() {
 
 #[test]
 fn inverse_field_map_exotic_falls_back_to_envelope() {
-    fn marker() -> Vec<(String, Option<Vec<u8>>)> {
-        vec![(ENVELOPE_MARKER.to_string(), None)]
+    fn marker() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        vec![(ENVELOPE_MARKER.as_bytes().to_vec(), None)]
     }
-    // 3 pairs without any "h": generic JSON envelope + marker header.
+    // 3 pairs without any "h": generic JSON envelope + marker header;
+    // names are hex-encoded too, so byte fidelity holds for any name.
     let (k, v, h) = decode_fields(&pairs(&[(b"a", b"\x01"), (b"b", b""), (b"c", b"zz")]));
     assert_eq!(k, None);
     assert_eq!(h, marker());
     let v = String::from_utf8(v.unwrap()).unwrap();
-    assert_eq!(v, r#"{"fields":[["a","01"],["b",""],["c","7a7a"]]}"#);
+    assert_eq!(v, r#"{"fields":[["61","01"],["62",""],["63","7a7a"]]}"#);
+    // A non-UTF-8 field name round-trips exactly (hex, no loss, no
+    // collision with any other lossy-mangled name).
+    let (k, v, h) = decode_fields(&pairs(&[
+        (b"a\xffb", b"\x01"),
+        (b"\xfez", b""),
+        (b"q", b"t"),
+    ]));
+    assert_eq!((k.as_deref(), h), (None, marker()));
+    let v = String::from_utf8(v.unwrap()).unwrap();
+    assert_eq!(v, r#"{"fields":[["61ff62","01"],["fe7a",""],["71","74"]]}"#);
     // "h" whose value is not a legal headers JSON: envelope + marker.
     let (k, v, h) = decode_fields(&pairs(&[(b"h", b"[{}]"), (b"v", b"V")]));
     assert_eq!((k.as_deref(), h), (None, marker()));
@@ -237,19 +253,30 @@ fn inverse_field_map_exotic_falls_back_to_envelope() {
 fn headers_json_inverse_roundtrip() {
     assert_eq!(parse_headers_json(HDRS_JSON), Some(hdrs()));
     assert_eq!(parse_headers_json(b"[]"), Some(vec![]));
+    // Legacy entries (raw string names under "n") still decode to the
+    // same headers -- durable data written before hex fidelity.
+    assert_eq!(parse_headers_json(HDRS_JSON_LEGACY), Some(hdrs()));
+    // A non-UTF-8 name decodes byte-exact from its hex form.
+    assert_eq!(
+        parse_headers_json(br#"[{"x":"61ff62","v":"00"}]"#),
+        Some(vec![(b"a\xffb".to_vec(), Some(vec![0x00]))])
+    );
     // Duplicate names stay in order (the wire format allows them).
     assert_eq!(
         parse_headers_json(br#"[{"n":"a","v":"ff"},{"n":"a","v":null}]"#),
         Some(vec![
-            ("a".to_string(), Some(vec![0xff])),
-            ("a".to_string(), None)
+            (b"a".to_vec(), Some(vec![0xff])),
+            (b"a".to_vec(), None)
         ])
     );
     // Anything else is None: bad JSON, bad hex, wrong shapes/types.
     for bad in [
         &b"[{"[..],
-        &br#"[{"n":"a","v":"zz"}]"#[..], // odd-length hex
-        &br#"[{"n":"a","v":"XY"}]"#[..], // non-hex digits
+        &br#"[{"n":"a","v":"zz"}]"#[..],          // odd-length hex
+        &br#"[{"n":"a","v":"XY"}]"#[..],          // non-hex digits
+        &br#"[{"x":"a","v":null}]"#[..],          // odd-length hex NAME
+        &br#"[{"x":"XY","v":null}]"#[..],         // non-hex NAME digits
+        &br#"[{"x":"61","n":"a","v":null}]"#[..], // both name keys
         &br#"[{"n":1,"v":null}]"#[..],
         &br#"[{"n":"a"}]"#[..],                // missing v
         &br#"[{"n":"a","v":null,"x":1}]"#[..], // extra key

@@ -86,7 +86,7 @@ fn sample_batch() -> Vec<u8> {
                 timestamp_delta: 9,
                 key: None,
                 value: None,
-                headers: vec![("h1", Some(&b"x"[..])), ("h2", None)],
+                headers: vec![(&b"h1"[..], Some(&b"x"[..])), (&b"h2"[..], None)],
             },
         ],
     )
