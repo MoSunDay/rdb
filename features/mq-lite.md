@@ -62,8 +62,8 @@
 ## Lite MQ 面规范（已落地）
 
 以下为规范（spec），由 `src/lite/`（`pel.rs` / `pending.rs` / `claim.rs` / `autoclaim.rs` / `read.rs` /
-`park_wait.rs` / `group.rs` / `ack.rs`）实现；对 Redis 的偏差总表见 [COMPAT.md](../COMPAT.md)
-Lite Mode 条目。
+`park_wait.rs` / `group.rs` / `ack.rs` / `dlq.rs` / `redeliver.rs`）实现；对 Redis 的偏差总表见
+[COMPAT.md](../COMPAT.md) Lite Mode 条目。
 
 ### PEL 物理布局（kind 0x0F 窗口）
 - 每条流一个 `KIND_STREAM_PEND`（0x0F）窗口，随流族回收范围整窗回收：
@@ -107,7 +107,61 @@ Lite Mode 条目。
 
 ### 可观测性与基准
 - `rdb_lite_backlog` gauge：各组缓存 pending 计数之和；首次加载组时从盘上重算。
+- `rdb_lite_dlq_depth` gauge：全部在册 DLQ 目标流的条目深度之和（点读聚合）。
+- `rdb_lite_messages{op=...}` counter：按操作计数，新增 `dlq`（死信转移条数）与
+  `redeliver`（空闲重投条数）两个 op。
 - bench 新增工况：`xadd` / `xreadgroup` / `xack`。
+
+### DLQ 与 MAXDELIVERY（死信队列）
+- **语法**：`XGROUP CREATE <stream> <group> <id|$> [MKSTREAM] [ORDERED [INFLIGHT <n>]]
+  [MAXDELIVERY <n≥1>] [DLQ <name>]`（两个新子选项与 `ORDERED` 正交，可任意组合）。
+  - `MAXDELIVERY <n>`：单条消息的投递次数上限；下一次交付会把 `times_delivered` 推过
+    `n` 时不再投递，改为死信转移。`n` 必须 ≥1（0 报
+    `ERR value is not an integer or out of range`）。
+  - `DLQ <name>`：死信目标流名，必须是合法 `parent/child` 全名（否则
+    `ERR invalid DLQ stream name`）；**必须随 MAXDELIVERY 出现**（无上限的组永不转移，
+    先行报 `ERR syntax error`，同 INFLIGHT 依赖 ORDERED 的先例）。
+  - 缺省目标 = 字面量 `<stream>/dlq`：三段名仍以首个 `/` 前的 parent 定 slot，
+    与源流同 slot 同窗；嵌套 child 不参与 XADD 裸 parent 轮转，DLQ 不会收到业务流量。
+- **转移语义（单 WAL 批原子）**：一次转移在**一个 WriteBatch** 内完成三件事——
+  删除源组 PEL 行、推进组 committed 水位（**语义等同 XACK**：跨洞转移停在
+  `head_after_ack`，重启不会复活）、把消息（原 id/字段 + 溯源字段 `__dlq_group` /
+  `__dlq_consumer` / `__dlq_times` / `__dlq_src`）写入 DLQ 流。判定与转移都发生在
+  投递路径（XREADGROUP 重投 / XCLAIM / XAUTOCLAIM / 空闲 sweep）持有的流 latch 内，
+  并发 claim 不可能双转；重复 claim 已转移的 id 既不投递也不追加 DLQ 副本。
+  溯源字段名与业务字段撞名时业务值原样保留。
+- **触发面**：转移判定只在投递时刻发生（无后台扫描器）；未配 MAXDELIVERY 的组
+  行为与之前完全一致（零开销）。
+- **ORDERED 组限制**：有序组只允许 **PEL 头**（最小 pending id）被转移——与
+  XCLAIM/XAUTOCLAIM 只认头的接管语义一致，越过头部的转移被抑制。
+- **DLQ 本身是普通流**：可 XRANGE/XLEN、可建组独立消费/ACK，也可再配
+  MAXDELIVERY 分级死信；指标 `rdb_lite_dlq_depth`（gauge）与
+  `rdb_lite_messages{op="dlq"}`（counter）。
+
+### 自动重投（空闲 sweep，默认关）
+- **配置**：`lite: redelivery_idle_ms: <ms>`（`src/conf.rs`，默认 **0 = 完全不启用**，
+  无后台任务）。设为正数后，200ms 一轮的旋转扫描从 kind-0x0E 窗口发现组（重启后
+  未被触碰的组也能被扫到；每轮 32 组、每组 16 行，大 PEL 跨轮分摊）。
+- **语义**：对 `now - delivered_ms >= redelivery_idle_ms` 的 PEL 行执行 claim 原语——
+  `times+1` 并刷新 `delivered_ms`，重投给**当前消费者**（不换主）；越过 MAXDELIVERY
+  的行直接走 DLQ 转移。已 ACK 的行永不重投。ORDERED 组只 sweep **PEL 头**
+  （`ordered::force_takeover`，与 claim 同路径）。
+- **实现姿态**：每轮 SYNC、流 latch 走 `try_lock`——正在执行命令的流本轮跳过，
+  绝不 park 在后台任务上；重投计数进 `rdb_lite_messages{op="redeliver"}`，
+  死信进 `{op="dlq"}`。
+
+### XTRIM MINID
+- **语法**：`XTRIM <stream> MINID [~|=] <id> [LIMIT <n>]`（对齐 Redis 6.2+）；与
+  `MAXLEN` 正交（可交替使用）。删除所有 **id 严格小于** `<id>` 的条目，边界 id 本身
+  保留；回复 = 本次删除条数。
+- `~`（近似）与 `=`（精确）**行为完全一致**：受害者精确计算，绝不欠删；`LIMIT <n>`
+  限制本轮删除上限（两种 flag 后均可带），余量留给下一次调用。
+- **时间窗留存**：id 首段即到达毫秒时间戳，故 `XTRIM <s> MINID <cutoff_ms>-0`
+  就是"保留最近时间窗"——一条周期命令即可，无需逐消息索引。
+- **kafka 账本守卫**：流上存在任何 kind-0x20 组提交账本行时，XTRIM/XDEL 一律拒绝
+  （`ERR stream <name> has committed consumer-group offsets; delete the groups first`），
+  防止 ordinal↔id 映射在 kafka 面读者脚下漂移；XDEL 同守卫。
+
 
 ## 有序消费组与 Kafka 校准语义（P0/P1/P2）
 
@@ -126,7 +180,8 @@ Lite Mode 条目。
 
 ### P0：有序消费组（队列独占所有权 + 有序投递）
 - `XGROUP CREATE ... ORDERED [INFLIGHT <n>]`（rdb 扩展；INFLIGHT 依赖 ORDERED，
-  有序组最小归一为 1）：组内队列同一时刻**至多一个消费者持有**。
+  有序组最小归一为 1；MAXDELIVERY/DLQ 子选项见「DLQ 与 MAXDELIVERY」节，与
+  ORDERED 正交）：组内队列同一时刻**至多一个消费者持有**。
 - 所有权为**内存态租约**（默认 30s，无协调者，测试钩子
   `shared.lite.set_lease_ms`）：`XREADGROUP ... >` 即申领；租约空闲过期后下个
   申领者接管并 **epoch 递增**——被废黜/被隔离消费者的 `>` 读一律空回
@@ -155,3 +210,4 @@ Lite Mode 条目。
 - 首次落地：[changelog 2026-08-17 lite-mode](./changelog/2026-08-17/lite-mode.md)
 - 引擎补齐：[changelog 2026-08-21](./changelog/2026-08-21/mq-lite-engine-and-kafka-decision.md)
 - 本批落地：[changelog 2026-09-09](./changelog/2026-09-09/mq-ordered-groups.md)
+- 引擎可靠性批次：[changelog 2026-10-06](./changelog/2026-10-06/mq-engine-batch1.md)

@@ -6,7 +6,10 @@
 # queue pick, explicit queue, XLEN, XRANGE COUNT), (b) XGROUP CREATE +
 # XREADGROUP `>` COUNT handoff, (c) XPENDING summary/range + XACK,
 # (d) second consumer + XAUTOCLAIM takeover, (e) ORDERED strict-serial
-# group + INFLIGHT knob, (f) XINFO STREAM / XINFO GROUPS.
+# group + INFLIGHT knob, (f) XINFO STREAM / XINFO GROUPS, (g) XGROUP
+# MAXDELIVERY dead-lettering into the default <stream>/dlq + consuming
+# the DLQ as a plain stream, (h) XTRIM MINID threshold trim (exact id,
+# LIMIT cap, <ms>-0 time-window form).
 # Semantics verified against source/tests BEFORE writing this script:
 # - Every X-command is cluster-whitelisted => NODE-LOCAL (src/router.rs:96
 #   is_whitelisted; src/command/mod.rs:437 skips slot routing). The
@@ -244,6 +247,93 @@ main () {
     assert_contains "XINFO GROUPS exposes the live owner slot" "owner" "$si"
     # redis-cli --raw prints the RESP integer without its ':' prefix.
     assert_contains "the ordered group is flagged ordered=1" "$(printf 'ordered\n1')" "$si"
+
+    # ---- (g) DLQ + MAXDELIVERY: poison messages dead-letter out --------
+    local ds=dl/q0 cl dr
+    assert_contains "a DLQ target without a MAXDELIVERY cap is a syntax error" \
+        "ERR syntax error" \
+        "$(rc "$mq" XGROUP CREATE "$ds" gx 0-0 MKSTREAM DLQ dl/other)"
+    assert_eq "MAXDELIVERY wants n >= 1" \
+        "ERR value is not an integer or out of range" \
+        "$(rc "$mq" XGROUP CREATE "$ds" gx 0-0 MKSTREAM MAXDELIVERY 0)"
+    assert_eq "XGROUP CREATE ... MAXDELIVERY 2 (no explicit DLQ name)" "OK" \
+        "$(rc "$mq" XGROUP CREATE "$ds" dg 0-0 MKSTREAM MAXDELIVERY 2)"
+    rc "$mq" XADD "$ds" 1-1 sku poison >/dev/null
+    rc "$mq" XADD "$ds" 1-2 sku fine >/dev/null
+    cl="$(rc "$mq" XREADGROUP GROUP dg c1 COUNT 1 STREAMS "$ds" '>')"
+    assert_eq "COUNT 1 hands only the first (poison) entry to c1" "1" \
+        "$(count_line poison "$cl")"
+    cl="$(rc "$mq" XCLAIM "$ds" dg c2 0 1-1)"
+    assert_contains "claim #2 (times 1->2, still within the cap) delivers" \
+        "1-1" "$cl"
+    cl="$(rc "$mq" XCLAIM "$ds" dg c2 0 1-1)"
+    assert_eq "claim #3 (times would pass the cap 2) transfers: no entry" \
+        "" "$cl"
+    assert_eq "the transfer empties the group PEL (summary 0)" "0" \
+        "$(nth 1 "$(rc "$mq" XPENDING "$ds" dg)")"
+    assert_eq "the default DLQ target is the literal <stream>/dlq" "1" \
+        "$(rc "$mq" XLEN "$ds/dlq")"
+    dr="$(rc "$mq" XRANGE "$ds/dlq" - +)"
+    assert_contains "the DLQ entry keeps the original payload" "poison" "$dr"
+    assert_contains "the DLQ entry traces the source group" "__dlq_group" "$dr"
+    assert_contains "the DLQ entry traces the source consumer" \
+        "__dlq_consumer" "$dr"
+    assert_contains "the DLQ entry traces the delivery count" "__dlq_times" "$dr"
+    assert_contains "the DLQ entry traces the source stream" "__dlq_src" "$dr"
+    # The DLQ is a plain stream: consume + ack it independently.
+    assert_eq "a group can subscribe to the DLQ itself" "OK" \
+        "$(rc "$mq" XGROUP CREATE "$ds/dlq" dgq 0-0 MKSTREAM)"
+    cl="$(rc "$mq" XREADGROUP GROUP dgq dc1 STREAMS "$ds/dlq" '>')"
+    assert_contains "the DLQ consumer receives the dead-lettered entry" \
+        "1-1" "$cl"
+    assert_contains "trace fields ride along for the DLQ consumer" \
+        "__dlq_group" "$cl"
+    assert_eq "XACK drains the DLQ group" "1" \
+        "$(rc "$mq" XACK "$ds/dlq" dgq 1-1)"
+    assert_eq "the DLQ group PEL is empty again" "0" \
+        "$(nth 1 "$(rc "$mq" XPENDING "$ds/dlq" dgq)")"
+
+    # ---- (h) XTRIM MINID: id threshold, LIMIT cap, time window ---------
+    local ts=tm/q0 tr
+    rc "$mq" XADD "$ts" 1-1 f v1 >/dev/null
+    rc "$mq" XADD "$ts" 1-2 f v2 >/dev/null
+    rc "$mq" XADD "$ts" 1-3 f v3 >/dev/null
+    rc "$mq" XADD "$ts" 1-4 f v4 >/dev/null
+    rc "$mq" XADD "$ts" 1-5 f v5 >/dev/null
+    assert_eq "XTRIM MINID = drops entries strictly below the id (2 of 5)" \
+        "2" "$(rc "$mq" XTRIM "$ts" MINID = 1-3)"
+    tr="$(rc "$mq" XRANGE "$ts" - +)"
+    assert_eq "the boundary id itself survives as the first entry" "1-3" \
+        "$(nth 1 "$tr")"
+    assert_not_contains "strictly-below ids are gone" "1-2" "$tr"
+    assert_eq "the approximate flag ~ is accepted and acts exactly (=)" "0" \
+        "$(rc "$mq" XTRIM "$ts" MINID '~' 1-3)"
+    # LIMIT caps one round: the remainder is a later call's work.
+    local t2=tm/q1
+    rc "$mq" XADD "$t2" 1-1 f v1 >/dev/null
+    rc "$mq" XADD "$t2" 1-2 f v2 >/dev/null
+    rc "$mq" XADD "$t2" 1-3 f v3 >/dev/null
+    rc "$mq" XADD "$t2" 1-4 f v4 >/dev/null
+    rc "$mq" XADD "$t2" 1-5 f v5 >/dev/null
+    assert_eq "LIMIT 1 caps the trim to one victim" "1" \
+        "$(rc "$mq" XTRIM "$t2" MINID = 1-3 LIMIT 1)"
+    tr="$(rc "$mq" XRANGE "$t2" - +)"
+    assert_eq "the capped trim leaves the next-below id as the head" "1-2" \
+        "$(nth 1 "$tr")"
+    assert_eq "XLEN after the capped trim" "4" "$(rc "$mq" XLEN "$t2")"
+    # Time-window retention: ids are `<ms timestamp>-<seq>`, so
+    # `XTRIM <s> MINID <cutoff_ms>-0` keeps exactly the entries whose
+    # arrival time is >= cutoff -- one periodic command, no per-message
+    # index (the sliding-window idiom from tests/lite_trim_minid_e2e.rs).
+    local t3=tm/q2
+    rc "$mq" XADD "$t3" 1000-0 f old >/dev/null
+    rc "$mq" XADD "$t3" 2000-0 f edge >/dev/null
+    rc "$mq" XADD "$t3" 3000-0 f new >/dev/null
+    assert_eq "MINID <ms>-0 keeps the time window (drop < cutoff)" "1" \
+        "$(rc "$mq" XTRIM "$t3" MINID 2000-0)"
+    tr="$(rc "$mq" XRANGE "$t3" - +)"
+    assert_eq "the window boundary entry survives" "2000-0" "$(nth 1 "$tr")"
+    assert_not_contains "pre-window entries are reaped" "old" "$tr"
 
     e2e_finish "$scenario"
 }
