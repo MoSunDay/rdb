@@ -24,6 +24,7 @@ fn agg(func: AggFunc, arg: Expr) -> Expr {
         func,
         arg: Some(Box::new(arg)),
         distinct: false,
+        sep: None,
     }
 }
 
@@ -90,6 +91,41 @@ fn sum_decimal_overflow_is_loud() {
     assert!(e.msg.contains("SUM overflow"), "{e}");
 }
 
+// Integer SUM overflow is a loud 1690-style error, never a wrapped
+// value (the H0 silent-wrong-result cleanup).
+#[test]
+fn sum_int_overflow_is_loud() {
+    let e = run(
+        &agg(
+            AggFunc::Sum,
+            Expr::Col {
+                table: None,
+                name: "v".into(),
+            },
+        ),
+        SqlType::Int,
+        vec![vec![Value::Int(i64::MAX)], vec![Value::Int(1)]],
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::WrongValue);
+    assert!(e.msg.contains("BIGINT value is out of range"), "{e}");
+    // in-range sums are unchanged
+    assert_eq!(
+        run(
+            &agg(
+                AggFunc::Sum,
+                Expr::Col {
+                    table: None,
+                    name: "v".into(),
+                }
+            ),
+            SqlType::Int,
+            vec![vec![Value::Int(i64::MAX - 1)], vec![Value::Int(1)]],
+        ),
+        Ok(Value::Int(i64::MAX))
+    );
+}
+
 // Mixing a Double into the group coarsens SUM/AVG to Double arithmetic,
 // matching the non-aggregate BinaryOp semantics.
 #[test]
@@ -132,4 +168,148 @@ fn min_max_count_over_decimals() {
         Ok(d(150))
     );
     assert_eq!(run(&agg(AggFunc::Count, col), eq, rows), Ok(Value::Int(3)));
+}
+
+// ---- GROUP_CONCAT: separator, distinct, NULL skipping ----
+
+#[test]
+fn group_concat_joins_with_separator() {
+    let col = || Expr::Col {
+        table: None,
+        name: "v".into(),
+    };
+    let gc = |distinct: bool, sep: Option<&str>| Expr::Agg {
+        func: AggFunc::GroupConcat,
+        arg: Some(Box::new(col())),
+        distinct,
+        sep: sep.map(str::to_string),
+    };
+    let rows = |vals: &[i64]| {
+        vals.iter()
+            .map(|v| vec![Value::Int(*v)])
+            .collect::<Vec<_>>()
+    };
+    // Default separator ','.
+    assert_eq!(
+        run(&gc(false, None), SqlType::Int, rows(&[1, 2, 3])),
+        Ok(Value::Str("1,2,3".into()))
+    );
+    // Custom separator.
+    assert_eq!(
+        run(&gc(false, Some("; ")), SqlType::Int, rows(&[1, 2, 3])),
+        Ok(Value::Str("1; 2; 3".into()))
+    );
+    // NULLs skip entirely.
+    let with_null = vec![vec![Value::Int(1)], vec![Value::Null], vec![Value::Int(2)]];
+    assert_eq!(
+        run(&gc(false, None), SqlType::Int, with_null),
+        Ok(Value::Str("1,2".into()))
+    );
+    // All-NULL (and empty) groups are the empty string, not NULL.
+    assert_eq!(
+        run(&gc(false, None), SqlType::Int, vec![vec![Value::Null]]),
+        Ok(Value::Str("".into()))
+    );
+    assert_eq!(
+        run(&gc(false, None), SqlType::Int, Vec::new()),
+        Ok(Value::Str("".into()))
+    );
+    // Distinct dedupes the joined values.
+    assert_eq!(
+        run(&gc(true, None), SqlType::Int, rows(&[1, 2, 1])),
+        Ok(Value::Str("1,2".into()))
+    );
+    // Text arguments render in their canonical form.
+    let srows = vec![vec![Value::Str("a".into())], vec![Value::Decimal(250, 2)]];
+    assert_eq!(
+        run(&gc(false, Some("|")), SqlType::VarChar, srows),
+        Ok(Value::Str("a|2.50".into()))
+    );
+}
+
+// ---- Scalar-function wrappers around aggregates ----
+// has_agg descends Func args, so substitute_aggs must too: the Agg
+// node is replaced by its literal BEFORE Func evaluation, instead of
+// reaching the plain evaluator and failing with ER 1235.
+
+fn func(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Func {
+        name: name.into(),
+        args,
+    }
+}
+
+fn lit_int(i: i64) -> Expr {
+    Expr::Lit(Value::Int(i))
+}
+
+#[test]
+fn round_wraps_the_group_sum() {
+    let col = || Expr::Col {
+        table: None,
+        name: "v".into(),
+    };
+    let eq = SqlType::Decimal {
+        precision: 18,
+        scale: 3,
+    };
+    // 1.005 + 5.351 = 6.356 -> ROUND(.., 2) = 6.36 (half away from 0)
+    let rows = vec![vec![Value::Decimal(1005, 3)], vec![Value::Decimal(5351, 3)]];
+    let e = func("round", vec![agg(AggFunc::Sum, col()), lit_int(2)]);
+    assert_eq!(run(&e, eq, rows), Ok(Value::Decimal(636, 2)));
+}
+
+#[test]
+fn coalesce_wraps_the_empty_group_sum() {
+    let col = || Expr::Col {
+        table: None,
+        name: "v".into(),
+    };
+    // SUM over no rows is NULL (MySQL); COALESCE picks the fallback 0.
+    let e = func("coalesce", vec![agg(AggFunc::Sum, col()), lit_int(0)]);
+    assert_eq!(run(&e, SqlType::Int, Vec::new()), Ok(Value::Int(0)));
+}
+
+#[test]
+fn nested_abs_wraps_the_group_avg() {
+    let col = || Expr::Col {
+        table: None,
+        name: "v".into(),
+    };
+    let eq = SqlType::Decimal {
+        precision: 18,
+        scale: 1,
+    };
+    // AVG(-2.1, -3.5) = -2.80000 (scale + 4 division); ABS lifts the
+    // sign at the same scale.
+    let rows = vec![vec![Value::Decimal(-21, 1)], vec![Value::Decimal(-35, 1)]];
+    let e = func("abs", vec![agg(AggFunc::Avg, col())]);
+    assert_eq!(run(&e, eq, rows.clone()), Ok(Value::Decimal(280_000, 5)));
+    // Wrappers nest too: ROUND(COALESCE(AVG(x), 0), 2) = -2.80.
+    let inner = func("coalesce", vec![agg(AggFunc::Avg, col()), lit_int(0)]);
+    let e = func("round", vec![inner, lit_int(2)]);
+    assert_eq!(run(&e, eq, rows), Ok(Value::Decimal(-280, 2)));
+}
+
+#[test]
+fn func_without_agg_passes_through_untouched() {
+    let col = || Expr::Col {
+        table: None,
+        name: "v".into(),
+    };
+    // No Agg node: the whole tree evaluates on the representative row
+    // like any plain expression (regression guard for the Func arm).
+    let rows = vec![vec![Value::Decimal(2567, 3)]];
+    let e = func("round", vec![col(), lit_int(2)]);
+    assert_eq!(
+        run(
+            &e,
+            SqlType::Decimal {
+                precision: 18,
+                scale: 3
+            },
+            rows
+        ),
+        Ok(Value::Decimal(257, 2))
+    );
 }

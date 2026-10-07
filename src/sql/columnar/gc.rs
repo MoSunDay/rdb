@@ -4,14 +4,17 @@
 //! registry. One sweep walks every meta key and classifies it:
 //!
 //! - undecodable meta or malformed key -> garbage;
-//! - meta whose table is no longer in the raft catalog -> garbage
-//!   (crash between the catalog tombstone and the meta-delete batch
-//!   of `drop_table_segments`, or a decide(commit) that raced a DROP).
-//!   An EMPTY catalog view proves nothing (right after a restart the
-//!   FSM/topology view may not have loaded while on-disk metas
-//!   predate it), so while the view holds no table at all every
-//!   decodable meta is kept for the round; an unreadable catalog
-//!   entry is likewise "unknown, not gone" and its metas are kept;
+//! - meta classified by the table_id parsed from its KEY against the
+//!   id-keyed raft truth (the meta's own table_name may be stale:
+//!   RENAME never rewrites metas): a LIVE id (in `list_tables_raft`)
+//!   is kept, checked FIRST so a legacy rename tombstone that still
+//!   reads as dropped cannot wipe a live id; a DROPPED id (in the
+//!   `sql_dropped/<id>` side set, or a legacy decimal tombstone) is
+//!   garbage -- this covers DROP and TRUNCATE old ids on every node,
+//!   since only the leader runs `drop_table_segments` eagerly; any
+//!   other id is "unknown, not gone" and kept (pre-side-entry debris,
+//!   or the restart window where the FSM view has not loaded and both
+//!   the live and dropped sets read empty -- absence proves nothing);
 //! - `Prepared` meta referenced by NO in-doubt 2PC marker -> garbage
 //!   once its file is missing or older than [`ORPHAN_MIN_AGE`] (a
 //!   crash after Prepare, before Decide). A marker-referenced meta
@@ -26,7 +29,7 @@
 //! batch does). Mirrors `storage::gc`: sync sweep on the blocking
 //! pool, quiet rounds log nothing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,13 +83,25 @@ fn sweep_core(
         return Ok(SweepStats::default());
     }
     let in_doubt: BTreeSet<Vec<u8>> = participant::in_doubt_keys(store).into_iter().collect();
-    // Absence in the catalog view only proves a DROP once the view is
-    // populated. Right after a restart (slow FSM restore, late topology
-    // sync) the view is empty while this node's segment metas predate
-    // it; sweeping them as "table gone" would silently delete every
-    // meta -- the source of truth -- so keep every decodable meta this
-    // round and retry once the view has loaded.
-    let view_empty = catalog::list_tables_raft(raft).is_empty();
+    // Id-keyed truth, built once per round: table ids are monotone,
+    // so an id is either live, dropped, or never issued. `live` comes
+    // from the name-keyed catalog view (schemas carry their id);
+    // `dropped` from the `sql_dropped/<id>` side markers every
+    // DROP/TRUNCATE writes (plus legacy decimal tombstones). Names are
+    // NOT consulted per meta: RENAME never rewrites segment metas, so
+    // the id parsed from the KEY is the only reliable identity.
+    let live: HashSet<u32> = catalog::list_tables_raft(raft)
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    let dropped: HashSet<u32> = catalog::dropped_ids_raft(raft).into_iter().collect();
+    // Both sets empty => the FSM view has not loaded yet (right after
+    // a restart, slow FSM restore or late topology sync) while this
+    // node's segment metas predate it. An empty view proves nothing:
+    // sweeping it as "table gone" would silently delete every meta --
+    // the source of truth -- so keep every decodable meta this round
+    // and retry once the view has loaded.
+    let view_loaded = !(live.is_empty() && dropped.is_empty());
     let mut garbage: Vec<Vec<u8>> = Vec::new();
     let mut garbage_ids: Vec<(u32, u64)> = Vec::new();
     let mut kept_live: Vec<SegmentMeta> = Vec::new();
@@ -104,22 +119,23 @@ fn sweep_core(
             }
         };
         metas_seen += 1;
-        // Tables gone from the catalog: drop crashed before the
-        // meta-delete batch, or a decide(commit) raced a DROP. An
-        // unreadable entry (Err) is unknown, not gone: keep.
-        match catalog::lookup_raft(raft, &meta.table_name) {
-            Ok(Some(_)) => {}
-            Ok(None) if !view_empty => {
-                garbage.push(key.to_vec());
-                garbage_ids.push(id);
-                return true;
-            }
-            Ok(None) => {} // empty view: keep, retry next round
-            Err(e) => eprintln!(
-                "[columnar-gc] catalog entry for {} unreadable ({e}); keeping its metas",
-                meta.table_name
-            ),
+        // Classify by table_id, LIVE FIRST: a table renamed by a
+        // PRE-UPGRADE binary still carries its legacy decimal
+        // tombstone -- which reads as dropped -- while the id is live
+        // under the new name, so liveness must win or a rename would
+        // wipe the renamed table's segments. A dropped (and not live)
+        // id is proven garbage: DROP or TRUNCATE old id, leader or
+        // follower alike, since only the leader runs the eager
+        // drop_table_segments batch and a crash between the tombstone
+        // and that batch leaves the metas to this sweep.
+        if !live.contains(&id.0) && dropped.contains(&id.0) {
+            garbage.push(key.to_vec());
+            garbage_ids.push(id);
+            return true;
         }
+        // Live, or unknown: unknown is "unknown, not gone"
+        // (pre-side-entry debris, or the restart window above where
+        // both sets read empty) -- never silently delete.
         if meta.state == SegmentState::Prepared
             && !in_doubt.contains(key)
             && file_stale(&dir, &meta.file, orphan_age)
@@ -134,7 +150,7 @@ fn sweep_core(
         }
         true
     })?;
-    if view_empty && metas_seen > 0 {
+    if !view_loaded && metas_seen > 0 {
         eprintln!(
             "[columnar-gc] catalog view empty with {metas_seen} segment metas present; kept all for this round"
         );

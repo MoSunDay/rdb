@@ -129,8 +129,23 @@ pub fn check_expr(e: &Expr, scope: &FromScope) -> SqlResult<()> {
         }
         Expr::Lit(_) | Expr::Placeholder => Ok(()),
         // Subqueries hoist out before any scope validation; their own
-        // bodies validate against their own FROM scopes.
-        Expr::Subquery(_) | Expr::InSubquery { .. } => Ok(()),
+        // bodies validate against their own FROM scopes. The ODKU
+        // VALUES(col) marker references the incoming row, not a FROM
+        // column; the upsert path validates it against the schema.
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::InsertValues(_) => Ok(()),
+        // EXISTS carries only the subquery; a bound correlated node's
+        // outer key expressions (and an IN's left side) resolve
+        // against THIS scope.
+        Expr::Exists { .. } => Ok(()),
+        Expr::Correlated { kind, keys, .. } => {
+            for k in keys {
+                check_expr(k, scope)?;
+            }
+            if let crate::sql::parse::ast::CorrelatedKind::In { lhs, .. } = kind {
+                check_expr(lhs, scope)?;
+            }
+            Ok(())
+        }
         Expr::BinaryOp { left, right, .. } => {
             check_expr(left, scope)?;
             check_expr(right, scope)
@@ -152,6 +167,28 @@ pub fn check_expr(e: &Expr, scope: &FromScope) -> SqlResult<()> {
             check_expr(high, scope)
         }
         Expr::Like { expr, pattern, .. } => {
+            check_expr(expr, scope)?;
+            check_expr(pattern, scope)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                check_expr(o, scope)?;
+            }
+            for (c, t) in branches {
+                check_expr(c, scope)?;
+                check_expr(t, scope)?;
+            }
+            match else_expr {
+                Some(e) => check_expr(e, scope),
+                None => Ok(()),
+            }
+        }
+        Expr::Cast { expr, .. } => check_expr(expr, scope),
+        Expr::Regexp { expr, pattern, .. } => {
             check_expr(expr, scope)?;
             check_expr(pattern, scope)
         }

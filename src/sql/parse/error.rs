@@ -43,6 +43,9 @@ pub enum ErrorCode {
     /// MySQL 1292 (ER_TRUNCATED_WRONG_VALUE): a literal cannot be
     /// interpreted in the column's domain (e.g. "Incorrect DATE value").
     WrongValue,
+    /// MySQL 1582 (ER_WRONG_PARAMCOUNT_TO_NATIVE_FNC): a scalar
+    /// function called with an argument count outside its signature.
+    WrongParamCount,
     Unknown,
 }
 
@@ -99,6 +102,9 @@ impl SqlError {
             // 1292: "Incorrect %s value: '%s'" — MySQL's own code for
             // unparseable temporal (and similar) literals.
             ErrorCode::WrongValue => ErrorKind::ER_TRUNCATED_WRONG_VALUE,
+            // 1582: "Incorrect parameter count in the call to native
+            // function '%s'" -- arity errors surface at prepare time.
+            ErrorCode::WrongParamCount => ErrorKind::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
             // 1213: the MySQL serialization-failure error clients retry on.
             ErrorCode::WriteConflict => ErrorKind::ER_LOCK_DEADLOCK,
             ErrorCode::TxnDdl => ErrorKind::ER_NOT_SUPPORTED_YET,

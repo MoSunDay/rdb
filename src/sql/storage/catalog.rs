@@ -7,6 +7,13 @@
 //! under their slot, so a dropped table may leave orphaned row bytes on
 //! non-leader nodes; the catalog tombstone makes them unreachable and a
 //! recreated table gets a fresh `table_id`, never aliasing the orphans.
+//! The name-keyed tombstone is id-less (empty value): a retired id
+//! lives under `sql_dropped/<id>` instead, so a same-name recreate (or
+//! TRUNCATE's fresh id under the same name) can no longer overwrite
+//! the dropped-id record. That side set keeps id allocation monotone
+//! AND is what the MVCC GC reads as the dropped tables; RENAME writes
+//! only the id-less name tombstone, so the id stays live (and its rows
+//! GC-safe) under the new name.
 
 use std::sync::Arc;
 
@@ -23,12 +30,23 @@ pub const CATALOG_PREFIX: &str = "sql_catalog/";
 /// see counter values.
 pub const SEQUENCE_PREFIX: &str = "sql_sequence/";
 
+/// FSM key prefix under which retired table ids live
+/// (`sql_dropped/<id>` -> table name at drop time). Drop writes this
+/// marker next to the id-less name tombstone: the side entry survives
+/// a same-name recreate (which only overwrites `sql_catalog/<name>`)
+/// and is what both id allocation and the MVCC GC read.
+pub const DROPPED_PREFIX: &str = "sql_dropped/";
+
 pub fn catalog_key(table: &str) -> String {
     format!("{CATALOG_PREFIX}{table}")
 }
 
 pub fn sequence_key(table: &str) -> String {
     format!("{SEQUENCE_PREFIX}{table}")
+}
+
+pub fn dropped_id_key(id: u32) -> String {
+    format!("{DROPPED_PREFIX}{id}")
 }
 
 /// Next AUTO_INCREMENT value of a table: the persisted decimal counter,
@@ -87,12 +105,18 @@ impl CatalogTxn<'_> {
         self.queue_entry(&catalog_key(&schema.name), value)
     }
 
-    /// Queue a schema drop. The tombstone value carries the dropped
-    /// table's id (a bare decimal, never valid TableSchema JSON), so id
-    /// allocation stays monotone across drop+recreate cycles even after
-    /// restarts; readers treat unparseable values as absent.
-    pub fn queue_drop(&mut self, table: &str, id: u32) -> Result<QueuedApply, String> {
-        self.queue_entry(&catalog_key(table), id.to_string())
+    /// Queue a schema drop as TWO entries: (a) an id-less tombstone
+    /// (empty value) at the table's name key -- readers treat empty
+    /// values as absent; (b) a marker at `sql_dropped/<id>` whose
+    /// value is the table name. The id-keyed side entry -- not the
+    /// name tombstone -- keeps id allocation monotone across
+    /// drop+recreate cycles and is what the MVCC GC reads; because it
+    /// lives under its own key, a same-name Put (TRUNCATE's fresh id,
+    /// DROP + recreate) can no longer erase the dropped-id record.
+    pub fn queue_drop(&mut self, table: &str, id: u32) -> Result<Vec<QueuedApply>, String> {
+        let tombstone = self.queue_entry(&catalog_key(table), String::new())?;
+        let marker = self.queue_entry(&dropped_id_key(id), table.to_string())?;
+        Ok(vec![tombstone, marker])
     }
 
     /// Queue one raw FSM entry (used for the AUTO_INCREMENT next-value
@@ -232,9 +256,12 @@ pub fn next_index_id(schema: &TableSchema) -> u32 {
     schema.indexes.iter().map(|i| i.id).max().unwrap_or(0) + 1
 }
 
-/// Ids of every dropped table still carrying a tombstone (value =
-/// decimal id). Together with the live set they keep id allocation
-/// monotone: an id is either live, tombstoned, or never issued.
+/// Ids of every dropped table: (a) markers under `sql_dropped/<id>`
+/// (the current shape, written by every Drop) and (b) legacy
+/// decimal-valued tombstones under `sql_catalog/` (pre-upgrade FSM
+/// entries; empty values never count). Together with the live set they
+/// keep id allocation monotone: an id is either live, dropped, or
+/// never issued.
 pub fn dropped_ids_raft(raft: &std::sync::RwLock<RaftState>) -> Vec<u32> {
     dropped_ids_state(&raft.read().unwrap())
 }
@@ -258,6 +285,16 @@ pub fn dropped_ids_state(raft: &RaftState) -> Vec<u32> {
             .collect(),
     };
     for (k, v) in entries {
+        // Current shape: the id-keyed marker written next to every
+        // name tombstone (its value, the table name, is informational).
+        if let Some(id) = k
+            .strip_prefix(DROPPED_PREFIX)
+            .and_then(|suffix| suffix.parse::<u32>().ok())
+        {
+            out.push(id);
+            continue;
+        }
+        // Legacy shape: decimal-valued tombstones under the name key.
         if !k.starts_with(CATALOG_PREFIX) || v.is_empty() {
             continue;
         }
@@ -268,6 +305,8 @@ pub fn dropped_ids_state(raft: &RaftState) -> Vec<u32> {
             out.push(id);
         }
     }
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -355,5 +394,61 @@ mod tests {
         });
         assert_eq!(dropped_ids_raft(&raft), vec![7]);
         assert_eq!(list_tables_raft(&raft).len(), 1, "live schema still listed");
+    }
+
+    /// `queue_drop` writes the id-less name tombstone AND the
+    /// `sql_dropped/<id>` marker; a later same-name Put (recreate /
+    /// TRUNCATE's fresh id) overwrites only the name entry, so the id
+    /// STAYS in the dropped set and GC still reclaims its bytes.
+    #[test]
+    fn queue_drop_side_entry_survives_same_name_put() {
+        let shared = shared_with_kv(vec![(catalog_key("t"), schema_json(4, "t"))]);
+        let queued = {
+            let mut guard = shared.raft.write().unwrap();
+            let mut txn = begin(&mut guard, "DDL").unwrap();
+            txn.queue_drop("t", 4).unwrap()
+        };
+        assert_eq!(queued.len(), 2, "name tombstone + id marker");
+        assert_eq!(
+            (queued[0].key.as_str(), queued[0].value.as_str()),
+            (catalog_key("t").as_str(), ""),
+            "name tombstone is id-less"
+        );
+        assert_eq!(
+            (queued[1].key.as_str(), queued[1].value.as_str()),
+            (dropped_id_key(4).as_str(), "t")
+        );
+        // The stub kv applies eagerly: the id already reads as dropped.
+        assert_eq!(dropped_ids(&shared), vec![4]);
+        // ... and survives the same-name Put that follows a recreate.
+        {
+            let mut guard = shared.raft.write().unwrap();
+            let mut txn = begin(&mut guard, "DDL").unwrap();
+            let schema = serde_json::from_str::<TableSchema>(&schema_json(9, "t")).unwrap();
+            txn.queue_put(&schema).unwrap();
+        }
+        assert_eq!(
+            dropped_ids(&shared),
+            vec![4],
+            "same-name put must not erase the dropped-id record"
+        );
+    }
+
+    /// The RENAME shape -- id-less `""` tombstone at the old name, NO
+    /// side entry, the id live under the new name -- never reads as
+    /// dropped: GC leaves the renamed table's rows alone and id
+    /// allocation still counts the live id.
+    #[test]
+    fn rename_shape_tombstone_is_not_a_dropped_id() {
+        let shared = shared_with_kv(vec![
+            (catalog_key("old"), String::new()),
+            (catalog_key("new"), schema_json(6, "new")),
+        ]);
+        assert!(dropped_ids(&shared).is_empty());
+        assert_eq!(
+            next_table_id(&shared),
+            7,
+            "the live id 6 still bounds allocation"
+        );
     }
 }

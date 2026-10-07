@@ -1,87 +1,17 @@
-//! Phase-1 MySQL language-surface e2e over one real rdb process:
-//! UNION [ALL], non-recursive CTEs (WITH), derived tables, and
-//! uncorrelated subqueries (scalar + IN), plus the loud rejections
-//! (INTERSECT/EXCEPT, WITH RECURSIVE, correlated refs, arity
-//! mismatch, multi-row scalars), the three-valued logic of
-//! IN / NOT IN / NOT, and compound EXPLAIN.
+//! MySQL language-surface e2e over one real rdb process: UNION
+//! [ALL], INTERSECT / EXCEPT (each [ALL]), non-recursive CTEs (WITH),
+//! derived tables, and subqueries -- uncorrelated and correlated
+//! (scalar / IN / EXISTS) -- plus the loud rejections that remain
+//! (WITH RECURSIVE, correlated JOIN conditions, arity mismatch,
+//! multi-row scalars), the three-valued logic of IN / NOT IN / NOT,
+//! and compound EXPLAIN.
 
 mod common;
 
+use common::mysql::{connect_root, ddl, int, rows, rows_ordered, s};
 use common::{spawn_node_mysql, wait_mysql_ready, wait_resp_ready};
 use mysql_async::prelude::*;
-use mysql_async::{OptsBuilder, Value as MVal};
-
-const PASS: &str = "e2e-sql-pass";
-
-async fn connect(node: &common::ProcNode) -> mysql_async::Conn {
-    let port = node
-        .mysql
-        .rsplit(':')
-        .next()
-        .expect("mysql port")
-        .parse::<u16>()
-        .expect("mysql port digits");
-    let opts = || {
-        OptsBuilder::default()
-            .ip_or_hostname("127.0.0.1")
-            .tcp_port(port)
-            .user(Some("root"))
-            .pass(Some(PASS))
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match mysql_async::Conn::new(opts()).await {
-            Ok(c) => return c,
-            Err(mysql_async::Error::Io(_)) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("mysql connect: {e}"),
-        }
-    }
-}
-
-async fn ddl(conn: &mut mysql_async::Conn, sql: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match conn.query_drop(sql).await {
-            Ok(()) => return,
-            Err(e) => {
-                if std::time::Instant::now() < deadline && e.to_string().contains("leader") {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    continue;
-                }
-                panic!("ddl {sql}: {e}")
-            }
-        }
-    }
-}
-
-async fn rows(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<MVal>> {
-    let rs: Vec<mysql_async::Row> = conn.query(sql).await.expect(sql);
-    rs.into_iter()
-        .map(|r| {
-            (0..r.len())
-                .map(|i| r.get::<MVal, _>(i).unwrap_or(MVal::NULL))
-                .collect()
-        })
-        .collect()
-}
-
-/// ORDER BY is part of what we exercise here; comparisons sort rows
-/// textually so both orders of arrival pass.
-async fn rows_stable(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<MVal>> {
-    let mut r = rows(conn, sql).await;
-    r.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-    r
-}
-
-fn int(i: i64) -> MVal {
-    MVal::Bytes(i.to_string().into_bytes())
-}
-
-fn s(v: &str) -> MVal {
-    MVal::Bytes(v.as_bytes().to_vec())
-}
+use mysql_async::Value as MVal;
 
 fn f(v: f64) -> MVal {
     MVal::Bytes(format!("{v}").into_bytes())
@@ -129,12 +59,12 @@ async fn union_all_concatenates_and_union_dedups() {
     let mut node = spawn_node_mysql(&dir, 0, true, None);
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut c = connect(&node).await;
+    let mut c = connect_root(&node).await;
     setup(&mut c).await;
 
     // UNION ALL keeps both sides' duplicates, tail ORDER BY applies
     // to the compound.
-    let got = rows_stable(
+    let got = rows_ordered(
         &mut c,
         "SELECT id FROM t UNION ALL SELECT ref_id FROM u ORDER BY 1",
     )
@@ -154,7 +84,7 @@ async fn union_all_concatenates_and_union_dedups() {
     );
 
     // plain UNION dedups (NULLs equal, exactly one survives).
-    let got = rows_stable(&mut c, "SELECT name FROM t UNION SELECT 'a' FROM u").await;
+    let got = rows_ordered(&mut c, "SELECT name FROM t UNION SELECT 'a' FROM u").await;
     assert_eq!(
         got,
         vec![vec![s("a")], vec![s("b")], vec![s("d")], vec![MVal::NULL]],
@@ -162,7 +92,7 @@ async fn union_all_concatenates_and_union_dedups() {
     );
 
     // int column UNION double column widens to double.
-    let got = rows_stable(
+    let got = rows_ordered(
         &mut c,
         "SELECT id FROM t WHERE id = 1 UNION ALL SELECT score FROM t WHERE id = 1",
     )
@@ -170,7 +100,7 @@ async fn union_all_concatenates_and_union_dedups() {
     assert_eq!(got, vec![vec![f(1.0)], vec![f(1.5)]], "numeric widen");
 
     // parenthesized operand with its own LIMIT, then outer tail.
-    let got = rows_stable(
+    let got = rows_ordered(
         &mut c,
         "(SELECT id FROM t ORDER BY id DESC LIMIT 1) UNION ALL (SELECT id FROM t ORDER BY id LIMIT 1)",
     )
@@ -185,9 +115,30 @@ async fn union_all_concatenates_and_union_dedups() {
     )
     .await;
 
-    // INTERSECT / EXCEPT reject loudly (Phase-1 scope: UNION only).
-    err_contains(&mut c, "SELECT id FROM t INTERSECT SELECT id FROM u", "set").await;
-    err_contains(&mut c, "SELECT id FROM t EXCEPT SELECT id FROM u", "set").await;
+    // INTERSECT / EXCEPT work since M3: DISTINCT variants (u.ref_id
+    // covers 1,2,9; t.id covers 1..4).
+    let got = rows_ordered(&mut c, "SELECT id FROM t INTERSECT SELECT ref_id FROM u").await;
+    assert_eq!(got, vec![vec![int(1)], vec![int(2)]], "intersect");
+    let got = rows_ordered(&mut c, "SELECT id FROM t EXCEPT SELECT ref_id FROM u").await;
+    assert_eq!(got, vec![vec![int(3)], vec![int(4)]], "except");
+    let got = rows_ordered(
+        &mut c,
+        "SELECT id FROM t EXCEPT ALL SELECT ref_id FROM u WHERE ref_id < 2",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![vec![int(2)], vec![int(3)], vec![int(4)]],
+        "except all"
+    );
+    // mixed chains fold left, like UNION always has: (t<3 UNION ALL
+    // u.ref_id) EXCEPT t<1 -> {1,2,1,2,9} minus {1} -> sorted {2,9}
+    let got = rows_ordered(
+        &mut c,
+        "SELECT id FROM t WHERE id < 3 UNION ALL SELECT ref_id FROM u EXCEPT SELECT id FROM t WHERE id < 2",
+    )
+    .await;
+    assert_eq!(got, vec![vec![int(2)], vec![int(9)]], "mixed chain");
 
     // tail LIMIT/OFFSET on the compound.
     let got = rows(
@@ -216,11 +167,11 @@ async fn ctes_derived_and_subqueries() {
     let mut node = spawn_node_mysql(&dir, 0, true, None);
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut c = connect(&node).await;
+    let mut c = connect_root(&node).await;
     setup(&mut c).await;
 
     // CTE referenced twice + join against a base table.
-    let got = rows_stable(
+    let got = rows_ordered(
         &mut c,
         "WITH scored AS (SELECT id, score FROM t WHERE score > 2.0) \
          SELECT a.id, b.id FROM scored a JOIN scored b ON a.id + 1 = b.id",
@@ -233,7 +184,7 @@ async fn ctes_derived_and_subqueries() {
     );
 
     // column alias list renames; later CTE sees earlier one.
-    let got = rows_stable(
+    let got = rows_ordered(
         &mut c,
         "WITH x (n) AS (SELECT id FROM t WHERE id <= 2), \
          y (m) AS (SELECT n + 10 FROM x) SELECT m FROM y ORDER BY m",
@@ -254,13 +205,13 @@ async fn ctes_derived_and_subqueries() {
     assert_eq!(got, vec![vec![f(2.5)]], "derived table");
 
     // IN (SELECT ...): membership + NOT IN.
-    let got = rows_stable(
+    let got = rows_ordered(
         &mut c,
         "SELECT id FROM t WHERE id IN (SELECT ref_id FROM u)",
     )
     .await;
     assert_eq!(got, vec![vec![int(1)], vec![int(2)]], "IN subquery");
-    let got = rows_stable(
+    let got = rows_ordered(
         &mut c,
         "SELECT id FROM t WHERE id NOT IN (SELECT ref_id FROM u) ORDER BY 1",
     )
@@ -274,11 +225,52 @@ async fn ctes_derived_and_subqueries() {
     assert_eq!(got, vec![vec![MVal::NULL]], "scalar subquery empty -> NULL");
     err_contains(&mut c, "SELECT (SELECT score FROM t)", "more than 1 row").await;
 
-    // correlated subqueries reject loudly (Phase-1 scope).
-    err_contains(
+    // correlated subqueries work (M3): IN / EXISTS / scalar bind per
+    // outer row; empty inner result -> NULL.
+    let got = rows_ordered(
         &mut c,
         "SELECT id FROM t WHERE id IN (SELECT ref_id FROM u WHERE u.ref_id = t.id)",
-        "correlated",
+    )
+    .await;
+    assert_eq!(got, vec![vec![int(1)], vec![int(2)]], "correlated IN");
+    let got = rows_ordered(
+        &mut c,
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.ref_id = t.id)",
+    )
+    .await;
+    assert_eq!(got, vec![vec![int(1)], vec![int(2)]], "correlated EXISTS");
+    let got = rows_ordered(
+        &mut c,
+        "SELECT id, (SELECT MAX(ref_id) FROM u WHERE u.ref_id = t.id) FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            vec![int(1), int(1)],
+            vec![int(2), int(2)],
+            vec![int(3), MVal::NULL],
+            vec![int(4), MVal::NULL]
+        ],
+        "correlated scalar, empty -> NULL"
+    );
+    // NOT IN over an empty member set keeps every row.
+    let got = rows_ordered(
+        &mut c,
+        "SELECT id FROM t WHERE id NOT IN (SELECT ref_id FROM u WHERE id = 99) ORDER BY 1",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![vec![int(1)], vec![int(2)], vec![int(3)], vec![int(4)]],
+        "NOT IN empty subquery"
+    );
+    // correlated JOIN conditions still reject loudly (no outer rows
+    // exist while the FROM materializes).
+    err_contains(
+        &mut c,
+        "SELECT t.id FROM t JOIN u ON u.ref_id = (SELECT MAX(ref_id) FROM u WHERE u.ref_id = t.id)",
+        "join",
     )
     .await;
 
@@ -291,7 +283,7 @@ async fn ctes_derived_and_subqueries() {
     .await;
 
     // subquery inside a CTE body also works.
-    let got = rows_stable(
+    let got = rows_ordered(
         &mut c,
         "WITH hit AS (SELECT id FROM t WHERE id IN (SELECT ref_id FROM u)) SELECT COUNT(*) FROM hit",
     )
@@ -312,7 +304,7 @@ async fn not_and_in_are_three_valued() {
     let mut node = spawn_node_mysql(&dir, 0, true, None);
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut c = connect(&node).await;
+    let mut c = connect_root(&node).await;
 
     for (sql, want) in [
         ("SELECT 1 IN (NULL, 1)", int(1)),
@@ -340,7 +332,7 @@ async fn decimal_wire_metadata_and_params() {
     let mut node = spawn_node_mysql(&dir, 0, true, None);
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut c = connect(&node).await;
+    let mut c = connect_root(&node).await;
 
     ddl(
         &mut c,

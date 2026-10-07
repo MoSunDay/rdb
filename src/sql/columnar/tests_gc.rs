@@ -150,20 +150,22 @@ async fn dropped_table_metas_and_files_swept() {
     let shared = shared();
     seed(&shared, &columnar_schema());
     let gone = commit_one(&shared).await;
-    // Crash simulation: the catalog tombstone landed but
-    // drop_table_segments' meta-delete batch never ran.
-    // A witness table keeps the catalog view non-empty: only an EMPTY
-    // view suspends the table-existence classification.
+    // Crash simulation: the real DROP landed both catalog writes --
+    // the id-less name tombstone AND the sql_dropped/<id> marker --
+    // but drop_table_segments' meta-delete batch never ran. A witness
+    // table keeps the view populated: only an unloaded view (both the
+    // live and dropped sets empty) suspends classification.
     let mut witness = columnar_schema();
     witness.id = TABLE_ID + 1;
     witness.name = "witness".into();
     seed(&shared, &witness);
-    shared
-        .raft
-        .write()
-        .unwrap()
-        .kv
-        .remove(&catalog::catalog_key(TABLE_NAME));
+    {
+        let mut raft = shared.raft.write().unwrap();
+        raft.kv
+            .insert(catalog::catalog_key(TABLE_NAME), String::new());
+        raft.kv
+            .insert(catalog::dropped_id_key(TABLE_ID), TABLE_NAME.to_string());
+    }
     let stats = gc::sweep(&shared, Duration::ZERO).unwrap();
     assert_eq!(
         stats,
@@ -268,8 +270,12 @@ async fn unreadable_catalog_entry_keeps_metas() {
     witness.name = "witness".into();
     seed(&shared, &witness);
     commit_one(&shared).await;
-    // Corrupt ONLY the target table's entry; the witness keeps the
-    // view non-empty so this exercises the Err arm, not the guard.
+    // Corrupt ONLY the target table's entry: the id then appears in
+    // neither the live set (unparsable schema) nor the dropped set
+    // (a non-decimal value is no legacy tombstone), so it is
+    // "unknown, not gone" and kept; the witness keeps the view
+    // populated so this is a genuine unknown, not the empty-view
+    // restart guard.
     shared
         .raft
         .write()
@@ -283,5 +289,103 @@ async fn unreadable_catalog_entry_keeps_metas() {
     assert!(
         stored_meta(&shared).is_some(),
         "meta kept on unreadable entry"
+    );
+}
+
+#[tokio::test]
+async fn renamed_table_metas_survive_sweep() {
+    let shared = shared();
+    seed(&shared, &columnar_schema());
+    let kept = commit_one(&shared).await;
+    // RENAME replayed through the stub raft catalog: the old name
+    // becomes an id-less tombstone and the SAME schema (same id 9)
+    // reappears under the new name -- RENAME writes no
+    // sql_dropped/<id> marker, the id stays live. The meta still says
+    // table_name "c1"; classification must key on table_id, not the
+    // possibly-stale name, or the rename silently wipes the table.
+    let mut renamed = columnar_schema();
+    renamed.name = "c2".into();
+    {
+        let mut raft = shared.raft.write().unwrap();
+        raft.kv
+            .insert(catalog::catalog_key(TABLE_NAME), String::new());
+        raft.kv.insert(
+            catalog::catalog_key(&renamed.name),
+            serde_json::to_string(&renamed).unwrap(),
+        );
+    }
+    assert_eq!(
+        gc::sweep(&shared, Duration::ZERO).unwrap(),
+        SweepStats::default()
+    );
+    assert!(stored_meta(&shared).is_some(), "renamed table's meta kept");
+    assert!(
+        writer::columnar_dir(&shared.conf).join(&kept.file).exists(),
+        "renamed table's file kept (still referenced)"
+    );
+}
+
+#[tokio::test]
+async fn truncated_table_old_id_metas_swept() {
+    let shared = shared();
+    seed(&shared, &columnar_schema());
+    let gone = commit_one(&shared).await;
+    // TRUNCATE replayed: same name, fresh id (10) under
+    // sql_catalog/c1, plus the sql_dropped/<9> marker for the retired
+    // id. This is the NON-LEADER path -- only the leader runs
+    // drop_table_segments eagerly, so on everyone else GC alone must
+    // reclaim the old id's metas (they would otherwise leak forever,
+    // the name resolving to the new table).
+    let mut fresh = columnar_schema();
+    fresh.id = TABLE_ID + 1;
+    {
+        let mut raft = shared.raft.write().unwrap();
+        raft.kv.insert(
+            catalog::catalog_key(TABLE_NAME),
+            serde_json::to_string(&fresh).unwrap(),
+        );
+        raft.kv
+            .insert(catalog::dropped_id_key(TABLE_ID), TABLE_NAME.to_string());
+    }
+    let stats = gc::sweep(&shared, Duration::ZERO).unwrap();
+    assert_eq!(
+        stats,
+        SweepStats {
+            metas_deleted: 1,
+            files_deleted: 1
+        }
+    );
+    assert!(stored_meta(&shared).is_none(), "old-id meta deleted");
+    assert!(
+        registry_of(&shared).segments(TABLE_ID).is_empty(),
+        "registry emptied for the old id"
+    );
+    assert!(
+        !writer::columnar_dir(&shared.conf).join(&gone.file).exists(),
+        "old-id file unlinked"
+    );
+}
+
+#[tokio::test]
+async fn unknown_table_id_metas_kept() {
+    let shared = shared();
+    // No catalog entry at all for the meta's table (neither live nor
+    // dropped): the view is populated via the witness, so this is a
+    // genuine unknown id -- never-issued or pre-side-entry debris,
+    // plus the restart window in general (only an id PRESENT in the
+    // dropped set proves a DROP). Unknown is kept, never deleted.
+    let mut witness = columnar_schema();
+    witness.id = TABLE_ID + 1;
+    witness.name = "witness".into();
+    seed(&shared, &witness);
+    let kept = commit_one(&shared).await;
+    assert_eq!(
+        gc::sweep(&shared, Duration::ZERO).unwrap(),
+        SweepStats::default()
+    );
+    assert!(stored_meta(&shared).is_some(), "unknown-id meta kept");
+    assert!(
+        writer::columnar_dir(&shared.conf).join(&kept.file).exists(),
+        "unknown-id file kept"
     );
 }

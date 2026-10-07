@@ -7,21 +7,29 @@
 //! through the fsync write path; an open transaction instead overlays
 //! the decisions onto its write buffer (`tx::stage_*`), flushed once at
 //! COMMIT. Reads inside a transaction run at its pinned `read_ts`.
+//!
+//! The INSERT family (plain / ODKU / REPLACE / INSERT ... SELECT) is
+//! decided here and in `exec::upsert` + `exec::insert_select`; every
+//! decided statement converges on [`apply_writes`], the one row-batch
+//! sink (versions + index ops + write-frontier probe + 2PC-or-local
+//! commit).
 
 use std::sync::Arc;
 
 use rocksdb::WriteBatch;
 
 use crate::sql::dist;
-use crate::sql::exec::expr::{coerce, eval, SingleTableScope};
+use crate::sql::exec::expr::{coerce, eval};
+use crate::sql::exec::insert_common::{bad_field, build_row_values, check_not_null, eval_cells};
 use crate::sql::exec::scan::{self, FromScope};
 use crate::sql::exec::select::{filter_rows, order_rows};
 use crate::sql::exec::sequence;
+use crate::sql::exec::upsert;
 use crate::sql::exec::write_probe;
 use crate::sql::exec::{ExecOutcome, SqlSession};
 use crate::sql::index::maintain::{self, Transition};
 use crate::sql::index::{self, RowSide};
-use crate::sql::parse::ast::{Expr, OrderKey, Statement};
+use crate::sql::parse::ast::{ConflictAction, Expr, InsertSource, OrderKey, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog;
 use crate::sql::storage::row;
@@ -38,22 +46,78 @@ pub async fn insert(
     let Statement::Insert {
         table,
         columns,
-        rows,
+        source,
+        conflict,
     } = stmt
     else {
         unreachable!("dispatch maps only Insert here");
     };
     let schema = lookup(shared, &table)?;
-    if rows.is_empty() {
+    if schema.engine.is_columnar() {
+        // The explicit conflict paths need the row engine (unique-index
+        // reads/migration), and INSERT ... SELECT needs the pre-write
+        // materialization semantics; the columnar engine is append-only
+        // (ER 1235, same gating family as UPDATE/DELETE below).
+        if !matches!(conflict, ConflictAction::Error) || matches!(source, InsertSource::Select(_)) {
+            return Err(SqlError::new(
+                ErrorCode::NotSupported,
+                format!(
+                    "columnar table '{table}' is append-only in this version: \
+                     {kind} is not supported",
+                    kind = conflict_label(&conflict, &source)
+                ),
+            ));
+        }
+    }
+    // Cluster veto (plan `m2-dml-conflicts` decision point 1, choice
+    // (b)): ODKU/REPLACE need the CONFLICTING EXISTING ROW at decide
+    // time, and the conflict read runs on the coordinator's local
+    // snapshot -- in a multi-node cluster the conflicting row (or its
+    // unique-index entry) usually lives on another slot owner, so the
+    // decision would silently miss it. A correct cluster conflict read
+    // is a per-key gather ahead of the 2PC (>= 1 RPC per probed pk and
+    // unique value), over the plan's "<= 2-RPC point read" bar for
+    // choice (a). Fails fast here (the forwarding boundary) with
+    // ER 1235; standalone / single-band clusters keep full support and
+    // e2e asserts this message.
+    if !matches!(conflict, ConflictAction::Error) && cluster_spans_remote(shared) {
+        return Err(SqlError::new(
+            ErrorCode::NotSupported,
+            format!(
+                "{} is not supported in cluster mode (m2-dml-conflicts decision 1b)",
+                conflict_label(&conflict, &source)
+            ),
+        ));
+    }
+    // Row sources converge on evaluated cell values first: VALUES
+    // tuples evaluate here, a SELECT source materializes to completion
+    // BEFORE any write (pre-statement snapshot for same-table reads).
+    let cell_rows: Vec<Vec<Value>> = match &source {
+        InsertSource::Values(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for exprs in rows {
+                out.push(eval_cells(&schema, exprs)?);
+            }
+            out
+        }
+        InsertSource::Select(cq) => {
+            crate::sql::exec::insert_select::materialize(shared, sess, cq, &columns, &schema)
+                .await?
+        }
+    };
+    if cell_rows.is_empty() {
         return Ok(ExecOutcome::Affected(0));
     }
     // AUTO_INCREMENT: the slot survives row building as NULL (the NOT
     // NULL check defers to the allocator); allocation then rewrites it
-    // under the raft-replicated counter (see exec/sequence.rs).
+    // under the raft-replicated counter (see exec/sequence.rs). Ids are
+    // allocated for EVERY incoming row before conflict decisions, so an
+    // ODKU row that takes the update branch burns its reserved id --
+    // same gap semantics as MySQL's ODKU.
     let ai = schema.auto_increment_index();
-    let mut full_rows = Vec::with_capacity(rows.len());
-    for exprs in &rows {
-        full_rows.push(build_insert_row(&schema, &columns, exprs, ai)?);
+    let mut full_rows = Vec::with_capacity(cell_rows.len());
+    for cells in cell_rows {
+        full_rows.push(build_row_values(&schema, &columns, cells, ai)?);
     }
     if let Some(idx) = ai {
         let first_auto;
@@ -67,89 +131,68 @@ pub async fn insert(
     if schema.engine.is_columnar() {
         return insert_columnar(shared, sess, &schema, full_rows).await;
     }
+    match conflict {
+        ConflictAction::OnDuplicate(assigns) => {
+            upsert::run_odku(shared, sess, &schema, full_rows, &assigns).await
+        }
+        ConflictAction::Replace => upsert::run_replace(shared, sess, &schema, full_rows).await,
+        ConflictAction::Error => plain_insert(shared, sess, &schema, full_rows, n).await,
+    }
+}
+
+/// Human label of an INSERT flavor for reject messages.
+fn conflict_label(conflict: &ConflictAction, source: &InsertSource) -> &'static str {
+    match (conflict, source) {
+        (ConflictAction::Replace, _) => "REPLACE INTO",
+        (ConflictAction::OnDuplicate(_), _) => "ON DUPLICATE KEY UPDATE",
+        (ConflictAction::Error, InsertSource::Select(_)) => "INSERT ... SELECT",
+        (ConflictAction::Error, InsertSource::Values(_)) => "INSERT",
+    }
+}
+
+/// True when a ready cluster has any participant besides this node:
+/// the exact condition under which a write becomes a 2PC.
+fn cluster_spans_remote(shared: &Shared) -> bool {
+    dist::routing(shared).is_some_and(|r| r.addrs.iter().any(|a| a != &r.host))
+}
+
+/// Plain INSERT (no explicit conflict clause): the pre-M2 behavior is
+/// kept verbatim -- pk collisions take the silent last-writer-wins
+/// upsert (StarRocks PRIMARY KEY model recovers the old row first so
+/// index maintenance sees a replace), unique-index collisions reject
+/// 1062 inside `apply_writes`' unique validation.
+async fn plain_insert(
+    shared: &Shared,
+    sess: &mut SqlSession,
+    schema: &TableSchema,
+    full_rows: Vec<Vec<Value>>,
+    n: u64,
+) -> SqlResult<ExecOutcome> {
     if let Some(txn) = sess.txn.as_mut() {
         for values in full_rows {
-            tx::stage_upsert(txn, &schema, values)?;
+            tx::stage_upsert(txn, schema, values)?;
         }
         return Ok(ExecOutcome::Affected(n));
     }
-    let pk_keys = full_rows
-        .iter()
-        .map(|r| pk_key_of(&schema, r))
-        .collect::<SqlResult<Vec<_>>>()?;
-    // StarRocks PRIMARY KEY model treats INSERT as UPSERT: recover each
-    // pk's visible row BEFORE the batch is stamped so index maintenance
-    // sees a replace (unique entries move with the new values) instead
-    // of a blind insert that would leave stale entries behind. Other
-    // models keep pure inserts (empty `old_rows`).
-    let old_rows: Vec<Option<Vec<Value>>> = if schema.key_model == KeyModel::PrimaryKey {
-        let now = shared.sql_ts.now();
-        let mut olds = Vec::with_capacity(pk_keys.len());
-        for pk in &pk_keys {
-            olds.push(
-                index::visible_row_at_pk(&shared.store, &schema, pk, now)
-                    .map_err(SqlError::from)?,
-            );
-        }
-        olds
-    } else {
-        Vec::new()
-    };
-    let trans: Vec<Transition<'_>> = full_rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| Transition {
-            old: old_rows.get(i).and_then(|o| o.as_ref()).map(|o| RowSide {
-                pk_key: &pk_keys[i],
-                values: o,
-            }),
-            new: Some(RowSide {
-                pk_key: &pk_keys[i],
-                values: r,
-            }),
-        })
-        .collect();
-    let idx = index_ops(shared, &schema, &trans)?;
-    // Index maintenance runs BEFORE the rows land: a unique violation
-    // must reject the statement without writing anything. M3: in a
-    // ready cluster with any remote slot-owner the batch becomes a 2PC
-    // (see sql::dist); single-node deployments keep the exact local
-    // batch path below.
-    let writes: dist::plan::SimpleWrites = full_rows
-        .iter()
-        .zip(pk_keys.iter())
-        .map(|(r, pk)| (pk.clone(), Some(r)))
-        .collect();
     let read_ts = shared.sql_ts.now();
-    // Write frontier before planning (see write_probe): one ts per row.
-    write_probe::reserve(
-        shared,
-        schema.id,
-        read_ts,
-        n,
-        pk_keys.iter().map(|k| k.as_slice()),
-        &idx,
-    )
-    .await?;
-    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)? {
-        return dist::twopc::run(shared, &plan)
-            .await
-            .map(|_| ExecOutcome::Affected(n));
+    let mut writes: Vec<RowWrite> = Vec::with_capacity(full_rows.len());
+    for values in full_rows {
+        let pk = pk_key_of(schema, &values)?;
+        // StarRocks PRIMARY KEY model treats INSERT as UPSERT: recover
+        // each pk's visible row BEFORE the batch is stamped so index
+        // maintenance sees a replace (unique entries move with the new
+        // values) instead of a blind insert leaving stale entries.
+        let old = if schema.key_model == KeyModel::PrimaryKey {
+            index::visible_row_at_pk(&shared.store, schema, &pk, read_ts).map_err(SqlError::from)?
+        } else {
+            None
+        };
+        writes.push(RowWrite {
+            deletes: old.map(|o| vec![(pk.clone(), o)]).unwrap_or_default(),
+            put: Some(values),
+        });
     }
-    let ts = shared.sql_ts.alloc_n_above(n, read_ts);
-    let mut batch = WriteBatch::default();
-    for (i, values) in full_rows.iter().enumerate() {
-        // Duplicate PKs inside one batch are legal: each row gets its
-        // own increasing ts, so the LAST one wins for later readers.
-        put_version(&mut batch, &schema, values, ts.start + i as u64)?;
-    }
-    maintain::apply_ops(&mut batch, idx);
-    // Same-batch ts floor (restart clock fencing, see tx::floor).
-    tx::floor::stamp(&mut batch, ts.end - 1);
-    ops::batch_write_async(Arc::clone(&shared.store), batch)
-        .await
-        .map_err(SqlError::from)?;
-    Ok(ExecOutcome::Affected(n))
+    apply_writes(shared, sess, schema, writes, read_ts, n).await
 }
 
 /// Columnar INSERT: append-only, no pk dedup, no index maintenance.
@@ -267,141 +310,59 @@ pub async fn update(
     )
     .await?;
 
-    // Decide writes purely, then either stage them (txn) or stamp one
-    // ts range over all versions (autocommit).
-    struct Planned {
-        tombstone_old_pk: Option<Vec<u8>>,
-        old: Vec<Value>,
-        values: Vec<Value>,
-    }
-    let mut plans: Vec<Planned> = Vec::new();
+    // Decide writes purely, then either stage them (txn) or hand the
+    // decided rows to the shared batch sink.
+    let mut writes: Vec<RowWrite> = Vec::new();
+    let mut any_moved = false;
     for old in &matched {
         let new = apply_assignments(&schema, &scope, old, &assignments)?;
         if new == *old {
             continue; // unchanged rows write no version
         }
         // PK reassignment = tombstone the old pk + insert the new
-        // (any pk column changing moves the row's physical key).
-        let new_pk_key = pk_key_of(&schema, &new)?;
-        let old_pk_key = pk_key_of(&schema, old)?;
-        let tombstone_old_pk = (new_pk_key != old_pk_key).then_some(old_pk_key);
-        plans.push(Planned {
-            tombstone_old_pk,
-            old: old.clone(),
-            values: new,
+        // (any pk column changing moves the row's physical key); the
+        // old side always rides along for index maintenance. The sink
+        // derives the tombstone from `deletes[0].pk != put pk`.
+        let (opk, npk) = (pk_key_of(&schema, old)?, pk_key_of(&schema, &new)?);
+        if npk != opk {
+            any_moved = true;
+        }
+        writes.push(RowWrite {
+            deletes: vec![(opk, old.clone())],
+            put: Some(new),
         });
     }
-    if plans.is_empty() {
+    if writes.is_empty() {
         return Ok(ExecOutcome::Affected(0));
     }
-    if let Some(txn) = sess.txn.as_mut() {
-        let n = plans.len() as u64;
-        for p in plans {
-            if let Some(old_key) = p.tombstone_old_pk {
-                tx::stage_delete(txn, &schema, old_key)?;
+    // A moved pk may not land on a row OTHER than the one being moved
+    // (MySQL ER 1062). The probe set is the live view FOLDED with
+    // each decided write in statement order: a target vacated earlier
+    // in the same statement is free (MySQL processes rows in retrieval
+    // order), while two rows converging on one target fail loudly on
+    // the second with ER 1062; cross-statement txn collisions are
+    // covered because `visible_live_rows` merges the txn's staged
+    // writes. Gated on "some write moved a pk" so normal UPDATEs pay
+    // no extra visibility scan.
+    if any_moved {
+        let live = visible_live_rows(shared, &schema, sess.txn.as_ref()).await?;
+        let mut pks = live
+            .iter()
+            .map(|r| pk_key_of(&schema, r))
+            .collect::<SqlResult<std::collections::BTreeSet<Vec<u8>>>>()?;
+        for w in &writes {
+            let Some(put) = &w.put else { continue };
+            let opk = &w.deletes[0].0;
+            let npk = pk_key_of(&schema, put)?;
+            if npk != *opk && pks.contains(&npk) {
+                return Err(pk_dup_entry(&schema, put));
             }
-            tx::stage_upsert(txn, &schema, p.values)?;
+            pks.remove(opk);
+            pks.insert(npk);
         }
-        return Ok(ExecOutcome::Affected(n));
     }
-    let versions = plans
-        .iter()
-        .map(|p| if p.tombstone_old_pk.is_some() { 2 } else { 1 })
-        .sum::<u64>();
-    // Index transitions BEFORE any row write: each plan carries its old
-    // side (the matched row) so UPDATEs delete stale entries, and a
-    // pk-moving update is one delete + one insert.
-    let pk_sides = plans
-        .iter()
-        .map(|p| {
-            let old_pk = match &p.tombstone_old_pk {
-                Some(k) => k.clone(),
-                None => pk_key_of(&schema, &p.old)?,
-            };
-            Ok((old_pk, pk_key_of(&schema, &p.values)?))
-        })
-        .collect::<SqlResult<Vec<(Vec<u8>, Vec<u8>)>>>()?;
-    let trans: Vec<Transition<'_>> = plans
-        .iter()
-        .zip(pk_sides.iter())
-        .flat_map(|(p, (old_pk, new_pk))| {
-            let old_side = RowSide {
-                pk_key: old_pk,
-                values: &p.old,
-            };
-            let new_side = RowSide {
-                pk_key: new_pk,
-                values: &p.values,
-            };
-            if old_pk == new_pk {
-                vec![Transition {
-                    old: Some(old_side),
-                    new: Some(new_side),
-                }]
-            } else {
-                vec![
-                    Transition {
-                        old: Some(old_side),
-                        new: None,
-                    },
-                    Transition {
-                        old: None,
-                        new: Some(new_side),
-                    },
-                ]
-            }
-        })
-        .collect();
-    let idx = index_ops(shared, &schema, &trans)?;
-    // M3 2PC hook (see the INSERT path note): the write list widens a
-    // pk-moving plan into tombstone + row, exactly the two versions
-    // the local batch below stamps.
-    let mut dist_writes: dist::plan::SimpleWrites = Vec::with_capacity(plans.len());
-    for p in &plans {
-        if let Some(old_key) = &p.tombstone_old_pk {
-            dist_writes.push((old_key.clone(), None));
-        }
-        dist_writes.push((pk_key_of(&schema, &p.values)?, Some(&p.values)));
-    }
-    let read_ts = shared.sql_ts.now();
-    // Write frontier before planning (see write_probe): one ts per
-    // write, pk moves add a tombstone.
-    write_probe::reserve(
-        shared,
-        schema.id,
-        read_ts,
-        dist_writes.len() as u64,
-        dist_writes.iter().map(|(pk, _)| pk.as_slice()),
-        &idx,
-    )
-    .await?;
-    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &dist_writes, &idx)? {
-        return dist::twopc::run(shared, &plan)
-            .await
-            .map(|_| ExecOutcome::Affected(plans.len() as u64));
-    }
-    let ts = shared.sql_ts.alloc_n_above(versions, read_ts);
-    let mut batch = WriteBatch::default();
-    let mut next = ts.start;
-    for p in &plans {
-        if let Some(old_key) = &p.tombstone_old_pk {
-            let slot = row::row_slot(&schema, old_key);
-            batch.put(
-                row::version_key(&schema, slot, old_key, next),
-                row::encode_tombstone(),
-            );
-            next += 1;
-        }
-        put_version(&mut batch, &schema, &p.values, next)?;
-        next += 1;
-    }
-    maintain::apply_ops(&mut batch, idx);
-    // Same-batch ts floor (restart clock fencing, see tx::floor).
-    tx::floor::stamp(&mut batch, ts.end - 1);
-    ops::batch_write_async(Arc::clone(&shared.store), batch)
-        .await
-        .map_err(SqlError::from)?;
-    Ok(ExecOutcome::Affected(plans.len() as u64))
+    let affected = writes.len() as u64;
+    apply_writes(shared, sess, &schema, writes, shared.sql_ts.now(), affected).await
 }
 
 pub async fn delete(
@@ -445,77 +406,20 @@ pub async fn delete(
     if n == 0 {
         return Ok(ExecOutcome::Affected(0));
     }
-    if let Some(txn) = sess.txn.as_mut() {
-        for r in matched {
-            tx::stage_delete(txn, &schema, pk_key_of(&schema, &r)?)?;
-        }
-        return Ok(ExecOutcome::Affected(n));
+    let mut writes: Vec<RowWrite> = Vec::with_capacity(matched.len());
+    for r in matched {
+        writes.push(RowWrite {
+            deletes: vec![(pk_key_of(&schema, &r)?, r)],
+            put: None,
+        });
     }
-    // Index entries of every deleted row leave in the same batch;
-    // unique checks are trivially satisfied (deletes claim nothing).
-    let pk_keys = matched
-        .iter()
-        .map(|r| pk_key_of(&schema, r))
-        .collect::<SqlResult<Vec<_>>>()?;
-    let trans: Vec<Transition<'_>> = matched
-        .iter()
-        .zip(pk_keys.iter())
-        .map(|(r, pk)| {
-            Transition::delete(RowSide {
-                pk_key: pk,
-                values: r,
-            })
-        })
-        .collect();
-    let idx = index_ops(shared, &schema, &trans)?;
-    // M3 2PC hook (see the INSERT path note).
-    let writes: dist::plan::SimpleWrites = pk_keys.iter().map(|pk| (pk.clone(), None)).collect();
-    let read_ts = shared.sql_ts.now();
-    // Write frontier before planning (see write_probe): one ts per row.
-    write_probe::reserve(
-        shared,
-        schema.id,
-        read_ts,
-        writes.len() as u64,
-        pk_keys.iter().map(|k| k.as_slice()),
-        &idx,
-    )
-    .await?;
-    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, &schema, &writes, &idx)? {
-        return dist::twopc::run(shared, &plan)
-            .await
-            .map(|_| ExecOutcome::Affected(n));
-    }
-    let ts = shared.sql_ts.alloc_n_above(n, read_ts);
-    let mut batch = WriteBatch::default();
-    for (i, r) in matched.iter().enumerate() {
-        let key = pk_key_of(&schema, r)?;
-        let slot = row::row_slot(&schema, &key);
-        batch.put(
-            row::version_key(&schema, slot, &key, ts.start + i as u64),
-            row::encode_tombstone(),
-        );
-    }
-    maintain::apply_ops(&mut batch, idx);
-    // Same-batch ts floor (restart clock fencing, see tx::floor).
-    tx::floor::stamp(&mut batch, ts.end - 1);
-    ops::batch_write_async(Arc::clone(&shared.store), batch)
-        .await
-        .map_err(SqlError::from)?;
-    Ok(ExecOutcome::Affected(n))
+    apply_writes(shared, sess, &schema, writes, shared.sql_ts.now(), n).await
 }
 
 fn lookup(shared: &Shared, table: &str) -> SqlResult<TableSchema> {
     catalog::lookup(shared, table)
         .map_err(SqlError::from)?
         .ok_or_else(|| SqlError::no_such_table(table))
-}
-
-fn bad_field(col: &str) -> SqlError {
-    SqlError::new(
-        ErrorCode::BadField,
-        format!("unknown column '{col}' in 'field list'"),
-    )
 }
 
 /// WHERE + ORDER BY + LIMIT shared by UPDATE and DELETE. In a ready
@@ -533,11 +437,32 @@ async fn matched_rows(
     limit: Option<u64>,
     txn: Option<&crate::sql::tx::Txn>,
 ) -> SqlResult<Vec<Vec<Value>>> {
-    // Autocommit matching takes its read point fresh: fold the raft
-    // cursor frontier first so `now()` rides the cluster's latest
-    // applied ts (a follower coordinating an UPDATE would otherwise
-    // match at its stale ts-block tail and silently miss rows stamped
-    // above it). Txn mode keeps the snapshot pinned at BEGIN.
+    let mut rows = visible_live_rows(shared, schema, txn).await?;
+    rows = filter_rows(&rows, scope, filter)?;
+    if !order_by.is_empty() {
+        order_rows(&mut rows, order_by, scope)?;
+    }
+    if let Some(l) = limit {
+        rows.truncate(l as usize);
+    }
+    Ok(rows)
+}
+
+/// The UNFILTERED live row set behind [`matched_rows`]: identical
+/// visibility (autocommit: frontier-synced `now()`; txn: pinned
+/// `read_ts` merged with staged writes; cluster: per-owner band
+/// gather). The pk-move check below needs it because a WHERE clause
+/// may have skipped the very row a moved pk wants to land on.
+async fn visible_live_rows(
+    shared: &Shared,
+    schema: &TableSchema,
+    txn: Option<&crate::sql::tx::Txn>,
+) -> SqlResult<Vec<Vec<Value>>> {
+    // Autocommit takes its read point fresh: fold the raft cursor
+    // frontier first so `now()` rides the cluster's latest applied ts
+    // (a follower coordinating a write would otherwise match at its
+    // stale ts-block tail and silently miss rows stamped above it).
+    // Txn mode keeps the snapshot pinned at BEGIN.
     let read_ts = txn.map(|t| t.read_ts).unwrap_or_else(|| {
         shared.sql_ts.sync_cursor_frontier();
         shared.sql_ts.now()
@@ -552,139 +477,13 @@ async fn matched_rows(
     if let Some(t) = txn {
         rows = crate::sql::tx::merge_rows(schema, rows, t)?;
     }
-    rows = filter_rows(&rows, scope, filter)?;
-    if !order_by.is_empty() {
-        order_rows(&mut rows, order_by, scope)?;
-    }
-    if let Some(l) = limit {
-        rows.truncate(l as usize);
-    }
     Ok(rows)
-}
-
-/// Build one full-width row from an INSERT VALUES tuple: expand the
-/// given columns (missing columns become NULL), evaluate the value
-/// expressions (no row context -- column refs rejected), coerce to the
-/// column types and enforce NOT NULL. `ai` is the AUTO_INCREMENT slot:
-/// its NULL check is deferred (the allocator assigns an id right after
-/// and never leaves NULL behind).
-fn build_insert_row(
-    schema: &TableSchema,
-    columns: &[String],
-    exprs: &[Expr],
-    ai: Option<usize>,
-) -> SqlResult<Vec<Value>> {
-    for e in exprs {
-        reject_col_refs(e)?;
-    }
-    let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-    let scope = SingleTableScope { columns: &names };
-    let mut slots: Vec<Option<Value>> = vec![None; schema.columns.len()];
-    if columns.is_empty() {
-        // Positional form: the tuple must name every column in order.
-        if exprs.len() != schema.columns.len() {
-            return Err(SqlError::new(
-                ErrorCode::WrongValueCount,
-                format!(
-                    "row has {} values, table '{}' has {} columns",
-                    exprs.len(),
-                    schema.name,
-                    schema.columns.len()
-                ),
-            ));
-        }
-        for (i, e) in exprs.iter().enumerate() {
-            slots[i] = Some(eval(e, &scope, &[])?);
-        }
-    } else {
-        if exprs.len() != columns.len() {
-            return Err(SqlError::new(
-                ErrorCode::WrongValueCount,
-                "column count doesn't match value count",
-            ));
-        }
-        for (col, e) in columns.iter().zip(exprs) {
-            let idx = schema.column_index(col).ok_or_else(|| bad_field(col))?;
-            if slots[idx].is_some() {
-                return Err(SqlError::new(
-                    ErrorCode::Parse,
-                    format!("column '{col}' specified twice"),
-                ));
-            }
-            slots[idx] = Some(eval(e, &scope, &[])?);
-        }
-    }
-    let mut out = Vec::with_capacity(schema.columns.len());
-    for (i, col) in schema.columns.iter().enumerate() {
-        let v = coerce(slots[i].take().unwrap_or(Value::Null), col.sql_type)?;
-        if Some(i) != ai {
-            check_not_null(&v, &col.name, col.nullable)?;
-        }
-        out.push(v);
-    }
-    Ok(out)
-}
-
-fn check_not_null(v: &Value, name: &str, nullable: bool) -> SqlResult<()> {
-    if matches!(v, Value::Null) && !nullable {
-        return Err(SqlError::new(
-            ErrorCode::BadNull,
-            format!("column '{name}' cannot be null"),
-        ));
-    }
-    Ok(())
-}
-
-/// Column references are not allowed in VALUES (no row exists yet).
-fn reject_col_refs(e: &Expr) -> SqlResult<()> {
-    match e {
-        Expr::Col { name, .. } => Err(SqlError::new(
-            ErrorCode::NotSupported,
-            format!("column '{name}' is not allowed in VALUES"),
-        )),
-        Expr::Lit(_) | Expr::Placeholder | Expr::Agg { arg: None, .. } => Ok(()),
-        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::new(
-            ErrorCode::NotSupported,
-            "subqueries are not allowed in VALUES",
-        )),
-        Expr::Agg { arg: Some(a), .. } => reject_col_refs(a),
-        Expr::Func { args, .. } => {
-            for a in args {
-                reject_col_refs(a)?;
-            }
-            Ok(())
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            reject_col_refs(left)?;
-            reject_col_refs(right)
-        }
-        Expr::Not(x) | Expr::Neg(x) => reject_col_refs(x),
-        Expr::IsNull { expr, .. } => reject_col_refs(expr),
-        Expr::InList { expr, list, .. } => {
-            reject_col_refs(expr)?;
-            for i in list {
-                reject_col_refs(i)?;
-            }
-            Ok(())
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            reject_col_refs(expr)?;
-            reject_col_refs(low)?;
-            reject_col_refs(high)
-        }
-        Expr::Like { expr, pattern, .. } => {
-            reject_col_refs(expr)?;
-            reject_col_refs(pattern)
-        }
-    }
 }
 
 /// Apply SET assignments: every expression evaluates against the
 /// CURRENT row (all of them, then applied), coerced to the column type;
 /// NOT NULL is re-checked on the result.
-fn apply_assignments(
+pub(crate) fn apply_assignments(
     schema: &TableSchema,
     scope: &FromScope,
     old: &[Value],
@@ -708,8 +507,28 @@ fn apply_assignments(
 
 /// Encoded primary key of a full-width row (all pk columns, in pk
 /// order; one component for single-column pks).
-fn pk_key_of(schema: &TableSchema, values: &[Value]) -> SqlResult<Vec<u8>> {
+pub(crate) fn pk_key_of(schema: &TableSchema, values: &[Value]) -> SqlResult<Vec<u8>> {
     row::pk_encode_row(schema, values).map_err(SqlError::from)
+}
+
+/// ER 1062 for a pk move landing on an occupied pk, in the engine's
+/// duplicate-entry shape `Duplicate entry <pk shown> for key
+/// 'PRIMARY'` (composite pks render their column values joined with
+/// '-'; see `index::dup_entry`).
+pub(crate) fn pk_dup_entry(schema: &TableSchema, row: &[Value]) -> SqlError {
+    let pk = schema.pk_indices();
+    if pk.len() == 1 {
+        return index::dup_entry(&row[pk[0]], "PRIMARY");
+    }
+    let shown = pk
+        .iter()
+        .map(|&i| index::keys::value_display(&row[i]))
+        .collect::<Vec<_>>()
+        .join("-");
+    SqlError::new(
+        ErrorCode::DupEntry,
+        format!("Duplicate entry '{shown}' for key 'PRIMARY'"),
+    )
 }
 
 /// Index-entry ops of one autocommit batch (no-op for indexless tables):
@@ -738,10 +557,182 @@ fn put_version(
 }
 
 /// Single-table FROM scope used by UPDATE/DELETE (and assignment eval).
-fn single_table_scope(schema: &TableSchema) -> FromScope {
+pub(crate) fn single_table_scope(schema: &TableSchema) -> FromScope {
     FromScope {
         sides: vec![scan::table_side(schema, &None)],
     }
+}
+
+/// One decided row write of a DML batch, the unit every write path
+/// (plain INSERT / UPDATE / DELETE / ODKU / REPLACE) converges on:
+/// the old rows leaving the table (physical pk + full values, feeding
+/// index maintenance and -- when their pk differs from the put's --
+/// tombstones) and optionally the new full-width row landing.
+pub(crate) struct RowWrite {
+    pub deletes: Vec<(Vec<u8>, Vec<Value>)>,
+    pub put: Option<Vec<Value>>,
+}
+
+/// Normalized [`RowWrite`]: put pk precomputed, tombstone verdict per
+/// delete (a delete whose pk equals the put pk is an in-place replace
+/// and stamps no tombstone).
+struct Sides {
+    dels: Vec<(Vec<u8>, Vec<Value>, bool)>,
+    put: Option<(Vec<u8>, Vec<Value>)>,
+}
+
+fn sides_of(schema: &TableSchema, writes: &[RowWrite]) -> SqlResult<Vec<Sides>> {
+    writes
+        .iter()
+        .map(|w| {
+            let put = match &w.put {
+                Some(v) => Some((pk_key_of(schema, v)?, v.clone())),
+                None => None,
+            };
+            Ok(Sides {
+                dels: w
+                    .deletes
+                    .iter()
+                    .map(|(pk, vals)| {
+                        let tombstone = put.as_ref().map(|(ppk, _)| ppk != pk).unwrap_or(true);
+                        (pk.clone(), vals.clone(), tombstone)
+                    })
+                    .collect(),
+                put,
+            })
+        })
+        .collect()
+}
+
+/// Apply one statement's decided row writes: an open txn stages them
+/// into its write buffer; autocommit derives the index-entry ops
+/// (unique constraints validated BEFORE anything lands), reserves the
+/// write frontier, then either 2PCs to the slot owners (any remote
+/// participant) or stamps one local batch. `affected` is the caller's
+/// statement-level affected-rows count (INSERT/UPDATE/DELETE/ODKU/REPLACE
+/// each count differently); every physical version consumes one ts of
+/// the allocated range, in batch order.
+pub(crate) async fn apply_writes(
+    shared: &Shared,
+    sess: &mut SqlSession,
+    schema: &TableSchema,
+    writes: Vec<RowWrite>,
+    read_ts: u64,
+    affected: u64,
+) -> SqlResult<ExecOutcome> {
+    if let Some(txn) = sess.txn.as_mut() {
+        for w in &writes {
+            for (pk, _) in &w.deletes {
+                tx::stage_delete(txn, schema, pk.clone())?;
+            }
+            if let Some(values) = &w.put {
+                tx::stage_upsert(txn, schema, values.clone())?;
+            }
+        }
+        return Ok(ExecOutcome::Affected(affected));
+    }
+    let sides = sides_of(schema, &writes)?;
+    let versions = sides
+        .iter()
+        .map(|s| s.dels.iter().filter(|(_, _, t)| *t).count() as u64 + u64::from(s.put.is_some()))
+        .sum::<u64>();
+    // Index transitions BEFORE any row write: each delete carries its
+    // old row side (stale entries leave), each put its new side, and a
+    // delete whose pk equals the put pk folds into ONE replace
+    // transition so unique entries move instead of flickering.
+    let trans: Vec<Transition<'_>> = sides
+        .iter()
+        .flat_map(|s| {
+            let mut ts: Vec<Transition<'_>> = Vec::with_capacity(s.dels.len() + 1);
+            for (pk, vals, tombstone) in &s.dels {
+                if !*tombstone {
+                    // in-place replace: old+new in one transition
+                    if let Some((ppk, pvals)) = &s.put {
+                        ts.push(Transition {
+                            old: Some(RowSide {
+                                pk_key: pk,
+                                values: vals,
+                            }),
+                            new: Some(RowSide {
+                                pk_key: ppk,
+                                values: pvals,
+                            }),
+                        });
+                    }
+                } else {
+                    ts.push(Transition::delete(RowSide {
+                        pk_key: pk,
+                        values: vals,
+                    }));
+                }
+            }
+            if let Some((ppk, pvals)) = &s.put {
+                // a put whose pk matched no delete is a pure insert
+                if s.dels.iter().all(|(dpk, _, _)| dpk != ppk) {
+                    ts.push(Transition::insert(RowSide {
+                        pk_key: ppk,
+                        values: pvals,
+                    }));
+                }
+            }
+            ts
+        })
+        .collect();
+    let idx = index_ops(shared, schema, &trans)?;
+    // M3 2PC hook: the write list widens pk moves into tombstone + row,
+    // exactly the versions the local batch below stamps.
+    let mut dist_writes: dist::plan::SimpleWrites = Vec::with_capacity(sides.len());
+    for s in &sides {
+        for (pk, _, tombstone) in &s.dels {
+            if *tombstone {
+                dist_writes.push((pk.clone(), None));
+            }
+        }
+        if let Some((ppk, pvals)) = &s.put {
+            dist_writes.push((ppk.clone(), Some(pvals)));
+        }
+    }
+    // Write frontier before planning (see write_probe): one ts per version.
+    write_probe::reserve(
+        shared,
+        schema.id,
+        read_ts,
+        versions,
+        dist_writes.iter().map(|(pk, _)| pk.as_slice()),
+        &idx,
+    )
+    .await?;
+    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, schema, &dist_writes, &idx)? {
+        return dist::twopc::run(shared, &plan)
+            .await
+            .map(|_| ExecOutcome::Affected(affected));
+    }
+    let ts = shared.sql_ts.alloc_n_above(versions, read_ts);
+    let mut batch = WriteBatch::default();
+    let mut next = ts.start;
+    for s in &sides {
+        for (pk, _, tombstone) in &s.dels {
+            if *tombstone {
+                let slot = row::row_slot(schema, pk);
+                batch.put(
+                    row::version_key(schema, slot, pk, next),
+                    row::encode_tombstone(),
+                );
+                next += 1;
+            }
+        }
+        if let Some((_, vals)) = &s.put {
+            put_version(&mut batch, schema, vals, next)?;
+            next += 1;
+        }
+    }
+    maintain::apply_ops(&mut batch, idx);
+    // Same-batch ts floor (restart clock fencing, see tx::floor).
+    tx::floor::stamp(&mut batch, ts.end - 1);
+    ops::batch_write_async(Arc::clone(&shared.store), batch)
+        .await
+        .map_err(SqlError::from)?;
+    Ok(ExecOutcome::Affected(affected))
 }
 
 #[cfg(test)]

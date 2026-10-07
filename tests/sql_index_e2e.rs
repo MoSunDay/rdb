@@ -5,53 +5,10 @@
 
 mod common;
 
+use common::mysql::{connect_root, ddl, int, rows, s};
 use common::{spawn_node_mysql, wait_mysql_ready, wait_resp_ready};
-use mysql_async::{prelude::*, OptsBuilder, Value as MVal};
-
-const PASS: &str = "e2e-sql-pass";
-async fn connect(node: &common::ProcNode) -> mysql_async::Conn {
-    let port = node
-        .mysql
-        .rsplit(':')
-        .next()
-        .expect("mysql port")
-        .parse::<u16>()
-        .expect("mysql port digits");
-    let opts = || {
-        OptsBuilder::default()
-            .ip_or_hostname("127.0.0.1")
-            .tcp_port(port)
-            .user(Some("root"))
-            .pass(Some(PASS))
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match mysql_async::Conn::new(opts()).await {
-            Ok(c) => return c,
-            Err(mysql_async::Error::Io(_)) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("mysql connect: {e}"),
-        }
-    }
-}
-
-/// DDL needs the raft leader; retry until the bootstrap node becomes one.
-async fn ddl(conn: &mut mysql_async::Conn, sql: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match conn.query_drop(sql).await {
-            Ok(()) => return,
-            Err(e) => {
-                if std::time::Instant::now() < deadline && e.to_string().contains("leader") {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    continue;
-                }
-                panic!("ddl {sql}: {e}");
-            }
-        }
-    }
-}
+use mysql_async::prelude::*;
+use mysql_async::Value as MVal;
 
 /// One fresh single-node world: node up + table created (no indexes).
 async fn world(name: &str) -> (common::ProcNode, mysql_async::Conn) {
@@ -61,7 +18,7 @@ async fn world(name: &str) -> (common::ProcNode, mysql_async::Conn) {
     let mut node = spawn_node_mysql(&dir, 0, true, None);
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut conn = connect(&node).await;
+    let mut conn = connect_root(&node).await;
     ddl(
         &mut conn,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL, n BIGINT NULL)",
@@ -70,25 +27,6 @@ async fn world(name: &str) -> (common::ProcNode, mysql_async::Conn) {
     (node, conn)
 }
 
-async fn rows(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<MVal>> {
-    let rs: Vec<mysql_async::Row> = conn.query(sql).await.expect(sql);
-    rs.into_iter()
-        .map(|r| {
-            (0..r.len())
-                .map(|i| r.get::<MVal, _>(i).unwrap_or(MVal::NULL))
-                .collect()
-        })
-        .collect()
-}
-
-/// Text-protocol cells are always `Value::Bytes` (length-prefixed on
-/// the wire) -- compare raw bytes, never Debug output.
-fn int(i: i64) -> MVal {
-    MVal::Bytes(i.to_string().into_bytes())
-}
-fn s(v: &str) -> MVal {
-    MVal::Bytes(v.as_bytes().to_vec())
-}
 fn ids(rs: &[Vec<MVal>]) -> Vec<MVal> {
     let mut out: Vec<MVal> = rs.iter().map(|r| r[0].clone()).collect();
     out.sort_by(cmp_mval);
@@ -265,7 +203,7 @@ async fn create_unique_index_rejects_existing_duplicates() {
 async fn txn_overlay_and_commit_maintenance() {
     let (mut node, mut c) = world("txn").await;
     ddl(&mut c, "CREATE INDEX idx_v ON t (v)").await;
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
     c.query_drop("INSERT INTO t (id, v) VALUES (1, 'red')")
         .await
         .unwrap();
@@ -310,7 +248,7 @@ async fn txn_overlay_and_commit_maintenance() {
 async fn unique_violation_at_commit() {
     let (mut node, mut c) = world("txn-uq").await;
     ddl(&mut c, "CREATE UNIQUE INDEX uq_n ON t (n)").await;
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
     c.query_drop("INSERT INTO t (id, n) VALUES (1, 10)")
         .await
         .unwrap();

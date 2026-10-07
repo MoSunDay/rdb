@@ -5,10 +5,10 @@
 //! literal computed from the group's rows ([`substitute_aggs`]); the
 //! rewritten tree then evaluates on the group's representative row.
 
-use crate::sql::exec::expr::{cmp_values, eval};
+use crate::sql::exec::expr::{bigint_out_of_range, cmp_values, eval};
 use crate::sql::exec::expr_decimal::{decimal_to_f64, div_decimal, rescale_decimal};
 use crate::sql::exec::scan::FromScope;
-use crate::sql::parse::ast::{AggFunc, Expr};
+use crate::sql::parse::ast::{AggFunc, CorrelatedKind, Expr};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::schema::Value;
 
@@ -77,7 +77,66 @@ fn substitute_aggs(e: &Expr, scope: &FromScope, u: &Unit) -> SqlResult<Expr> {
             pattern: Box::new(substitute_aggs(pattern, scope, u)?),
             negated: *negated,
         },
-        // Leaves (and Func, whose eval is an unsupported error anyway).
+        // Scalar-function wrappers aggregate through their arguments
+        // (`has_agg` already descends these): rewrite each arg so
+        // ROUND(SUM(x), 2) / COALESCE(SUM(x), 0) see the computed
+        // literal instead of a stray Agg node at Func evaluation.
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_aggs(a, scope, u))
+                .collect::<SqlResult<Vec<_>>>()?,
+        },
+        // CASE branches may aggregate (HAVING-style CASE WHEN COUNT..),
+        // so descend; CAST/REGEXP wrap a single expression each.
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|o| substitute_aggs(o, scope, u).map(Box::new))
+                .transpose()?,
+            branches: branches
+                .iter()
+                .map(|(c, t)| Ok((substitute_aggs(c, scope, u)?, substitute_aggs(t, scope, u)?)))
+                .collect::<SqlResult<Vec<_>>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|e| substitute_aggs(e, scope, u).map(Box::new))
+                .transpose()?,
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: Box::new(substitute_aggs(expr, scope, u)?),
+            to: *to,
+        },
+        // A bound correlated node: only an IN's left side can carry an
+        // aggregate of THIS query (`COUNT(*) IN (SELECT ...)`); keys
+        // are plain outer columns and cases are values.
+        Expr::Correlated { kind, keys, cases } => Expr::Correlated {
+            kind: match kind {
+                CorrelatedKind::In { lhs, negated } => CorrelatedKind::In {
+                    lhs: Box::new(substitute_aggs(lhs, scope, u)?),
+                    negated: *negated,
+                },
+                k => k.clone(),
+            },
+            keys: keys.clone(),
+            cases: cases.clone(),
+        },
+        Expr::Regexp {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Regexp {
+            expr: Box::new(substitute_aggs(expr, scope, u)?),
+            pattern: Box::new(substitute_aggs(pattern, scope, u)?),
+            negated: *negated,
+        },
+        // Leaves and hoisted subqueries: `has_agg` reports no
+        // aggregate of THIS query inside any of these shapes.
         other => other.clone(),
     })
 }
@@ -88,6 +147,7 @@ fn eval_aggregate(e: &Expr, scope: &FromScope, rows: &[Vec<Value>]) -> SqlResult
         func,
         arg,
         distinct,
+        sep,
     } = e
     else {
         unreachable!("caller checked the shape");
@@ -110,7 +170,23 @@ fn eval_aggregate(e: &Expr, scope: &FromScope, rows: &[Vec<Value>]) -> SqlResult
         AggFunc::Sum => sum_values(&vals),
         AggFunc::Avg => avg_values(&vals),
         AggFunc::Min | AggFunc::Max => Ok(min_max(&vals, matches!(func, AggFunc::Max))),
+        AggFunc::GroupConcat => group_concat(&vals, sep.as_deref().unwrap_or(",")),
     }
+}
+
+/// GROUP_CONCAT: every value renders in its canonical text form
+/// (`func::value_text`, the CONCAT coercion) and joins with the
+/// separator (default `,`); an all-NULL group is the empty string,
+/// like MySQL (NULL args were already skipped above).
+fn group_concat(vals: &[Value], sep: &str) -> SqlResult<Value> {
+    let mut out = String::new();
+    for v in vals {
+        if !out.is_empty() {
+            out.push_str(sep);
+        }
+        out.push_str(&crate::sql::exec::func::value_text(v)?);
+    }
+    Ok(Value::Str(out))
 }
 
 /// Whether every value is exact numeric (Int/Decimal, no Double).
@@ -127,14 +203,17 @@ fn sum_values(vals: &[Value]) -> SqlResult<Value> {
         return Ok(Value::Null); // SUM over no non-NULL rows is NULL
     }
     if vals.iter().all(|v| matches!(v, Value::Int(_))) {
-        // Overflow-promotion is out of scope for v1: i64 wrapping sum.
-        let sum = vals.iter().fold(0i64, |acc, v| {
+        // BIGINT SUM has no DECIMAL promotion in this engine, so an
+        // overflow is a loud 1690-style error, never a wrapped value.
+        let sum = vals.iter().try_fold(0i64, |acc, v| {
             let Value::Int(i) = v else {
                 unreachable!("checked")
             };
-            acc.wrapping_add(*i)
+            acc.checked_add(*i)
         });
-        return Ok(Value::Int(sum));
+        return sum
+            .map(Value::Int)
+            .ok_or_else(|| bigint_out_of_range("SUM(...)"));
     }
     // Decimal (alone or mixed with Int) sums exactly at the coarser
     // input scale; a Double anywhere keeps the double path below.
@@ -238,9 +317,16 @@ pub fn has_agg(e: &Expr) -> bool {
     match e {
         Expr::Agg { .. } => true,
         Expr::Lit(_) | Expr::Placeholder | Expr::Col { .. } => false,
+        Expr::InsertValues(_) => false,
         // Subqueries hoist out before evaluation; their aggregates
-        // belong to the inner query, not this one.
-        Expr::Subquery(_) | Expr::InSubquery { .. } => false,
+        // belong to the inner query, not this one. A bound correlated
+        // node's IN left side is evaluated HERE, so its aggregates do
+        // count (keys are plain outer columns).
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => false,
+        Expr::Correlated { kind, keys, .. } => {
+            keys.iter().any(has_agg)
+                || matches!(kind, CorrelatedKind::In { lhs, .. } if has_agg(lhs))
+        }
         Expr::BinaryOp { left, right, .. } => has_agg(left) || has_agg(right),
         Expr::Not(x) | Expr::Neg(x) => has_agg(x),
         Expr::IsNull { expr, .. } => has_agg(expr),
@@ -250,6 +336,17 @@ pub fn has_agg(e: &Expr) -> bool {
         } => has_agg(expr) || has_agg(low) || has_agg(high),
         Expr::Like { expr, pattern, .. } => has_agg(expr) || has_agg(pattern),
         Expr::Func { args, .. } => args.iter().any(has_agg),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(has_agg)
+                || branches.iter().any(|(c, t)| has_agg(c) || has_agg(t))
+                || else_expr.as_deref().is_some_and(has_agg)
+        }
+        Expr::Cast { expr, .. } => has_agg(expr),
+        Expr::Regexp { expr, pattern, .. } => has_agg(expr) || has_agg(pattern),
     }
 }
 

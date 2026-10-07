@@ -6,11 +6,17 @@
 pub mod ast;
 pub mod error;
 pub(crate) mod expr;
+pub(crate) mod func_forms;
+pub(crate) mod func_sig;
+pub(crate) mod order_keys;
+pub(crate) mod order_limit;
 pub(crate) mod query;
 pub(crate) mod session;
 pub mod starrocks;
 pub(crate) mod table;
 pub(crate) mod translate;
+pub(crate) mod translate_ddl;
+pub(crate) mod translate_dml;
 pub(crate) mod translate_type;
 
 pub use ast::*;
@@ -150,8 +156,8 @@ mod tests {
             q.items[1],
             SelectItem::Expr { ref alias, .. } if alias.as_deref() == Some("n")
         ));
-        assert_eq!(q.limit, Some(5));
-        assert_eq!(q.offset, 2);
+        assert_eq!(q.limit, Some(LimitValue::Const(5)));
+        assert_eq!(q.offset, LimitValue::Const(2));
         assert!(!q.order_by[0].asc);
     }
 
@@ -215,10 +221,13 @@ mod tests {
     fn temporal_typed_string_literals() {
         // DATE '...' / TIMESTAMP '...' ride as plain strings; the
         // engine coerces them on use (coerce/cmp parse the string).
-        let Statement::Insert { rows, .. } =
+        let Statement::Insert { source, .. } =
             stmt("INSERT INTO t (d) VALUES (DATE '2024-02-29'), (TIMESTAMP '2024-02-29 12:00:00')")
         else {
             panic!("shape");
+        };
+        let crate::sql::parse::ast::InsertSource::Values(rows) = source else {
+            panic!("values source");
         };
         assert_eq!(rows[0][0], Expr::Lit(Value::Str("2024-02-29".into())));
         assert_eq!(
@@ -344,7 +353,8 @@ mod tests {
                 expr: Expr::Agg {
                     func: AggFunc::Count,
                     arg: None,
-                    distinct: false
+                    distinct: false,
+                    ..
                 },
                 ..
             }
@@ -397,15 +407,58 @@ mod tests {
 
     #[test]
     fn unsupported_is_explicit() {
-        let e = parse_statement("SELECT * FROM t EXCEPT SELECT * FROM t2").expect_err("e");
+        // MINUS (non-standard) and BY NAME quantifiers stay rejected.
+        let e = parse_statement("SELECT * FROM t MINUS SELECT * FROM t2").expect_err("e");
         assert!(e.msg.contains("not supported"), "{e}");
-        assert!(parse_statement("SELECT * FROM t INTERSECT SELECT * FROM t2").is_err());
+        assert!(parse_statement("SELECT * FROM t UNION BY NAME SELECT * FROM t2").is_err());
         assert!(parse_statement("WITH RECURSIVE r (n) AS (SELECT 1) SELECT n FROM r").is_err());
-        // FROM-less SELECT and UNION are supported since phase 1.
+        // FROM-less SELECT, UNION, and since M3 INTERSECT / EXCEPT
+        // (each [ALL] / DISTINCT) all parse into the compound IR.
         assert!(parse_statement("SELECT 1").is_ok());
+        for op in [
+            "UNION",
+            "UNION ALL",
+            "INTERSECT",
+            "INTERSECT ALL",
+            "EXCEPT",
+            "EXCEPT DISTINCT",
+        ] {
+            let sql = format!("SELECT * FROM t {op} SELECT * FROM t2");
+            let stmt = parse_statement(&sql).unwrap_or_else(|e| panic!("{op}: {e}"));
+            let Statement::SelectCompound(cq) = stmt else {
+                panic!("compound");
+            };
+            let QueryBody::SetOp { op: got, all, .. } = &cq.body else {
+                panic!("set op body for {op}");
+            };
+            let want = match op {
+                s if s.starts_with("UNION") => crate::sql::parse::ast::SetOp::Union,
+                s if s.starts_with("INTERSECT") => crate::sql::parse::ast::SetOp::Intersect,
+                _ => crate::sql::parse::ast::SetOp::Except,
+            };
+            assert_eq!(*got, want, "{op}");
+            assert_eq!(*all, op.ends_with("ALL"), "{op}");
+        }
+        // mixed chains nest as the parser folds them (left-to-right).
+        let Statement::SelectCompound(cq) =
+            parse_statement("SELECT 1 UNION SELECT 2 EXCEPT SELECT 3").unwrap()
+        else {
+            panic!("compound");
+        };
+        let QueryBody::SetOp {
+            op: crate::sql::parse::ast::SetOp::Except,
+            left,
+            ..
+        } = &cq.body
+        else {
+            panic!("top op EXCEPT");
+        };
         assert!(matches!(
-            parse_statement("SELECT * FROM t UNION SELECT * FROM t2"),
-            Ok(Statement::SelectCompound(_))
+            left.as_ref(),
+            QueryBody::SetOp {
+                op: crate::sql::parse::ast::SetOp::Union,
+                ..
+            }
         ));
     }
 

@@ -6,76 +6,10 @@
 
 mod common;
 
+use common::mysql::{connect_root, int, rows, run, s};
 use common::{spawn_node_mysql, wait_mysql_ready, wait_resp_ready};
 use mysql_async::prelude::*;
-use mysql_async::{OptsBuilder, Value as MVal};
-
-const PASS: &str = "e2e-sql-pass";
-
-async fn connect(node: &common::ProcNode) -> mysql_async::Conn {
-    let port = node
-        .mysql
-        .rsplit(':')
-        .next()
-        .expect("mysql port")
-        .parse::<u16>()
-        .expect("mysql port digits");
-    let opts = || {
-        OptsBuilder::default()
-            .ip_or_hostname("127.0.0.1")
-            .tcp_port(port)
-            .user(Some("root"))
-            .pass(Some(PASS))
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match mysql_async::Conn::new(opts()).await {
-            Ok(c) => return c,
-            Err(mysql_async::Error::Io(_)) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("mysql connect: {e}"),
-        }
-    }
-}
-
-/// DDL and counter-bumping INSERTs are leader-only writes; the bootstrap
-/// node becomes leader within a second or two, so retry until it sticks.
-async fn run(conn: &mut mysql_async::Conn, sql: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match conn.query_drop(sql).await {
-            Ok(()) => return,
-            Err(e) => {
-                if std::time::Instant::now() < deadline && e.to_string().contains("leader") {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    continue;
-                }
-                panic!("run {sql}: {e}")
-            }
-        }
-    }
-}
-
-async fn rows(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<MVal>> {
-    let rs: Vec<mysql_async::Row> = conn.query(sql).await.expect(sql);
-    rs.into_iter()
-        .map(|r| {
-            (0..r.len())
-                .map(|i| r.get::<MVal, _>(i).unwrap_or(MVal::NULL))
-                .collect()
-        })
-        .collect()
-}
-
-/// Text-protocol cells are length-prefixed bytes, ints included.
-fn int(i: i64) -> MVal {
-    MVal::Bytes(i.to_string().into_bytes())
-}
-
-fn s(v: &str) -> MVal {
-    MVal::Bytes(v.as_bytes().to_vec())
-}
+use mysql_async::Value as MVal;
 
 async fn world(name: &str) -> (common::ProcNode, mysql_async::Conn) {
     let dir = std::env::temp_dir().join(format!("rdb-sql-ai-{name}-{}", std::process::id()));
@@ -84,7 +18,7 @@ async fn world(name: &str) -> (common::ProcNode, mysql_async::Conn) {
     let mut node = spawn_node_mysql(&dir, 0, true, None);
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut conn = connect(&node).await;
+    let mut conn = connect_root(&node).await;
     run(
         &mut conn,
         "CREATE TABLE ai (id BIGINT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64) NULL)",
@@ -188,7 +122,7 @@ async fn counter_survives_restart() {
     node.respawn();
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut c = connect(&node).await;
+    let mut c = connect_root(&node).await;
     run(&mut c, "INSERT INTO ai (v) VALUES ('post-restart')").await;
     let after = rows(&mut c, "SELECT id FROM ai WHERE v = 'post-restart'").await;
     assert_eq!(
@@ -279,7 +213,7 @@ async fn cluster_allocates_unique_ids_through_raft() {
     let nodes = common::start_sql_cluster(&dir, 3).await;
     // The helper asserts node0 leads first (and it keeps the leadership).
     let leader = 0;
-    let mut lc = connect(&nodes[leader]).await;
+    let mut lc = connect_root(&nodes[leader]).await;
     run(
         &mut lc,
         "CREATE TABLE ai (id BIGINT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64) NULL)",
@@ -312,7 +246,7 @@ async fn cluster_allocates_unique_ids_through_raft() {
     // Gather from every node: ids are unique by construction (each pk
     // arrives from exactly its slot owner), which is the assertion.
     for (i, node) in nodes.iter().enumerate() {
-        let mut c = connect(node).await;
+        let mut c = connect_root(node).await;
         let mut got: Vec<i64> = rows(&mut c, "SELECT id FROM ai")
             .await
             .into_iter()
@@ -328,7 +262,7 @@ async fn cluster_allocates_unique_ids_through_raft() {
 
     // Non-leaders refuse to allocate: same leader-only rule as DDL.
     let follower = (leader + 1) % nodes.len();
-    let mut fc = connect(&nodes[follower]).await;
+    let mut fc = connect_root(&nodes[follower]).await;
     let err = fc
         .query_drop("INSERT INTO ai (v) VALUES ('nope')")
         .await
@@ -358,7 +292,7 @@ async fn concurrent_inserts_hand_out_unique_ids() {
 
     let mut futs = Vec::new();
     for t in 0..4u8 {
-        let mut conn = connect(&node).await;
+        let mut conn = connect_root(&node).await;
         futs.push(async move {
             for i in 0..10 {
                 run(

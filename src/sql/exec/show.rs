@@ -1,22 +1,171 @@
-//! SHOW TABLES / SHOW COLUMNS: thin catalog reads rendered as rowsets.
+//! SHOW metadata surface: thin catalog/sysvar reads rendered as
+//! rowsets -- TABLES / COLUMNS / INDEX / CREATE TABLE / DATABASES /
+//! VARIABLES / STATUS (M4). Rendering is pure schema -> text; the
+//! sysvar table itself lives in `front::vars` (one source shared with
+//! the @@var query path).
 
-use crate::sql::exec::{ColMeta, ExecOutcome, SqlSession};
+use crate::sql::exec::{ColMeta, ExecOutcome, SqlSession, DEFAULT_DB};
+use crate::sql::front::vars;
 use crate::sql::parse::ast::Statement;
 use crate::sql::parse::error::{SqlError, SqlResult};
 use crate::sql::storage::catalog;
-use crate::sql::storage::schema::{SqlType, TableSchema, Value};
+use crate::sql::storage::schema::{Engine, KeyModel, SqlType, TableSchema, Value};
 use crate::state::Shared;
 
-/// Default schema name for the `Tables_in_<db>` column when no USE ran.
-const DEFAULT_DB: &str = "rdb";
+/// Server version the SHOW VARIABLES row reports (matches the
+/// handshake / `@@version`, `front::shim::SERVER_VERSION`).
+const SERVER_VERSION: &str = "8.0.32-rdb";
 
 pub fn run(shared: &Shared, sess: &SqlSession, stmt: &Statement) -> SqlResult<ExecOutcome> {
     match stmt {
         Statement::ShowTables => show_tables(shared, sess),
         Statement::ShowColumns(table) => show_columns(shared, table),
         Statement::ShowIndexes(table) => show_indexes(shared, table),
+        Statement::ShowCreateTable(table) => show_create_table(shared, table),
+        Statement::ShowDatabases => show_databases(sess),
+        Statement::ShowVariables { like } => Ok(show_kv(
+            "Variable_name",
+            vars::show_variables_rows(
+                like.as_deref(),
+                SERVER_VERSION,
+                &vars::SessionVars {
+                    isolation: sess.isolation.clone(),
+                },
+            ),
+        )),
+        Statement::ShowStatus { like } => Ok(show_kv(
+            "Variable_name",
+            vars::show_status_rows(like.as_deref()),
+        )),
         _ => unreachable!("dispatch maps only SHOW statements here"),
     }
+}
+
+/// The two-column Variable_name/Value rowset both VARIABLES and STATUS
+/// render (MySQL uses this shape for SHOW STATUS too).
+fn show_kv(header: &str, rows: Vec<(String, Value)>) -> ExecOutcome {
+    ExecOutcome::Rows {
+        columns: vec![
+            ColMeta::computed("", header, SqlType::VarChar),
+            ColMeta::computed("", "Value", SqlType::VarChar),
+        ],
+        rows: rows
+            .into_iter()
+            .map(|(name, value)| vec![Value::Str(name), render_kv_value(value)])
+            .collect(),
+    }
+}
+
+/// SHOW output is text: numbers render in their SQL literal form,
+/// strings pass through verbatim (MySQL SHOW cells are never quoted).
+fn render_kv_value(v: Value) -> Value {
+    Value::Str(match v {
+        Value::Null => String::new(),
+        Value::Int(i) => i.to_string(),
+        Value::Str(s) => s,
+        other => format!("{other:?}"),
+    })
+}
+
+fn show_databases(sess: &SqlSession) -> SqlResult<ExecOutcome> {
+    // Single-database model: the implicit default plus the session's
+    // USE target when one was picked (deduped, name-order stable).
+    let mut names = vec![DEFAULT_DB.to_string()];
+    if !sess.db.is_empty() && !sess.db.eq_ignore_ascii_case(DEFAULT_DB) {
+        names.push(sess.db.clone());
+    }
+    Ok(ExecOutcome::Rows {
+        columns: vec![ColMeta::computed("", "Database", SqlType::VarChar)],
+        rows: names.into_iter().map(|n| vec![Value::Str(n)]).collect(),
+    })
+}
+
+fn show_create_table(shared: &Shared, table: &str) -> SqlResult<ExecOutcome> {
+    let schema = catalog::lookup(shared, table)
+        .map_err(SqlError::from)?
+        .ok_or_else(|| SqlError::no_such_table(table))?;
+    Ok(ExecOutcome::Rows {
+        columns: vec![
+            ColMeta::computed("", "Table", SqlType::VarChar),
+            ColMeta::computed("", "Create Table", SqlType::VarChar),
+        ],
+        rows: vec![vec![
+            Value::Str(schema.name.clone()),
+            Value::Str(render_create_table(&schema)),
+        ]],
+    })
+}
+
+/// Canonical MySQL-style `CREATE TABLE` rendered from the stored
+/// schema. Deterministic (declaration-order columns, pk, then indexes
+/// by catalog order) and a ROUND TRIP: the rendered text re-parses and
+/// rebuilds an equivalent schema (unit-tested below). Engine clause:
+/// the row engine reports `InnoDB` (the stock default it behaves as),
+/// columnar reports itself (the ENGINE=columnar option).
+pub(crate) fn render_create_table(schema: &TableSchema) -> String {
+    let q = |s: &str| format!("`{s}`");
+    let mut out = format!(
+        "CREATE TABLE {} (
+",
+        q(&schema.name)
+    );
+    let mut lines = Vec::with_capacity(schema.columns.len() + 1 + schema.indexes.len());
+    for (i, c) in schema.columns.iter().enumerate() {
+        let mut line = format!("  {} {}", q(&c.name), type_name(c.sql_type));
+        let pk_col = schema.pk.iter().any(|p| p.eq_ignore_ascii_case(&c.name));
+        // Engine coercion makes pk columns NOT NULL already; render the
+        // stored nullability either way (round-trip re-derives it).
+        if c.nullable && !(pk_col && schema.key_model != KeyModel::Duplicate) {
+            line.push_str(" NULL DEFAULT NULL");
+        } else {
+            line.push_str(" NOT NULL");
+        }
+        if schema
+            .auto_increment
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&c.name))
+            && i == schema.auto_increment_index().unwrap_or(usize::MAX)
+        {
+            line.push_str(" AUTO_INCREMENT");
+        }
+        lines.push(line);
+    }
+    if !schema.pk.is_empty() && schema.key_model != KeyModel::Duplicate {
+        let cols: Vec<String> = schema.pk.iter().map(|p| q(p)).collect();
+        lines.push(format!("  PRIMARY KEY ({})", cols.join(", ")));
+    }
+    for idx in &schema.indexes {
+        let kind = if idx.unique { "UNIQUE KEY" } else { "KEY" };
+        lines.push(format!("  {} {} ({})", kind, q(&idx.name), q(&idx.column)));
+    }
+    out.push_str(&lines.join(
+        ",
+",
+    ));
+    out.push_str(
+        "
+)",
+    );
+    // StarRocks model clauses (schema-recorded): DUPLICATE KEY list
+    // and the distribution descriptor. The pre-parser re-lifts both.
+    if schema.key_model == KeyModel::Duplicate {
+        let cols: Vec<String> = schema.pk.iter().map(|p| q(p)).collect();
+        out.push_str(&format!(" DUPLICATE KEY({})", cols.join(", ")));
+        if let Some(d) = &schema.distribution {
+            let cols: Vec<String> = d.columns.iter().map(|c| q(c)).collect();
+            out.push_str(&format!(
+                " DISTRIBUTED BY HASH({}) BUCKETS {}",
+                cols.join(", "),
+                d.buckets
+            ));
+        }
+    }
+    let engine = match schema.engine {
+        Engine::Columnar => "columnar",
+        Engine::Row => "InnoDB",
+    };
+    out.push_str(&format!(" ENGINE={engine}"));
+    out
 }
 
 fn show_tables(shared: &Shared, sess: &SqlSession) -> SqlResult<ExecOutcome> {
@@ -154,163 +303,5 @@ pub(crate) fn type_name(t: SqlType) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sql::exec::ddl;
-    use crate::sql::parse::parse_statement;
-    use crate::state::testutil;
-
-    #[tokio::test]
-    async fn show_tables_lists_created_tables_with_db_column() {
-        let shared = testutil::shared_with(testutil::test_config());
-        ddl::run(
-            &shared,
-            parse_statement("CREATE TABLE b (id BIGINT PRIMARY KEY)").unwrap(),
-        )
-        .await
-        .unwrap();
-        ddl::run(
-            &shared,
-            parse_statement("CREATE TABLE a (id BIGINT PRIMARY KEY)").unwrap(),
-        )
-        .await
-        .unwrap();
-        // dropped tables disappear (tombstone filtered)
-        ddl::run(&shared, parse_statement("DROP TABLE b").unwrap())
-            .await
-            .unwrap();
-
-        let Ok(ExecOutcome::Rows { columns, rows }) = run(
-            &shared,
-            &SqlSession {
-                db: "mydb".into(),
-                ..Default::default()
-            },
-            &parse_statement("SHOW TABLES").unwrap(),
-        ) else {
-            panic!("rows");
-        };
-        assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0].name, "Tables_in_mydb");
-        assert_eq!(rows, vec![vec![Value::Str("a".into())]]);
-
-        // no USE ran -> default db name
-        let Ok(ExecOutcome::Rows { columns, .. }) = run(
-            &shared,
-            &SqlSession::default(),
-            &parse_statement("SHOW TABLES").unwrap(),
-        ) else {
-            panic!("rows");
-        };
-        assert_eq!(columns[0].name, "Tables_in_rdb");
-    }
-
-    #[tokio::test]
-    async fn show_columns_shape() {
-        let shared = testutil::shared_with(testutil::test_config());
-        ddl::run(
-            &shared,
-            parse_statement(
-                "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL, d DOUBLE NOT NULL, \
-                 amount DECIMAL(18,4) NULL)",
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let Ok(ExecOutcome::Rows { columns, rows }) = run(
-            &shared,
-            &SqlSession::default(),
-            &parse_statement("SHOW COLUMNS FROM t").unwrap(),
-        ) else {
-            panic!("rows");
-        };
-        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["Field", "Type", "Null", "Key", "Default", "Extra"]
-        );
-        let cell = |r: usize, c: usize| match &rows[r][c] {
-            Value::Str(s) => s.clone(),
-            other => panic!("str expected, got {other:?}"),
-        };
-        assert_eq!(cell(0, 0), "id");
-        assert_eq!(cell(0, 1), "bigint");
-        assert_eq!(cell(0, 2), "NO", "pk is implicitly NOT NULL");
-        assert_eq!(cell(0, 3), "PRI");
-        assert_eq!(cell(1, 0), "v");
-        assert_eq!(cell(1, 2), "YES");
-        assert_eq!(cell(1, 3), "", "unindexed column carries no Key marker");
-        assert_eq!(cell(2, 1), "double");
-        assert_eq!(cell(2, 2), "NO", "declared NOT NULL");
-        assert_eq!(cell(0, 4), "NULL");
-        // DECIMAL spells its full width/scale form.
-        assert_eq!(cell(3, 0), "amount");
-        assert_eq!(cell(3, 1), "decimal(18,4)");
-        assert_eq!(cell(3, 2), "YES");
-
-        // unknown table errors
-        let err = run(
-            &shared,
-            &SqlSession::default(),
-            &parse_statement("SHOW COLUMNS FROM nope").unwrap(),
-        )
-        .unwrap_err();
-        assert_eq!(err.code, crate::sql::parse::error::ErrorCode::NoSuchTable);
-    }
-
-    #[tokio::test]
-    async fn show_indexes_lists_pk_and_secondary() {
-        let shared = testutil::shared_with(testutil::test_config());
-        ddl::run(
-            &shared,
-            parse_statement(
-                "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL, n BIGINT NULL)",
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        ddl::run(
-            &shared,
-            parse_statement("CREATE INDEX idx_v ON t (v)").unwrap(),
-        )
-        .await
-        .unwrap();
-        ddl::run(
-            &shared,
-            parse_statement("CREATE UNIQUE INDEX uq_n ON t (n)").unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let stmt = parse_statement("SHOW INDEX FROM t").unwrap();
-        let Ok(ExecOutcome::Rows { rows, .. }) = run(&shared, &SqlSession::default(), &stmt) else {
-            panic!("rows");
-        };
-        let entry = |r: usize| match (&rows[r][1], &rows[r][2], &rows[r][4]) {
-            (Value::Int(nu), Value::Str(k), Value::Str(c)) => (*nu, k.clone(), c.clone()),
-            other => panic!("shape {other:?}"),
-        };
-        assert_eq!(entry(0), (0, "PRIMARY".to_string(), "id".to_string()));
-        assert_eq!(entry(1), (1, "idx_v".to_string(), "v".to_string()));
-        assert_eq!(entry(2), (0, "uq_n".to_string(), "n".to_string()));
-
-        // SHOW COLUMNS Key flags follow the index kinds
-        let Ok(ExecOutcome::Rows { rows, .. }) = run(
-            &shared,
-            &SqlSession::default(),
-            &parse_statement("SHOW COLUMNS FROM t").unwrap(),
-        ) else {
-            panic!("rows");
-        };
-        let flag = |r: usize| match &rows[r][3] {
-            Value::Str(s) => s.clone(),
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(flag(0), "PRI");
-        assert_eq!(flag(1), "MUL");
-        assert_eq!(flag(2), "UNI");
-    }
-}
+#[path = "show_tests.rs"]
+mod tests;

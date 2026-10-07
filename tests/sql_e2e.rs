@@ -5,84 +5,11 @@
 
 mod common;
 
-use common::{mysql_root_conn, spawn_node_mysql, wait_mysql_ready, wait_resp_ready};
+use common::mysql::{connect_root, ddl, int, rows, rows_ordered, s, ER_PARSE_ERROR, PASS};
+use common::{spawn_node_mysql, wait_mysql_ready, wait_resp_ready};
 use mysql_async::prelude::*;
-use mysql_async::{OptsBuilder, Value as MVal};
-
-const PASS: &str = "e2e-sql-pass";
-
-async fn connect(node: &common::ProcNode, user: &str, pass: &str) -> mysql_async::Conn {
-    let port = node
-        .mysql
-        .rsplit(':')
-        .next()
-        .expect("mysql port")
-        .parse::<u16>()
-        .expect("mysql port digits");
-    let opts = || {
-        OptsBuilder::default()
-            .ip_or_hostname("127.0.0.1")
-            .tcp_port(port)
-            .user(Some(user))
-            .pass(Some(pass))
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match mysql_async::Conn::new(opts()).await {
-            Ok(c) => return c,
-            Err(mysql_async::Error::Io(_)) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("mysql connect: {e}"),
-        }
-    }
-}
-
-/// DDL needs the raft leader; the bootstrap node becomes one within a
-/// second or two, so retry the first CREATE until it sticks.
-async fn ddl(conn: &mut mysql_async::Conn, sql: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match conn.query_drop(sql).await {
-            Ok(()) => return,
-            Err(e) => {
-                if std::time::Instant::now() < deadline && e.to_string().contains("leader") {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    continue;
-                }
-                panic!("ddl {sql}: {e}")
-            }
-        }
-    }
-}
-
-async fn rows(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<MVal>> {
-    let rs: Vec<mysql_async::Row> = conn.query(sql).await.expect(sql);
-    rs.into_iter()
-        .map(|r| {
-            (0..r.len())
-                .map(|i| r.get::<MVal, _>(i).unwrap_or(MVal::NULL))
-                .collect()
-        })
-        .collect()
-}
-
-async fn rows_ordered(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<MVal>> {
-    let mut r = rows(conn, sql).await;
-    // Queries below carry explicit ORDER BY; sort for stable comparisons.
-    r.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-    r
-}
-
-/// Text-protocol cells are always length-prefixed bytes on the wire,
-/// so mysql_async hands back `Value::Bytes` for ints too.
-fn int(i: i64) -> MVal {
-    MVal::Bytes(i.to_string().into_bytes())
-}
-
-fn s(v: &str) -> MVal {
-    MVal::Bytes(v.as_bytes().to_vec())
-}
+use mysql_async::OptsBuilder;
+use mysql_async::Value as MVal;
 
 #[tokio::test]
 async fn ddl_dml_select_full_flow() {
@@ -93,7 +20,7 @@ async fn ddl_dml_select_full_flow() {
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
 
-    let mut c = connect(&node, "root", PASS).await;
+    let mut c = connect_root(&node).await;
 
     // ---- DDL ----
     ddl(
@@ -227,6 +154,29 @@ async fn ddl_dml_select_full_flow() {
     let got = rows(&mut c, "SELECT name FROM users WHERE id = 10").await;
     assert_eq!(got, vec![vec![s("eva")]]);
 
+    // LIMIT ? OFFSET ? binds limit-then-offset (the text order):
+    // ids > 1 are 2, 3, 10; offset 1 skips 2, limit 2 takes 3 and 10.
+    let got: Vec<(i64,)> = c
+        .exec(
+            "SELECT id FROM users WHERE id > ? ORDER BY id LIMIT ? OFFSET ?",
+            (1i64, 2i64, 1i64),
+        )
+        .await
+        .expect("prepared limit offset");
+    assert_eq!(got, vec![(3,), (10,)]);
+
+    // the two-placeholder comma form (`LIMIT offset, count`) would
+    // bind the values swapped -- it rejects loudly at prepare time
+    let err = c
+        .exec::<mysql_async::Row, _, _>("SELECT id FROM users LIMIT ?, ?", (1i64, 2i64))
+        .await
+        .expect_err("LIMIT ?, ? must reject");
+    let mysql_async::Error::Server(e) = err else {
+        panic!("expected server error for LIMIT ?, ?");
+    };
+    assert_eq!(e.code, ER_PARSE_ERROR, "errno: {}", e.code);
+    assert!(e.message.contains("use LIMIT ? OFFSET ?"), "{}", e.message);
+
     // ---- EXPLAIN ----
     // (compare raw cells: mysql Value's Debug truncates Bytes to 8 chars)
     let got = rows(
@@ -326,7 +276,7 @@ async fn concurrent_create_tables_stay_isolated() {
 
     let mut conns: Vec<mysql_async::Conn> = Vec::new();
     for _ in 0..4 {
-        conns.push(mysql_root_conn(&node, PASS).await);
+        conns.push(connect_root(&node).await);
     }
 
     // 4 conns x 3 tables of their own, all in flight together: 12
@@ -348,8 +298,8 @@ async fn concurrent_create_tables_stay_isolated() {
     .await;
 
     // two conns race on the SAME name: exactly one wins
-    let mut ra = mysql_root_conn(&node, PASS).await;
-    let mut rb = mysql_root_conn(&node, PASS).await;
+    let mut ra = connect_root(&node).await;
+    let mut rb = connect_root(&node).await;
     let create = "CREATE TABLE shared_raced (id BIGINT PRIMARY KEY, tag VARCHAR(16))";
     let raced = futures::future::join_all([ra.query_drop(create), rb.query_drop(create)]).await;
     let mut winners = 0;

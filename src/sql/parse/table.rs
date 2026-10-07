@@ -1,6 +1,6 @@
 //! FROM-clause translation: tables, derived tables and joins.
 
-use sqlparser::ast::{JoinConstraint, JoinOperator, TableFactor, TableWithJoins};
+use sqlparser::ast::{JoinConstraint, JoinOperator, ObjectNamePart, TableFactor, TableWithJoins};
 
 use crate::sql::parse::ast::{Expr, JoinKind, TableRef};
 use crate::sql::parse::error::{SqlError, SqlResult};
@@ -16,10 +16,23 @@ pub(crate) fn translate_table_with_joins(twj: &TableWithJoins) -> SqlResult<Tabl
 
 fn translate_factor(f: &TableFactor) -> SqlResult<TableRef> {
     match f {
-        TableFactor::Table { name, alias, .. } => Ok(TableRef::Table {
-            name: object_name(name)?,
-            alias: alias.as_ref().map(|a| a.name.value.clone()),
-        }),
+        TableFactor::Table { name, alias, .. } => {
+            // `FROM DUAL` (case-insensitive, single-part, unaliased) is
+            // MySQL's no-table placeholder: same path as a FROM-less
+            // SELECT. A qualified `db.dual`, a `dual2`, or an aliased
+            // `dual d` stays an ordinary table name, like MySQL.
+            if alias.is_none()
+                && name.0.len() == 1
+                && matches!(&name.0[0], ObjectNamePart::Identifier(id)
+                    if id.value.eq_ignore_ascii_case("dual"))
+            {
+                return Ok(TableRef::NoTable);
+            }
+            Ok(TableRef::Table {
+                name: object_name(name)?,
+                alias: alias.as_ref().map(|a| a.name.value.clone()),
+            })
+        }
         TableFactor::Derived {
             lateral,
             subquery,

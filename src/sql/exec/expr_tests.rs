@@ -68,6 +68,74 @@ fn eval_null_semantics() {
     assert!(matches!(eval_str(&e), Ok(Value::Null)));
 }
 
+/// `<=>` is the one equality that never returns NULL.
+#[test]
+fn eval_null_safe_equality() {
+    use crate::sql::parse::ast::BinOp::NullSafeEq;
+    let bin = |l: Value, r: Value| {
+        eval_str(&Expr::BinaryOp {
+            left: Box::new(Expr::Lit(l)),
+            op: NullSafeEq,
+            right: Box::new(Expr::Lit(r)),
+        })
+    };
+    assert_eq!(bin(Value::Null, Value::Null), Ok(Value::Bool(true)));
+    assert_eq!(bin(Value::Int(1), Value::Null), Ok(Value::Bool(false)));
+    assert_eq!(bin(Value::Null, Value::Int(1)), Ok(Value::Bool(false)));
+    assert_eq!(bin(Value::Int(1), Value::Int(1)), Ok(Value::Bool(true)));
+    assert_eq!(bin(Value::Int(1), Value::Int(2)), Ok(Value::Bool(false)));
+    // Cross-domain equality keeps the plain `=` comparison rules.
+    assert_eq!(
+        bin(Value::Str("a".into()), Value::Str("a".into())),
+        Ok(Value::Bool(true))
+    );
+}
+
+/// XOR is three-valued: NULL on either side is NULL, otherwise the
+/// truth values' inequality.
+#[test]
+fn eval_logical_xor_three_valued() {
+    use crate::sql::parse::ast::BinOp::LogicalXor;
+    let bin = |l: Value, r: Value| {
+        eval_str(&Expr::BinaryOp {
+            left: Box::new(Expr::Lit(l)),
+            op: LogicalXor,
+            right: Box::new(Expr::Lit(r)),
+        })
+    };
+    assert_eq!(
+        bin(Value::Bool(true), Value::Bool(false)),
+        Ok(Value::Bool(true))
+    );
+    assert_eq!(
+        bin(Value::Bool(true), Value::Bool(true)),
+        Ok(Value::Bool(false))
+    );
+    assert_eq!(bin(Value::Int(1), Value::Int(0)), Ok(Value::Bool(true)));
+    assert_eq!(bin(Value::Null, Value::Bool(true)), Ok(Value::Null));
+    assert_eq!(bin(Value::Bool(false), Value::Null), Ok(Value::Null));
+}
+
+/// Bit operators ride eval_binop into the u64 helpers (func/numeric
+/// covers the value-level semantics in depth).
+#[test]
+fn eval_bitops_through_binop() {
+    use crate::sql::parse::ast::BinOp::*;
+    let bin = |op: BinOp, l: i64, r: i64| {
+        eval_str(&Expr::BinaryOp {
+            left: Box::new(Expr::Lit(Value::Int(l))),
+            op,
+            right: Box::new(Expr::Lit(Value::Int(r))),
+        })
+    };
+    assert_eq!(bin(BitAnd, 6, 3), Ok(Value::Int(2)));
+    assert_eq!(bin(BitOr, 6, 3), Ok(Value::Int(7)));
+    assert_eq!(bin(BitXor, 6, 3), Ok(Value::Int(5)));
+    assert_eq!(bin(Shl, 1, 4), Ok(Value::Int(16)));
+    assert_eq!(bin(Shr, 16, 4), Ok(Value::Int(1)));
+    assert_eq!(bin(BitAnd, -1, 255), Ok(Value::Int(255)));
+}
+
 #[test]
 fn coerce_types() {
     assert!(matches!(
@@ -196,26 +264,8 @@ fn temporal_arith_errors_loudly() {
     assert_eq!(e.msg, "DATE/DATETIME values do not support arithmetic");
 }
 
-#[test]
-fn clock_functions_smoke() {
-    // Kind only -- the value moves with the wall clock. (Function
-    // names arrive lowercased from the translator.)
-    assert!(matches!(eval_func("now", &[]), Ok(Value::DateTime(_))));
-    assert!(matches!(
-        eval_func("current_timestamp", &[Value::Int(6)]),
-        Ok(Value::DateTime(_))
-    ));
-    assert!(matches!(
-        eval_func("localtimestamp", &[]),
-        Ok(Value::DateTime(_))
-    ));
-    assert!(matches!(eval_func("curdate", &[]), Ok(Value::Date(_))));
-    assert!(matches!(
-        eval_func("current_date", &[Value::Int(0)]),
-        Ok(Value::Date(_))
-    ));
-    assert!(eval_func("now", &[Value::Int(1), Value::Int(2)]).is_err());
-}
+// Clock/length/abs function tests moved to exec/func/*_tests.rs with
+// the family split (same assertions, eval_func entry).
 
 /// NOT routes through three-valued logic: NOT NULL stays unknown
 /// (it used to collapse NULL to FALSE and report TRUE).
@@ -284,39 +334,59 @@ fn in_null_semantics() {
     ));
 }
 
-/// MySQL LENGTH() counts BYTES, CHAR_LENGTH() counts characters.
+/// Integer arithmetic is checked: overflow at the i64 rails raises the
+/// MySQL-1690-style error instead of silently wrapping; div/mod by
+/// zero stay NULL (the documented deviation) and MIN % -1 is an exact
+/// 0 that fits.
 #[test]
-fn length_counts_bytes_char_length_counts_chars() {
-    // 'héllo': 5 chars, 6 bytes (é is two bytes in utf-8).
-    assert_eq!(
-        eval_func("length", &[Value::Str("h\u{e9}llo".into())]),
-        Ok(Value::Int(6))
-    );
-    assert_eq!(
-        eval_func("char_length", &[Value::Str("h\u{e9}llo".into())]),
-        Ok(Value::Int(5))
-    );
-    assert!(matches!(
-        eval_func("length", &[Value::Null]),
-        Ok(Value::Null)
-    ));
-}
-
-/// Integer div/mod wrap like Add/Sub/Mul: MIN / -1 must not panic
-/// (divide-by-zero still evaluates to NULL).
-#[test]
-fn eval_int_div_mod_wrap_extremes() {
+fn eval_int_overflow_is_loud() {
     use crate::sql::parse::ast::BinOp::*;
+    use crate::sql::parse::error::ErrorCode;
     let bin = |op: BinOp, l: Expr, r: Expr| Expr::BinaryOp {
         left: Box::new(l),
         op,
         right: Box::new(r),
     };
     let lit = |i: i64| Expr::Lit(Value::Int(i));
+    let max = i64::MAX;
     let min = i64::MIN;
-    assert_eq!(eval_str(&bin(Div, lit(min), lit(-1))), Ok(Value::Int(min)));
-    assert_eq!(eval_str(&bin(Mod, lit(min), lit(-1))), Ok(Value::Int(0)));
-    // divide / modulo by zero stays NULL
+    // Add/Sub/Mul at both rails: code + 1690 wording with the
+    // rendered operation.
+    for (op, sym, l, r) in [
+        (Add, "+", max, 1),
+        (Add, "+", min, -1),
+        (Sub, "-", min, 1),
+        (Sub, "-", max, -1),
+        (Mul, "*", max, 2),
+        (Mul, "*", min, 2),
+        // MIN * -1 is +2^63, one past MAX: also out of range.
+        (Mul, "*", min, -1),
+    ] {
+        let e = eval_str(&bin(op, lit(l), lit(r))).unwrap_err();
+        assert_eq!(e.code, ErrorCode::WrongValue, "({l} {sym} {r})");
+        assert_eq!(
+            e.msg,
+            format!("BIGINT value is out of range in '({l} {sym} {r})'")
+        );
+    }
+    // Non-overflowing extremes are unchanged (Mul keeps MIN in range).
+    assert_eq!(
+        eval_str(&bin(Add, lit(max), lit(-1))),
+        Ok(Value::Int(max - 1))
+    );
+    assert_eq!(
+        eval_str(&bin(Sub, lit(min), lit(-1))),
+        Ok(Value::Int(min + 1))
+    );
+    assert_eq!(eval_str(&bin(Mul, lit(min), lit(1))), Ok(Value::Int(min)));
+    // Div: MIN / -1 overflows loudly...
+    let e = eval_str(&bin(Div, lit(min), lit(-1))).unwrap_err();
+    assert_eq!(e.code, ErrorCode::WrongValue);
+    assert_eq!(
+        e.msg,
+        "BIGINT value is out of range in '(-9223372036854775808 / -1)'"
+    );
+    // ...while divide / modulo by zero stays NULL.
     assert!(matches!(
         eval_str(&bin(Div, lit(7), lit(0))),
         Ok(Value::Null)
@@ -325,6 +395,8 @@ fn eval_int_div_mod_wrap_extremes() {
         eval_str(&bin(Mod, lit(7), lit(0))),
         Ok(Value::Null)
     ));
+    // MIN % -1 is mathematically 0 and fits.
+    assert_eq!(eval_str(&bin(Mod, lit(min), lit(-1))), Ok(Value::Int(0)));
     // ordinary division and modulo are unchanged
     assert!(matches!(
         eval_str(&bin(Div, lit(7), lit(2))),
@@ -334,6 +406,36 @@ fn eval_int_div_mod_wrap_extremes() {
         eval_str(&bin(Mod, lit(7), lit(2))),
         Ok(Value::Int(1))
     ));
+}
+
+/// Neg at the rails: i64::MIN (and the i128::MIN decimal mantissa)
+/// have no positive peer and fail loudly; ordinary negation of Int,
+/// Double and Decimal is unchanged.
+#[test]
+fn eval_neg_extremes() {
+    use crate::sql::parse::error::ErrorCode;
+    let neg = |v: Value| eval_str(&Expr::Neg(Box::new(Expr::Lit(v))));
+    let e = neg(Value::Int(i64::MIN)).unwrap_err();
+    assert_eq!(e.code, ErrorCode::WrongValue);
+    assert_eq!(
+        e.msg,
+        "BIGINT value is out of range in '(- -9223372036854775808)'"
+    );
+    assert_eq!(neg(Value::Int(i64::MAX)), Ok(Value::Int(i64::MIN + 1)));
+    assert_eq!(neg(Value::Int(0)), Ok(Value::Int(0)));
+    assert_eq!(neg(Value::Double(1.5)), Ok(Value::Double(-1.5)));
+    assert_eq!(neg(Value::Decimal(150, 2)), Ok(Value::Decimal(-150, 2)));
+    // The i128::MIN mantissa is not reachable through an SQL literal
+    // (exact literals cap at 38 significant digits), but the value
+    // domain allows it: negation must be loud, never wrapped.
+    let e = neg(Value::Decimal(i128::MIN, 0)).unwrap_err();
+    assert_eq!(e.code, ErrorCode::WrongValue);
+    assert_eq!(
+        e.msg,
+        "BIGINT value is out of range in \
+         '(- -170141183460469231731687303715884105728)'"
+    );
+    assert!(matches!(neg(Value::Null), Ok(Value::Null)));
 }
 
 /// Minimal-but-correct decimal semantics of this batch: exact i128
@@ -528,29 +630,6 @@ fn eval_division_decimal_scale_and_rounding() {
         bin(Div, Value::Decimal(i128::MAX, 0), d(1, 38)),
         Ok(Value::Double(_))
     ));
-}
-
-// ABS keeps the input scale and mirrors the i128::MIN guard the other
-// decimal helpers share.
-#[test]
-fn eval_abs_decimal() {
-    let f = |v: Value| {
-        eval(
-            &Expr::Func {
-                name: "abs".into(),
-                args: vec![Expr::Lit(v)],
-            },
-            &Scope,
-            &[],
-        )
-    };
-    assert_eq!(f(Value::Decimal(-150, 2)), Ok(Value::Decimal(150, 2)));
-    assert_eq!(f(Value::Decimal(150, 2)), Ok(Value::Decimal(150, 2)));
-    assert_eq!(f(Value::Decimal(0, 4)), Ok(Value::Decimal(0, 4)));
-    assert_eq!(
-        f(Value::Decimal(i128::MIN, 2)).unwrap_err().code,
-        ErrorCode::WrongValue
-    );
 }
 
 // The column width is enforced after rounding, so a value that fits

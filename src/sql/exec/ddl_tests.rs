@@ -250,10 +250,11 @@ async fn create_and_drop_index_keeps_ids_stable() {
     ));
 }
 
-/// Monotone table ids (audit fix): DROP writes the dropped id as
-/// the tombstone value, so a re-created table -- same name or any
-/// other -- never reuses an issued id and can never alias the old
-/// table's orphaned row bytes. Runs the real CREATE/DROP path.
+/// Monotone table ids (audit fix): DROP writes an id-less name
+/// tombstone PLUS the `sql_dropped/<id>` side marker, so a re-created
+/// table -- same name or any other -- never reuses an issued id and
+/// can never alias the old table's orphaned row bytes. Runs the real
+/// CREATE/DROP path.
 #[tokio::test]
 async fn table_ids_stay_monotone_across_drop_recreate() {
     let shared = testutil::shared_with(testutil::test_config());
@@ -295,10 +296,11 @@ async fn table_ids_stay_monotone_across_drop_recreate() {
     .unwrap();
     assert_eq!(catalog::lookup(&shared, "v").unwrap().unwrap().id, 4);
 
-    // Tombstones live under the table-name key, so re-creating "t"
-    // replaced id 1's tombstone with the live id-2 schema -- safe,
-    // because 2 now bounds allocation. Only u's tombstone survives.
-    assert_eq!(catalog::dropped_ids(&shared), vec![3]);
+    // Dropped ids retire under `sql_dropped/<id>`, so re-creating "t"
+    // (live id 2 now) does NOT erase id 1's record: both the original
+    // t and u stay retired, keeping GC reclamation and id monotonicity
+    // correct across same-name recreates.
+    assert_eq!(catalog::dropped_ids(&shared), vec![1, 3]);
 }
 
 /// DECIMAL columns land on the row engine (storage/encoding batch);

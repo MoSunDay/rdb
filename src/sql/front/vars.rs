@@ -92,6 +92,18 @@ pub fn sysvar_value(name: &str, version: &str, session: &SessionVars) -> Option<
                 .clone()
                 .unwrap_or_else(|| "REPEATABLE-READ".to_string()),
         )),
+        // Common ORM/driver probes (M4): values that are true of this
+        // server (auto-increment stepping is the engine's own), or the
+        // documented static defaults (max_connections has no configured
+        // bound; MySQL's stock default 151 is reported verbatim).
+        "auto_increment_increment" | "auto_increment_offset" => Some(Value::Int(1)),
+        "character_set_database" => Some(Value::Str("utf8mb4".to_string())),
+        // Comparisons are bytewise (COMPAT.md): the *_bin collation is
+        // the honest name for that.
+        "collation_connection" | "collation_server" => Some(Value::Str("utf8mb4_bin".to_string())),
+        "init_connect" => Some(Value::Str(String::new())),
+        "max_connections" => Some(Value::Int(151)),
+        "performance_schema" => Some(Value::Int(0)),
         _ => None,
     }
 }
@@ -123,6 +135,95 @@ pub fn sysvar_outcome(
         columns,
         rows: vec![row],
     })
+}
+
+/// Every variable name `sysvar_value` can answer, in stable (sorted)
+/// order -- the SHOW VARIABLES row source. Keep in lockstep with the
+/// match arms above.
+pub fn sysvar_names() -> &'static [&'static str] {
+    &[
+        "autocommit",
+        "auto_increment_increment",
+        "auto_increment_offset",
+        "character_set_client",
+        "character_set_connection",
+        "character_set_database",
+        "character_set_results",
+        "collation_connection",
+        "collation_server",
+        "init_connect",
+        "interactive_timeout",
+        "lower_case_table_names",
+        "max_allowed_packet",
+        "max_connections",
+        "net_read_timeout",
+        "net_write_timeout",
+        "performance_schema",
+        "socket",
+        "sql_mode",
+        "time_zone",
+        "transaction_isolation",
+        "tx_isolation",
+        "version",
+        "version_comment",
+        "wait_timeout",
+    ]
+}
+
+/// The SHOW STATUS row source: only counters the server can answer
+/// HONESTLY. `Uptime` is wall-clock seconds since process start (the
+/// one lazy constant); no load/connection counters are fabricated --
+/// there is no connection registry yet, so they are absent rather than
+/// hard-coded zeros.
+pub fn status_names() -> &'static [&'static str] {
+    &["Uptime"]
+}
+
+fn process_start() -> std::time::Instant {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
+/// Value of one status variable (see [`status_names`]).
+pub fn status_value(name: &str) -> Option<Value> {
+    match name {
+        "Uptime" => Some(Value::Int(
+            i64::try_from(process_start().elapsed().as_secs()).unwrap_or(i64::MAX),
+        )),
+        _ => None,
+    }
+}
+
+/// SHOW ... LIKE filter, MySQL convention: `_` (one char) and `%`
+/// (any run) wildcards over a CASE-INSENSITIVE compare (SHOW-only;
+/// data LIKE stays bytewise, gap-matrix decision 3).
+pub fn show_like_match(name: &str, pattern: &str) -> bool {
+    crate::sql::exec::expr::like_match(&name.to_ascii_lowercase(), &pattern.to_ascii_lowercase())
+}
+
+/// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pat']`: the whole sysvar
+/// table (the scope keywords are cosmetic -- variables are static),
+/// filtered by the optional pattern.
+pub fn show_variables_rows(
+    like: Option<&str>,
+    version: &str,
+    session: &SessionVars,
+) -> Vec<(String, Value)> {
+    sysvar_names()
+        .iter()
+        .filter(|n| like.is_none_or(|p| show_like_match(n, p)))
+        .filter_map(|n| sysvar_value(n, version, session).map(|v| ((*n).to_string(), v)))
+        .collect()
+}
+
+/// `SHOW [GLOBAL|SESSION] STATUS [LIKE 'pat']`: the honest status
+/// subset over the same filter.
+pub fn show_status_rows(like: Option<&str>) -> Vec<(String, Value)> {
+    status_names()
+        .iter()
+        .filter(|n| like.is_none_or(|p| show_like_match(n, p)))
+        .filter_map(|n| status_value(n).map(|v| ((*n).to_string(), v)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -202,6 +303,54 @@ mod tests {
             // snapshot reads = REPEATABLE READ).
             assert_eq!(rows[0][0], Value::Str("REPEATABLE-READ".to_string()));
         }
+    }
+
+    #[test]
+    fn show_like_match_follows_mysql_convention() {
+        // % and _ wildcards, case-insensitive (SHOW-only folding)
+        assert!(show_like_match("wait_timeout", "wait%"));
+        assert!(show_like_match("wait_timeout", "WAIT%"));
+        assert!(show_like_match("version", "VERS%"));
+        assert!(show_like_match("version", "%ION"));
+        assert!(show_like_match("version", "vers_on"));
+        assert!(!show_like_match("version", "vers__on"));
+        assert!(!show_like_match("wait_timeout", "net%"));
+    }
+
+    #[test]
+    fn show_variables_rows_filter_and_completeness() {
+        let all = show_variables_rows(None, "8.0.32-rdb", &SessionVars::default());
+        // every name the table claims is answerable
+        assert_eq!(all.len(), sysvar_names().len());
+        // (non-Null values only; SHOW renders them as text at exec)
+        // LIKE filters by prefix; values render as stored
+        let wait = show_variables_rows(Some("wait%"), "8.0.32-rdb", &SessionVars::default());
+        assert_eq!(wait.len(), 1);
+        assert_eq!(wait[0].0, "wait_timeout");
+        assert_eq!(wait[0].1, Value::Int(28_800));
+        // session-scoped value rides through the SHOW path too
+        let iso = show_variables_rows(
+            Some("transaction_isolation"),
+            "8.0.32-rdb",
+            &SessionVars {
+                isolation: Some("READ-COMMITTED".to_string()),
+            },
+        );
+        assert_eq!(iso[0].1, Value::Str("READ-COMMITTED".to_string()));
+        // a filter matching nothing is an empty rowset, not an error
+        assert!(
+            show_variables_rows(Some("zzz%"), "8.0.32-rdb", &SessionVars::default()).is_empty()
+        );
+    }
+
+    #[test]
+    fn show_status_rows_are_the_honest_subset() {
+        let rows = show_status_rows(None);
+        assert_eq!(rows.len(), 1, "only answerable counters are listed");
+        assert_eq!(rows[0].0, "Uptime");
+        assert!(matches!(rows[0].1, Value::Int(_)));
+        assert_eq!(show_status_rows(Some("zzz%")).len(), 0);
+        assert_eq!(show_status_rows(Some("uptime")).len(), 1, "case-folded");
     }
 
     #[test]

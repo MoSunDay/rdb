@@ -18,6 +18,11 @@ pub enum Statement {
         /// StarRocks table model lifted by the pre-parser (`None` for
         /// plain MySQL DDL; see `parse::starrocks`).
         starrocks: Option<crate::sql::parse::starrocks::StarRocksModel>,
+        /// Inline `KEY idx (col)` / `UNIQUE KEY uq (col)` constraints:
+        /// single-column indexes declared with the table. They land as
+        /// real index entries right after the schema put (same path as
+        /// CREATE INDEX; the fresh table has nothing to backfill).
+        indexes: Vec<InlineIndex>,
     },
     DropTable {
         name: String,
@@ -35,10 +40,30 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    /// `TRUNCATE [TABLE] t`: DDL semantics (decision point 5 of the
+    /// mysql-gap plan) -- rejected inside an open txn like every DDL,
+    /// not rollbackable, wipes rows/indexes/columnar segments and
+    /// resets AUTO_INCREMENT (implemented as a same-name table-id
+    /// swap, see `exec::ddl_alter`).
+    TruncateTable {
+        name: String,
+    },
+    /// `RENAME TABLE a TO b` / `ALTER TABLE a RENAME [TO|AS] b`:
+    /// catalog-only rename; `table_id` and every physical key stay
+    /// put, so data/indexes/auto-increment survive in place.
+    RenameTable {
+        from: String,
+        to: String,
+    },
+    /// INSERT (and its MySQL conflict forms REPLACE / ON DUPLICATE KEY
+    /// UPDATE): `columns` is the explicit column list (empty =
+    /// positional over every table column), `source` the row source,
+    /// `conflict` the conflict semantics.
     Insert {
         table: String,
         columns: Vec<String>,
-        rows: Vec<Vec<Expr>>,
+        source: InsertSource,
+        conflict: ConflictAction,
     },
     Select(Query),
     Update {
@@ -81,12 +106,36 @@ pub enum Statement {
     ShowColumns(String),
     /// SHOW INDEX FROM <table> (sqlparser parses it as ShowVariable).
     ShowIndexes(String),
+    /// SHOW CREATE TABLE <table>: canonical MySQL-style DDL rendered
+    /// from the stored schema (re-executable round trip).
+    ShowCreateTable(String),
+    /// SHOW DATABASES: the single-database model lists the default db
+    /// (plus the USE target when the session picked one).
+    ShowDatabases,
+    /// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pat']` (the scope
+    /// keywords are accepted and ignored -- variables are static).
+    ShowVariables {
+        like: Option<String>,
+    },
+    /// `SHOW [GLOBAL|SESSION] STATUS [LIKE 'pat']` over the minimal
+    /// honest status subset (no fabricated load counters).
+    ShowStatus {
+        like: Option<String>,
+    },
     /// SET ...: accepted and ignored (no session variables in v1).
     SetIgnored,
     /// A compound query: optional CTEs, a set-operation body
     /// (UNION [ALL]) or a single SELECT, plus trailing ORDER BY /
     /// LIMIT that apply to the whole compound.
     SelectCompound(Box<CompoundQuery>),
+}
+
+/// One inline CREATE TABLE index constraint (`KEY` / `UNIQUE KEY`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlineIndex {
+    pub name: String,
+    pub column: String,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +148,39 @@ pub struct ColumnSpec {
     pub auto_increment: bool,
 }
 
+/// Row source of an INSERT. `INSERT ... SET c = e` normalizes to one
+/// [`InsertSource::Values`] row at translate time (the SET form is
+/// exactly a named single-row VALUES list).
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    /// `VALUES (e, ...), (e, ...)`: per-row expressions, evaluated
+    /// with no row context (column references reject).
+    Values(Vec<Vec<Expr>>),
+    /// `INSERT ... SELECT ...`: a compound query materialized to
+    /// completion BEFORE any write of the statement lands, so
+    /// `INSERT INTO t SELECT ... FROM t` reads the pre-statement
+    /// snapshot.
+    Select(Box<CompoundQuery>),
+}
+
+/// Conflict semantics of an INSERT against existing rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictAction {
+    /// Plain INSERT: a pk collision keeps the historical silent
+    /// last-writer-wins upsert (the StarRocks PRIMARY KEY model; see
+    /// `exec::write`), a unique-index collision still rejects 1062.
+    /// ODKU/REPLACE below are the EXPLICIT conflict paths.
+    Error,
+    /// `ON DUPLICATE KEY UPDATE assignments`: the first conflicting
+    /// live row (pk first, then unique indexes in column order) takes
+    /// the UPDATE branch; `VALUES(col)` in an assignment (IR:
+    /// [`Expr::InsertValues`]) reads the incoming row's column.
+    OnDuplicate(Vec<(String, Expr)>),
+    /// `REPLACE INTO`: delete every conflicting row (pk + unique
+    /// hits), then insert the incoming row.
+    Replace,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub items: Vec<SelectItem>,
@@ -107,8 +189,8 @@ pub struct Query {
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
     pub order_by: Vec<OrderKey>,
-    pub limit: Option<u64>,
-    pub offset: u64,
+    pub limit: Option<LimitValue>,
+    pub offset: LimitValue,
     pub distinct: bool,
     /// Trailing locking clause (`FOR UPDATE` / `FOR SHARE`): metadata
     /// only -- the result shape is unchanged; the executor takes row
@@ -123,6 +205,37 @@ pub enum LockRead {
     ForShare,
 }
 
+/// LIMIT / OFFSET value: a numeric literal, or a `?` placeholder that
+/// survives `bind_placeholders` (which turns it into a bound literal)
+/// and is coerced to u64 once, at execution time -- MySQL
+/// prepared-statement `LIMIT ?` / `OFFSET ?`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LimitValue {
+    Const(u64),
+    /// Boxed: `Statement::Select(Query)` must not grow past the
+    /// variant-size lint threshold (clippy -D warnings in CI).
+    Param(Box<Expr>),
+}
+
+impl LimitValue {
+    /// LIMIT/OFFSET absent: the zero placeholder every query without
+    /// an OFFSET clause carries.
+    pub fn zero() -> LimitValue {
+        LimitValue::Const(0)
+    }
+}
+
+impl ConflictAction {
+    /// The assignment list of `ON DUPLICATE KEY UPDATE` (None for the
+    /// plain and REPLACE forms).
+    pub fn assignments(&self) -> Option<&[(String, Expr)]> {
+        match self {
+            ConflictAction::OnDuplicate(a) => Some(a),
+            ConflictAction::Error | ConflictAction::Replace => None,
+        }
+    }
+}
+
 /// Top-level query expression: CTE scope, set-operation body, and
 /// the trailing ORDER BY / LIMIT / OFFSET owned by the outermost
 /// query (inner operands carry none).
@@ -133,24 +246,45 @@ pub struct CompoundQuery {
     pub ctes: Vec<Cte>,
     pub body: QueryBody,
     pub order_by: Vec<OrderKey>,
-    pub limit: Option<u64>,
-    pub offset: u64,
+    pub limit: Option<LimitValue>,
+    pub offset: LimitValue,
 }
 
-/// Set-operation tree over plain SELECTs. Only UNION [ALL] is
-/// supported (INTERSECT / EXCEPT / MINUS reject at parse time).
+/// Set-operation tree over plain SELECTs: UNION / INTERSECT / EXCEPT,
+/// each `[ALL]` (plain = DISTINCT). MySQL has no INTERSECT precedence
+/// rule: mixed chains evaluate exactly as the parser nests them
+/// (sqlparser folds same-precedence chains left-to-right).
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryBody {
     Select(Box<Query>),
     /// A parenthesized full query `(SELECT ... ORDER BY ... LIMIT
     /// ...)`: evaluated as its own compound, own trailing clauses.
     Nested(Box<CompoundQuery>),
-    Union {
+    SetOp {
+        op: SetOp,
         left: Box<QueryBody>,
         right: Box<QueryBody>,
-        /// `UNION ALL` keeps duplicates; plain `UNION` dedups.
+        /// `... ALL` keeps duplicates; plain / `DISTINCT` dedups.
         all: bool,
     },
+}
+
+/// One set operator. `MINUS` stays rejected at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl std::fmt::Display for SetOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SetOp::Union => "UNION",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        })
+    }
 }
 
 /// One non-recursive common table expression.
@@ -222,6 +356,9 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// GROUP_CONCAT: `sep` rides on the [`Expr::Agg`] node (a call
+    /// property, not a function kind).
+    GroupConcat,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,6 +396,25 @@ pub enum Expr {
         query: Box<CompoundQuery>,
         negated: bool,
     },
+    /// `[NOT] EXISTS (SELECT ...)`: true iff the subquery yields at
+    /// least one row. Uncorrelated forms fold to a literal at
+    /// rewrite time; correlated ones become [`Expr::Correlated`].
+    Exists {
+        query: Box<CompoundQuery>,
+        negated: bool,
+    },
+    /// A correlated subquery's result, pre-computed per distinct
+    /// outer-row binding by `exec::correlated::bind` (pure data, no
+    /// storage access at evaluation time). `keys` are outer-scope
+    /// expressions; evaluating them against the current row picks the
+    /// matching `cases` entry (entries were computed for every key
+    /// tuple the outer rows produce, so a miss falls back to the
+    /// SQL default: NULL scalar / false EXISTS / empty IN set).
+    Correlated {
+        kind: CorrelatedKind,
+        keys: Vec<Expr>,
+        cases: Vec<(Vec<Value>, CorrelatedOut)>,
+    },
     Between {
         expr: Box<Expr>,
         low: Box<Expr>,
@@ -270,20 +426,75 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END` (both forms).
+    /// `operand` present = simple CASE (WHEN values compare `=`);
+    /// absent = searched CASE (WHEN conditions must be true).
+    Case {
+        operand: Option<Box<Expr>>,
+        /// (WHEN condition-or-value, THEN result) pairs, in order.
+        branches: Vec<(Expr, Expr)>,
+        else_expr: Option<Box<Expr>>,
+    },
+    /// `CAST(expr AS spec)` / `CONVERT(expr, spec)`. `spec` is the
+    /// narrow MySQL cast target set the storage layer can express.
+    Cast {
+        expr: Box<Expr>,
+        to: CastSpec,
+    },
+    /// `expr [NOT] REGEXP|RLIKE pattern` (byte-oriented regex match).
+    Regexp {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+    },
     Agg {
         func: AggFunc,
         arg: Option<Box<Expr>>,
         distinct: bool,
+        /// GROUP_CONCAT separator (default `,` when None); other
+        /// aggregates ignore it.
+        sep: Option<String>,
     },
     Func {
         name: String,
         args: Vec<Expr>,
     },
+    /// `VALUES(col)` inside an ON DUPLICATE KEY UPDATE assignment: the
+    /// INCOMING row's value of `col`. Only `parse::translate_dml`
+    /// produces it (a `VALUES()` call anywhere else is a parse error)
+    /// and only the upsert path evaluates it -- by substituting the
+    /// incoming row's literal before generic evaluation.
+    InsertValues(String),
+}
+
+/// Which subquery flavor a [`Expr::Correlated`] node replaced; the
+/// kind decides how a binding's pre-computed output maps to a value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CorrelatedKind {
+    /// `(SELECT ...)`: single column, at most one row per binding
+    /// (empty -> NULL, more -> MySQL 1242 style error at bind time).
+    Scalar,
+    /// `[NOT] EXISTS (...)`: rows-nonempty test.
+    Exists { negated: bool },
+    /// `lhs [NOT] IN (SELECT ...)`: `lhs` evaluates in the OUTER
+    /// scope per row; the binding contributes the member set.
+    In { lhs: Box<Expr>, negated: bool },
+}
+
+/// One binding's subquery output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CorrelatedOut {
+    /// Scalar result (exactly the one cell).
+    Scalar(Value),
+    /// First-column values of the subquery rows (IN / EXISTS).
+    Rows(Vec<Value>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Eq,
+    /// `<=>`: NULL-safe equality (NULL <=> NULL is TRUE).
+    NullSafeEq,
     NotEq,
     Lt,
     LtEq,
@@ -291,11 +502,35 @@ pub enum BinOp {
     GtEq,
     And,
     Or,
+    /// `XOR` keyword: three-valued logical exclusion.
+    LogicalXor,
     Add,
     Sub,
     Mul,
     Div,
     Mod,
+    /// `&`, `|`, `^`: 64-bit unsigned semantics on Int (u64 wrap).
+    BitAnd,
+    BitOr,
+    BitXor,
+    /// `<<` / `>>`: u64 shifts; a shift >= 64 yields 0 (MySQL).
+    Shl,
+    Shr,
+}
+
+/// Target of `CAST(x AS spec)` / `CONVERT(x, spec)`: the MySQL cast
+/// types the storage layer can express (SIGNED/UNSIGNED integers,
+/// CHAR(n) strings, DECIMAL(p,s) exact fixed-point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastSpec {
+    Signed,
+    Unsigned,
+    /// `CHAR(n)`: n is the optional length in characters (truncate).
+    Char(Option<u32>),
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
 }
 
 impl Statement {
@@ -305,7 +540,9 @@ impl Statement {
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
             | Statement::CreateIndex { .. }
-            | Statement::DropIndex { .. } => "ddl",
+            | Statement::DropIndex { .. }
+            | Statement::TruncateTable { .. }
+            | Statement::RenameTable { .. } => "ddl",
             Statement::Select(_) => "select",
             Statement::Insert { .. } => "insert",
             Statement::Update { .. } => "update",

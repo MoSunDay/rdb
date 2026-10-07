@@ -64,12 +64,20 @@ pub async fn serve(listener: TcpListener, shared: Arc<Shared>) -> ! {
 /// Connection-level errors (failed auth, reset peer, malformed packet)
 /// are logged and dropped: the listener outlives every connection.
 async fn handle_conn(sock: TcpStream, shared: Arc<Shared>, user: String, password: String) {
+    // Peer host for the session identity (`USER()` renders user@host);
+    // an unresolvable peer (already-closed socket) falls back to
+    // "unknown" rather than failing the connection.
+    let peer_host = sock
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let (read_half, write_half) = sock.into_split();
     let shim = new_shim::<tokio::net::tcp::OwnedWriteHalf>(
         Arc::clone(&shared),
         user,
         password,
         conn_seed(),
+        peer_host,
     );
     let sess = shim.session_handle();
     let opts = intermediary_options();

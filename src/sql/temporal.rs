@@ -34,8 +34,8 @@ fn is_leap(y: i64) -> bool {
 }
 
 /// Days in one month of a (proleptic Gregorian) year; 0 for a month
-/// outside 1..=12.
-fn days_in_month(y: i64, m: u32) -> u32 {
+/// outside 1..=12. (Public for the DATE_ADD month-clamping math.)
+pub fn days_in_month(y: i64, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

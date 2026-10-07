@@ -5,8 +5,8 @@
 //! executor only ever sees runnable shapes.
 
 use sqlparser::ast::{
-    CreateTableOptions, Expr as SqlExpr, FromTable, ObjectName, ObjectNamePart, SetExpr, SqlOption,
-    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    CreateTableOptions, Expr as SqlExpr, FromTable, ObjectName, ObjectNamePart, SqlOption,
+    Statement as SqlStatement, TableConstraint, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -37,8 +37,12 @@ pub fn placeholder_count(stmt: &Statement) -> usize {
     fn count_expr(x: &Expr) -> usize {
         match x {
             Expr::Placeholder => 1,
-            Expr::Lit(_) | Expr::Col { .. } => 0,
-            Expr::Subquery(cq) | Expr::InSubquery { query: cq, .. } => count_compound(cq),
+            Expr::Lit(_) | Expr::Col { .. } | Expr::InsertValues(_) => 0,
+            Expr::Subquery(cq)
+            | Expr::InSubquery { query: cq, .. }
+            | Expr::Exists { query: cq, .. } => count_compound(cq),
+            // Bind-time node: placeholders in keys/lhs bound above.
+            Expr::Correlated { .. } => 0,
             Expr::BinaryOp { left, right, .. } => count_expr(left) + count_expr(right),
             Expr::Not(x) | Expr::Neg(x) => count_expr(x),
             Expr::IsNull { expr, .. } => count_expr(expr),
@@ -51,6 +55,20 @@ pub fn placeholder_count(stmt: &Statement) -> usize {
             Expr::Like { expr, pattern, .. } => count_expr(expr) + count_expr(pattern),
             Expr::Agg { arg, .. } => arg.as_deref().map(count_expr).unwrap_or(0),
             Expr::Func { args, .. } => args.iter().map(count_expr).sum(),
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand.as_deref().map(count_expr).unwrap_or(0)
+                    + branches
+                        .iter()
+                        .map(|(c, t)| count_expr(c) + count_expr(t))
+                        .sum::<usize>()
+                    + else_expr.as_deref().map(count_expr).unwrap_or(0)
+            }
+            Expr::Cast { expr, .. } => count_expr(expr),
+            Expr::Regexp { expr, pattern, .. } => count_expr(expr) + count_expr(pattern),
         }
     }
     fn count_query(q: &Query) -> usize {
@@ -69,6 +87,15 @@ pub fn placeholder_count(stmt: &Statement) -> usize {
                 .iter()
                 .map(|k| count_expr(&k.expr))
                 .sum::<usize>()
+            // LIMIT / OFFSET parameters come last in the SQL text.
+            + q.limit.as_ref().map(count_limit).unwrap_or(0)
+            + count_limit(&q.offset)
+    }
+    fn count_limit(l: &LimitValue) -> usize {
+        match l {
+            LimitValue::Const(_) => 0,
+            LimitValue::Param(e) => count_expr(e),
+        }
     }
     fn count_compound(cq: &CompoundQuery) -> usize {
         cq.ctes
@@ -80,12 +107,14 @@ pub fn placeholder_count(stmt: &Statement) -> usize {
                 .iter()
                 .map(|k| count_expr(&k.expr))
                 .sum::<usize>()
+            + cq.limit.as_ref().map(count_limit).unwrap_or(0)
+            + count_limit(&cq.offset)
     }
     fn count_body(b: &QueryBody) -> usize {
         match b {
             QueryBody::Select(q) => count_query(q) + count_from(&q.from),
             QueryBody::Nested(inner) => count_compound(inner),
-            QueryBody::Union { left, right, .. } => count_body(left) + count_body(right),
+            QueryBody::SetOp { left, right, .. } => count_body(left) + count_body(right),
         }
     }
     fn count_from(t: &TableRef) -> usize {
@@ -98,7 +127,21 @@ pub fn placeholder_count(stmt: &Statement) -> usize {
     match stmt {
         Statement::Select(q) => count_query(q) + count_from(&q.from),
         Statement::SelectCompound(cq) => count_compound(cq),
-        Statement::Insert { rows, .. } => rows.iter().flat_map(|r| r.iter().map(count_expr)).sum(),
+        Statement::Insert {
+            source, conflict, ..
+        } => {
+            let rows = match source {
+                InsertSource::Values(rows) => rows
+                    .iter()
+                    .flat_map(|r| r.iter().map(count_expr))
+                    .sum::<usize>(),
+                InsertSource::Select(cq) => count_compound(cq),
+            };
+            rows + conflict
+                .assignments()
+                .map(|a| a.iter().map(|(_, x)| count_expr(x)).sum::<usize>())
+                .unwrap_or(0)
+        }
         Statement::Update {
             assignments,
             filter,
@@ -131,11 +174,22 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
                 *e = Expr::Lit(values[*next].clone());
                 *next += 1;
             }
-            Expr::Lit(_) | Expr::Col { .. } => {}
+            Expr::Lit(_) | Expr::Col { .. } | Expr::InsertValues(_) => {}
             Expr::Subquery(cq) => bind_compound(cq, next, values),
             Expr::InSubquery { expr, query, .. } => {
                 bind(expr, next, values);
                 bind_compound(query, next, values);
+            }
+            Expr::Exists { query, .. } => bind_compound(query, next, values),
+            // Bind-time node; unreachable on parsed statements (kept
+            // total for the exhaustive match).
+            Expr::Correlated { kind, keys, .. } => {
+                if let CorrelatedKind::In { lhs, .. } = kind {
+                    bind(lhs, next, values);
+                }
+                for k in keys {
+                    bind(k, next, values);
+                }
             }
             Expr::BinaryOp { left, right, .. } => {
                 bind(left, next, values);
@@ -170,6 +224,27 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
                     bind(a, next, values);
                 }
             }
+            Expr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(o) = operand.as_mut() {
+                    bind(o, next, values);
+                }
+                for (c, t) in branches.iter_mut() {
+                    bind(c, next, values);
+                    bind(t, next, values);
+                }
+                if let Some(e) = else_expr.as_mut() {
+                    bind(e, next, values);
+                }
+            }
+            Expr::Cast { expr, .. } => bind(expr, next, values),
+            Expr::Regexp { expr, pattern, .. } => {
+                bind(expr, next, values);
+                bind(pattern, next, values);
+            }
         }
     }
     fn bind_query(q: &mut Query, next: &mut usize, values: &[Value]) {
@@ -190,6 +265,13 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
         for k in &mut q.order_by {
             bind(&mut k.expr, next, values);
         }
+        // LIMIT / OFFSET placeholders bind last (they trail the rest
+        // of the statement text), limit-then-offset -- the text order
+        // of `LIMIT ? OFFSET ?`. The two-placeholder comma form
+        // (`LIMIT ?, ?`, offset-first in text) is rejected at parse
+        // time, so this order is never ambiguous.
+        bind_limit(q.limit.as_mut(), next, values);
+        bind_limit(Some(&mut q.offset), next, values);
     }
     fn bind_compound(cq: &mut CompoundQuery, next: &mut usize, values: &[Value]) {
         for cte in &mut cq.ctes {
@@ -199,6 +281,13 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
         for k in &mut cq.order_by {
             bind(&mut k.expr, next, values);
         }
+        bind_limit(cq.limit.as_mut(), next, values);
+        bind_limit(Some(&mut cq.offset), next, values);
+    }
+    fn bind_limit(l: Option<&mut LimitValue>, next: &mut usize, values: &[Value]) {
+        if let Some(LimitValue::Param(e)) = l {
+            bind(e, next, values);
+        }
     }
     fn bind_body(b: &mut QueryBody, next: &mut usize, values: &[Value]) {
         match b {
@@ -207,7 +296,7 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
                 bind_from(&mut q.from, next, values);
             }
             QueryBody::Nested(inner) => bind_compound(inner, next, values),
-            QueryBody::Union { left, right, .. } => {
+            QueryBody::SetOp { left, right, .. } => {
                 bind_body(left, next, values);
                 bind_body(right, next, values);
             }
@@ -229,10 +318,25 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
             bind_from(&mut q.from, &mut next, values);
         }
         Statement::SelectCompound(cq) => bind_compound(cq, &mut next, values),
-        Statement::Insert { rows, .. } => {
-            for row in rows {
-                for v in row {
-                    bind(v, &mut next, values);
+        Statement::Insert {
+            source, conflict, ..
+        } => {
+            match source {
+                InsertSource::Values(rows) => {
+                    for row in rows {
+                        for v in row {
+                            bind(v, &mut next, values);
+                        }
+                    }
+                }
+                InsertSource::Select(cq) => bind_compound(cq, &mut next, values),
+            }
+            // ODKU assignment placeholders bind after the row sources
+            // (they trail the VALUES/SELECT clause in the statement
+            // text -- MySQL positional order).
+            if let ConflictAction::OnDuplicate(assigns) = conflict {
+                for (_, x) in assigns.iter_mut() {
+                    bind(x, &mut next, values);
                 }
             }
         }
@@ -302,28 +406,8 @@ fn translate(stmt: SqlStatement, sr: Option<&StarRocksModel>) -> SqlResult<State
             names,
             table,
             ..
-        } => translate_drop(object_type, if_exists, &names, table.as_ref()),
-        SqlStatement::CreateIndex(c) => {
-            if c.columns.len() != 1 {
-                return Err(SqlError::unsupported("multi-column indexes"));
-            }
-            let col = match &c.columns[0].column.expr {
-                SqlExpr::Identifier(id) => id.value.clone(),
-                other => return Err(SqlError::unsupported(format!("index key {other}"))),
-            };
-            Ok(Statement::CreateIndex {
-                table: object_name(&c.table_name)?,
-                name: c
-                    .name
-                    .as_ref()
-                    .map(object_name)
-                    .transpose()?
-                    .unwrap_or_else(|| format!("idx_{col}")),
-                column: col,
-                unique: c.unique,
-                if_not_exists: c.if_not_exists,
-            })
-        }
+        } => super::translate_ddl::translate_drop(object_type, if_exists, &names, table.as_ref()),
+        SqlStatement::CreateIndex(c) => super::translate_ddl::translate_create_index(c),
         SqlStatement::Explain { statement, .. } => {
             Ok(Statement::Explain(Box::new(translate(*statement, sr)?)))
         }
@@ -373,6 +457,19 @@ fn translate(stmt: SqlStatement, sr: Option<&StarRocksModel>) -> SqlResult<State
                 Err(SqlError::unsupported("SHOW variables"))
             }
         }
+        SqlStatement::ShowDatabases { .. } => Ok(Statement::ShowDatabases),
+        SqlStatement::ShowCreate { obj_type, obj_name } => {
+            super::translate_ddl::translate_show_create(obj_type, &obj_name)
+        }
+        SqlStatement::ShowVariables { filter, .. } => {
+            super::translate_ddl::translate_show_filter(filter, true)
+        }
+        SqlStatement::ShowStatus { filter, .. } => {
+            super::translate_ddl::translate_show_filter(filter, false)
+        }
+        SqlStatement::Truncate(t) => super::translate_ddl::translate_truncate(t),
+        SqlStatement::RenameTable(r) => super::translate_ddl::translate_rename(&r),
+        SqlStatement::AlterTable(a) => super::translate_ddl::translate_alter_table(a),
         SqlStatement::Set(set) => translate_set(set),
         other => Err(SqlError::unsupported(format!("{other}"))),
     }
@@ -444,36 +541,6 @@ fn translate_set_transaction(modes: &[sqlparser::ast::TransactionMode]) -> SqlRe
     }
 }
 
-fn translate_drop(
-    object_type: sqlparser::ast::ObjectType,
-    if_exists: bool,
-    names: &[ObjectName],
-    table: Option<&ObjectName>,
-) -> SqlResult<Statement> {
-    if names.len() != 1 {
-        return Err(SqlError::unsupported("dropping multiple objects"));
-    }
-    let name = object_name(&names[0])?;
-    match object_type {
-        sqlparser::ast::ObjectType::Table if table.is_none() => {
-            Ok(Statement::DropTable { name, if_exists })
-        }
-        sqlparser::ast::ObjectType::Index => {
-            // MySQL: DROP INDEX idx ON tbl
-            let table = table
-                .map(object_name)
-                .transpose()?
-                .ok_or_else(|| SqlError::parse("DROP INDEX needs ON <table>"))?;
-            Ok(Statement::DropIndex {
-                table,
-                name,
-                if_exists,
-            })
-        }
-        other => Err(SqlError::unsupported(format!("DROP {other}"))),
-    }
-}
-
 fn translate_create_table(
     c: sqlparser::ast::CreateTable,
     sr: Option<&StarRocksModel>,
@@ -497,8 +564,10 @@ fn translate_create_table(
     // Pk columns in declaration order: inline `col ... PRIMARY KEY`
     // contributes one; a `PRIMARY KEY (a, b, ...)` table constraint
     // contributes its whole list (multi-column pks, composite support).
-    // Mixing the two forms, or two constraints, still rejects.
+    // Mixing the two forms, or two constraints, still rejects. `KEY` /
+    // `UNIQUE KEY` constraints are inline secondary indexes (M4).
     let mut pk: Vec<String> = inline_pk.into_iter().collect();
+    let mut indexes = Vec::new();
     for constraint in &c.constraints {
         match constraint {
             TableConstraint::PrimaryKey(cons) => {
@@ -511,6 +580,32 @@ fn translate_create_table(
                         other => return Err(SqlError::unsupported(format!("PRIMARY KEY {other}"))),
                     });
                 }
+            }
+            TableConstraint::Index(cons) => {
+                let column = super::translate_ddl::index_column_of(&cons.columns)?;
+                indexes.push(InlineIndex {
+                    name: cons
+                        .name
+                        .as_ref()
+                        .map(|n| n.value.clone())
+                        .unwrap_or_else(|| format!("idx_{column}")),
+                    column,
+                    unique: false,
+                });
+            }
+            TableConstraint::Unique(cons) => {
+                let column = super::translate_ddl::index_column_of(&cons.columns)?;
+                let name = cons
+                    .index_name
+                    .as_ref()
+                    .map(|n| n.value.clone())
+                    .or_else(|| cons.name.as_ref().map(|n| n.value.clone()))
+                    .unwrap_or_else(|| format!("idx_{column}"));
+                indexes.push(InlineIndex {
+                    name,
+                    column,
+                    unique: true,
+                });
             }
             _ => return Err(SqlError::unsupported("other table constraints")),
         }
@@ -552,6 +647,7 @@ fn translate_create_table(
         pk,
         engine: table_engine(&c.table_options),
         starrocks: sr.cloned(),
+        indexes,
     })
 }
 
@@ -582,53 +678,7 @@ fn table_engine(opts: &CreateTableOptions) -> Engine {
 }
 
 fn translate_insert(i: sqlparser::ast::Insert) -> SqlResult<Statement> {
-    if i.on.is_some() {
-        return Err(SqlError::unsupported(
-            "ON DUPLICATE KEY UPDATE / ON CONFLICT",
-        ));
-    }
-    if !i.assignments.is_empty() {
-        return Err(SqlError::unsupported("INSERT ... SET"));
-    }
-    if i.replace_into {
-        return Err(SqlError::unsupported("REPLACE INTO"));
-    }
-    let table = match &i.table {
-        TableObject::TableName(n) => object_name(n)?,
-        other => return Err(SqlError::unsupported(format!("INSERT target {other}"))),
-    };
-    let columns = i
-        .columns
-        .iter()
-        .map(object_name)
-        .collect::<SqlResult<Vec<String>>>()?;
-    let source = i
-        .source
-        .ok_or_else(|| SqlError::parse("INSERT needs VALUES"))?;
-    let SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(SqlError::unsupported("INSERT source other than VALUES"));
-    };
-    if source.with.is_some() {
-        return Err(SqlError::unsupported("INSERT with CTE"));
-    }
-    let rows = values
-        .rows
-        .iter()
-        .map(|row| row.iter().map(translate_expr).collect())
-        .collect::<SqlResult<Vec<Vec<Expr>>>>()?;
-    for row in &rows {
-        if row.is_empty() || (!columns.is_empty() && row.len() != columns.len()) {
-            return Err(SqlError::new(
-                ErrorCode::WrongValueCount,
-                "INSERT row arity does not match column list",
-            ));
-        }
-    }
-    Ok(Statement::Insert {
-        table,
-        columns,
-        rows,
-    })
+    super::translate_dml::translate_insert(i)
 }
 
 fn translate_update(u: sqlparser::ast::Update) -> SqlResult<Statement> {

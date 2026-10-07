@@ -7,8 +7,12 @@ use sqlparser::ast::{
 
 use crate::sql::parse::ast::*;
 use crate::sql::parse::error::{SqlError, SqlResult};
+use crate::sql::parse::order_keys::{
+    translate_group_for_select, translate_having, translate_order_for_select,
+};
+use crate::sql::parse::order_limit::{translate_limit_value, translate_offset_value};
 use crate::sql::parse::table::translate_table_with_joins;
-use crate::sql::parse::translate::{translate_expr, translate_limit, translate_order};
+use crate::sql::parse::translate::{translate_expr, translate_order};
 
 /// A full query expression: WITH + set-operation body + trailing
 /// ORDER BY / LIMIT. Used for every compound shape (CTE, UNION,
@@ -69,7 +73,7 @@ pub(crate) fn translate_compound(q: &SqlQuery) -> SqlResult<CompoundQuery> {
 }
 
 /// One set-operation operand: a SELECT, a parenthesized full query
-/// (own ORDER BY / LIMIT, no outer locks), or a UNION of two.
+/// (own ORDER BY / LIMIT, no outer locks), or a set operation of two.
 fn translate_body(b: &SetExpr, locks: Option<&sqlparser::ast::LockClause>) -> SqlResult<QueryBody> {
     match b {
         SetExpr::Select(sel) => {
@@ -84,15 +88,19 @@ fn translate_body(b: &SetExpr, locks: Option<&sqlparser::ast::LockClause>) -> Sq
             left,
             right,
         } => {
-            if !matches!(op, SetOperator::Union) {
-                return Err(SqlError::unsupported(format!("{op} set operations")));
-            }
+            let op = match op {
+                SetOperator::Union => SetOp::Union,
+                SetOperator::Intersect => SetOp::Intersect,
+                SetOperator::Except => SetOp::Except,
+                other => return Err(SqlError::unsupported(format!("{other} set operations"))),
+            };
             let all = match set_quantifier {
                 SetQuantifier::All => true,
                 SetQuantifier::None | SetQuantifier::Distinct => false,
                 q => return Err(SqlError::unsupported(format!("{q:?} set quantifier"))),
             };
-            Ok(QueryBody::Union {
+            Ok(QueryBody::SetOp {
+                op,
                 left: Box::new(translate_body(left, None)?),
                 right: Box::new(translate_body(right, None)?),
                 all,
@@ -120,22 +128,28 @@ pub(crate) fn translate_select(sel: &sqlparser::ast::Select) -> SqlResult<Query>
         None => TableRef::NoTable,
     };
     let group_by = match &sel.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs
-            .iter()
-            .map(translate_expr)
-            .collect::<SqlResult<Vec<_>>>()?,
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
+            translate_group_for_select(exprs, &items)?
+        }
         sqlparser::ast::GroupByExpr::All(_) => return Err(SqlError::unsupported("GROUP BY ALL")),
     };
     let distinct = matches!(&sel.distinct, Some(sqlparser::ast::Distinct::Distinct));
+    // HAVING may reference select-list aliases (MySQL output-column
+    // resolution); substitution needs the projection.
+    let having = sel
+        .having
+        .as_ref()
+        .map(|h| translate_having(h, &items))
+        .transpose()?;
     Ok(Query {
         items,
         from,
         filter: sel.selection.as_ref().map(translate_expr).transpose()?,
         group_by,
-        having: sel.having.as_ref().map(translate_expr).transpose()?,
+        having,
         order_by: Vec::new(),
         limit: None,
-        offset: 0,
+        offset: LimitValue::zero(),
         distinct,
         lock: None,
     })
@@ -158,10 +172,12 @@ pub(crate) fn translate_query(q: &SqlQuery) -> SqlResult<Query> {
     let (limit, offset) = translate_limit_clause(&q.limit_clause)?;
     query.limit = limit;
     query.offset = offset;
+    // Ordinals and select-list aliases resolve against this query's
+    // own projection (MySQL output-column semantics).
     query.order_by = match &q.order_by {
         None => Vec::new(),
         Some(ob) => match &ob.kind {
-            OrderByKind::Expressions(exprs) => translate_order(exprs)?,
+            OrderByKind::Expressions(exprs) => translate_order_for_select(exprs, &query.items)?,
             OrderByKind::All(_) => return Err(SqlError::unsupported("ORDER BY ALL")),
         },
     };
@@ -204,10 +220,10 @@ fn translate_lock(
 
 fn translate_limit_clause(
     lc: &Option<sqlparser::ast::LimitClause>,
-) -> SqlResult<(Option<u64>, u64)> {
+) -> SqlResult<(Option<LimitValue>, LimitValue)> {
     use sqlparser::ast::LimitClause;
     match lc {
-        None => Ok((None, 0)),
+        None => Ok((None, LimitValue::zero())),
         Some(LimitClause::LimitOffset {
             limit,
             offset,
@@ -217,25 +233,34 @@ fn translate_limit_clause(
                 return Err(SqlError::unsupported("LIMIT ... BY"));
             }
             Ok((
-                translate_limit(limit)?,
+                translate_limit_value(limit)?,
                 offset
                     .as_ref()
-                    .map(|o| translate_offset(&o.value))
+                    .map(|o| translate_offset_value(&o.value))
                     .transpose()?
-                    .unwrap_or(0),
+                    .unwrap_or_else(LimitValue::zero),
             ))
         }
-        Some(LimitClause::OffsetCommaLimit { offset, limit }) => Ok((
-            translate_limit(&Some(limit.clone()))?,
-            translate_offset(offset)?,
-        )),
-    }
-}
-
-fn translate_offset(e: &sqlparser::ast::Expr) -> SqlResult<u64> {
-    match translate_expr(e)? {
-        Expr::Lit(crate::sql::storage::schema::Value::Int(n)) if n >= 0 => Ok(n as u64),
-        _ => Err(SqlError::parse("OFFSET must be a non-negative integer")),
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+            let limit = translate_limit_value(&Some(limit.clone()))?;
+            let offset = translate_offset_value(offset)?;
+            // The comma form is offset-first in SQL text, but the
+            // binder walks limit-then-offset (the order the
+            // `LIMIT ? OFFSET ?` spelling needs), so two `?`
+            // operands would bind the user's offset into the count
+            // and vice versa. Reject the ambiguous shape loudly;
+            // single-placeholder comma forms stay positional-safe
+            // (a Const operand skips its bind slot).
+            if matches!(
+                (&limit, &offset),
+                (Some(LimitValue::Param(_)), LimitValue::Param(_))
+            ) {
+                return Err(SqlError::parse(
+                    "LIMIT ?, ? with two placeholders is not supported; use LIMIT ? OFFSET ?",
+                ));
+            }
+            Ok((limit, offset))
+        }
     }
 }
 
