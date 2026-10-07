@@ -14,6 +14,7 @@
 
 pub mod ack;
 pub mod append;
+pub mod append_opts;
 pub mod autoclaim;
 pub mod claim;
 pub mod delay;
@@ -34,6 +35,7 @@ pub mod read_xread;
 pub mod redeliver;
 pub mod redeliver_loop;
 pub mod select;
+pub mod xinfo_full;
 
 #[cfg(test)]
 mod read_tests;

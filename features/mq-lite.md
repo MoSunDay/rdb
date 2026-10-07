@@ -90,8 +90,14 @@
 - `XPENDING <stream> <group>`：摘要——总数 / 最小 id / 最大 id / 每消费者计数。
 - `XPENDING ... <start> <end> <count> [consumer]`：范围形态，支持 IDLE 过滤与
   consumer 过滤。
-- `XCLAIM`：min-idle-time、FORCE、JUSTID；**不支持** IDLE / TIME / RETRYCOUNT / LASTID
-  （语法错误）。
+- `XCLAIM`：min-idle-time、FORCE、JUSTID，以及投递提示 `IDLE <ms>` / `TIME <unix-ms>` /
+  `RETRYCOUNT <n>`（与 id 列表任意交错，Redis 同款文法；**不支持** LASTID，语法错误）。
+  提示作用于**每个成功 claim 的 PEL 行**（JUSTID claim 同样写入——所有权转移也是一次
+  PEL 写）：IDLE → `delivered_ms = now - idle`（回拨，钳到 0）；TIME → `delivered_ms`
+  直接取给定墙钟（idle 由 now 推导）；RETRYCOUNT → `times_delivered` 整体改写（不再
+  自增）。`delivered_ms` 仍是空闲口径的**唯一事实源**：XPENDING 的 idle/deliveries 两列、
+  min-idle 门与空闲 sweep 全部由它推导——大 IDLE / 过去 TIME 回拨后的行会**更早**满足
+  min-idle（正确行为）。坏值报 `ERR value is not an integer or out of range`。
 - `XAUTOCLAIM`：游标续扫；COUNT 默认 100，单轮扫描上限 10×COUNT；回复为 Redis≥7 的
   三元素形态（含 deleted-ids 数组）；JUSTID 支持。
 
@@ -199,6 +205,101 @@
 - **kafka 账本守卫**：流上存在任何 kind-0x20 组提交账本行时，XTRIM/XDEL 一律拒绝
   （`ERR stream <name> has committed consumer-group offsets; delete the groups first`），
   防止 ordinal↔id 映射在 kafka 面读者脚下漂移；XDEL 同守卫。
+
+### XADD 选项与追加时修剪（NOMKSTREAM / MAXLEN / MINID）
+
+选项解析集中在 `src/lite/append_opts.rs`（`parse_xadd`），与 XTRIM **共用**修剪解析器
+（`parse_trim` / `trim_at`）与受害者计算（`trim_victims`），不另起一套语法：
+
+| 选项 | 语义 | 备注 |
+| --- | --- | --- |
+| `NOMKSTREAM` | 流不存在时**不建键**，回 nil（RESP2 `$-1`，与读路径的空回同形） | 键缺席可用 `XINFO STREAM`（`ERR no such key`）/ `XLEN`（0）验证；流已存在则为普通追加 |
+| `DELAY <ms>` | 暂存到到期交换（见上节） | 历史位置在 id 之后；纯数字、u64 范围，坏值报 not-an-integer |
+| `MAXLEN [~\|=] <n>` | 追加后把流修剪到最新 `n` 条（新条目计入） | 与 XTRIM 的 MAXLEN 同语义 |
+| `MINID [~\|=] <id> [LIMIT <n>]` | 追加后删除 id **严格小于** `<id>` 的条目 | LIMIT 收窄为 XTRIM 参数语义（见 `plans/2026-10-07-mq-p3-backfill` §1 复核结论） |
+
+- **位置文法**：选项可出现在 id 之前或之后（`XADD <s> [NOMKSTREAM][trim] [<id\|*>]
+  [DELAY <ms>] <f> <v> ...`）。一旦 id **之前**出现了选项块，id 即为必填（Redis 自身
+  文法如此，客户端把自动 id 写成 `*`）；无前置选项时保持历史的奇偶省略文法
+  （`XADD s f v` = 自动 id）不变。
+- **同一批次**：追加（或 DELAY 暂存）与修剪受害者删除落在**同一个 latched fsync 批次**
+  （meta len 先加后剪）；新条目本身在计划够得着时也入受害者（如 `MAXLEN 0`、MINID
+  高于新 id）。XADD 携带修剪同样过 kafka 账本守卫。
+- 选项可重复，后者覆盖前者；错误文案沿用 XTRIM 家族（wrong number of arguments /
+  not an integer / Invalid stream ID）。
+
+### XINFO STREAM FULL
+
+`XINFO STREAM <stream> FULL [COUNT <n>]`（COUNT 默认 10，须 >0）：Redis 7 形态的深视图，
+编码在 `src/lite/xinfo_full.rs`（分发留在 `info.rs`）。流级 = `length`、
+`last-generated-id`、`entries`（最新 `n` 条、按 id 升序输出，`[id, f, v ...]` 同
+XRANGE 帧）、`groups`。组级 = `name`、`last-delivered-id`（缓存优先，回落组记录）、
+`pending`（`[id, consumer, 距上次投递 ms, 投递次数]` 行，COUNT 截断）、`consumers`。
+消费者级 = `name`、`seen-time`、`pending`（精确计数，**不**截断）、`pel`
+（`[id, 距上次投递 ms, 投递次数]` 行，COUNT 截断）。
+
+**省略字段**（引擎模型没有对应数据，宁缺毋假）：`radix-tree-keys` / `radix-tree-nodes`
+（无 radix 索引）、`entries-added` / `max-deleted-entry-id` /
+`recorded-first-entry-id`（meta 无这些计数器，见 `model.rs` 的 `MetaPayload`）、组级
+`entries-read` / `lag`（无按组读取计数）。`seen-time` 为**近似值**：取该消费者最新
+PEL 投递时间，无 PEL 历史时取登记时间（`ConsumerState.created_ms`）——与
+`XINFO CONSUMERS` 的 idle 口径同源。非 FULL 的 `XINFO STREAM` 输出保持不变
+（length / last-generated-id / groups / idle-ms）。
+
+### 广播消费（broadcast）客户端模式
+
+**模式**：一条流要"每个订阅者都拿到全量消息"时，给**每个订阅者一个独立消费组**
+（one group per subscriber），各组各自 `XREADGROUP GROUP <g_i> <c> ... > ` 从自己的
+`delivered` 水位读全流；与之相对的**竞争消费**（competing consumers）是同组多名
+消费者分摊消息。两种模式可并存于同一流（再建一个"工作组"即可）。
+
+依据（引擎行为，均可在 `src/lite/` 验证）：
+- **组间完全隔离**：每组有自己的 `delivered`/`committed` 水位与整个 kind-0x0F PEL
+  窗口（`pel.rs`：PEL 键 = `stream ++ group ++ tag ++ id`，组名为键的一部分）——
+  一组的 XACK/XCLAIM/XAUTOCLAIM/XPENDING 只看本组行，互不可见。
+- **DLQ / MAXDELIVERY / 重投也是组内属性**：`maxdelivery`/`dlq` 挂在组记录上
+  （`model.rs` `GroupPayload`），空闲 sweep 按组扫描（`redeliver.rs` `discover_groups`
+  直读 kind-0x0E 组记录）——一个订阅者积压死信不影响其它订阅者的投递。
+- **投递顺序对所有组一致**：条目按 id 升序投递（`read.rs` 的 `>` 路径沿 entry 键序
+  扫描），故所有组看到相同的全序。
+- **延迟消息的到期序对所有组一致**：到期交换按 due 全局排序写入流
+  （`delay.rs` 暂存行扫 due 交换、分配正式 id）——各组看到的都是**按到期时间排序
+  后**的到达序（同 due 批内按预约 id 序），不会出现两订阅者看到的相对顺序不同。
+
+最小 RESP 会话示例（两个订阅者各一组，竞争消费对照）：
+
+```text
+# 发布方：一条流，三个订阅视角（g1/g2 广播组 + gw 工作组）
+XGROUP CREATE bc/q0 g1 0-0 MKSTREAM     # 订阅者 1 的组
+XGROUP CREATE bc/q0 g2 0-0 MKSTREAM     # 订阅者 2 的组
+XGROUP CREATE bc/q0 gw 0-0 MKSTREAM     # （对照）竞争消费工作组
+XADD bc/q0 1-1 f hello
+XADD bc/q0 2-1 f world
+
+# 订阅者 1：拿到全量（自己的水位从 0-0 起）
+XREADGROUP GROUP g1 sub1 COUNT 10 STREAMS bc/q0 >
+1) 1) "bc/q0"
+   2) 1) 1) "1-1" 2) "f" 3) "hello"
+      2) 1) "2-1" 2) "f" 3) "world"
+
+# 订阅者 2：同样全量——组隔离，g1 的读/ACK 不影响 g2
+XREADGROUP GROUP g2 sub2 COUNT 10 STREAMS bc/q0 >
+1) 1) "bc/q0"
+   2) 1) 1) "1-1" 2) "f" 3) "hello"
+      2) 1) "2-1" 2) "f" 3) "world"
+
+# 工作组任一成员只拿一半（对照：竞争消费分摊）
+XREADGROUP GROUP gw w1 COUNT 1 STREAMS bc/q0 >
+1) 1) "bc/q0" 2) 1) 1) "1-1" 2) "f" 3) "hello"
+XREADGROUP GROUP gw w2 COUNT 1 STREAMS bc/q0 >
+1) 1) "bc/q0" 2) 1) 1) "2-1" 2) "f" 3) "world"
+
+# 各组独立 ACK/重投：g1 确认 1-1 只动 g1 的 PEL（g2 仍可独立确认/重试）
+XACK bc/q0 g1 1-1
+:1
+XPENDING bc/q0 g2        # g2 的 PEL 原封不动
+1) (integer) 2 ...
+```
 
 
 ### HTTP 面（rocksmq front，WP4）

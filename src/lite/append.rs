@@ -13,6 +13,7 @@ use crate::monitor;
 use crate::resp::codec as resp;
 use crate::store::ops;
 
+use super::append_opts;
 use super::entries::{append_entry_frame, count_reap, id_from_key, stream_of, Entry};
 use super::model::{self, MetaPayload, MetaRead};
 use super::{offset, select, stat_bump, TopicName};
@@ -26,23 +27,13 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
         return resp::append_error(ctx.out, "ERR wrong number of arguments for 'xadd' command");
     }
     let args = ctx.args.clone();
-    let (id_arg, pairs): (&[u8], &[Vec<u8>]) = if (args.len() - 1).is_multiple_of(2) {
-        (b"*", &args[1..])
-    } else {
-        (&args[1], &args[2..])
-    };
-    if pairs.len() < 2 || pairs.len() % 2 != 0 {
-        return resp::append_error(ctx.out, "ERR wrong number of arguments for 'xadd' command");
-    }
-    // Leading `DELAY <ms>` option (WP2): threading only -- the parse and
-    // the staging write live in `super::delay`.
-    let (delay_ms, pairs) = match super::delay::split_delay(pairs) {
-        Ok(split) => split,
+    // Option block (NOMKSTREAM / trim / DELAY) + optional id + pairs:
+    // the whole front-end parse lives in `super::append_opts`.
+    let head = match append_opts::parse_xadd(&args) {
+        Ok(h) => h,
         Err(e) => return resp::append_error(ctx.out, e),
     };
-    if pairs.len() < 2 || pairs.len() % 2 != 0 {
-        return resp::append_error(ctx.out, "ERR wrong number of arguments for 'xadd' command");
-    }
+    let (id_arg, pairs, delay_ms) = (head.id_arg, head.pairs, head.opts.delay_ms);
     let name = match super::parse_topic_name(&args[0]) {
         Ok(n) => n,
         Err(e) => return resp::append_error(ctx.out, &e),
@@ -64,6 +55,11 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     stream.extend_from_slice(&child);
     let prefix = hash::slot_with_prefix(&parent).1;
     let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
+    // An XADD-borne trim is a trim: the kafka committed-offset ledger
+    // guard applies exactly as it does to XTRIM/XDEL.
+    if head.opts.trim.is_some() && ledger_guarded(ctx, &prefix, &stream) {
+        return;
+    }
 
     let now = expire::now_ms();
     let read = model::read_meta(
@@ -93,6 +89,12 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
         ),
         Ok(MetaRead::Live(m)) => (m, false),
     };
+    // NOMKSTREAM (Redis 7): a missing stream must NOT materialize --
+    // no meta, no entry, no stats; the null bulk is the whole reply
+    // (the RESP2 nil form the read paths already use for "no result").
+    if fresh && head.opts.nomkstream {
+        return resp::append_null(ctx.out);
+    }
     let id =
         if id_arg == b"*" {
             match model::auto_id((!fresh).then_some(meta.last_id()), now) {
@@ -128,6 +130,22 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
     // excluding staged rows until the due exchange bumps it).
     if delay_ms == 0 {
         next.len += 1;
+    }
+    // XADD trim (MAXLEN/MINID, Redis 7 shape): victims of the
+    // POST-append entry set ride the same latched batch/fsync; the new
+    // row joins the victims when the plan reaches it (the store scan
+    // cannot see the in-batch key), and len settles after the cut.
+    let mut victims = Vec::new();
+    if let Some(plan) = head.opts.trim {
+        victims = append_opts::trim_victims(
+            &ctx.shared.store,
+            &prefix,
+            &stream,
+            plan,
+            next.len,
+            (delay_ms == 0).then_some(id),
+        );
+        next.len = next.len.saturating_sub(victims.len() as u64);
     }
     let mkey = model::meta_key(&prefix, &stream);
     let old_expire = if fresh {
@@ -166,6 +184,9 @@ pub async fn xadd(ctx: &mut Ctx<'_>) {
             Some(due) => super::delay::stage_row(&mut batch, &prefix, &stream, id, due, &fpairs),
             None => return resp::append_error(ctx.out, "ERR delay deadline overflow"),
         }
+    }
+    for k in &victims {
+        batch.delete(k);
     }
     expire::set_ttl_entries(&mut batch, &prefix, mkey.clone(), old_expire, new_expire);
 
@@ -270,70 +291,6 @@ pub async fn xrange(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// One XTRIM strategy, parsed ahead of any store access (pure).
-enum TrimPlan {
-    /// Keep the newest `n` entries.
-    MaxLen(u64),
-    /// Drop every entry with id strictly below `id`; `limit` caps the
-    /// number removed in this call.
-    MinId {
-        id: model::EntryId,
-        limit: Option<u64>,
-    },
-}
-
-/// Parse `MAXLEN [<~|=>] <n>` | `MINID [<~|=>] <id> [LIMIT <n>]`.
-/// The `~` (approximate) and `=` (exact) flags are accepted for wire
-/// compatibility but implemented IDENTICALLY: victims are computed
-/// precisely, so the approximation never under-deletes. Likewise Redis
-/// reserves `LIMIT` for the `~` form only; ours accepts it after both
-/// forms with the same semantics -- one less error branch, no
-/// behavioral difference.
-fn parse_trim(args: &[Vec<u8>]) -> Result<TrimPlan, &'static str> {
-    const BAD: &str = "ERR wrong number of arguments for 'xtrim' command";
-    let is_flag = |a: &[u8]| a == b"~" || a == b"=";
-    if args.len() < 3 || args.len() > 6 {
-        return Err(BAD);
-    }
-    let int_of = |a: &[u8]| -> Option<u64> {
-        std::str::from_utf8(a)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-    };
-    if args[1].eq_ignore_ascii_case(b"MAXLEN") {
-        let n = match &args[2..] {
-            [n] => n,
-            [m, n] if is_flag(m) => n,
-            _ => return Err(BAD),
-        };
-        return match int_of(n) {
-            Some(n) => Ok(TrimPlan::MaxLen(n)),
-            None => Err("ERR value is not an integer or out of range"),
-        };
-    }
-    if !args[1].eq_ignore_ascii_case(b"MINID") {
-        return Err(BAD);
-    }
-    let (id_arg, limit) = match &args[2..] {
-        [id] => (id, None),
-        [m, id] if is_flag(m) => (id, None),
-        [id, l, n] if l.eq_ignore_ascii_case(b"LIMIT") => (id, Some(n)),
-        [m, id, l, n] if is_flag(m) && l.eq_ignore_ascii_case(b"LIMIT") => (id, Some(n)),
-        _ => return Err(BAD),
-    };
-    let Some(id) = model::parse_id(id_arg) else {
-        return Err("ERR Invalid stream ID specified as stream command argument");
-    };
-    let limit = match limit {
-        None => None,
-        Some(n) => match int_of(n) {
-            Some(n) => Some(n),
-            None => return Err("ERR value is not an integer or out of range"),
-        },
-    };
-    Ok(TrimPlan::MinId { id, limit })
-}
-
 /// XTRIM/XDEL guard against the kafka committed-offset ledger: a
 /// stream with ANY kind-0x20 row has group commits pinning ordinals to
 /// the active entry set, and trimming/deleting entries would shift the
@@ -379,7 +336,7 @@ fn ledger_guarded(ctx: &mut Ctx<'_>, prefix: &[u8], stream: &[u8]) -> bool {
 /// every entry older than `id` (a `<ms>-0` id doubles as time-window
 /// retention). Returns the number trimmed.
 pub async fn xtrim(ctx: &mut Ctx<'_>) {
-    let plan = match parse_trim(&ctx.args) {
+    let plan = match append_opts::parse_trim(&ctx.args) {
         Ok(p) => p,
         Err(e) => return resp::append_error(ctx.out, e),
     };
@@ -400,50 +357,10 @@ pub async fn xtrim(ctx: &mut Ctx<'_>) {
     .and_then(|r| r.live()) else {
         return resp::append_int(ctx.out, 0);
     };
-    let base = model::entry_base(&prefix, &stream);
-    let victims = match plan {
-        TrimPlan::MaxLen(maxlen) => {
-            let trim = meta.len.saturating_sub(maxlen) as usize;
-            if trim == 0 {
-                return resp::append_int(ctx.out, 0);
-            }
-            // Cap the preallocation (trim is user-controlled u64) and never
-            // walk past this stream's key range: a corrupted/over-counted
-            // meta.len must not delete neighbouring keys.
-            let mut victims = Vec::with_capacity(trim.min(4096));
-            let _ = ops::for_each_from(&ctx.shared.store, &base, false, &mut |k, _| {
-                if !k.starts_with(&base) {
-                    return false;
-                }
-                victims.push(k.to_vec());
-                victims.len() < trim
-            });
-            victims
-        }
-        TrimPlan::MinId { id: minid, limit } => {
-            // Entry keys are laid out in id order, so the walk ends at
-            // the FIRST id >= minid -- everything before it is a victim
-            // by construction (and LIMIT simply stops the batch early,
-            // leaving the rest for a later call; the budget is checked
-            // BEFORE a victim is taken, so LIMIT 0 trims NOTHING).
-            let mut victims = Vec::new();
-            let _ = ops::for_each_from(&ctx.shared.store, &base, false, &mut |k, _| {
-                if !k.starts_with(&base) {
-                    return false;
-                }
-                if limit.is_some_and(|n| victims.len() as u64 >= n) {
-                    return false;
-                }
-                match id_from_key(&base, k) {
-                    Some(id) if id < minid => victims.push(k.to_vec()),
-                    Some(_) => return false, // reached the keep boundary
-                    None => {}               // foreign suffix inside the window: skip
-                }
-                true
-            });
-            victims
-        }
-    };
+    // Victims of the plan over the live entry set (moved to
+    // `append_opts`, shared with the XADD-borne trim).
+    let victims =
+        append_opts::trim_victims(&ctx.shared.store, &prefix, &stream, plan, meta.len, None);
     let mut batch = WriteBatch::default();
     for k in &victims {
         batch.delete(k);

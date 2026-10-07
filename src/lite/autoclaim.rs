@@ -8,6 +8,7 @@ use crate::resp::codec as resp;
 
 use super::claim::{
     claimed_state, group_absent, nogroup, parse_u64, read_entry, register_consumer, succ_id,
+    ClaimHints,
 };
 use super::dlq;
 use super::entries;
@@ -220,6 +221,7 @@ pub async fn xautoclaim(ctx: &mut Ctx<'_>) {
                         &consumer,
                         now,
                         epoch,
+                        &ClaimHints::default(),
                     )),
                 );
                 if justid {

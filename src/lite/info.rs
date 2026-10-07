@@ -255,25 +255,35 @@ pub async fn xinfo(ctx: &mut Ctx<'_>) {
         }
         b"lite" if ctx.args.len() == 1 => lite_info(ctx),
         b"consumers" if ctx.args.len() == 3 => consumers_info(ctx),
-        b"stream" | b"groups" | b"topics" if ctx.args.len() == 2 => {
+        b"stream" => match super::xinfo_full::stream_args(&ctx.args[2..]) {
+            // FULL (with its optional COUNT) builds the deep view in
+            // `super::xinfo_full`; None keeps the plain summary.
+            Ok(None) => {
+                let Some((stream, prefix)) = stream_and_prefix(ctx, 1) else {
+                    return;
+                };
+                stream_info(ctx, &stream, &prefix)
+            }
+            Ok(Some(count)) => {
+                let Some((stream, prefix)) = stream_and_prefix(ctx, 1) else {
+                    return;
+                };
+                super::xinfo_full::stream_full(ctx, &stream, &prefix, count)
+            }
+            Err(e) => resp::append_error(ctx.out, e),
+        },
+        b"groups" | b"topics" if ctx.args.len() == 2 => {
             let arg = ctx.args[1].clone();
-            match sub.as_slice() {
-                b"topics" => {
-                    if !super::valid_part(&arg) {
-                        return resp::append_error(ctx.out, "ERR invalid topic name");
-                    }
-                    topics_info(ctx, &arg)
+            if sub.as_slice() == b"topics" {
+                if !super::valid_part(&arg) {
+                    return resp::append_error(ctx.out, "ERR invalid topic name");
                 }
-                _ => {
-                    let Some((stream, prefix)) = stream_and_prefix(ctx, 1) else {
-                        return;
-                    };
-                    if sub.as_slice() == b"stream" {
-                        stream_info(ctx, &stream, &prefix)
-                    } else {
-                        groups_info(ctx, &stream, &prefix)
-                    }
-                }
+                topics_info(ctx, &arg)
+            } else {
+                let Some((stream, prefix)) = stream_and_prefix(ctx, 1) else {
+                    return;
+                };
+                groups_info(ctx, &stream, &prefix)
             }
         }
         _ => resp::append_error(

@@ -58,6 +58,17 @@ C 级行、`05-p3-pool.md` 出池标注与 `features/changelog/` 记录（W4 收
 | 14 | 消费者注册行 idle GC | 立项（独立波） | 组内死成员按 idle 回收；三重判据（无 PEL ∧ 无活跃租约 ∧ 超时），默认关 |
 | 15 | 广播消费客户端模式文档化 | 立项（纯文档） | `features/mq-lite.md` 增广播模式节：每消费者独立组名 |
 
+> **复核结论（2026-10-07，W1 #9b）**：#9 的 LIMIT 子句维持「= XTRIM 参数语义」的收缩
+> 结论，**已覆盖**。证据：XTRIM 与 XADD 修剪共用同一解析器与执行器——
+> `src/lite/append_opts.rs:110-123`（`trim_at` 解析 `MINID [<~|=>] <id> [LIMIT <n>]`，
+> XTRIM 的 `parse_trim` 与 XADD 的 `scan_opts` 都经它）、`src/lite/append_opts.rs:263`
+> 与 `:274`（LIMIT 预算在取受害者**之前**判定，LIMIT 0 = 本轮不删）、执行侧
+> `src/lite/append.rs:362`（xtrim）与 `:140`（xadd 携带修剪同批删除）。行为由
+> `tests/lite_trim_minid_e2e.rs`（LIMIT 分段/LIMIT 0，既有）与
+> `tests/lite_xinfo_full_e2e.rs::xadd_trim_pins_xtrim_limit_semantics`（XADD
+> `MINID ... LIMIT` 钉行为，本批新增）双重钉住。#9a 新增的 NOMKSTREAM / XADD 修剪
+> 不引入任何私有 LIMIT 语法。
+
 分诊口径：**13 条立项进入执行波次**；#3 观望（唯一动存储格式的条目，等真实
 by-ts 诉求再评）；#9 立项但 LIMIT 子句按既有 XTRIM 参数语义收窄，不新增私有
 语法（台账在 `COMPAT.md` MQ 节注明）。
