@@ -251,11 +251,12 @@ mod tests {
 
     #[test]
     fn api_versions_v0_and_v3_shapes() {
-        // The advertised table = implemented_apis() in order (15 rows
-        // after P3 added the six coordinator apis and Batch 2 added
-        // ListGroups/DeleteGroups).
+        // The advertised table = implemented_apis() in order (20 rows
+        // after P3 added the six coordinator apis, Batch 2 added
+        // ListGroups/DeleteGroups and the P3 backfill added the five
+        // topic-admin/epoch rows).
         let want = super::super::implemented_apis();
-        assert_eq!(want.len(), 15);
+        assert_eq!(want.len(), 20);
 
         let v0 = api_versions_body(0, 0, false);
         let mut r = Reader::new(&v0);
@@ -287,22 +288,22 @@ mod tests {
 
     #[test]
     fn api_versions_sasl_rows_only_when_enabled() {
-        // Token on: 17 rows, key-sorted -- SaslHandshake(17) between
-        // ListGroups(16) and ApiVersions(18), SaslAuthenticate(36)
-        // between ApiVersions(18) and DeleteGroups(42).
+        // Token on: 22 rows, key-sorted -- SaslHandshake(17) between
+        // ListGroups(16) and CreateTopics(19); SaslAuthenticate(36)
+        // between DescribeConfigs(32) and CreatePartitions(37).
         let sasl_on = api_versions_body(0, 0, true);
         let mut r = Reader::new(&sasl_on);
         assert_eq!(r.i16(), Some(0));
-        assert_eq!(r.array_len(), Some(Some(17)));
+        assert_eq!(r.array_len(), Some(Some(22)));
         let mut keys = Vec::new();
-        for _ in 0..17 {
+        for _ in 0..22 {
             keys.push(r.i16().unwrap());
             r.i16();
             r.i16();
         }
         assert_eq!(
             keys,
-            vec![0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 36, 42]
+            vec![0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 23, 32, 36, 37, 42]
         );
         assert_eq!(r.remaining(), 0);
     }

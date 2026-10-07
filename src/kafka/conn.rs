@@ -21,12 +21,14 @@ use crate::kafka::fetch;
 use crate::kafka::frame::{parse_req_header, put_i32, put_resp_header, Reader};
 use crate::kafka::handshake;
 use crate::kafka::{admin, sasl};
+use crate::kafka::{admin_configs, admin_topics};
 use crate::kafka::{
-    api_flexible, api_name, api_supported, API_KEY_API_VERSIONS, API_KEY_DELETE_GROUPS,
+    api_flexible, api_name, api_supported, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS,
+    API_KEY_CREATE_TOPICS, API_KEY_DELETE_GROUPS, API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CONFIGS,
     API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT,
     API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE,
-    API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, API_KEY_SYNC_GROUP,
+    API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_OFFSET_FOR_LEADER_EPOCH,
+    API_KEY_PRODUCE, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, API_KEY_SYNC_GROUP,
 };
 use crate::kafka::{offsets_commit, offsets_query, produce};
 use crate::monitor;
@@ -340,6 +342,44 @@ async fn process(
                 return Err(format!("{} v{} unsupported", api_label, api_version));
             }
             Some(admin::handle_list_groups(&mut body, api_version, shared, coord).await?)
+        }
+        API_KEY_CREATE_TOPICS => {
+            if !api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            Some(admin_topics::handle_create_topics(&mut body, api_version, shared).await?)
+        }
+        API_KEY_DELETE_TOPICS => {
+            if !api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            Some(admin_topics::handle_delete_topics(&mut body, api_version, shared).await?)
+        }
+        API_KEY_CREATE_PARTITIONS => {
+            if !api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            Some(admin_topics::handle_create_partitions(&mut body, api_version, shared).await?)
+        }
+        API_KEY_DESCRIBE_CONFIGS => {
+            if !api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            Some(admin_configs::handle_describe_configs(
+                &mut body,
+                api_version,
+                shared,
+            )?)
+        }
+        API_KEY_OFFSET_FOR_LEADER_EPOCH => {
+            if !api_supported(api_key, api_version) {
+                return Err(format!("{} v{} unsupported", api_label, api_version));
+            }
+            Some(admin_configs::handle_offset_for_leader_epoch(
+                &mut body,
+                api_version,
+                shared,
+            )?)
         }
         API_KEY_DELETE_GROUPS => {
             if !api_supported(api_key, api_version) {

@@ -295,7 +295,7 @@ async fn sasl_token_matrix() {
         r.i16();
         r.i16();
     }
-    assert_eq!(keys.len(), 17, "15 + the SASL pair");
+    assert_eq!(keys.len(), 22, "20 + the SASL pair");
     assert!(keys.contains(&17) && keys.contains(&36));
     // Unauthenticated Produce is dropped without any reply.
     let mut b = Vec::new();
