@@ -262,8 +262,27 @@ pub async fn pending_rows(a: &str, s: &[u8], g: &[u8], n: usize) -> Vec<(String,
     rows
 }
 
-// ---- in-process helpers shared by the claim-options / xinfo-full suites ----
+/// A blocking read parked on its OWN connection and held open (the
+/// idle-consumer-GC lease tests): AUTH + command are written and the
+/// reply is never drained, so the server keeps the reader parked for
+/// as long as the guard lives; dropping it closes the socket.
+pub struct ParkedRead {
+    _sock: tokio::net::TcpStream,
+}
 
+pub async fn park_read(addr: &str, args: &[&[u8]]) -> ParkedRead {
+    use tokio::io::AsyncWriteExt;
+    let mut sock = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("park connect");
+    let auth = frame(&[b"AUTH", TOKEN.as_bytes()]);
+    let cmd = frame(args);
+    sock.write_all(&auth).await.expect("park auth write");
+    sock.write_all(&cmd).await.expect("park cmd write");
+    ParkedRead { _sock: sock }
+}
+
+// ---- in-process helpers shared by the claim-options / xinfo-full suites ----
 use rdb::state::Shared;
 
 /// XADD with an explicit id, asserting the echoed id reply (keeps every

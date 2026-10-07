@@ -356,6 +356,47 @@ RocksMQ HTTP 前置（[rocksmq-http.md](./rocksmq-http.md)）在本批对齐四�
   （头仍然赢）；XAUTOCLAIM 单轮最多认领头一行。成功接管后 epoch 递增并唤醒
   等待者；PEL 行携带所属 epoch（可观测性）。
 
+### 消费者 idle GC（`lite.consumer_gc_ms`，默认关）
+
+**定位**：后台回收"死掉"的组成员——消费者登记行（kind 0x0F tag 0x01）随首次投递/CREATECONSUMER
+落盘后永不自清，长期运行的话题会积累幽灵成员（XINFO CONSUMERS / XINFO FULL 越来越长）。
+GC 由 `lite: consumer_gc_ms: <ms>` 门控（`src/conf.rs`，默认 **0 = 完全不启用**、无后台任务，
+升级零行为变化），实现在 `src/lite/consumer_gc.rs`。
+
+**三重判据（缺一不可，任一不满足即保留）**：
+1. **无 PEL 条目**——该消费者名下 pending 为零。本轮在流 latch 下整段扫完该组 PEL 以"证明"
+   空（超过 1024 行的大 PEL 本轮跳过该组，轮转照常，绝不猜测）；
+2. **无活跃租约**——既没有停在等待中的 XREADGROUP（`Runtime::parked` 计数，read.rs 在
+   `wait_targets` await 前后成对 acquire/release），也不是有序组队列的**在租** owner
+   （`ordered::peek` + `lease_live`：有序机制自身的所有权租约已覆盖 owner，无需另建）；
+3. **空闲越过阈值**——`now - seen_ms >= consumer_gc_ms`。
+
+**seen_ms 口径（本批新增字段）**：`ConsumerState` 增加 `seen_ms`（`#[serde(default)]`，
+旧行解码为 0 时保守回落 `created_ms`），由**本来就要同步落盘的写**顺带刷新，**零新增 fsync**：
+`>` 投递到该消费者（read.rs，随 PEL 行同批，`created_ms` 保持不漂移）、XCLAIM/XAUTOCLAIM
+指向它（claim.rs `register_consumer`，随 claim 批）、XACK 其名下条目（ack.rs 经
+`pel::touch_seen`，只刷新已知名、绝不复活已回收名）。**不刷新**的场景（有意为之）：
+空轮询（`>` 读到空不写库，不为此加写）、后台重投 sweep（无人参与的时钟刷新会让僵尸成员
+永生，恰是有序租约 `takeover_if_stale` 明确避免的语义）。因此一个"只轮询不收消息"的消费者
+在阈值后可能被回收——它在下一次投递时随投递批自动重新登记（首见重写，一个批），自愈无感。
+
+**删除路径**：复用 XGROUP DELCONSUMER 的同一套代码——`group::plan_consumer_removals`
+（PEL 行清除 + 登记行删除，同批）+ `group::consumer_removal_effects`（backlog 回退、有序
+所有权释放、运行时登记遗忘），经流 meta latch（`try_lock`，redeliver 同约定：正在执行命令
+的流本轮跳过）下的一次**同步** `ops::batch_write` 提交。
+
+**与重投 sweep / XINFO 的交互**：GC 不持有也不触碰 sweep 的发现游标与 resume map（自带
+独立发现游标），两者交错互不干扰；GC 删除登记行后，`XINFO CONSUMERS` 与 `XINFO STREAM
+FULL` 的 consumers 名册随之收缩（两者名册 = 登记行 ∪ PEL 行主）。FULL 的 `seen-time`
+字段口径不变（仍是最新 PEL 投递时间、无 PEL 时登记时间的近似，不读 `seen_ms`）。**kill -9 持久性**：回收是
+同步批写，SIGKILL 后重启已回收成员**不会**重现（proc e2e 断言），幸存者及其 PEL 完整；
+重启后 delivered 水位回卷到 committed，未 ack 行按 at-least-once 重投给下一个 `>` 读者。
+
+**节奏**：1s 一轮（慢于 flusher 的 200ms：回收时延无观测面，阈值通常是分钟级，且每轮要
+整扫一组 PEL），每轮至多 32 组（发现复用 redeliver 的旋转扫描）。**有序 owner 豁免**是租约
+性的而非永久：租约在（默认 30s 内有投递刷新）必保；租约过期且 PEL 空、seen 过期的遗弃
+owner 与普通成员一样回收（队列由下一个询问者接管）。
+
 ## 关联
 - 实现：[agents/rust](../agents/rust/index.md)（`lite/` 模块族）
 - 偏差总表：[COMPAT.md](../COMPAT.md)

@@ -474,13 +474,23 @@ async fn deliver_new(
                 }),
             );
         }
-        // First sight of this consumer: registry row rides the batch.
-        if !ctx.shared.lite.ensure_consumer(&s.stream, group, consumer) {
-            batch.put(
-                pel::consumer_key(&s.prefix, &s.stream, group, consumer),
-                pel::encode_consumer(&pel::ConsumerState { created_ms: now_ms }),
-            );
-        }
+        // Registry row rides the batch EVERY delivery now (not just the
+        // first sight): `seen_ms` is the idle-GC activity clock, and the
+        // rewrite preserves the remembered `created_ms` -- one extra
+        // small put inside the batch the PEL rows already sync, no new
+        // commit and no new fsync per operation.
+        let created = ctx
+            .shared
+            .lite
+            .ensure_consumer(&s.stream, group, consumer, now_ms)
+            .unwrap_or(now_ms);
+        batch.put(
+            pel::consumer_key(&s.prefix, &s.stream, group, consumer),
+            pel::encode_consumer(&pel::ConsumerState {
+                created_ms: created,
+                seen_ms: now_ms,
+            }),
+        );
         total += v.len() as u64;
         // A dead-letter-only round delivers nothing: an empty entry
         // list would reply `[[stream, *0]]` -- an inner empty-array
@@ -679,7 +689,19 @@ pub async fn xreadgroup(ctx: &mut Ctx<'_>) {
         // registration, so it must never touch the store or latches.
         let shared = ctx.shared;
         let gate_open = |s: &StreamSpec| gate_open_cached(shared, s, &group, &consumer);
-        match wait_targets(ctx, &targets, left, &gate_open).await {
+        // Parked-reader lease (idle-GC veto #2): while this command is
+        // blocked in wait_targets, its consumer counts as an active
+        // member of every `>` target and is never collected. Refcounted
+        // acquire/release around the await, so every wake path (timeout,
+        // error, data, gate) drops the count exactly once.
+        for s in &fresh {
+            ctx.shared.lite.park_acquire(&s.stream, &group, &consumer);
+        }
+        let woke = wait_targets(ctx, &targets, left, &gate_open).await;
+        for s in &fresh {
+            ctx.shared.lite.park_release(&s.stream, &group, &consumer);
+        }
+        match woke {
             None => return nil_array(ctx.out),
             Some(Err(e)) => {
                 return resp::append_error(ctx.out, &format!("ERR: xreadgroup failed: {e}"))

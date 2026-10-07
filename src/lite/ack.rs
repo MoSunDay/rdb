@@ -76,16 +76,17 @@ pub async fn xack(ctx: &mut Ctx<'_>) {
         // PEL rows go away with their ack: point-check every id first.
         // Ids at/below the watermark (SETID rewinds, reclaimed
         // redeliveries) can still be pending, so the deletion is not
-        // gated on the reply count.
-        let pend_hits: Vec<model::EntryId> = ids
+        // gated on the reply count. The surviving states also name each
+        // row's OWNER: an ack is consumer activity, so the owners' seen
+        // clock rides the very batch that deletes their rows.
+        let pend_hits: Vec<(model::EntryId, Vec<u8>)> = ids
             .iter()
-            .filter(|id| {
-                super::pel::get_pend(&ctx.shared.store, &prefix, &stream, &group, **id)
+            .filter_map(|id| {
+                super::pel::get_pend(&ctx.shared.store, &prefix, &stream, &group, *id)
                     .ok()
                     .flatten()
-                    .is_some()
+                    .map(|st| (*id, st.consumer))
             })
-            .copied()
             .collect();
         let max_acked = ids.iter().max().copied().unwrap_or(old_committed);
         // Contiguous-prefix probe: only meaningful when the ack reaches
@@ -139,8 +140,24 @@ pub async fn xack(ctx: &mut Ctx<'_>) {
                         model::encode_group(&super::dlq::payload_of(&st)),
                     );
                 }
-                for id in &pend_hits {
+                for (id, _) in &pend_hits {
                     batch.delete(super::pel::pend_key(&prefix, &stream, &group, *id));
+                }
+                // Seen refresh for every DISTINCT owner of an acked row
+                // (refresh-only, never a resurrect -- see `touch_seen`);
+                // one small put per owner inside the already-synced
+                // batch, no new fsync per ack.
+                let now = crate::ds::expire::now_ms();
+                let mut owners: Vec<&Vec<u8>> = Vec::new();
+                for (_, owner) in &pend_hits {
+                    if !owners.contains(&owner) {
+                        owners.push(owner);
+                    }
+                }
+                for owner in owners {
+                    super::pel::touch_seen(
+                        ctx.shared, &mut batch, &prefix, &stream, &group, owner, now,
+                    );
                 }
                 if let Err(e) = ctx.commit(batch).await {
                     return resp::append_error(ctx.out, &format!("ERR: xack failed: {e}"));

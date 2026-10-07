@@ -17,6 +17,7 @@ pub mod append;
 pub mod append_opts;
 pub mod autoclaim;
 pub mod claim;
+pub mod consumer_gc;
 pub mod delay;
 pub mod dlq;
 pub mod dlq_depth;
@@ -131,9 +132,16 @@ pub struct Runtime {
     /// Per-parent round-robin cursors.
     pub picks: Mutex<HashMap<Vec<u8>, u64>>,
     /// Consumers already registered this process, (stream, group,
-    /// consumer) raw bytes: delivery skips the registry-key rewrite once
-    /// the name is known (the key survives on disk).
-    pub consumers: Mutex<HashSet<pel::ConsumerId>>,
+    /// consumer) raw bytes -> remembered `created_ms`: the registry row
+    /// survives on disk, so a `seen_ms` refresh rewrites it without a
+    /// re-read while delivery still skips the FIRST-sight rewrite.
+    pub consumers: Mutex<HashMap<pel::ConsumerId, u64>>,
+    /// Parked XREADGROUP leases, (stream, group, consumer) -> number of
+    /// commands currently blocked waiting on it: the idle consumer GC's
+    /// "active member" veto (a blocked reader is never collectable).
+    /// Process-local by design -- a restart drops every connection, so
+    /// no pre-restart zombie reader can exist.
+    pub parked: Mutex<HashMap<pel::ConsumerId, u32>>,
     /// Deferred orphan sweeps: streams whose family records were deleted
     /// by a NON-command path (XIDLE active-expire reap, lazy idle purge,
     /// DEL/EXPIRE of a stream key) and still need the latched sweep of
@@ -178,15 +186,41 @@ impl Runtime {
 }
 
 impl Runtime {
-    /// First-sight check for the consumer registry: `false` = not yet
-    /// known this process (the caller writes the registry key once),
-    /// `true` = already registered -- and remembered either way.
-    pub fn ensure_consumer(&self, stream: &[u8], group: &[u8], consumer: &[u8]) -> bool {
-        let mut set = self
+    /// First-sight check for the consumer registry: `None` = not yet
+    /// known this process (the caller writes the registry row, stamping
+    /// `created_ms = now_ms`), `Some(created_ms)` = the remembered
+    /// creation time, so a `seen_ms` refresh rewrites the row without
+    /// drifting `created_ms` -- and the name is remembered either way.
+    pub fn ensure_consumer(
+        &self,
+        stream: &[u8],
+        group: &[u8],
+        consumer: &[u8],
+        created_ms: u64,
+    ) -> Option<u64> {
+        let mut map = self
             .consumers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set.insert((stream.to_vec(), group.to_vec(), consumer.to_vec()))
+        let key = (stream.to_vec(), group.to_vec(), consumer.to_vec());
+        match map.get(&key) {
+            Some(c) => Some(*c),
+            None => {
+                map.insert(key, created_ms);
+                None
+            }
+        }
+    }
+
+    /// Remembered creation time of one consumer (no insert): the ack
+    /// path's refresh-only `seen_ms` touch falls back to a point read
+    /// of the persisted row when this misses.
+    pub fn consumer_created(&self, stream: &[u8], group: &[u8], consumer: &[u8]) -> Option<u64> {
+        self.consumers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(stream.to_vec(), group.to_vec(), consumer.to_vec()))
+            .copied()
     }
 
     /// Forget one consumer (XGROUP DELCONSUMER).
@@ -204,7 +238,48 @@ impl Runtime {
             .consumers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set.retain(|(s, g, _)| !(s == stream && g == group));
+        set.retain(|(s, g, _), _| !(s == stream && g == group));
+    }
+
+    /// Count one (stream, group, consumer) as blocked in a waiting
+    /// XREADGROUP: refcounted, because the same name may wait from more
+    /// than one connection. The idle consumer GC vetoes collection of
+    /// any name with a live count.
+    pub fn park_acquire(&self, stream: &[u8], group: &[u8], consumer: &[u8]) {
+        let mut map = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (stream.to_vec(), group.to_vec(), consumer.to_vec());
+        *map.entry(key).or_insert(0) += 1;
+    }
+
+    /// Drop one parked-wait count (missing keys are a no-op, so a
+    /// DELCONSUMER between park and wake cannot poison the map).
+    pub fn park_release(&self, stream: &[u8], group: &[u8], consumer: &[u8]) {
+        let mut map = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (stream.to_vec(), group.to_vec(), consumer.to_vec());
+        match map.get(&key) {
+            Some(n) if *n <= 1 => {
+                map.remove(&key);
+            }
+            Some(_) => {
+                map.entry(key).and_modify(|n| *n -= 1);
+            }
+            None => {}
+        }
+    }
+
+    /// Whether a consumer is currently blocked in a waiting XREADGROUP
+    /// (the idle GC's lease veto #2).
+    pub fn is_parked(&self, stream: &[u8], group: &[u8], consumer: &[u8]) -> bool {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(stream.to_vec(), group.to_vec(), consumer.to_vec()))
     }
 }
 
@@ -214,7 +289,8 @@ pub fn new_runtime() -> Runtime {
         owners: Mutex::new(HashMap::new()),
         lease_ms: std::sync::atomic::AtomicU64::new(DEFAULT_LEASE_MS),
         picks: Mutex::new(HashMap::new()),
-        consumers: Mutex::new(HashSet::new()),
+        consumers: Mutex::new(HashMap::new()),
+        parked: Mutex::new(HashMap::new()),
         reaps: Mutex::new(Vec::new()),
         stats: Stats::default(),
     }
