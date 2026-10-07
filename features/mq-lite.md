@@ -404,3 +404,4 @@ owner 与普通成员一样回收（队列由下一个询问者接管）。
 - 引擎补齐：[changelog 2026-08-21](./changelog/2026-08-21/mq-lite-engine-and-kafka-decision.md)
 - 本批落地：[changelog 2026-09-09](./changelog/2026-09-09/mq-ordered-groups.md)
 - 引擎可靠性批次：[changelog 2026-10-06](./changelog/2026-10-06/mq-engine-batch1.md)
+- P3 按需池回填（XADD 选项/XCLAIM 提示/XINFO FULL/GC/广播）：[changelog 2026-10-07](./changelog/2026-10-07/mq-p3-backfill.md)

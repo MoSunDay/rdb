@@ -146,21 +146,30 @@ B 级共性：均为"常用 MQ 客户端开箱即用"所需的最小面补齐；
 ## C 级（P3 按需池）
 
 以下条目**本计划不排期**，逐条触发条件与理由在 `05-p3-pool.md`（触发即从池中
-取出单独立项，不改本矩阵）：
+取出单独立项，不改本矩阵）。
 
-- CreateTopics / DeleteTopics / CreatePartitions
-- `kafka_auto_create_topics`
-- produce timestamp 保留
-- ListOffsets v2+
-- DescribeConfigs 桩
-- OffsetForLeaderEpoch
-- XCLAIM TIME / RETRYCOUNT / IDLE
-- XINFO FULL
-- XADD NOMKSTREAM / LIMIT
-- HTTP 批量 produce、批量 ack、`/range` 回放
-- `rocksmq_max_connections`
-- 消费者注册行 idle GC
-- 广播消费客户端模式文档化
+**2026-10-07 出池注记**：全池触发立项，经 `plans/2026-10-07-mq-p3-backfill/`
+落地（摘要 `features/changelog/2026-10-07/mq-p3-backfill.md`；shas：91d78ff、
+1619c8c、1d55e69、b8c3c10、17979dd，配置键 697b3b9）。行标注沿用本矩阵记号：
+
+- CreateTopics / DeleteTopics / CreatePartitions —— ✅ 已落地（`src/kafka/
+  admin_topics.rs` + `topic_store.rs`）
+- `kafka_auto_create_topics` —— ✅ 已落地（默认 false 零行为变化）
+- produce timestamp 保留 —— ❌ 悬置（#3 观望：唯一动存储格式项，再评条件 =
+  出现按事件时间检索/回放的真实诉求，见 `05` §2 存留行）
+- ListOffsets v2+ —— ✅ 已落地（v0–v5，v4+ leader_epoch 恒 -1）
+- DescribeConfigs 桩 —— ✅ 已落地（静态最小集桩，`admin_configs.rs`）
+- OffsetForLeaderEpoch —— ✅ 已落地（常量应答：epoch -1 + log 末端）
+- XCLAIM TIME / RETRYCOUNT / IDLE —— ✅ 已落地（LASTID 仍不支持）
+- XINFO FULL —— ✅ 已落地（`src/lite/xinfo_full.rs`）
+- XADD NOMKSTREAM / LIMIT —— ✅ 已落地；**LIMIT 收缩**：语义 = 既有 XTRIM 参数
+  （`src/lite/append_opts.rs` 共用解析器），已覆盖不造私有语法，台账
+  `COMPAT.md`
+- HTTP 批量 produce、批量 ack、`/range` 回放 —— ✅ 已落地（`src/rocksmq/
+  batch.rs` + `range.rs`）
+- `rocksmq_max_connections` —— ✅ 已落地（0 = 内建 4096，达上限静默拒纳）
+- 消费者注册行 idle GC —— ✅ 已落地（三重判据 + kill -9 持久，默认关）
+- 广播消费客户端模式文档化 —— ✅ 已落地（`features/mq-lite.md` 广播节）
 
 ## 显式不做
 
@@ -232,7 +241,7 @@ wire 语义，强行映射会破坏 Fetch 的 ordinal 稳定性假设），跨�
 | kafka ListGroups / DeleteGroups | `03` | Batch 2 |
 | kafka 鉴权（SASL PLAIN） | `03` | Batch 2 |
 | rocksmq 鉴权（Bearer） | `04` | Batch 2 |
-| C 级全部条目 | `05` | Batch 3（按需，触发后另立） |
+| C 级全部条目 | `05` | Batch 3（按需）：2026-10-07 触发全池立项，经 `plans/2026-10-07-mq-p3-backfill/` 出池落地（#3 观望悬置） |
 
 - Batch 1 = `01` 全部 + `03` 的 headers 回放缺陷修复，含 5 个新 e2e：
   `lite_dlq_e2e.rs`、`lite_redeliver_e2e.rs`、`lite_trim_minid_e2e.rs`、
@@ -270,6 +279,8 @@ wire 语义，强行映射会破坏 Fetch 的 ordinal 稳定性假设），跨�
 
 - `05` 池内条目逐条按触发条件评估；触发即从池取出、另立计划文档，不回改
   本矩阵。
+- 2026-10-07 落地注记：全池触发，另立 `plans/2026-10-07-mq-p3-backfill/` 执行
+  完毕（C 级行标注见上节）；池内仅存 #3 观望行。
 
 ## 验收基线与文档同步（指向 06）
 

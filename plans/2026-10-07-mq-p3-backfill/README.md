@@ -1,10 +1,11 @@
 # 2026-10-07 mq-p3-backfill：P3 按需池全池补齐计划
 
-> 状态：proposed
+> 状态：landed（2026-10-07 W4 收尾；#3 观望未实施、W3 未排期，见 §6 收尾）
 > 日期：2026-10-07
 > 输入：`plans/2026-10-06-mq-gap/05-p3-pool.md` §2 按需池（条目 #1–#15）
 > 关联：本文件即本计划总览（承担 `00` 号角色；按 `plans/index.md` 约定，单文档
-> 计划允许总览直接以 README.md 承载，工作包不另拆号）
+> 计划允许总览直接以 README.md 承载，工作包不另拆号）；落地摘要归档
+> `features/changelog/2026-10-07/mq-p3-backfill.md`
 
 本文是 P3 按需池的**全池立项计划**：2026-10-07 用户指令「做好补齐的规划」触发
 `05-p3-pool.md` 附录 A 登记，按 §1.3 立项流程成文。范围 = 池内 #1–#15 的分诊、
@@ -153,3 +154,38 @@ by-ts 诉求再评）；#9 立项但 LIMIT 子句按既有 XTRIM 参数语义收
 | 专项回归门 | `lite_ordered_*`、`flushdb_*`、`kafka_*` 全族、`rocksmq_*` 全族逐套绿 |
 | 行数审计 | 新文件 ≤400 行；迭代文件 ≤800 行（`src/conf.rs` 355 起步、`tests/common/mod.rs` 799 冻结） |
 | 台账完整性 | 出池三件套（00 矩阵 / 05 池 / changelog）同批落；#9 LIMIT 语义收缩在 `COMPAT.md` 注明 |
+
+## 6. 收尾（2026-10-07 W4 落地记录）
+
+### 6.1 实际提交清单
+
+| 序 | sha | 内容 |
+| --- | --- | --- |
+| 0 | bbcd728 | docs(plans)：本计划登记 + `plans/index.md` 索引行 |
+| 1 | 697b3b9 | feat(conf) W0：`kafka_auto_create_topics` / `rocksmq_max_connections` / `lite.consumer_gc_ms` 三键 + yaml 样例 + conf 单测 |
+| 2 | 91d78ff | feat(kafka) W1-K：ListOffsets v2–v5（leader_epoch 解码，v6 以下全 classic） |
+| 3 | 1619c8c | feat(kafka) W1-K：CreateTopics(19)/DeleteTopics(20)/CreatePartitions(37) + DescribeConfigs(32) 桩 + OffsetForLeaderEpoch(23) + produce auto-create 接线；广告面 15→20 |
+| 4 | 1d55e69 | feat(lite) W1-L：`append_opts.rs`（NOMKSTREAM/共用修剪）+ XCLAIM IDLE/TIME/RETRYCOUNT + XINFO FULL（`xinfo_full.rs`）+ 广播文档 |
+| 5 | b8c3c10 | feat(rocksmq) W1-H：`/produce_batch` + `/ack_batch` + `/range` + `guard.rs` 连接上限 |
+| 6 | 17979dd | feat(lite) W2：`consumer_gc.rs` idle GC（三重判据、seen_ms、有序 owner 豁免、kill -9 持久） |
+| 7 | —（本批） | docs：出池三件套 + `features/kafka-front.md`/`mq-lite.md`/`rocksmq-http.md`/`COMPAT.md`/`e2e-coverage.md` + changelog |
+
+### 6.2 测试与验收
+
+- 用例总数 **1780 → 1839（+59，只增不减）**；新增 6 个 e2e 文件
+  （`kafka_topics_e2e`/`lite_claim_opts_e2e`/`lite_xinfo_full_e2e`/
+  `rocksmq_batch_range_e2e`/`lite_consumer_gc_e2e`/`lite_consumer_gc_proc_e2e`）
+  + 公共 harness `tests/common/mq.rs`（`tests/common/mod.rs` 维持 799 行未加）；
+  广告面 20 行断言更新在 `kafka_wire_e2e`。
+- 出池三件套同批：`00-gap-matrix.md` C 级标注、`05-p3-pool.md` §2 出池注记、
+  `features/changelog/2026-10-07/mq-p3-backfill.md`；#9 收缩台账落 `COMPAT.md`。
+
+### 6.3 与计划的偏差
+
+- **提交切分**：§3.3 计划 feat(lite) ×2，实际合并为 ×1（1d55e69）——L 车道两条
+  并行线共享 `src/lite/mod.rs` 等接线 hunk，不可分割；内容无增减。
+- **场景脚本扩段**（§2 W4 车道）：`scenario_kafka_sdk.sh` admin 步与
+  `scenario_lite_mq.sh` FULL/NOMKSTREAM 步由并行收尾车道进行中，随其合入
+  （e2e-coverage 已按场景覆盖入口登记）。
+- **W3 未排期**（按 §2 原文）：#3 观望不动存储格式；再评条件 = 出现按事件时间
+  检索/回放的真实诉求。池内存留行即 `05-p3-pool.md` §2 的 #3。

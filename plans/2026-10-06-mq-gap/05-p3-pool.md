@@ -97,23 +97,22 @@
 
 ## 2. 池条目总表
 
+> **2026-10-07 已出池（14 条）**：#1、#2、#4–#15 经
+> `plans/2026-10-07-mq-p3-backfill/` 全池立项并落地，按 §5.2 从本表同步移除
+> （状态归该计划文档管）。摘要与逐条落点：`features/changelog/2026-10-07/
+> mq-p3-backfill.md`；shas：91d78ff（#4）、1619c8c（#1/#2/#5/#6）、1d55e69
+> （#7/#8/#9/#15）、b8c3c10（#10–#13）、17979dd（#14），配置键 697b3b9。
+> 00 号矩阵的 C 级节相应改为**标注后的历史快照**（✅/❌ 记号 + 出池注记），
+> 不再是本表的逐行镜像；§5.3 清单的"两处行数相等"检查以本表存留行为准。
+> **#9 出池口径（收缩注记）**：LIMIT 子句语义 = 既有 XTRIM 的 LIMIT 参数，
+> 复核结论"已覆盖、不造私有语法"（证据链在计划 §1），台账注记落在 `COMPAT.md`
+> MQ 节；本表不再单列。
+
+存留条目：
+
 | # | 条目 | 内容 | 触发条件 | 预估落点 | 预估规模 |
 |---|---|---|---|---|---|
-| 1 | CreateTopics / DeleteTopics / CreatePartitions | Kafka AdminClient 建/删 topic 映射为显式建 parent 流 + N 队列 | 出现以 SDK AdminClient 自动建/删 topic 的真实负载 | `src/kafka/catalog.rs` / 新 admin 模块 | 中（wire 面 + 建流编排 + e2e） |
-| 2 | `kafka_auto_create_topics` | 配置 parity：Produce 到未知 topic 时按开关建默认分区 | 客户端依赖 auto-create 语义（现按面规范回 error 3） | `src/conf.rs` + `src/kafka/mapping.rs` | 小 |
-| 3 | produce timestamp 保留 | ListOffsets by-ts 改用事件时间（现落库即丢弃、按到达时钟） | 下游依赖按时间戳回溯 offset | `src/kafka/produce.rs` / `offsets_query.rs` | 中（写入格式 + 存量兼容） |
-| 4 | ListOffsets v2+ | 补 v2+ 请求版本（现仅注册 v0–v1，未实现版本回 error 35） | 新 SDK 默认只发 v2+ | `src/kafka/offsets_query.rs` | 小 |
-| 5 | DescribeConfigs 桩 | 回最小配置集（topic 级空/默认值即可） | SDK AdminClient 启动期强依赖 | `src/kafka/`（admin 模块） | 小 |
-| 6 | OffsetForLeaderEpoch | 单节点语义下 epoch 恒定，回常量应答 | 消费者 leader epoch 校验开启且报错频发 | `src/kafka/coordinator/` | 中 |
-| 7 | XCLAIM TIME/RETRYCOUNT/IDLE | claim 时显式改写投递时间/次数/空闲 | 客户端迁移脚本依赖 | `src/lite/claim.rs` | 小 |
-| 8 | XINFO FULL | 流/组/PEL 全量视图 | 运维排障需求 | `src/lite/info.rs` | 中 |
-| 9 | XADD NOMKSTREAM/LIMIT | 不建流开关 + 追加限额 | 客户端库默认附带 | `src/lite/append.rs` | 小 |
-| 10 | HTTP 批量 produce | 单请求多条写入 | 单请求批量写入压测 / 网关聚合需求 | `src/rocksmq/api.rs` | 中 |
-| 11 | HTTP 批量 ack | 单请求多条确认 | 同条目 10 | `src/rocksmq/api.rs` | 小 |
-| 12 | HTTP `/range` 回放 | 按 id 区间拉历史消息 | 审计 / 回填需求 | `src/rocksmq/query.rs` | 中 |
-| 13 | `rocksmq_max_connections` | 连接数上限（配置 parity） | 公网暴露或资源保护需求 | `src/conf.rs` + rocksmq 接入层 | 小 |
-| 14 | 消费者注册行 idle GC | 组内死成员按 idle 回收 | 长期运行后组内死成员堆积导致 XINFO/组查询膨胀 | Lite 组模型（`src/lite/model.rs` 一线） | 中 |
-| 15 | 广播消费客户端模式文档化 | 每消费者独立组名模式（纯文档） | 多播场景用户问询 | `features/mq-lite.md` | 小（纯文档） |
+| 3 | produce timestamp 保留 | ListOffsets by-ts 改用事件时间（现落库即丢弃、按到达时钟） | 下游依赖按时间戳回溯 offset（再评条件：出现按事件时间检索/回放的真实诉求；唯一动存储格式项） | `src/kafka/produce.rs` / `offsets_query.rs` | 中（写入格式 + 存量兼容） |
 
 列口径：
 
@@ -135,7 +134,9 @@
 ### 2.2 与工作包交付物的交叠看板
 
 池条目立项时若与已合入的工作包交付物同文件，须先做冲突核对（§3.2 已述纪律）。
-交叠点速查：
+交叠点速查（本表与 §3 分组备注均为**出池前的分诊快照**，供 #3 再评或后续入池
+条目复用；已出池条目的核对结论记录在 `plans/2026-10-07-mq-p3-backfill/` §3.4
+路径隔离白名单）：
 
 | 池条目 | 交叠的工作包面 | 核对要点 |
 |---|---|---|
