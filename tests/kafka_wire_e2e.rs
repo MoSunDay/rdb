@@ -61,8 +61,8 @@ async fn api_versions_and_metadata_over_the_wire() {
     );
     assert_eq!(
         [r.i16(), r.i16(), r.i16()],
-        [Some(2), Some(0), Some(1)],
-        "ListOffsets v0-v1"
+        [Some(2), Some(0), Some(5)],
+        "ListOffsets v0-v5 (all classic)"
     );
     assert_eq!(
         [r.i16(), r.i16(), r.i16()],
@@ -137,7 +137,7 @@ async fn api_versions_and_metadata_over_the_wire() {
     for (key, lo, hi) in [
         (0, 0, 3),
         (1, 0, 10),
-        (2, 0, 1),
+        (2, 0, 5),
         (3, 0, 8),
         (8, 0, 2),
         (9, 0, 7),
