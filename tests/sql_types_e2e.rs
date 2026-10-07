@@ -6,64 +6,13 @@
 
 mod common;
 
+use common::mysql::{col_types, ddl, rows, s, sorted_cells, PASS};
 use common::{
     mysql_root_conn, mysql_server_error, spawn_node_mysql, wait_mysql_ready, wait_resp_ready,
 };
-use mysql_async::consts::{ColumnType, ColumnType::*};
+use mysql_async::consts::ColumnType::*;
 use mysql_async::prelude::*;
 use mysql_async::Value as MVal;
-
-const PASS: &str = "e2e-sql-pass";
-
-/// DDL needs the raft leader; retry until the bootstrap node becomes one.
-async fn ddl(conn: &mut mysql_async::Conn, sql: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match conn.query_drop(sql).await {
-            Ok(()) => return,
-            Err(e) => {
-                if std::time::Instant::now() < deadline && e.to_string().contains("leader") {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    continue;
-                }
-                panic!("ddl {sql}: {e}")
-            }
-        }
-    }
-}
-
-async fn rows(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<MVal>> {
-    let rs: Vec<mysql_async::Row> = conn.query(sql).await.expect(sql);
-    rs.into_iter()
-        .map(|r| {
-            (0..r.len())
-                .map(|i| r.get::<MVal, _>(i).unwrap_or(MVal::NULL))
-                .collect()
-        })
-        .collect()
-}
-
-/// Sorted text cells of a single-column result (order unspecified).
-async fn sorted_cells(conn: &mut mysql_async::Conn, sql: &str) -> Vec<MVal> {
-    let mut cells: Vec<MVal> = rows(conn, sql)
-        .await
-        .into_iter()
-        .map(|mut r| r.remove(0))
-        .collect();
-    cells.sort_by_key(|c| format!("{c:?}"));
-    cells
-}
-
-fn s(v: &str) -> MVal {
-    MVal::Bytes(v.as_bytes().to_vec())
-}
-
-/// First row's column wire types (metadata assertions).
-async fn col_types(conn: &mut mysql_async::Conn, sql: &str) -> Vec<ColumnType> {
-    let rs: Vec<mysql_async::Row> = conn.query(sql).await.expect(sql);
-    let row = rs.first().unwrap_or_else(|| panic!("no rows for {sql}"));
-    row.columns_ref().iter().map(|c| c.column_type()).collect()
-}
 
 fn digits(b: &[u8]) -> bool {
     !b.is_empty() && b.iter().all(u8::is_ascii_digit)
@@ -426,131 +375,5 @@ async fn unsupported_and_zero_temporal_values_loud() {
     assert!(e.message.contains("Incorrect DATE value"), "{}", e.message);
     let got = rows(&mut c, "SELECT COUNT(*) FROM ok").await;
     assert_eq!(got, vec![vec![s("0")]], "nothing stored");
-    node.kill_now();
-}
-
-/// DECIMAL end to end: exact literal arithmetic (0.1 + 0.2 is 0.30,
-/// never a binary-float 0.30000000000000004), half-away-from-zero
-/// rounding on writes, SUM/AVG widening, exact comparisons through a
-/// secondary index, DESCRIBE and the precision edge.
-#[tokio::test]
-async fn decimal_exact_semantics_end_to_end() {
-    let dir = std::env::temp_dir().join(format!("rdb-sql-types-dec-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut node = spawn_node_mysql(&dir, 0, true, None);
-    wait_resp_ready(&mut node, 15).await;
-    wait_mysql_ready(&node, 15).await;
-    let mut c = mysql_root_conn(&node, PASS).await;
-
-    // Exact literals: plain int.frac text never touches an f64. The sum
-    // renders at scale max(1,1)=1 like MySQL, and 0.1+0.2 is exactly 0.3.
-    assert_eq!(rows(&mut c, "SELECT 0.1 + 0.2").await, vec![vec![s("0.3")]]);
-    assert_eq!(rows(&mut c, "SELECT 1 / 3").await, vec![vec![s("0")]]);
-    assert_eq!(
-        rows(&mut c, "SELECT 1.0 / 3").await,
-        vec![vec![s("0.33333")]]
-    );
-    assert_eq!(
-        rows(&mut c, "SELECT -0.05 / 0.10").await,
-        vec![vec![s("-0.500000")]]
-    );
-
-    // Column writes round half away from zero at the declared scale.
-    ddl(
-        &mut c,
-        "CREATE TABLE dec (id BIGINT PRIMARY KEY, v DECIMAL(10,2))",
-    )
-    .await;
-    for (id, v) in [(1, "1.005"), (2, "2.344"), (3, "-1.005"), (4, "NULL")] {
-        c.query_drop(format!("INSERT INTO dec (id, v) VALUES ({id}, {v})"))
-            .await
-            .expect("seed dec");
-    }
-    assert_eq!(
-        rows(&mut c, "SELECT v FROM dec ORDER BY id").await,
-        vec![
-            vec![s("1.01")],
-            vec![s("2.34")],
-            vec![s("-1.01")],
-            vec![MVal::NULL]
-        ]
-    );
-
-    // Metadata and DESCRIBE carry the declared type.
-    assert_eq!(
-        col_types(&mut c, "SELECT v FROM dec").await,
-        vec![MYSQL_TYPE_NEWDECIMAL]
-    );
-    assert_eq!(
-        rows(&mut c, "DESCRIBE dec").await[0][..2],
-        vec![s("id"), s("bigint")][..]
-    );
-    assert_eq!(
-        rows(&mut c, "DESCRIBE dec").await[1][..2],
-        vec![s("v"), s("decimal(10,2)")][..]
-    );
-
-    // Exact comparisons drive a secondary index (cross-scale literal).
-    ddl(&mut c, "CREATE INDEX idx_v ON dec (v)").await;
-    assert_eq!(
-        rows(&mut c, "SELECT id FROM dec WHERE v = 1.010").await,
-        vec![vec![s("1")]]
-    );
-    let rs = rows(&mut c, "EXPLAIN SELECT id FROM dec WHERE v = 1.010").await;
-    let MVal::Bytes(b) = &rs[0][0] else {
-        panic!("plan line")
-    };
-    assert_eq!(
-        String::from_utf8(b.clone()).unwrap(),
-        "IndexScan idx_v -> 1 pks"
-    );
-
-    // ORDER BY walks the numeric order, negatives first.
-    assert_eq!(
-        rows(&mut c, "SELECT v FROM dec WHERE v IS NOT NULL ORDER BY v").await,
-        vec![vec![s("-1.01")], vec![s("1.01")], vec![s("2.34")]]
-    );
-
-    // SUM stays decimal at the column scale; AVG divides at scale+4.
-    assert_eq!(
-        rows(&mut c, "SELECT SUM(v) FROM dec").await,
-        vec![vec![s("2.34")]]
-    );
-    assert_eq!(
-        rows(&mut c, "SELECT AVG(v) FROM dec").await,
-        vec![vec![s("0.780000")]]
-    );
-    assert_eq!(
-        rows(&mut c, "SELECT SUM(v) FROM dec WHERE id = 4").await,
-        vec![vec![MVal::NULL]]
-    );
-    assert_eq!(
-        rows(&mut c, "SELECT v + 1 FROM dec WHERE id = 4").await,
-        vec![vec![MVal::NULL]]
-    );
-
-    // The declared precision is enforced after rounding (MySQL 1292).
-    ddl(
-        &mut c,
-        "CREATE TABLE p5 (id BIGINT PRIMARY KEY, v DECIMAL(5,2))",
-    )
-    .await;
-    c.query_drop("INSERT INTO p5 (id, v) VALUES (1, 999.99)")
-        .await
-        .expect("edge fits");
-    for sql in [
-        "INSERT INTO p5 (id, v) VALUES (2, 123456)",
-        "INSERT INTO p5 (id, v) VALUES (2, 1000)",
-        "UPDATE p5 SET v = 999.995 WHERE id = 1",
-    ] {
-        let e = mysql_server_error(&mut c, sql).await;
-        assert_eq!(e.code, 1292, "{sql}: {}", e.message);
-        assert!(e.message.contains("Out of range"), "{sql}: {}", e.message);
-    }
-    assert_eq!(
-        rows(&mut c, "SELECT COUNT(*) FROM p5").await,
-        vec![vec![s("1")]]
-    );
     node.kill_now();
 }

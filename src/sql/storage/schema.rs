@@ -242,9 +242,10 @@ where
 }
 
 /// A table schema, stored as JSON under `sql_catalog/<table>` (see
-/// `catalog.rs`). `id` is stable across renames (there are none in v1) and
-/// namespaces physical row keys, so a dropped+recreated table never reads
-/// the old table's orphaned rows.
+/// `catalog.rs`). `id` namespaces physical row keys: RENAME keeps it
+/// (a catalog-only move, zero data copy) while TRUNCATE swaps it (the
+/// old id's keys become unreachable, like a drop+recreate), so a
+/// recreated or truncated table never reads the old table's rows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub id: u32,

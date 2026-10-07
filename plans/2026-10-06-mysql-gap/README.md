@@ -1,5 +1,13 @@
 # MySQL 兼容差距收敛计划（2026-10-06）
 
+> **执行状态（2026-10-06）**：M0-M5 全部落地——六个里程碑的落地记录见
+> `features/changelog/2026-10-06/mysql-m0-query-semantics.md` …
+> `mysql-m5-e2e-blindspots.md`（序数/别名/LIMIT ?/FROM DUAL → 函数族 → DML 冲突 →
+> 子查询/集合 → DDL/session → e2e 盲区）；`gap-matrix.md` 已标注落地状态与实际
+> 选型（集群 ODKU/REPLACE 1235 等）。文档同步在**收尾一次性完成**：逐里程碑
+> changelog 随各里程碑写入，`COMPAT`/`agents`/`features` 的同步集中在本次
+> （SQL 契约因 COMPAT.md 行数上限拆至 `COMPAT.sql.md`）。
+
 针对 Rust SQL 层（`src/sql/`：`parse` / `exec` / `front` / `plan` / `dist` / `index` / `columnar` / `tx`）
 与 MySQL 语义差距的调查已完成，本目录把调查结论固化为可执行的里程碑计划。核心判断：
 

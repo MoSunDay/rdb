@@ -1,7 +1,8 @@
 use super::*;
 use crate::sql::exec::{ddl, write, SqlSession};
 use crate::sql::parse::ast::Statement;
-use crate::sql::parse::parse_statement;
+use crate::sql::parse::error::ErrorCode;
+use crate::sql::parse::{bind_placeholders, parse_statement, placeholder_count};
 use crate::state::testutil;
 
 /// Engine with `t(id BIGINT PK, v VARCHAR NULL)` holding
@@ -232,6 +233,63 @@ fn result_type_pins_literals_and_typed_functions() {
     assert_eq!(result_type(&Expr::Placeholder, &scope), SqlType::VarChar);
 }
 
+/// Full-pipeline smoke of the M1 groundwork nodes: parse -> execute ->
+/// rows, plus the result-column metadata of CASE/CAST/REGEXP/`<=>`.
+#[tokio::test]
+async fn case_cast_regexp_operators_execute() {
+    let shared = setup().await;
+    // CASE searched + simple forms over real rows (v is NULL on 2, 4).
+    let rows = col(
+        &shared,
+        "SELECT CASE WHEN v IS NULL THEN 'none' ELSE v END FROM t WHERE id <= 2 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![Value::Str("b".into()), Value::Str("none".into())]
+    );
+    let rows = col(
+        &shared,
+        "SELECT CASE id WHEN 1 THEN 'one' ELSE 'other' END FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows[0], Value::Str("one".into()));
+
+    // CAST matrix through the executor + typed result columns.
+    let (meta, rows) = select_all(&shared, "SELECT CAST('12.5' AS SIGNED)").await;
+    assert_eq!(meta[0].sql_type, SqlType::Int);
+    assert_eq!(rows[0][0], Value::Int(13));
+    let (meta, rows) = select_all(&shared, "SELECT CAST(42 AS CHAR(2))").await;
+    assert_eq!(meta[0].sql_type, SqlType::VarChar);
+    assert_eq!(rows[0][0], Value::Str("42".into()));
+    let (meta, rows) = select_all(&shared, "SELECT CAST(1 AS DECIMAL(5,2))").await;
+    assert_eq!(
+        meta[0].sql_type,
+        SqlType::Decimal {
+            precision: 5,
+            scale: 2
+        }
+    );
+    assert_eq!(rows[0][0], Value::Decimal(100, 2));
+
+    // REGEXP (1/0, NOT form) and the new operators in WHERE.
+    let rows = col(&shared, "SELECT 'hello' REGEXP '^h'").await;
+    assert_eq!(rows, vec![Value::Int(1)]);
+    let rows = col(&shared, "SELECT 'hello' NOT REGEXP '^z'").await;
+    assert_eq!(rows, vec![Value::Int(1)]);
+    let ids = col(&shared, "SELECT id FROM t WHERE v <=> NULL ORDER BY id").await;
+    assert_eq!(ids, vec![Value::Int(2), Value::Int(4)]);
+    let (_, rows) = select_all(&shared, "SELECT 5 & 3, 1 << 4, 1 XOR 0").await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Int(1), Value::Int(16), Value::Bool(true)]]
+    );
+    // EXPLAIN renders the new nodes without panicking.
+    let (meta, rows) = select_all(&shared, "SELECT CASE WHEN 1=1 THEN 1 ELSE 2 END").await;
+    assert_eq!(meta[0].sql_type, SqlType::Int);
+    assert_eq!(rows[0][0], Value::Int(1));
+}
+
 #[tokio::test]
 async fn select_now_metadata_is_datetime() {
     let shared = setup().await;
@@ -246,4 +304,302 @@ async fn select_now_metadata_is_datetime() {
     assert_eq!(meta[0].sql_type, SqlType::VarChar);
     let (meta, _) = select_all(&shared, "SELECT CURDATE()").await;
     assert_eq!(meta[0].sql_type, SqlType::Date);
+}
+
+// ---- M0 query semantics: ordinals, aliases, LIMIT ?, FROM DUAL ----
+
+/// Same harness as `select_all` but for statements carrying `?`
+/// placeholders: count, bind, then run.
+async fn select_bound(
+    shared: &crate::state::Shared,
+    sql: &str,
+    values: &[Value],
+) -> crate::sql::parse::SqlResult<(Vec<ColMeta>, Vec<Vec<Value>>)> {
+    let mut stmt = parse_statement(sql).unwrap();
+    assert_eq!(
+        placeholder_count(&stmt),
+        values.len(),
+        "placeholder count must include LIMIT / OFFSET parameters"
+    );
+    bind_placeholders(&mut stmt, values).expect("bind");
+    let Statement::Select(q) = stmt else {
+        panic!("select");
+    };
+    run(shared, &SqlSession::default(), q).await
+}
+
+#[tokio::test]
+async fn order_by_ordinal_sorts_by_output_column() {
+    let shared = setup().await;
+    // ORDER BY 2 == ORDER BY v (NULLs smallest, stable); col() takes
+    // the first projected column (id).
+    let got = col(&shared, "SELECT id, v FROM t ORDER BY 2").await;
+    assert_eq!(
+        got,
+        vec![Value::Int(2), Value::Int(4), Value::Int(3), Value::Int(1)]
+    );
+    // ordinal over an expression projection sorts by its value
+    let got = col(&shared, "SELECT id * id FROM t ORDER BY 1 DESC").await;
+    assert_eq!(
+        got,
+        vec![Value::Int(16), Value::Int(9), Value::Int(4), Value::Int(1)]
+    );
+    // quoted '1' is a constant, not a position: scan order survives
+    let got = col(&shared, "SELECT id * id FROM t ORDER BY '1'").await;
+    assert_eq!(
+        got,
+        vec![Value::Int(1), Value::Int(4), Value::Int(9), Value::Int(16)]
+    );
+}
+
+#[tokio::test]
+async fn order_by_ordinal_out_of_range_errors() {
+    // out-of-range ordinals fail at translate time, ER 1054 style
+    let err = parse_statement("SELECT id FROM t ORDER BY 9").expect_err("out of range");
+    assert_eq!(err.code, ErrorCode::BadField);
+    assert!(
+        err.msg.contains("Unknown column '9' in 'order clause'"),
+        "{}",
+        err.msg
+    );
+}
+
+#[tokio::test]
+async fn group_by_ordinal_groups_by_output_column() {
+    let shared = setup().await;
+    let (_, rows) = select_all(&shared, "SELECT v, COUNT(*) FROM t GROUP BY 1 ORDER BY 1").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Null, Value::Int(2)],
+            vec![Value::Str("a".into()), Value::Int(1)],
+            vec![Value::Str("b".into()), Value::Int(1)],
+        ]
+    );
+    // out-of-range GROUP BY ordinal fails at translate time
+    let err = parse_statement("SELECT v FROM t GROUP BY 3").expect_err("out of range");
+    assert!(
+        err.msg.contains("Unknown column '3' in 'group statement'"),
+        "{}",
+        err.msg
+    );
+}
+
+#[tokio::test]
+async fn order_by_alias_sorts_by_projection() {
+    let shared = setup().await;
+    let got = col(&shared, "SELECT id * id AS sq FROM t ORDER BY sq DESC").await;
+    assert_eq!(
+        got,
+        vec![Value::Int(16), Value::Int(9), Value::Int(4), Value::Int(1)]
+    );
+    // a bare alias reference that matches no projection or FROM column
+    // still fails unknown-column
+    let Statement::Select(q) = parse_statement("SELECT id FROM t ORDER BY nope").unwrap() else {
+        panic!("select");
+    };
+    let err = run(&shared, &SqlSession::default(), q)
+        .await
+        .expect_err("unknown column");
+    assert!(err.msg.contains("unknown column"), "{}", err.msg);
+}
+
+#[tokio::test]
+async fn having_alias_filters_groups() {
+    let shared = setup().await;
+    let rows = select_all(
+        &shared,
+        "SELECT v, COUNT(*) AS cnt FROM t GROUP BY v HAVING cnt > 1",
+    )
+    .await
+    .1;
+    assert_eq!(rows, vec![vec![Value::Null, Value::Int(2)]]);
+}
+
+#[tokio::test]
+async fn alias_beats_source_column_in_order_by() {
+    let shared = setup().await;
+    // `v` names both a FROM column and the alias of `id`: the alias
+    // wins (MySQL select-list preference), so rows come out by id.
+    let got = col(&shared, "SELECT id AS v, v AS id FROM t ORDER BY v").await;
+    assert_eq!(
+        got,
+        vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]
+    );
+}
+
+#[tokio::test]
+async fn limit_and_offset_placeholders_bind_and_run() {
+    let shared = setup().await;
+    let (meta, rows) = select_bound(
+        &shared,
+        "SELECT id FROM t ORDER BY id LIMIT ? OFFSET ?",
+        &[Value::Int(2), Value::Int(2)],
+    )
+    .await
+    .expect("bound limit");
+    assert_eq!(meta.len(), 1);
+    assert_eq!(rows, vec![vec![Value::Int(3)], vec![Value::Int(4)]]);
+    // bad bindings reject at execution with the LIMIT literal error
+    for values in [
+        vec![Value::Int(-1), Value::Int(0)],
+        vec![Value::Double(2.0), Value::Int(0)],
+        vec![Value::Str("2".into()), Value::Int(0)],
+    ] {
+        let err = select_bound(&shared, "SELECT id FROM t LIMIT ? OFFSET ?", &values)
+            .await
+            .expect_err("bad limit binding");
+        assert!(
+            err.msg.contains("LIMIT must be a non-negative integer"),
+            "{values:?}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn from_dual_behaves_like_no_from() {
+    let shared = setup().await;
+    let rows = select_all(&shared, "SELECT 1 AS one FROM DUAL").await.1;
+    assert_eq!(rows, vec![vec![Value::Int(1)]]);
+    // WHERE / LIMIT apply to the single synthetic row
+    let rows = select_all(&shared, "SELECT 2 FROM dual WHERE 1 = 0")
+        .await
+        .1;
+    assert!(rows.is_empty());
+    let rows = select_all(&shared, "SELECT 3 FROM DUAL LIMIT 1").await.1;
+    assert_eq!(rows, vec![vec![Value::Int(3)]]);
+    // a lookalike name is still an ordinary (missing) table
+    let Statement::Select(q) = parse_statement("SELECT 1 FROM dual2").unwrap() else {
+        panic!("select");
+    };
+    let err = run(&shared, &SqlSession::default(), q)
+        .await
+        .expect_err("dual2 must stay a table name");
+    assert_eq!(err.code, ErrorCode::NoSuchTable, "{}", err.msg);
+}
+
+// ---- part B: full-pipeline smoke of the function families ----
+
+#[tokio::test]
+async fn part_b_function_families_execute() {
+    let shared = setup().await;
+    // String family through SQL text, including the FROM/FOR and TRIM
+    // special forms.
+    let (_, rows) = select_all(
+        &shared,
+        "SELECT CONCAT('a', 1, 2.5), CONCAT_WS('-', 'a', NULL, 'b')",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![vec![Value::Str("a12.5".into()), Value::Str("a-b".into())]]
+    );
+    let rows = col(&shared, "SELECT SUBSTRING('Quadratically' FROM 5 FOR 6)").await;
+    assert_eq!(rows, vec![Value::Str("ratica".into())]);
+    let rows = col(&shared, "SELECT TRIM(BOTH 'x' FROM 'xxbarxx')").await;
+    assert_eq!(rows, vec![Value::Str("bar".into())]);
+    let rows = col(&shared, "SELECT LPAD('hi', 7, '?.')").await;
+    assert_eq!(rows, vec![Value::Str("?.?.?hi".into())]);
+    let (_, rows) = select_all(&shared, "SELECT HEX('ab'), UNHEX('6162')").await;
+    // HEX answers text; UNHEX answers bytes.
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Str("6162".into()),
+            Value::Bytes(b"ab".to_vec())
+        ]]
+    );
+
+    // Numeric family: exact decimal round with NEWDECIMAL metadata.
+    let (meta, rows) = select_all(
+        &shared,
+        "SELECT ROUND(2.005, 2), TRUNCATE(-1.999, 1), GREATEST(1, 2, 3)",
+    )
+    .await;
+    assert_eq!(
+        meta[0].sql_type,
+        SqlType::Decimal {
+            precision: 38,
+            scale: 2
+        }
+    );
+    assert_eq!(
+        rows[0],
+        vec![
+            Value::Decimal(201, 2),
+            Value::Decimal(-19, 1), // exact: -1.999 truncated to -1.9
+            Value::Int(3)
+        ]
+    );
+
+    // Datetime family: INTERVAL forms, DATEDIFF, DATE_FORMAT, the
+    // UNIX_TIMESTAMP pair.
+    let rows = col(&shared, "SELECT DATE_ADD('2024-01-31', INTERVAL 1 MONTH)").await;
+    assert_eq!(rows, vec![Value::Str("2024-02-29".into())]);
+    let rows = col(
+        &shared,
+        "SELECT DATE_ADD('2024-01-31 00:00:00', INTERVAL 1 DAY)",
+    )
+    .await;
+    assert_eq!(rows, vec![Value::Str("2024-02-01 00:00:00".into())]);
+    let rows = col(&shared, "SELECT '2024-03-01' - INTERVAL 2 DAY").await;
+    assert_eq!(rows, vec![Value::Str("2024-02-28".into())]);
+    let rows = col(&shared, "SELECT DATEDIFF('2024-01-02', '2024-01-05')").await;
+    assert_eq!(rows, vec![Value::Int(-3)]);
+    let rows = col(
+        &shared,
+        "SELECT DATE_FORMAT('2024-02-29 13:05:09', '%Y-%m-%d %T %W')",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![Value::Str("2024-02-29 13:05:09 Thursday".into())]
+    );
+    let rows = col(
+        &shared,
+        "SELECT FROM_UNIXTIME(UNIX_TIMESTAMP('2024-01-02 03:04:05'))",
+    )
+    .await;
+    assert_eq!(rows, vec![Value::Str("2024-01-02 03:04:05".into())]);
+
+    // Lazy control family over the NULL-bearing column.
+    let rows = col(&shared, "SELECT IFNULL(v, 'none') FROM t ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            Value::Str("b".into()),
+            Value::Str("none".into()),
+            Value::Str("a".into()),
+            Value::Str("none".into())
+        ]
+    );
+    let rows = col(
+        &shared,
+        "SELECT IF(v <=> NULL, 'null', 'set') FROM t WHERE id <= 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![Value::Str("set".into()), Value::Str("null".into())]
+    );
+    let rows = col(&shared, "SELECT COALESCE(NULL, NULLIF('a', 'a'), 3)").await;
+    assert_eq!(rows, vec![Value::Int(3)]);
+
+    // GROUP_CONCAT: separator, DISTINCT, NULL skipping.
+    let rows = col(&shared, "SELECT GROUP_CONCAT(v SEPARATOR '|') FROM t").await;
+    assert_eq!(rows, vec![Value::Str("b|a".into())]);
+    let rows = col(
+        &shared,
+        "SELECT GROUP_CONCAT(DISTINCT IFNULL(v, 'a')) FROM t",
+    )
+    .await;
+    // Rows scan in pk order: 'b','a','a','a' -> dedup -> b,a.
+    assert_eq!(rows, vec![Value::Str("b,a".into())]);
+    // Functions ride WHERE too.
+    let ids = col(
+        &shared,
+        "SELECT id FROM t WHERE CHAR_LENGTH(IFNULL(v, '')) = 0 ORDER BY id",
+    )
+    .await;
+    assert_eq!(ids, vec![Value::Int(2), Value::Int(4)]);
 }

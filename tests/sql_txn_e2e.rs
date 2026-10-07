@@ -6,55 +6,10 @@
 
 mod common;
 
+use common::mysql::{connect_root, ddl, int, rows, s};
 use common::{spawn_node_mysql, wait_mysql_ready, wait_resp_ready};
 use mysql_async::prelude::*;
-use mysql_async::{OptsBuilder, Value as MVal};
-
-const PASS: &str = "e2e-sql-pass";
-
-async fn connect(node: &common::ProcNode) -> mysql_async::Conn {
-    let port = node
-        .mysql
-        .rsplit(':')
-        .next()
-        .expect("mysql port")
-        .parse::<u16>()
-        .expect("mysql port digits");
-    let opts = || {
-        OptsBuilder::default()
-            .ip_or_hostname("127.0.0.1")
-            .tcp_port(port)
-            .user(Some("root"))
-            .pass(Some(PASS))
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match mysql_async::Conn::new(opts()).await {
-            Ok(c) => return c,
-            Err(mysql_async::Error::Io(_)) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("mysql connect: {e}"),
-        }
-    }
-}
-
-/// DDL needs the raft leader; retry until the bootstrap node becomes one.
-async fn ddl(conn: &mut mysql_async::Conn, sql: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match conn.query_drop(sql).await {
-            Ok(()) => return,
-            Err(e) => {
-                if std::time::Instant::now() < deadline && e.to_string().contains("leader") {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    continue;
-                }
-                panic!("ddl {sql}: {e}");
-            }
-        }
-    }
-}
+use mysql_async::Value as MVal;
 
 /// One fresh single-node world per test: node up + table created.
 async fn world(name: &str, table_sql: &str) -> (common::ProcNode, mysql_async::Conn) {
@@ -64,31 +19,9 @@ async fn world(name: &str, table_sql: &str) -> (common::ProcNode, mysql_async::C
     let mut node = spawn_node_mysql(&dir, 0, true, None);
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut conn = connect(&node).await;
+    let mut conn = connect_root(&node).await;
     ddl(&mut conn, table_sql).await;
     (node, conn)
-}
-
-async fn rows(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<MVal>> {
-    let rs: Vec<mysql_async::Row> = conn.query(sql).await.expect(sql);
-    rs.into_iter()
-        .map(|r| {
-            (0..r.len())
-                .map(|i| r.get::<MVal, _>(i).unwrap_or(MVal::NULL))
-                .collect()
-        })
-        .collect()
-}
-
-/// Text-protocol cells are always length-prefixed bytes on the wire,
-/// so mysql_async hands back `Value::Bytes` for ints too. Compare raw
-/// bytes, never Debug output (Debug truncates Bytes at 8 chars).
-fn int(i: i64) -> MVal {
-    MVal::Bytes(i.to_string().into_bytes())
-}
-
-fn s(v: &str) -> MVal {
-    MVal::Bytes(v.as_bytes().to_vec())
 }
 
 fn one_int(rows: &[Vec<MVal>]) -> i64 {
@@ -106,7 +39,7 @@ async fn snapshot_isolation_between_connections() {
         "CREATE TABLE si (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)",
     )
     .await;
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
 
     a.query_drop("BEGIN").await.expect("begin");
     assert_eq!(one_int(&rows(&mut a, "SELECT COUNT(*) FROM si").await), 0);
@@ -139,7 +72,7 @@ async fn repeatable_read_inside_txn() {
         "CREATE TABLE rr (id BIGINT PRIMARY KEY, score BIGINT NOT NULL)",
     )
     .await;
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
     b.query_drop("INSERT INTO rr (id, score) VALUES (1, 10)")
         .await
         .expect("seed");
@@ -169,7 +102,7 @@ async fn own_write_visibility_and_rollback() {
         "CREATE TABLE own (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)",
     )
     .await;
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
 
     a.query_drop("BEGIN").await.expect("begin");
     a.query_drop("INSERT INTO own (id, v) VALUES (100, 'a')")
@@ -220,7 +153,7 @@ async fn commit_persists_staged_writes() {
         "CREATE TABLE p (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)",
     )
     .await;
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
 
     a.query_drop("BEGIN").await.expect("begin");
     a.query_drop("INSERT INTO p (id, v) VALUES (7, 'seven')")
@@ -247,7 +180,7 @@ async fn write_write_conflict_first_committer_wins() {
         "CREATE TABLE ww (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)",
     )
     .await;
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
     b.query_drop("INSERT INTO ww (id, v) VALUES (1, 'init')")
         .await
         .expect("seed");
@@ -288,6 +221,11 @@ async fn ddl_rejected_inside_txn() {
         "CREATE TABLE nope (id BIGINT PRIMARY KEY)",
         "DROP TABLE base",
         "CREATE INDEX noix ON base (id)",
+        // M4 DDL surface rejects identically inside a txn (TRUNCATE is
+        // DDL by decision point 5; RENAME mutates the raft catalog).
+        "TRUNCATE TABLE base",
+        "RENAME TABLE base TO nope",
+        "ALTER TABLE base RENAME TO nope",
     ] {
         let err = a.query_drop(sql).await.expect_err("DDL must be rejected");
         let msg = err.to_string();
@@ -326,7 +264,7 @@ async fn disconnect_rolls_back_open_txn() {
     a.disconnect().await.expect("disconnect conn A");
 
     // conn B polls until the staged row is definitively gone
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let count = one_int(&rows(&mut b, "SELECT COUNT(*) FROM gone").await);
@@ -367,7 +305,7 @@ async fn multi_statement_txn_applies_every_update() {
         "CREATE TABLE mu (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL)",
     )
     .await;
-    let mut b = connect(&node).await;
+    let mut b = connect_root(&node).await;
 
     a.query_drop("INSERT INTO mu (id, v) VALUES (1, 'a'), (2, 'b')")
         .await

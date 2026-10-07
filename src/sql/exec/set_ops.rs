@@ -1,12 +1,16 @@
-//! Compound query execution: CTEs (WITH), UNION [ALL], and the
-//! trailing ORDER BY / LIMIT that belong to the whole compound.
+//! Compound query execution: CTEs (WITH), set operations
+//! (UNION / INTERSECT / EXCEPT, each `[ALL]`), and the trailing
+//! ORDER BY / LIMIT that belong to the whole compound.
 //!
 //! Each operand materializes into a [`Relation`] (SELECTs run through
 //! the normal select pipeline -- including cluster scatter-gather --
 //! at the caller's snapshot timestamp, so a compound never mixes read
-//! points). UNION validates column arity, widens numeric columns,
-//! dedups plain UNION, and adopts the left operand's column names,
-//! like MySQL.
+//! points). Every operator validates column arity, widens numeric
+//! columns, and adopts the left operand's column names, like MySQL.
+//! DISTINCT variants dedup (NULLs equal); ALL variants do multiset
+//! arithmetic (min / subtraction / concatenation). Both operands are
+//! fully materialized on this node before combining, so nothing here
+//! assumes streaming across cluster nodes.
 
 use std::sync::Arc;
 
@@ -14,8 +18,9 @@ use crate::sql::exec::expr::{cmp_values, eval};
 use crate::sql::exec::relation::{relation_of, CteScope, Relation};
 use crate::sql::exec::select;
 use crate::sql::exec::subquery::SubqCtx;
-use crate::sql::parse::ast::{CompoundQuery, OrderKey, QueryBody};
+use crate::sql::parse::ast::{CompoundQuery, LimitValue, OrderKey, QueryBody, SetOp};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
+use crate::sql::parse::order_limit::limit_u64;
 use crate::sql::storage::schema::{SqlType, Value};
 use crate::sql::tx::Txn;
 use crate::state::Shared;
@@ -39,9 +44,10 @@ pub async fn run_compound(
         read_ts,
         txn,
         ctes: &scope,
+        outer: None,
     };
     let mut rel = Box::pin(eval_body(shared, read_ts, txn, &cq.body, &ctx)).await?;
-    apply_tail(&mut rel, &cq.order_by, cq.limit, cq.offset)?;
+    apply_tail(&mut rel, &cq.order_by, cq.limit.as_ref(), &cq.offset)?;
     Ok(rel)
 }
 
@@ -80,23 +86,31 @@ async fn eval_body(
         QueryBody::Nested(inner) => {
             Box::pin(run_compound(shared, read_ts, txn, inner, ctx.ctes)).await
         }
-        QueryBody::Union { left, right, all } => {
+        QueryBody::SetOp {
+            op,
+            left,
+            right,
+            all,
+        } => {
             let l = Box::pin(eval_body(shared, read_ts, txn, left, ctx)).await?;
             let r = Box::pin(eval_body(shared, read_ts, txn, right, ctx)).await?;
-            union_relations(l, r, *all)
+            merge_relations(*op, l, r, *all)
         }
     }
 }
 
-/// UNION semantics: arity must match, numeric columns widen
-/// (INT|DOUBLE -> DOUBLE), plain UNION dedups (NULLs equal, like
-/// MySQL), UNION ALL concatenates. Column names come from the left.
-fn union_relations(l: Relation, r: Relation, all: bool) -> SqlResult<Relation> {
+/// Set-operation semantics shared by UNION / INTERSECT / EXCEPT:
+/// arity must match (the error names the operator), numeric columns
+/// widen (INT|DOUBLE -> DOUBLE), and each side's cells normalize to
+/// the merged column types BEFORE rows combine, so row equality sees
+/// `1 = 1.0` and Date = midnight DATETIME. Column names come from
+/// the left operand, like MySQL.
+fn merge_relations(op: SetOp, l: Relation, r: Relation, all: bool) -> SqlResult<Relation> {
     if l.columns.len() != r.columns.len() {
         return Err(SqlError::new(
             ErrorCode::NotSupported,
             format!(
-                "UNION operands yield different column counts ({} vs {})",
+                "{op} operands yield different column counts ({} vs {})",
                 l.columns.len(),
                 r.columns.len()
             ),
@@ -119,15 +133,93 @@ fn union_relations(l: Relation, r: Relation, all: bool) -> SqlResult<Relation> {
             })
         })
         .collect::<SqlResult<Vec<_>>>()?;
-    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(l.rows.len() + r.rows.len());
-    rows.extend(l.rows.iter().cloned());
-    rows.extend(r.rows.iter().cloned());
-    widen_cells(&columns, &mut rows)?;
-    if !all {
-        rows.sort_by(|a, b| row_cmp(a, b));
-        rows.dedup_by(|a, b| row_cmp(a, b) == std::cmp::Ordering::Equal);
-    }
+    let mut lrows = l.rows.as_slice().to_vec();
+    let mut rrows = r.rows.as_slice().to_vec();
+    widen_cells(&columns, &mut lrows)?;
+    widen_cells(&columns, &mut rrows)?;
+    let rows = combine_rows(op, all, lrows, rrows);
     Ok(relation_of(columns, rows))
+}
+
+/// Row combination per operator and quantifier. DISTINCT variants
+/// return sorted unique rows (same observable order UNION DISTINCT
+/// has always had); ALL variants keep the left operand's row order
+/// (UNION ALL concatenates, INTERSECT ALL / EXCEPT ALL emit their
+/// multiplicities at each survivor's first left appearance).
+fn combine_rows(op: SetOp, all: bool, l: Vec<Vec<Value>>, r: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    match (op, all) {
+        (SetOp::Union, true) => {
+            let mut out = l;
+            out.extend(r);
+            out
+        }
+        (SetOp::Union, false) => {
+            let mut out = l;
+            out.extend(r);
+            sorted_unique(out)
+        }
+        (SetOp::Intersect, false) => {
+            let right = sorted_unique(r);
+            sorted_unique(l)
+                .into_iter()
+                .filter(|row| right.binary_search_by(|probe| row_cmp(probe, row)).is_ok())
+                .collect()
+        }
+        (SetOp::Except, false) => {
+            let right = sorted_unique(r);
+            sorted_unique(l)
+                .into_iter()
+                .filter(|row| right.binary_search_by(|probe| row_cmp(probe, row)).is_err())
+                .collect()
+        }
+        (SetOp::Intersect, true) => multiset(&l, &r, |cl, cr| cl.min(cr)),
+        (SetOp::Except, true) => multiset(&l, &r, |cl, cr| cl.saturating_sub(cr)),
+    }
+}
+
+/// Multiset arithmetic: each distinct left row is emitted
+/// `f(count_left, count_right)` times (min for INTERSECT ALL,
+/// subtraction for EXCEPT ALL), at its first left appearance. NULLs
+/// equal, like the dedup path.
+fn multiset(
+    l: &[Vec<Value>],
+    r: &[Vec<Value>],
+    f: impl Fn(usize, usize) -> usize,
+) -> Vec<Vec<Value>> {
+    // Sorted copy of the right side: occurrence counts resolve by
+    // partition points around the equal-run.
+    let mut right = r.to_vec();
+    right.sort_by(|a, b| row_cmp(a, b));
+    let count_right = |target: &[Value]| {
+        let lo = right.partition_point(|x| row_cmp(x, target) == std::cmp::Ordering::Less);
+        let hi = right.partition_point(|x| row_cmp(x, target) != std::cmp::Ordering::Greater);
+        hi - lo
+    };
+    // Run-length encoding of the left side, first-appearance order.
+    let mut counts: Vec<(Vec<Value>, usize)> = Vec::new();
+    for row in l {
+        match counts
+            .iter_mut()
+            .find(|(x, _)| row_cmp(x, row) == std::cmp::Ordering::Equal)
+        {
+            Some((_, n)) => *n += 1,
+            None => counts.push((row.clone(), 1)),
+        }
+    }
+    let mut out = Vec::new();
+    for (row, cl) in counts {
+        for _ in 0..f(cl, count_right(&row)) {
+            out.push(row.clone());
+        }
+    }
+    out
+}
+
+/// Sort and dedup whole rows (row_cmp order, NULLs first and equal).
+fn sorted_unique(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    rows.sort_by(|a, b| row_cmp(a, b));
+    rows.dedup_by(|a, b| row_cmp(a, b) == std::cmp::Ordering::Equal);
+    rows
 }
 
 /// Columnwise SQL comparison; inhomogeneous cells compare Equal so
@@ -168,7 +260,7 @@ fn widen(a: SqlType, b: SqlType) -> SqlResult<SqlType> {
         (Date, DateTime) | (DateTime, Date) => Ok(DateTime),
         (a, b) => Err(SqlError::new(
             ErrorCode::NotSupported,
-            format!("UNION of incompatible column types {a:?} and {b:?}"),
+            format!("set operation of incompatible column types {a:?} and {b:?}"),
         )),
     }
 }
@@ -224,10 +316,10 @@ fn widen_cells(columns: &[crate::sql::exec::ColMeta], rows: &mut [Vec<Value>]) -
 fn apply_tail(
     rel: &mut Relation,
     keys: &[OrderKey],
-    limit: Option<u64>,
-    offset: u64,
+    limit: Option<&LimitValue>,
+    offset: &LimitValue,
 ) -> SqlResult<()> {
-    if keys.is_empty() && limit.is_none() && offset == 0 {
+    if keys.is_empty() && limit.is_none() && *offset == LimitValue::zero() {
         return Ok(());
     }
     let mut rows = match Arc::get_mut(&mut rel.rows) {
@@ -258,8 +350,12 @@ fn apply_tail(
         });
         rows = pairs.into_iter().map(|(_, r)| r).collect();
     }
-    let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
-    rows = rows.into_iter().skip(offset as usize).take(take).collect();
+    // LIMIT / OFFSET coerce once: a bound `?` must be a non-negative
+    // integer, exactly like a numeric literal.
+    let take = limit.map(limit_u64).transpose()?.map(|l| l as usize);
+    let take = take.unwrap_or(usize::MAX);
+    let skip = limit_u64(offset)? as usize;
+    rows = rows.into_iter().skip(skip).take(take).collect();
     rel.rows = Arc::new(rows);
     Ok(())
 }
@@ -286,113 +382,5 @@ fn ordinal_or_eval(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sql::exec::ColMeta;
-    use crate::sql::storage::schema::SqlType;
-
-    fn col(name: &str, ty: SqlType) -> ColMeta {
-        ColMeta::computed("", name, ty)
-    }
-
-    fn rel(cols: Vec<ColMeta>, rows: Vec<Vec<Value>>) -> Relation {
-        Relation::new(cols, rows)
-    }
-
-    #[test]
-    fn union_all_concatenates_and_keeps_duplicates() {
-        let l = rel(
-            vec![col("a", SqlType::Int)],
-            vec![vec![Value::Int(1)], vec![Value::Int(1)]],
-        );
-        let r = rel(vec![col("b", SqlType::Int)], vec![vec![Value::Int(1)]]);
-        let out = union_relations(l, r, true).unwrap();
-        assert_eq!(out.rows.len(), 3);
-        // left operand names the output column.
-        assert_eq!(out.columns[0].name, "a");
-    }
-
-    #[test]
-    fn union_distinct_dedups_rows_and_nulls() {
-        let l = rel(
-            vec![col("a", SqlType::Int)],
-            vec![vec![Value::Null], vec![Value::Int(1)], vec![Value::Null]],
-        );
-        let r = rel(
-            vec![col("b", SqlType::Int)],
-            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
-        );
-        let out = union_relations(l, r, false).unwrap();
-        let vals: Vec<&Value> = out.rows.iter().map(|r| &r[0]).collect();
-        assert_eq!(vals, vec![&Value::Null, &Value::Int(1), &Value::Int(2)]);
-    }
-
-    #[test]
-    fn union_arity_mismatch_and_type_widen() {
-        let l1 = rel(vec![col("a", SqlType::Int)], vec![vec![Value::Int(1)]]);
-        let r2 = rel(
-            vec![col("x", SqlType::Int), col("y", SqlType::Int)],
-            vec![vec![Value::Int(1), Value::Int(2)]],
-        );
-        assert!(union_relations(l1.clone(), r2, true).is_err());
-
-        let rd = rel(
-            vec![col("d", SqlType::Double)],
-            vec![vec![Value::Double(1.5)]],
-        );
-        let out = union_relations(l1, rd, true).unwrap();
-        assert_eq!(out.columns[0].sql_type, SqlType::Double);
-
-        let rs = rel(
-            vec![col("s", SqlType::VarChar)],
-            vec![vec![Value::Str("x".into())]],
-        );
-        let l1 = rel(vec![col("a", SqlType::Int)], vec![vec![Value::Int(1)]]);
-        assert!(union_relations(l1, rs, true).is_err());
-    }
-
-    #[test]
-    fn union_widens_date_to_datetime_and_lifts_cells() {
-        use crate::sql::temporal::MICROS_PER_DAY;
-        let day = rel(
-            vec![col("d", SqlType::Date)],
-            vec![vec![Value::Date(19_782)]],
-        );
-        let stamp = rel(
-            vec![col("t", SqlType::DateTime)],
-            vec![vec![Value::DateTime(19_783 * MICROS_PER_DAY)]],
-        );
-        // date | datetime -> datetime, and the Date cell lifts to
-        // midnight microseconds so rendering keeps full precision.
-        let out = union_relations(day.clone(), stamp.clone(), true).unwrap();
-        assert_eq!(out.columns[0].sql_type, SqlType::DateTime);
-        assert_eq!(
-            out.rows.as_slice(),
-            &[
-                vec![Value::DateTime(19_782 * MICROS_PER_DAY)],
-                vec![Value::DateTime(19_783 * MICROS_PER_DAY)]
-            ]
-        );
-        // operand order does not matter
-        let out = union_relations(stamp, day, true).unwrap();
-        assert_eq!(out.columns[0].sql_type, SqlType::DateTime);
-        // plain UNION dedups the widened midnight pair
-        let l = rel(
-            vec![col("d", SqlType::Date)],
-            vec![vec![Value::Date(19_782)]],
-        );
-        let r = rel(
-            vec![col("t", SqlType::DateTime)],
-            vec![vec![Value::DateTime(19_782 * MICROS_PER_DAY)]],
-        );
-        let out = union_relations(l, r, false).unwrap();
-        assert_eq!(
-            out.rows.as_slice(),
-            &[vec![Value::DateTime(19_782 * MICROS_PER_DAY)]]
-        );
-        // temporal never mixes with numerics or text
-        let nums = rel(vec![col("n", SqlType::Int)], vec![vec![Value::Int(1)]]);
-        let l = rel(vec![col("d", SqlType::Date)], vec![vec![Value::Date(0)]]);
-        assert!(union_relations(l, nums, true).is_err());
-    }
-}
+#[path = "set_ops_tests.rs"]
+mod set_ops_tests;

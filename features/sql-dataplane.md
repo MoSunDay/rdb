@@ -1,11 +1,16 @@
-Commit: 98e17a5
+Commit: b0d81c9
 # SQL 数据面（MySQL 协议 + 分布式事务）
 
 ## 能力
 - 任意 rdb 节点开启 `mysql_bind` 后即是一个 MySQL 服务端：native-password 登录
-  （`mysql_user`/`mysql_password` 配置），支持 CREATE/DROP TABLE、CREATE/DROP INDEX、
-  INSERT/UPDATE/DELETE、SELECT（WHERE/ORDER BY/LIMIT/DISTINCT/JOIN/GROUP BY/
-  HAVING/聚合）、SHOW TABLES/COLUMNS/INDEX、EXPLAIN、`?` 预编译语句；列类型
+  （`mysql_user`/`mysql_password` 配置），支持 CREATE/DROP TABLE、TRUNCATE、RENAME、
+  CREATE/DROP/ALTER INDEX（单列）、INSERT（含 ODKU/REPLACE/INSERT…SELECT/INSERT…SET）、
+  UPDATE/DELETE、SELECT（WHERE/ORDER BY/LIMIT/DISTINCT/JOIN/GROUP BY/HAVING/聚合/
+  子查询——相关标量/IN/EXISTS/INTERSECT/EXCEPT、ORDER BY/GROUP BY 序数与 SELECT
+  别名）、SHOW TABLES/COLUMNS/INDEX/CREATE TABLE/DATABASES/VARIABLES[LIKE]/STATUS、
+  EXPLAIN、`?` 预编译语句（含 `LIMIT ?`）；表达式层 51 个标量函数 + CASE/CAST +
+  `<=>`/REGEXP/位算子 + GROUP_CONCAT；会话函数 DATABASE()/USER()/CONNECTION_ID()、
+  USE；完整契约与偏差台账见 `COMPAT.sql.md`；列类型
   BOOL/BIGINT/DOUBLE/VARCHAR/BLOB/DATE/DATETIME/TIMESTAMP/DECIMAL(p,s)（TIMESTAMP
   为 DATETIME 别名，`NOW()`/`CURDATE()` 等时钟函数可用；TIME 仍不支持）。
 - 主键：单列或复合（`PRIMARY KEY(a,b)`，列类型限制见下节）；AUTO_INCREMENT 仍限
@@ -21,6 +26,7 @@ Commit: 98e17a5
 - 列存表：`CREATE TABLE ... ENGINE=columnar`——追加式（仅 INSERT，UPDATE/DELETE/
   索引不支持），每次提交每表生成一个不可变列式段文件；读为全段扫描
   （WHERE/聚合/JOIN 照常生效）。详见 `COMPAT.md` "Columnar table engine" 节。
+  2026-10-06 MySQL-gap M2 起 ODKU/REPLACE/INSERT…SELECT 对列存表一律 1235。
 
 ## DECIMAL(p,s)（精确十进制）
 - 声明 `DECIMAL(p,s)`/`NUMERIC(p,s)`：p 取 1..=38，s ≤ p（裸 `DECIMAL` = (10,0)）；
@@ -115,6 +121,38 @@ Commit: 98e17a5
 - 隔离级别仍为既有的快照隔离一级（对外呈现 REPEATABLE-READ；`SET TRANSACTION
   ISOLATION LEVEL` 接受并回显，但不改变行为）。
 
+## MySQL 兼容收敛（2026-10-06，M0-M5）
+
+差距计划 `plans/2026-10-06-mysql-gap/` 六个里程碑全部落地（逐里程碑见
+`changelog/2026-10-06/mysql-m{0..5}-*.md`）；契约细节与偏差在 `COMPAT.sql.md`：
+
+- **查询语义修复（M0）**：`ORDER BY 1`/`GROUP BY 1` 序数与 ORDER BY/HAVING 别名
+  解析两组**静默错误结果**清零（序数曾被当常量排序键——排序恒 no-op；别名曾按
+  未知列拒绝，现在别名优先于同名 FROM 列）；`LIMIT ?`/`OFFSET ?` 占位符绑定期
+  校验（1064）；`FROM DUAL` 归一为无 FROM。
+- **表达式与函数族（M1）**：`exec/func/` 家族拆分后合计 51 个标量函数入口 +
+  CASE/CAST 两结构 + 9 种新算子（`<=>`、REGEXP/RLIKE、`& | ^ << >>`、XOR）+
+  GROUP_CONCAT 聚合（SEPARATOR/DISTINCT；内层 ORDER BY 1235）；结果列元数据按
+  name→类型表定型；CEIL/FLOOR 关键字形态为 e2e 发现缺口、已补。
+- **DML 冲突路径（M2）**：ODKU（affected 1/2/0、`VALUES(col)` 读待插入行而裸列
+  读现存行、改 pk 同写迁移索引）、REPLACE（删 pk + 全部 unique 命中后插入）、
+  INSERT…SELECT（源写前一次快照物化，集群下可用）、INSERT…SET；集群模式
+  ODKU/REPLACE 响亮 1235（计划决策 1b），plain INSERT pk 静默 upsert 保持不变。
+- **子查询与集合操作（M3）**：相关标量/IN/EXISTS 子查询（defer→bind 两趟、按
+  distinct 外层键记忆化）；INTERSECT/EXCEPT [DISTINCT|ALL]（INTERSECT 结合更紧、
+  同级左折叠）；NOT IN 空集全保留/含 NULL 永不为真的三值语义由 e2e 钉死。
+- **DDL 与会话面（M4）**：TRUNCATE（同名换 table_id 一次 raft 决策全集群生效、
+  事务内拒绝、AUTO_INCREMENT 重置）、RENAME（纯目录改名 + 旧名 prepared 失效）、
+  ALTER/CREATE/DROP INDEX 与建表内联 KEY、SHOW CREATE TABLE（渲染可重建往返）/
+  DATABASES/VARIABLES[LIKE]/STATUS、DATABASE()/USER()/CONNECTION_ID() 每次执行
+  绑定、USE 设置会话库。
+- **e2e 盲区（M5）**：`tests/common/mysql.rs` 统一 MySQL e2e 脚手架；LEFT/RIGHT
+  OUTER JOIN 与 SQL 面三进程 leader failover 首次 e2e——台账见
+  `e2e-coverage.md`。
+- 偏差与 P2 延期（byte-wise 大小写、`Int/Int` 整除、集群 ODKU/REPLACE 1235、
+  GROUP_CONCAT 内层排序、复合/前缀索引、ALTER COLUMN、WITH RECURSIVE、KILL 等）
+  集中记录于 `COMPAT.sql.md` 的 "MySQL-gap deviation ledger" 条目。
+
 ## 相关
 - 实现模块：[agents/rust/sql.md](../agents/rust/sql.md)；契约与偏差：
-  `COMPAT.md` "SQL data plane" 节。
+  [COMPAT.sql.md](../COMPAT.sql.md)（原 `COMPAT.md` "SQL data plane" 节）。

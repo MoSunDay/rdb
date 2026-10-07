@@ -1,4 +1,4 @@
-Commit: 90e8c9b
+Commit: b0d81c9
 # E2E 覆盖地图与缺口台账
 
 > 缺口基线为 git `f071032`（2026-09-26 全量只读比对，30/188 命令零覆盖等）；基线缺口
@@ -119,6 +119,60 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
     增 AdminClient 建/删 topic 步（真实 SDK 走 CreateTopics/DeleteTopics wire）、
     `scenario_lite_mq.sh` 增 XINFO FULL / NOMKSTREAM 步——作为场景层回归入口计入
     本批覆盖，脚本断言随收尾合入。
+- **SQL 兼容收敛（2026-10-06 MySQL-gap M0-M5，首次入台账；计划
+  `plans/2026-10-06-mysql-gap/`，逐里程碑 `changelog/2026-10-06/mysql-m*.md`）**：
+  - `sql_query_semantics_e2e`（6）：ORDER BY/GROUP BY 序数（`'1'`/`-1`/`1+1` 常量键
+    no-op 差分钉死序数不再退化）、ORDER BY/HAVING 别名（别名胜出同名源列）、
+    prepared `LIMIT ?`/`OFFSET ?` 与负/小数/字符串绑定 1064、FROM DUAL、
+    1054/1235 措辞负矩阵。
+  - `sql_funcs_{string,numeric,datetime,control}_e2e`（29 = 7+8+7+7）：四函数族精确
+    值 + 结果列元数据定型 + prepared + 负矩阵（1582 arity、1235 方言）；control
+    含 CASE 惰性、`<=>`/XOR 真值表、CAST/CONVERT 全目标。
+  - `sql_upsert_e2e`（5）/`sql_insert_select_e2e`（3）/`sql_upsert_cluster_e2e`（1）：
+    affected 1/2/0 全矩阵（pk/unique、多行混合累计）、`VALUES(col)` 引用与
+    `c = c + VALUES(c)`、改 pk ODKU、REPLACE 删多插一、INSERT…SELECT 语句前快照
+    （同表翻倍）、INSERT…SET、ODKU 烧号、集群 ODKU/REPLACE 每节点 1235 + plain
+    与 INSERT…SELECT 跨 band 2PC 提交三节点一致。
+  - `sql_subquery_e2e`（10）：相关标量/IN/EXISTS（空集/NULL 陷阱）、两层嵌套、
+    setop 臂内相关、INTERSECT/EXCEPT DISTINCT/ALL 多重集算术与混合链优先级
+    差分、窄拒绝矩阵（相关 JOIN 条件/派生表外层引用/skip-level/WITH RECURSIVE）。
+  - `sql_ddl_surface_e2e`（5）/`sql_ddl_surface_cluster_e2e`（1）：TRUNCATE（条目
+    随旧 table_id 清扫、自增重置、事务内拒绝）、RENAME（prepared 旧名 re-exec
+    干净报错不悬挂）、索引 DDL 全形态（ALTER/CREATE/DROP INDEX + 内联 KEY）、
+    SHOW 面（CREATE TABLE 逐字断言 + 渲染重建往返、VARIABLES LIKE、STATUS）、
+    会话函数 per-exec 绑定；集群侧 TRUNCATE/RENAME ack 即刻全节点可见 + follower
+    响亮拒绝。
+  - `sql_outer_join_e2e`（7）：LEFT/RIGHT [OUTER] JOIN 首次 e2e——NULL 补齐、
+    anti-join、OUTER 关键字可省、链式/过滤/INNER 混排、join 键索引语义不变、
+    RIGHT ≡ 换位 LEFT。
+  - `sql_failover_e2e`（2）：三进程 SIGKILL SQL leader——旧连接 10s 内干净报错、
+    新 leader 接管 DDL/跨 band 写/ts 授块（尸体 band 响亮失败、绝不部分提交）；
+    尸体 respawn 追平后全成员可读杀前基线（MVCC 一致）。
+  - `sql_decimal_e2e`（1）：自 `sql_types_e2e` 拆出的 DECIMAL 精确语义自包含用例
+    （字节级等价搬家）。
+- **SQL 静默错误结果清零（2026-10-06 mysql-hardening H0；计划
+  `plans/2026-10-06-mysql-hardening/`，changelog `mysql-h0-silent-wrong-results.md`）**：
+  - `sql_rename_gc_e2e`（1，新增）：`RDB_SQL_GC_PERIOD_MS=200` 缩短 GC 周期，RENAME
+    后 5+ 轮清扫数据完好（回归 RENAME 数据丢失 ship-blocker）；TRUNCATE 后旧数据
+    确清、新写入完好。
+  - `sql_upsert_e2e`（6）：+同语句腾出唯一值的 ODKU/REPLACE 正确分支（affected 3，
+    无辜行不再误删）、ODKU/普通 UPDATE pk 挪移活行线上 1062（ER_DUP_ENTRY）。
+  - `sql_subquery_e2e`（11）：+内层同名未限定列绑定内层表（遮蔽回归，线上）。
+  - `sql_query_semantics_e2e`（7）：+ROUND(SUM)/COALESCE(SUM) 聚合包裹、ODKU 赋值
+    与 UPDATE ORDER BY 中的会话函数绑定。
+  - `sql_e2e`：+prepared `LIMIT ? OFFSET ?` 参数序（换位即错的数据）与
+    `LIMIT ?, ?` 双占位符 1064。
+  - `sql_funcs_numeric_e2e`（8）/`sql_funcs_string_e2e`（7）：+整型溢出 1690 措辞
+    负矩阵 ×5（Add/Sub/Mul/Div/Neg）、CONCAT_WS 空串参数分隔符矩阵。
+  - 既有套件更新：`mysql_compat_e2e`（M3 增 INTERSECT/EXCEPT DISTINCT/ALL 与混合链
+    左折叠、尾部 `ORDER BY 1 LIMIT .. OFFSET ..`、相关 IN/EXISTS/标量子查询与拒绝
+    矩阵断言）；`tests/common/mysql.rs`（M5 新增）收敛 7 个单机套件
+    （sql/sql_types/sql_txn/sql_index/mysql_compat/auto_increment/columnar）的
+    connect/ddl/rows 样板并吸收
+    `sql_funcs_common`/`sql_upsert_common`（目录已删，各套件行数 -16%~-32%）；9 个
+    集群/HA 编排套件（sql_2pc/sql_join_cluster/sql_setop_cluster/sql_dist_read/
+    sql_restart/sql_composite_pk/sql_ddl_visibility/starrocks_model/
+    sql_upsert_cluster）**有意未迁移**（自带编排/取证样板，后续分批）。
 - **Shell 场景**：新增 `scenario_ha_failover.sh`（首次启用 `e2e_kill_node`，kill→MOVED-backup ~4-5s、
   回切 ~5s）、`scenario_lite_mq.sh`（XADD/XREADGROUP/XPENDING/XACK/XAUTOCLAIM + ORDERED/INFLIGHT，
   2026-10-06 增 (g) DLQ/MAXDELIVERY 死信+DLQ 独立消费、(h) XTRIM MINID/LIMIT/时间窗

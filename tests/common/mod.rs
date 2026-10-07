@@ -21,6 +21,7 @@ use mysql_async::prelude::Queryable;
 /// /root/rdb/config -- no secrets in the repo).
 pub mod lite;
 pub mod mq;
+pub mod mysql;
 
 pub const TOKEN: &str = "e2e-fake-token-0123456789abcdef0123456789abcdef";
 

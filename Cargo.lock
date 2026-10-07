@@ -2022,6 +2022,7 @@ dependencies = [
  "openraft",
  "opensrv-mysql",
  "prometheus",
+ "regex",
  "rocksdb",
  "serde",
  "serde_json",

@@ -3,12 +3,13 @@
 //! Values are [`schema::Value`]s; rows are schema-ordered slices. Column
 //! references resolve by (optional table, name) against the query's scope.
 
-use crate::sql::parse::ast::{BinOp, Expr};
+use crate::sql::parse::ast::{BinOp, CorrelatedKind, CorrelatedOut, Expr};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::schema::{format_decimal, SqlType, Value};
 use crate::sql::temporal::{self, MICROS_PER_DAY};
 
 use super::expr_decimal::{arith_decimal, decimal_out_of_range, decimal_to_f64, fit_column, pow10};
+use super::func::{eval_bitop, eval_case, eval_cast, eval_func, eval_lazy, regexp_match};
 
 /// Resolve `table.name` -> column index; tables must be unambiguous.
 pub trait ColumnScope {
@@ -43,10 +44,37 @@ pub fn eval<S: ColumnScope>(e: &Expr, scope: &S, row: &[Value]) -> SqlResult<Val
         )),
         // Subqueries are pre-materialized by `exec::subquery`; one
         // reaching eval means the rewrite was skipped.
-        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::new(
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => Err(SqlError::new(
             ErrorCode::NotSupported,
             "internal: unrewritten subquery reached evaluation",
         )),
+        // Bound correlated subquery: the keys select a pre-computed
+        // case computed by `exec::correlated::bind`.
+        Expr::Correlated { kind, keys, cases } => {
+            let key: Vec<Value> = keys
+                .iter()
+                .map(|k| eval(k, scope, row))
+                .collect::<SqlResult<Vec<_>>>()?;
+            let found = cases.iter().find(|(k, _)| k == &key).map(|(_, out)| out);
+            match kind {
+                CorrelatedKind::Scalar => match found {
+                    Some(CorrelatedOut::Scalar(v)) => Ok(v.clone()),
+                    _ => Ok(Value::Null),
+                },
+                CorrelatedKind::Exists { negated } => {
+                    let any = matches!(found, Some(CorrelatedOut::Rows(r)) if !r.is_empty());
+                    Ok(Value::Bool(if *negated { !any } else { any }))
+                }
+                CorrelatedKind::In { lhs, negated } => {
+                    let v = eval(lhs, scope, row)?;
+                    let items = match found {
+                        Some(CorrelatedOut::Rows(r)) => r.as_slice(),
+                        _ => &[],
+                    };
+                    in_predicate(&v, items, *negated)
+                }
+            }
+        }
         Expr::Col { table, name } => {
             let idx = scope.resolve(table.as_deref(), name).ok_or_else(|| {
                 SqlError::new(ErrorCode::BadField, format!("unknown column '{name}'"))
@@ -70,9 +98,19 @@ pub fn eval<S: ColumnScope>(e: &Expr, scope: &S, row: &[Value]) -> SqlResult<Val
         Expr::Neg(inner) => {
             let v = eval(inner, scope, row)?;
             match v {
-                Value::Int(i) => Ok(Value::Int(i.wrapping_neg())),
+                // i64::MIN has no positive peer: loud 1690, not a wrap.
+                Value::Int(i) => Ok(Value::Int(
+                    i.checked_neg()
+                        .ok_or_else(|| bigint_out_of_range(&format!("(- {i})")))?,
+                )),
                 Value::Double(d) => Ok(Value::Double(-d)),
-                Value::Decimal(m, s) => Ok(Value::Decimal(m.wrapping_neg(), s)),
+                // Same i128::MIN edge on the decimal mantissa.
+                Value::Decimal(m, s) => Ok(Value::Decimal(
+                    m.checked_neg().ok_or_else(|| {
+                        bigint_out_of_range(&format!("(- {})", format_decimal(m, s)))
+                    })?,
+                    s,
+                )),
                 Value::Null => Ok(Value::Null),
                 other => Err(SqlError::new(
                     ErrorCode::NotSupported,
@@ -95,23 +133,7 @@ pub fn eval<S: ColumnScope>(e: &Expr, scope: &S, row: &[Value]) -> SqlResult<Val
             for item in list {
                 items.push(eval(item, scope, row)?);
             }
-            if matches!(v, Value::Null) {
-                return Ok(Value::Null);
-            }
-            // Equality short-circuits first; a NULL member only makes the
-            // predicate unknown when no member compared equal (three-valued IN).
-            let mut saw_null = false;
-            for item in &items {
-                if matches!(item, Value::Null) {
-                    saw_null = true;
-                } else if eq_values(&v, item)? {
-                    return Ok(Value::Bool(!*negated));
-                }
-            }
-            if saw_null {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Bool(*negated))
+            in_predicate(&v, &items, *negated)
         }
         Expr::Between {
             expr,
@@ -150,14 +172,80 @@ pub fn eval<S: ColumnScope>(e: &Expr, scope: &S, row: &[Value]) -> SqlResult<Val
             ErrorCode::NotSupported,
             "aggregate used outside aggregation".to_string(),
         )),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => eval_case(
+            operand.as_deref(),
+            branches,
+            else_expr.as_deref(),
+            scope,
+            row,
+        ),
+        // The operand evaluates eagerly; the cast itself is a pure
+        // value-level rewrite (func::control, reusing the coercion
+        // helpers).
+        Expr::Cast { expr, to } => eval_cast(eval(expr, scope, row)?, to),
+        Expr::Regexp {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let v = eval(expr, scope, row)?;
+            let p = eval(pattern, scope, row)?;
+            // 1/0 like MySQL's own REGEXP result; NULL propagates.
+            Ok(match regexp_match(&v, &p)? {
+                Value::Int(i) => Value::Int(if *negated { 1 - i } else { i }),
+                null @ Value::Null => null,
+                other => unreachable!("regexp_match yields Int or Null, got {other:?}"),
+            })
+        }
         Expr::Func { name, args } => {
+            // The control family's lazy entries (IF/IFNULL/NULLIF/
+            // COALESCE) intercept BEFORE argument evaluation: IF must
+            // not evaluate the untaken branch, NULLIF stops at the
+            // second operand when the first is NULL.
+            if let Some(r) = eval_lazy(name, args, scope, row) {
+                return r;
+            }
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
                 vals.push(eval(a, scope, row)?);
             }
             eval_func(name, &vals)
         }
+        // VALUES(col) markers only exist inside ODKU assignments and
+        // are substituted against the incoming row before this generic
+        // evaluator runs (exec::upsert); one reaching here is an
+        // internal routing error, reported loudly.
+        Expr::InsertValues(col) => Err(crate::sql::exec::upsert::stray_values_marker(col)),
     }
+}
+
+/// Three-valued `x [NOT] IN (items)`: NULL `x` is unknown; a NULL
+/// member only makes the result unknown when nothing compared equal.
+/// Empty items: plain IN is false, NOT IN is true (the SQL empty-set
+/// rule). Shared by literal IN lists and bound correlated IN
+/// subqueries.
+fn in_predicate(v: &Value, items: &[Value], negated: bool) -> SqlResult<Value> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    // Equality short-circuits first; a NULL member only makes the
+    // predicate unknown when no member compared equal.
+    let mut saw_null = false;
+    for item in items {
+        if matches!(item, Value::Null) {
+            saw_null = true;
+        } else if eq_values(v, item)? {
+            return Ok(Value::Bool(!negated));
+        }
+    }
+    if saw_null {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Bool(negated))
 }
 
 /// SQL three-valued truthiness: NULL -> error context handled by callers.
@@ -175,7 +263,9 @@ pub fn truthy(v: &Value) -> SqlResult<bool> {
     }
 }
 
-fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
+/// Value-level binary operator (shared with the function families:
+/// `MOD(a,b)` is exactly `a % b`).
+pub(crate) fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
     use BinOp::*;
     match op {
         And => {
@@ -212,6 +302,22 @@ fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
             };
             Ok(Value::Bool(b))
         }
+        // `<=>` never yields NULL: both NULL is TRUE, one NULL FALSE.
+        NullSafeEq => {
+            let b = match (l, r) {
+                (Value::Null, Value::Null) => true,
+                (Value::Null, _) | (_, Value::Null) => false,
+                (a, b) => cmp_values(a, b)?.is_eq(),
+            };
+            Ok(Value::Bool(b))
+        }
+        // `a XOR b`: three-valued (NULL on either side -> NULL).
+        LogicalXor => Ok(match (truthy_as_tristate(l)?, truthy_as_tristate(r)?) {
+            (Some(a), Some(b)) => Value::Bool(a != b),
+            _ => Value::Null,
+        }),
+        // `& | ^ << >>`: 64-bit unsigned on Int, NULL propagating.
+        BitAnd | BitOr | BitXor | Shl | Shr => eval_bitop(op, l, r),
         Add | Sub | Mul | Div | Mod => {
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 return Ok(Value::Null);
@@ -226,6 +332,16 @@ fn truthy_as_tristate(v: &Value) -> SqlResult<Option<bool>> {
         Value::Null => Ok(None),
         other => Ok(Some(truthy(other)?)),
     }
+}
+
+/// MySQL 1690 wording: integer overflow is a loud error, never a
+/// silent wrap. `expr` is the rendered operation ("(a + b)", "(- x)",
+/// "ABS(x)").
+pub(crate) fn bigint_out_of_range(expr: &str) -> SqlError {
+    SqlError::new(
+        ErrorCode::WrongValue,
+        format!("BIGINT value is out of range in '{expr}'"),
+    )
 }
 
 fn arith(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
@@ -281,28 +397,43 @@ fn arith(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
             format!("arithmetic on {l:?} and {r:?}"),
         ));
     };
-    Ok(match op {
-        Add => Value::Int(a.wrapping_add(*b)),
-        Sub => Value::Int(a.wrapping_sub(*b)),
-        Mul => Value::Int(a.wrapping_mul(*b)),
+    // Checked integer arithmetic: overflow raises the loud 1690-style
+    // error (the old wrapping_* ops silently returned i64::MIN etc).
+    let sym = match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        _ => "%",
+    };
+    let v = match op {
+        Add => a.checked_add(*b),
+        Sub => a.checked_sub(*b),
+        Mul => a.checked_mul(*b),
         Div => {
             if *b == 0 {
                 return Ok(Value::Null);
             }
-            // wrapping, like Add/Sub/Mul above: MIN / -1 must not panic.
-            Value::Int(a.wrapping_div(*b))
+            // MIN / -1 overflows i64: loud like Add/Sub/Mul.
+            a.checked_div(*b)
         }
         Mod => {
             if *b == 0 {
                 return Ok(Value::Null);
             }
-            Value::Int(a.wrapping_rem(*b))
+            // MIN % -1 is mathematically 0 and fits; checked_rem
+            // rejects it (its overflow is the paired division), so the
+            // wrapping rem is the exact answer here.
+            return Ok(Value::Int(a.wrapping_rem(*b)));
         }
         _ => unreachable!(),
-    })
+    };
+    Ok(Value::Int(v.ok_or_else(|| {
+        bigint_out_of_range(&format!("({a} {sym} {b})"))
+    })?))
 }
 
-fn as_double(v: &Value) -> SqlResult<f64> {
+pub(crate) fn as_double(v: &Value) -> SqlResult<f64> {
     match v {
         Value::Int(i) => Ok(*i as f64),
         Value::Double(d) => Ok(*d),
@@ -503,7 +634,10 @@ fn eq_values(l: &Value, r: &Value) -> SqlResult<bool> {
 
 /// SQL LIKE with `%` (any run) and `_` (one char); `\` escapes.
 /// Case sensitivity follows storage (bytewise), like MySQL's binary collation.
-fn like_match(s: &str, pattern: &str) -> bool {
+/// Shared with the SHOW metadata surface, which case-folds its inputs
+/// FIRST (MySQL SHOW ... LIKE convention) -- the matcher itself stays
+/// bytewise.
+pub(crate) fn like_match(s: &str, pattern: &str) -> bool {
     fn go(s: &[char], p: &[char]) -> bool {
         match (p.first(), p.get(1)) {
             (Some('%'), Some('%')) => go(s, &p[1..]), // collapse %%
@@ -530,73 +664,6 @@ fn like_match(s: &str, pattern: &str) -> bool {
         &s.chars().collect::<Vec<_>>(),
         &pattern.chars().collect::<Vec<_>>(),
     )
-}
-
-fn eval_func(name: &str, args: &[Value]) -> SqlResult<Value> {
-    match (name, args) {
-        ("length", [v]) | ("char_length", [v]) => match v {
-            // MySQL: LENGTH() counts bytes, CHAR_LENGTH() counts characters.
-            Value::Str(s) => Ok(Value::Int(if name == "char_length" {
-                s.chars().count() as i64
-            } else {
-                s.len() as i64
-            })),
-            Value::Bytes(b) => Ok(Value::Int(b.len() as i64)),
-            Value::Null => Ok(Value::Null),
-            other => Err(SqlError::new(
-                ErrorCode::NotSupported,
-                format!("length({other:?})"),
-            )),
-        },
-        ("upper", [v]) => match v {
-            Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
-            Value::Null => Ok(Value::Null),
-            other => Err(SqlError::new(
-                ErrorCode::NotSupported,
-                format!("upper({other:?})"),
-            )),
-        },
-        ("lower", [v]) => match v {
-            Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
-            Value::Null => Ok(Value::Null),
-            other => Err(SqlError::new(
-                ErrorCode::NotSupported,
-                format!("lower({other:?})"),
-            )),
-        },
-        ("abs", [v]) => match v {
-            Value::Int(i) => Ok(Value::Int(i.wrapping_abs())),
-            Value::Double(d) => Ok(Value::Double(d.abs())),
-            // i128::MIN has no positive peer: loud, never wrapped.
-            Value::Decimal(m, s) => Ok(Value::Decimal(
-                m.checked_abs()
-                    .ok_or_else(|| decimal_out_of_range(&format_decimal(*m, *s), *s))?,
-                *s,
-            )),
-            Value::Null => Ok(Value::Null),
-            other => Err(SqlError::new(
-                ErrorCode::NotSupported,
-                format!("abs({other:?})"),
-            )),
-        },
-        ("version", []) => Ok(Value::Str(env!("CARGO_PKG_VERSION").to_string())),
-        // Clock functions: UTC wall clock (no session timezone), always
-        // microsecond precision -- an fsp argument parses but is ignored.
-        ("now", [] | [_])
-        | ("current_timestamp", [] | [_])
-        | ("sysdate", [] | [_])
-        | ("localtime", [] | [_])
-        | ("localtimestamp", [] | [_]) => Ok(Value::DateTime(temporal::now_micros())),
-        ("curdate", [] | [_]) | ("current_date", [] | [_]) => {
-            Ok(Value::Date(temporal::today_days()))
-        }
-        // AUTO_INCREMENT session function; see exec/sequence.rs.
-        ("last_insert_id", args) => crate::sql::exec::sequence::last_insert_id_value(args),
-        _ => Err(SqlError::new(
-            ErrorCode::NotSupported,
-            format!("unknown function {name}"),
-        )),
-    }
 }
 
 /// Coerce a value for a typed column on write (INSERT/UPDATE payload).

@@ -1,4 +1,6 @@
-//! CREATE/DROP TABLE and CREATE/DROP INDEX.
+//! CREATE/DROP TABLE (the ALTER family -- CREATE/DROP INDEX,
+//! TRUNCATE, RENAME -- lives in `ddl_alter`, riding the same
+//! machinery).
 //!
 //! DDL is linearizable through the raft control plane: each statement
 //! runs its whole critical section -- schema reads (lookup, table-id
@@ -28,21 +30,15 @@
 
 use std::sync::Arc;
 
-use rocksdb::WriteBatch;
-
-use crate::sql::dist;
-use crate::sql::exec::scan;
+use crate::sql::exec::ddl_alter;
 use crate::sql::exec::show;
 use crate::sql::exec::ExecOutcome;
-use crate::sql::index::{self, IndexOps, IndexRef};
 use crate::sql::parse::ast::{ColumnSpec, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog::{self, CatalogTxn};
 use crate::sql::storage::replicate;
-use crate::sql::storage::row;
-use crate::sql::storage::schema::{ColumnDef, Engine, IndexDef, KeyModel, SqlType, TableSchema};
+use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel, SqlType, TableSchema};
 use crate::state::{self, RaftState, Shared};
-use crate::store::ops;
 
 pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
     match stmt {
@@ -53,39 +49,50 @@ pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
             pk,
             engine,
             starrocks,
+            indexes,
         } => {
             create_table(
                 shared,
-                &name,
-                if_not_exists,
-                &columns,
-                &pk,
-                engine,
-                starrocks.as_ref(),
+                &CreateTableBody {
+                    name: &name,
+                    if_not_exists,
+                    columns: &columns,
+                    pk: &pk,
+                    engine,
+                    starrocks: starrocks.as_ref(),
+                    indexes: &indexes,
+                },
             )
             .await
         }
         Statement::DropTable { name, if_exists } => drop_table(shared, &name, if_exists).await,
+        // The ALTER family (index create/drop, TRUNCATE, RENAME) lives
+        // in `ddl_alter` but rides the SAME machinery below.
         Statement::CreateIndex {
             table,
             name,
             column,
             unique,
             if_not_exists,
-        } => create_index(shared, &table, &name, &column, unique, if_not_exists).await,
+        } => ddl_alter::create_index(shared, &table, &name, &column, unique, if_not_exists).await,
         Statement::DropIndex {
             table,
             name,
             if_exists,
-        } => drop_index(shared, &table, &name, if_exists).await,
+        } => ddl_alter::drop_index(shared, &table, &name, if_exists).await,
+        Statement::TruncateTable { name } => ddl_alter::truncate_table(shared, &name).await,
+        Statement::RenameTable { from, to } => ddl_alter::rename_table(shared, &from, &to).await,
         _ => unreachable!("dispatch maps only DDL statements here"),
     }
 }
 
 /// One catalog mutation to apply under the DDL lock. Drop carries the
-/// schema: its id becomes the tombstone value (monotone id allocation).
-/// Kv carries a raw FSM entry (the AUTO_INCREMENT counter lifecycle).
-enum CatalogMutation {
+/// schema: it queues an id-less name tombstone PLUS a
+/// `sql_dropped/<id>` marker -- the side entry is what retires the id
+/// (monotone allocation, MVCC GC); the name tombstone alone (RENAME's
+/// shape) keeps the id live. Kv carries a raw FSM entry (the
+/// AUTO_INCREMENT counter lifecycle).
+pub(crate) enum CatalogMutation {
     Put(TableSchema),
     Drop(TableSchema),
     Kv { key: String, value: String },
@@ -98,14 +105,14 @@ enum CatalogMutation {
 /// (IF NOT/EXISTS no-ops) from a real decision: `catalog_txn` drains
 /// `mutations` as it applies them, so an applied plan comes back with
 /// an empty `mutations` and that emptiness must not be read as a no-op.
-struct DdlPlan {
-    mutations: Vec<CatalogMutation>,
-    schema: Option<TableSchema>,
-    changed: bool,
+pub(crate) struct DdlPlan {
+    pub(crate) mutations: Vec<CatalogMutation>,
+    pub(crate) schema: Option<TableSchema>,
+    pub(crate) changed: bool,
 }
 
 impl DdlPlan {
-    fn noop() -> DdlPlan {
+    pub(crate) fn noop() -> DdlPlan {
         DdlPlan {
             mutations: Vec::new(),
             schema: None,
@@ -135,26 +142,38 @@ pub(crate) static CATALOG_MUX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 /// holding it across `raft_apply_await` deadlocks the leader). Kept
 /// for single-mutation follow-ups that need no decision (the
 /// AUTO_INCREMENT counter lifecycle).
-async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<()> {
+pub(crate) async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<()> {
     let _catalog = CATALOG_MUX.lock().await;
     let raft = Arc::clone(&shared.raft);
     let queued = tokio::task::spawn_blocking(move || {
         let mut guard = raft.write().unwrap();
         let mut txn: CatalogTxn<'_> = catalog::begin(&mut guard, "DDL").map_err(SqlError::from)?;
-        let queued = match mutation {
-            CatalogMutation::Put(schema) => txn.queue_put(&schema),
-            CatalogMutation::Drop(schema) => txn.queue_drop(&schema.name, schema.id),
-            CatalogMutation::Kv { key, value } => txn.queue_put_kv(&key, &value),
+        let mut queued = Vec::new();
+        match mutation {
+            CatalogMutation::Put(schema) => {
+                queued.push(txn.queue_put(&schema).map_err(SqlError::from)?)
+            }
+            // Drop queues two entries (name tombstone + sql_dropped
+            // marker): both are awaited and replicated below.
+            CatalogMutation::Drop(schema) => queued.extend(
+                txn.queue_drop(&schema.name, schema.id)
+                    .map_err(SqlError::from)?,
+            ),
+            CatalogMutation::Kv { key, value } => {
+                queued.push(txn.queue_put_kv(&key, &value).map_err(SqlError::from)?)
+            }
         }
-        .map_err(SqlError::from)?;
         Ok::<_, SqlError>(queued)
     })
     .await
     .map_err(|e| SqlError::new(ErrorCode::Unknown, e.to_string()))??;
-    state::raft_apply_await(queued.ticket)
-        .await
-        .map_err(SqlError::from)?;
-    let applied = vec![(queued.key, queued.value)];
+    let mut applied = Vec::with_capacity(queued.len());
+    for q in queued {
+        state::raft_apply_await(q.ticket)
+            .await
+            .map_err(SqlError::from)?;
+        applied.push((q.key, q.value));
+    }
     // The ack implies follower visibility: hold the response until the
     // peers' FSMs serve the mutation (best-effort, see `replicate`).
     replicate::wait_peers_serve(shared, &applied).await;
@@ -170,7 +189,7 @@ async fn catalog_apply(shared: &Shared, mutation: CatalogMutation) -> SqlResult<
 /// only do cheap reads (plus local store reads for the unique-index
 /// pre-check). The commits are awaited AFTER the guard is dropped: the
 /// guard must never span an await (see `catalog_apply`).
-async fn catalog_txn<F>(shared: &Shared, decide: F) -> SqlResult<DdlPlan>
+pub(crate) async fn catalog_txn<F>(shared: &Shared, decide: F) -> SqlResult<DdlPlan>
 where
     F: FnOnce(&RaftState) -> SqlResult<DdlPlan> + Send + 'static,
 {
@@ -184,13 +203,21 @@ where
         let mut plan = decide(txn.state())?;
         let mut queued = Vec::with_capacity(plan.mutations.len());
         for mutation in std::mem::take(&mut plan.mutations) {
-            let q = match mutation {
-                CatalogMutation::Put(schema) => txn.queue_put(&schema),
-                CatalogMutation::Drop(schema) => txn.queue_drop(&schema.name, schema.id),
-                CatalogMutation::Kv { key, value } => txn.queue_put_kv(&key, &value),
+            match mutation {
+                CatalogMutation::Put(schema) => {
+                    queued.push(txn.queue_put(&schema).map_err(SqlError::from)?)
+                }
+                // Drop queues two entries (name tombstone +
+                // sql_dropped marker): the plan length underestimates
+                // the awaited commits, which is fine -- the vec grows.
+                CatalogMutation::Drop(schema) => queued.extend(
+                    txn.queue_drop(&schema.name, schema.id)
+                        .map_err(SqlError::from)?,
+                ),
+                CatalogMutation::Kv { key, value } => {
+                    queued.push(txn.queue_put_kv(&key, &value).map_err(SqlError::from)?)
+                }
             }
-            .map_err(SqlError::from)?;
-            queued.push(q);
         }
         Ok::<_, SqlError>((plan, queued))
     })
@@ -209,16 +236,21 @@ where
     Ok(plan)
 }
 
-async fn create_table(
-    shared: &Shared,
-    name: &str,
+/// The borrowed pieces of one `Statement::CreateTable` (keeps
+/// `create_table` under clippy's argument budget).
+struct CreateTableBody<'a> {
+    name: &'a str,
     if_not_exists: bool,
-    columns: &[ColumnSpec],
-    pk: &[String],
+    columns: &'a [ColumnSpec],
+    pk: &'a [String],
     engine: Engine,
-    starrocks: Option<&crate::sql::parse::starrocks::StarRocksModel>,
-) -> SqlResult<ExecOutcome> {
-    let schema = build_schema(0, name, columns, pk, engine, starrocks)?;
+    starrocks: Option<&'a crate::sql::parse::starrocks::StarRocksModel>,
+    indexes: &'a [crate::sql::parse::ast::InlineIndex],
+}
+
+async fn create_table(shared: &Shared, body: &CreateTableBody<'_>) -> SqlResult<ExecOutcome> {
+    let (name, if_not_exists, indexes) = (&body.name, body.if_not_exists, body.indexes);
+    let schema = build_schema(0, name, body.columns, body.pk, body.engine, body.starrocks)?;
     let table = name.to_string();
     let plan = catalog_txn(shared, move |raft| {
         if catalog::lookup_state(raft, &table)?.is_some() {
@@ -254,6 +286,20 @@ async fn create_table(
                 key: catalog::sequence_key(&schema.name),
                 value: "1".to_string(),
             },
+        )
+        .await?;
+    }
+    // Inline KEY/UNIQUE KEY constraints become real indexes right after
+    // the schema lands: the same windowed path CREATE INDEX takes (the
+    // fresh table is empty, so there is nothing to backfill).
+    for idx in indexes {
+        ddl_alter::create_index(
+            shared,
+            &schema.name,
+            &idx.name,
+            &idx.column,
+            idx.unique,
+            false,
         )
         .await?;
     }
@@ -298,232 +344,7 @@ async fn drop_table(shared: &Shared, name: &str, if_exists: bool) -> SqlResult<E
     Ok(ExecOutcome::Ok)
 }
 
-async fn create_index(
-    shared: &Shared,
-    table: &str,
-    name: &str,
-    column: &str,
-    unique: bool,
-    if_not_exists: bool,
-) -> SqlResult<ExecOutcome> {
-    // Store handle + snapshot ts are captured BEFORE the window: the
-    // unique-index pre-check reads local rows inside it.
-    let store = Arc::clone(&shared.store);
-    let now = shared.sql_ts.now();
-    let (table, name, column) = (table.to_string(), name.to_string(), column.to_string());
-    let index = IndexRef {
-        name: name.clone(),
-        column: column.clone(),
-        unique,
-    };
-    let probe = index.clone();
-    let target = table.clone();
-    let plan = catalog_txn(shared, move |raft| {
-        let index = probe;
-        let mut schema =
-            catalog::lookup_state(raft, &table)?.ok_or_else(|| SqlError::no_such_table(&table))?;
-        if schema.engine.is_columnar() {
-            return Err(SqlError::new(
-                ErrorCode::NotSupported,
-                format!("indexes are not supported on columnar table '{table}'"),
-            ));
-        }
-        if schema.index(&name).is_some() {
-            if if_not_exists {
-                return Ok(DdlPlan::noop());
-            }
-            return Err(SqlError::new(
-                ErrorCode::DupEntry,
-                format!("index '{name}' already exists"),
-            ));
-        }
-        if schema.column_index(&column).is_none() {
-            return Err(SqlError::new(
-                ErrorCode::BadField,
-                format!("unknown column '{column}' in '{table}'"),
-            ));
-        }
-        // Multi-column indexes never reach here (translate rejects them),
-        // but keep the guard local: M2 indexes exactly one column.
-        // UNIQUE pre-check runs BEFORE the catalog entry exists, so a clean
-        // rejection leaves nothing behind. Rows are read at the CURRENT
-        // committed snapshot.
-        if unique {
-            let rows = scan::visible_rows(&store, &schema, now)?;
-            index::maintain::assert_no_duplicates(&schema, &index, &rows)?;
-        }
-        let id = catalog::next_index_id(&schema);
-        schema.indexes.push(IndexDef {
-            id,
-            name,
-            column,
-            unique,
-        });
-        Ok(DdlPlan {
-            mutations: vec![CatalogMutation::Put(schema)],
-            schema: None,
-            changed: true,
-        })
-    })
-    .await?;
-    // IF NOT EXISTS on an existing index: the window decided nothing.
-    if !plan.changed {
-        return Ok(ExecOutcome::Ok);
-    }
-    // Backfill: rescan AFTER the catalog entry is committed, so every
-    // row visible at this point is covered (any writer that started
-    // earlier and lands later may miss its entry -- the accepted M2
-    // race window; the residual WHERE filter hides stale entries, and
-    // missing entries only cost the planner an index that finds fewer
-    // pks than exist, which the fallback heuristic bounds).
-    let schema = lookup_table(shared, &target)?;
-    backfill_index(shared, &schema, &index).await?;
-    Ok(ExecOutcome::Ok)
-}
-
-/// Write index entries for every live row (leader-side, after the
-/// catalog entry committed). One synced batch per whole backfill.
-/// Backfill one new index's entries for every LIVE row of the table.
-/// The row set is gathered across slot owners (rows live on every
-/// node), and the produced entries are routed to the OWNER of each
-/// key's slot: a local batch would leave unique-key entries on the
-/// leader for slots other nodes own, and the owning participants would
-/// then never see them -- the unique veto would miss exactly the
-/// pre-existing values. All-local key sets keep the single-batch path.
-async fn backfill_index(shared: &Shared, schema: &TableSchema, index: &IndexRef) -> SqlResult<()> {
-    let read_ts = shared.sql_ts.now();
-    let rows = match dist::gather::gatherable_by_name(shared) {
-        Some(bs) => dist::gather::gather_rows(shared, &bs, schema, read_ts).await?,
-        None => scan::visible_rows(&shared.store, schema, read_ts)?,
-    };
-    let mut ops: IndexOps = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let pk_key = row::pk_encode_row(schema, r).map_err(SqlError::from)?;
-        ops.extend(index::entries_for_live_row(schema, index, &pk_key, r).map_err(SqlError::from)?);
-    }
-    if ops.is_empty() {
-        return Ok(());
-    }
-    // A unique index over already-duplicated values is unbuildable:
-    // two pks claiming one key can never both win, and routing them to
-    // different owners would silently weaken the constraint. Reject the
-    // CREATE like a duplicate insert instead (before any key lands).
-    let mut owners: std::collections::BTreeMap<&[u8], &[u8]> = std::collections::BTreeMap::new();
-    for (key, val) in &ops {
-        let Some(pk) = val.as_deref() else { continue };
-        if let Some(prev) = owners.get(key.as_slice()) {
-            if *prev != pk {
-                return Err(SqlError::new(
-                    ErrorCode::DupEntry,
-                    format!(
-                        "Duplicate entry '{}' for key '{}': the column already holds duplicates",
-                        String::from_utf8_lossy(pk),
-                        index.name
-                    ),
-                ));
-            }
-        }
-        owners.insert(key.as_slice(), pk);
-    }
-    drop(owners);
-    // Route entries to each key's slot owner: 2PC when any owner is
-    // another node, one local batch otherwise (single-node world or
-    // every key on this node).
-    let no_writes: dist::plan::SimpleWrites = Vec::new();
-    // Reserve the write frontier first like every other commit path:
-    // the index-only plan still allocates one ts (the 2PC txn id), and
-    // it must clear `read_ts` without degrading to the GAP fallback.
-    // Strict when any entry key has a remote owner (2PC backfill).
-    let probes: Vec<Vec<u8>> = ops.iter().map(|(k, _)| k.clone()).collect();
-    let strict = dist::any_remote_owner(shared, &probes);
-    shared
-        .sql_ts
-        .reserve_write_frontier(read_ts, 1, strict)
-        .await?;
-    if let Some(plan) = dist::plan::try_plan_simple(shared, read_ts, schema, &no_writes, &ops)? {
-        return dist::twopc::run(shared, &plan).await;
-    }
-    let mut batch = WriteBatch::default();
-    index::maintain::apply_ops(&mut batch, ops);
-    ops::batch_write_async(Arc::clone(&shared.store), batch)
-        .await
-        .map_err(SqlError::from)
-}
-
-async fn drop_index(
-    shared: &Shared,
-    table: &str,
-    name: &str,
-    if_exists: bool,
-) -> SqlResult<ExecOutcome> {
-    let (table, needle) = (table.to_string(), name.to_string());
-    let plan = catalog_txn(shared, move |raft| {
-        let name = needle;
-        let mut schema =
-            catalog::lookup_state(raft, &table)?.ok_or_else(|| SqlError::no_such_table(&table))?;
-        let Some(pos) = schema
-            .indexes
-            .iter()
-            .position(|i| i.name.eq_ignore_ascii_case(&name))
-        else {
-            if if_exists {
-                return Ok(DdlPlan::noop());
-            }
-            return Err(SqlError::new(
-                ErrorCode::Unknown,
-                format!("index '{name}' doesn't exist"),
-            ));
-        };
-        // Capture the column before the definition leaves the schema: the
-        // on-disk keys are identified by (table_id, col_pos) alone. The
-        // check runs inside the window so a clean rejection leaves the
-        // catalog untouched.
-        let col = schema.indexes[pos].column.clone();
-        if schema.column_index(&col).is_none() {
-            return Err(SqlError::new(
-                ErrorCode::BadField,
-                format!("unknown column '{col}'"),
-            ));
-        }
-        // Removal by position keeps the remaining index ids stable. The
-        // catalog entry goes first: if the entry sweep then fails, the
-        // orphaned keys are unreachable (no index def) and harmless, while
-        // the reverse order could leave a DECLARED index with no entries.
-        // The echoed schema is the PRE-removal snapshot: the follow-up
-        // sweep still needs the dropped column's position.
-        let echo = schema.clone();
-        schema.indexes.remove(pos);
-        Ok(DdlPlan {
-            mutations: vec![CatalogMutation::Put(schema)],
-            schema: Some(echo),
-            changed: true,
-        })
-    })
-    .await?;
-    // IF EXISTS on a missing index: the window decided nothing.
-    if !plan.changed {
-        return Ok(ExecOutcome::Ok);
-    }
-    let Some(snapshot) = plan.schema else {
-        return Ok(ExecOutcome::Ok);
-    };
-    // Recover (table_id, col_pos) from the echoed pre-removal schema;
-    // both lookups were validated inside the window.
-    let pos = snapshot
-        .indexes
-        .iter()
-        .position(|i| i.name.eq_ignore_ascii_case(name))
-        .expect("dropped index present in the pre-removal snapshot");
-    let col_pos = snapshot
-        .column_index(&snapshot.indexes[pos].column)
-        .expect("dropped index column present in the pre-removal snapshot");
-    index::drop_entries(Arc::clone(&shared.store), snapshot.id, col_pos as u32)
-        .await
-        .map_err(SqlError::from)?;
-    Ok(ExecOutcome::Ok)
-}
-
-fn lookup_table(shared: &Shared, table: &str) -> SqlResult<TableSchema> {
+pub(crate) fn lookup_table(shared: &Shared, table: &str) -> SqlResult<TableSchema> {
     catalog::lookup(shared, table)
         .map_err(SqlError::from)?
         .ok_or_else(|| SqlError::no_such_table(table))
@@ -533,7 +354,7 @@ fn lookup_table(shared: &Shared, table: &str) -> SqlResult<TableSchema> {
 /// ids stay monotone across drop+recreate cycles even after restarts.
 /// Runs inside the DDL guard window (`catalog_txn`), which is what
 /// keeps two concurrent CREATEs from observing the same max.
-fn alloc_table_id(raft: &RaftState) -> u32 {
+pub(crate) fn alloc_table_id(raft: &RaftState) -> u32 {
     let live_max = catalog::list_tables_state(raft)
         .iter()
         .map(|s| s.id)

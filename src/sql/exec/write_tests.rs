@@ -214,6 +214,130 @@ async fn update_pk_change_tombstones_old_key() {
 }
 
 #[tokio::test]
+async fn update_pk_move_onto_live_row_is_1062() {
+    let shared = setup().await;
+    exec(&shared, "INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b')").await;
+    // moving row 2 ONTO live row 1 must not silently merge the two
+    // rows: MySQL rejects with ER 1062 and nothing lands.
+    let err = write(
+        &shared,
+        parse_statement("UPDATE t SET id = 1 WHERE id = 2").unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::DupEntry, "{err}");
+    assert!(
+        err.msg.contains("Duplicate entry 1 for key 'PRIMARY'"),
+        "{err}"
+    );
+    let (_, got) = rows(&shared, "SELECT id, v FROM t ORDER BY id").await;
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Int(1), Value::Str("a".into())],
+            vec![Value::Int(2), Value::Str("b".into())],
+        ]
+    );
+    // the same clash through the txn path: a staged row occupies the
+    // target pk even though it is invisible to other sessions.
+    let mut sess = SqlSession::default();
+    shared.sql_ts.sync_cursor_frontier();
+    sess.txn = Some(tx::begin(&shared.sql_ts));
+    write_in(
+        &shared,
+        &mut sess,
+        parse_statement("INSERT INTO t (id, v) VALUES (5, 'e')").unwrap(),
+    )
+    .await
+    .unwrap();
+    let err = write_in(
+        &shared,
+        &mut sess,
+        parse_statement("UPDATE t SET id = 5 WHERE id = 2").unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::DupEntry, "{err}");
+    tx::rollback(&shared.sql_ts, sess.txn.take().unwrap());
+    let (_, got) = rows(&shared, "SELECT id FROM t ORDER BY id").await;
+    assert_eq!(got.len(), 2);
+}
+
+#[tokio::test]
+async fn update_two_rows_same_target_pk_is_1062() {
+    let shared = setup().await;
+    exec(&shared, "INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b')").await;
+    // both matched rows converge on pk 10: the snapshot probe alone
+    // would miss it (10 is not live), but folding each decided write
+    // in statement order makes the SECOND write clash -- MySQL would
+    // reject mid-application, so nothing may land here either.
+    let err = write(
+        &shared,
+        parse_statement("UPDATE t SET id = 10 WHERE id IN (1, 2)").unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::DupEntry, "{err}");
+    assert!(
+        err.msg.contains("Duplicate entry 10 for key 'PRIMARY'"),
+        "{err}"
+    );
+    // decide-then-apply: the rejected statement left no rows behind
+    let (_, got) = rows(&shared, "SELECT id, v FROM t ORDER BY id").await;
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Int(1), Value::Str("a".into())],
+            vec![Value::Int(2), Value::Str("b".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn update_vacated_target_pk_within_statement_is_allowed() {
+    let shared = setup().await;
+    exec(&shared, "INSERT INTO t (id, v) VALUES (2, 'b'), (3, 'c')").await;
+    // row 2 vacates pk 2 before row 3 moves onto it -- the folded
+    // probe accepts, matching MySQL's row-by-row application.
+    assert!(matches!(
+        exec(&shared, "UPDATE t SET id = id - 1 WHERE id IN (2, 3)").await,
+        ExecOutcome::Affected(2)
+    ));
+    let (_, got) = rows(&shared, "SELECT id, v FROM t ORDER BY id").await;
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Int(1), Value::Str("b".into())],
+            vec![Value::Int(2), Value::Str("c".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn update_pk_self_assign_and_vacated_moves_stay_silent() {
+    let shared = setup().await;
+    exec(&shared, "INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b')").await;
+    // self-assignment writes no version (the row is unchanged)
+    assert!(matches!(
+        exec(&shared, "UPDATE t SET id = 1 WHERE id = 1").await,
+        ExecOutcome::Affected(0)
+    ));
+    // and a move onto a genuinely vacated pk stays legal
+    assert!(matches!(
+        exec(&shared, "UPDATE t SET id = 9 WHERE id = 1").await,
+        ExecOutcome::Affected(1)
+    ));
+    let (_, got) = rows(&shared, "SELECT id, v FROM t ORDER BY id").await;
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Int(2), Value::Str("b".into())],
+            vec![Value::Int(9), Value::Str("a".into())],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn older_read_ts_sees_older_version() {
     let shared = setup().await;
     exec(&shared, "INSERT INTO t (id, v) VALUES (1, 'old')").await;

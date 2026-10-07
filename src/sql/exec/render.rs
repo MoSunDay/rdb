@@ -5,9 +5,11 @@
 
 use crate::sql::exec::{ColMeta, ExecOutcome};
 use crate::sql::parse::ast::{
-    BinOp, CompoundQuery, Expr, JoinKind, Query, QueryBody, SelectItem, Statement, TableRef,
+    BinOp, CompoundQuery, CorrelatedKind, Expr, JoinKind, LimitValue, Query, QueryBody, SelectItem,
+    SetOp, Statement, TableRef,
 };
 use crate::sql::parse::error::SqlResult;
+use crate::sql::parse::order_limit::limit_display;
 use crate::sql::storage::schema::{SqlType, Value};
 
 /// Render one expression the way it was written, e.g. `score + 1`,
@@ -20,6 +22,8 @@ pub fn expr_display(e: &Expr) -> String {
         },
         Expr::Lit(v) => lit_display(v),
         Expr::Placeholder => "?".to_string(),
+        // only ODKU assignments carry the marker; display mirrors MySQL
+        Expr::InsertValues(col) => format!("VALUES({col})"),
         Expr::Subquery(_) => "(SELECT ...)".to_string(),
         Expr::InSubquery { negated, .. } => {
             if *negated {
@@ -28,6 +32,16 @@ pub fn expr_display(e: &Expr) -> String {
                 "<expr> IN (SELECT ...)".to_string()
             }
         }
+        Expr::Exists { negated, .. } => {
+            if *negated {
+                "NOT EXISTS (SELECT ...)".to_string()
+            } else {
+                "EXISTS (SELECT ...)".to_string()
+            }
+        }
+        // Bind-time node (never in a parsed statement); rendered only
+        // defensively.
+        Expr::Correlated { .. } => "«correlated subquery»".to_string(),
         Expr::BinaryOp { left, op, right } => {
             format!(
                 "{} {} {}",
@@ -78,19 +92,61 @@ pub fn expr_display(e: &Expr) -> String {
             if *negated { "NOT " } else { "" },
             expr_display(pattern)
         ),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            let mut out = String::from("CASE ");
+            if let Some(op) = operand {
+                out.push_str(&expr_display(op));
+                out.push(' ');
+            }
+            for (cond, then) in branches {
+                out.push_str(&format!(
+                    "WHEN {} THEN {} ",
+                    expr_display(cond),
+                    expr_display(then)
+                ));
+            }
+            if let Some(e) = else_expr {
+                out.push_str(&format!("ELSE {} ", expr_display(e)));
+            }
+            out.push_str("END");
+            out
+        }
+        Expr::Cast { expr, to } => {
+            format!("CAST({} AS {})", expr_display(expr), cast_spec_display(to))
+        }
+        Expr::Regexp {
+            expr,
+            pattern,
+            negated,
+        } => format!(
+            "{} {}REGEXP {}",
+            expr_display(expr),
+            if *negated { "NOT " } else { "" },
+            expr_display(pattern)
+        ),
         Expr::Agg {
             func,
             arg,
             distinct,
+            sep,
         } => {
             let name = agg_name(func);
-            match arg {
+            let base = match arg {
                 None => format!("{name}(*)"),
                 Some(a) => format!(
                     "{name}({}{})",
                     if *distinct { "DISTINCT " } else { "" },
                     expr_display(a)
                 ),
+            };
+            match sep {
+                // GROUP_CONCAT's separator renders like the SQL text.
+                Some(sep) => format!("{base} SEPARATOR '{}'", escape_quotes(sep)),
+                None => base,
             }
         }
         Expr::Func { name, args } => format!(
@@ -120,6 +176,7 @@ fn lit_display(v: &Value) -> String {
 fn binop_display(op: BinOp) -> &'static str {
     match op {
         BinOp::Eq => "=",
+        BinOp::NullSafeEq => "<=>",
         BinOp::NotEq => "<>",
         BinOp::Lt => "<",
         BinOp::LtEq => "<=",
@@ -127,16 +184,40 @@ fn binop_display(op: BinOp) -> &'static str {
         BinOp::GtEq => ">=",
         BinOp::And => "AND",
         BinOp::Or => "OR",
+        BinOp::LogicalXor => "XOR",
         BinOp::Add => "+",
         BinOp::Sub => "-",
         BinOp::Mul => "*",
         BinOp::Div => "/",
         BinOp::Mod => "%",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
     }
+}
+
+/// MySQL spelling of a CAST target (EXPLAIN text only).
+fn cast_spec_display(spec: &crate::sql::parse::ast::CastSpec) -> String {
+    use crate::sql::parse::ast::CastSpec;
+    match spec {
+        CastSpec::Signed => "SIGNED".to_string(),
+        CastSpec::Unsigned => "UNSIGNED".to_string(),
+        CastSpec::Char(None) => "CHAR".to_string(),
+        CastSpec::Char(Some(n)) => format!("CHAR({n})"),
+        CastSpec::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
+    }
+}
+
+/// Single-quoted-literal escaping for the SEPARATOR display.
+fn escape_quotes(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\'\'")
 }
 
 fn agg_name(f: &crate::sql::parse::ast::AggFunc) -> &'static str {
     match f {
+        crate::sql::parse::ast::AggFunc::GroupConcat => "GROUP_CONCAT",
         crate::sql::parse::ast::AggFunc::Count => "COUNT",
         crate::sql::parse::ast::AggFunc::Sum => "SUM",
         crate::sql::parse::ast::AggFunc::Avg => "AVG",
@@ -185,10 +266,14 @@ fn explain_compound(cq: &CompoundQuery, headline: Vec<String>) -> Vec<String> {
             .join(", ");
         lines.push(format!("Sort: {keys}"));
     }
-    if let Some(l) = cq.limit {
-        lines.push(format!("Limit: {l} offset {}", cq.offset));
-    } else if cq.offset > 0 {
-        lines.push(format!("Offset: {}", cq.offset));
+    if let Some(l) = &cq.limit {
+        lines.push(format!(
+            "Limit: {} offset {}",
+            limit_display(l),
+            limit_display(&cq.offset)
+        ));
+    } else if cq.offset != LimitValue::zero() {
+        lines.push(format!("Offset: {}", limit_display(&cq.offset)));
     }
     lines
 }
@@ -197,13 +282,20 @@ fn explain_body(b: &QueryBody) -> Vec<String> {
     match b {
         QueryBody::Select(q) => explain_select(q, Vec::new()),
         QueryBody::Nested(inner) => explain_compound(inner, Vec::new()),
-        QueryBody::Union { left, right, all } => {
+        QueryBody::SetOp {
+            op,
+            left,
+            right,
+            all,
+        } => {
             let mut lines = explain_body(left);
-            lines.push(if *all {
-                "Union-All".to_string()
-            } else {
-                "Union-Distinct".to_string()
-            });
+            // rendered like UNION always has been ("Union-All")
+            let word = match op {
+                SetOp::Union => "Union",
+                SetOp::Intersect => "Intersect",
+                SetOp::Except => "Except",
+            };
+            lines.push(format!("{word}-{}", if *all { "All" } else { "Distinct" }));
             lines.extend(explain_body(right));
             lines
         }
@@ -271,12 +363,16 @@ fn explain_select(q: &Query, headline: Vec<String>) -> Vec<String> {
             .join(", ");
         lines.push(format!("Order: {keys}"));
     }
-    if q.limit.is_some() || q.offset > 0 {
+    if q.limit.is_some() || q.offset != LimitValue::zero() {
         let limit = q
             .limit
-            .map(|l| l.to_string())
+            .as_ref()
+            .map(limit_display)
             .unwrap_or_else(|| "all".to_string());
-        lines.push(format!("Limit: {limit} Offset: {}", q.offset));
+        lines.push(format!(
+            "Limit: {limit} Offset: {}",
+            limit_display(&q.offset)
+        ));
     }
     lines
 }
@@ -334,7 +430,18 @@ fn collect_aggs(e: &Expr, out: &mut Vec<String>) {
     match e {
         Expr::Agg { .. } => out.push(expr_display(e)),
         Expr::Lit(_) | Expr::Placeholder | Expr::Col { .. } => {}
-        Expr::Subquery(_) | Expr::InSubquery { .. } => {}
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::InsertValues(_) => {}
+        // EXISTS carries only the subquery; a bound correlated node's
+        // keys/lhs carry no aggregates of THIS query.
+        Expr::Exists { .. } => {}
+        Expr::Correlated { kind, keys, .. } => {
+            if let CorrelatedKind::In { lhs, .. } = kind {
+                collect_aggs(lhs, out);
+            }
+            for k in keys {
+                collect_aggs(k, out);
+            }
+        }
         Expr::BinaryOp { left, right, .. } => {
             collect_aggs(left, out);
             collect_aggs(right, out);
@@ -355,6 +462,27 @@ fn collect_aggs(e: &Expr, out: &mut Vec<String>) {
             collect_aggs(high, out);
         }
         Expr::Like { expr, pattern, .. } => {
+            collect_aggs(expr, out);
+            collect_aggs(pattern, out);
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                collect_aggs(o, out);
+            }
+            for (c, t) in branches {
+                collect_aggs(c, out);
+                collect_aggs(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_aggs(e, out);
+            }
+        }
+        Expr::Cast { expr, .. } => collect_aggs(expr, out),
+        Expr::Regexp { expr, pattern, .. } => {
             collect_aggs(expr, out);
             collect_aggs(pattern, out);
         }
@@ -400,7 +528,9 @@ mod tests {
         assert_eq!(lines[3], "Aggregate: COUNT(*)");
         assert_eq!(lines[4], "Having: COUNT(*) > 1");
         assert_eq!(lines[5], "Project: id, COUNT(*) AS n");
-        assert_eq!(lines[6], "Order: n DESC");
+        // ORDER BY alias resolves to the aliased projection at
+        // translate time, so EXPLAIN shows the evaluated key.
+        assert_eq!(lines[6], "Order: COUNT(*) DESC");
         assert_eq!(lines[7], "Limit: 5 Offset: 2");
     }
 
@@ -418,6 +548,32 @@ mod tests {
         assert_eq!(
             rows[0][0],
             Value::Str("Direct execution (insert)".to_string())
+        );
+    }
+
+    // The M1 groundwork nodes render as written (round-trippable text
+    // for filters/projections in the plan).
+    #[test]
+    fn explain_renders_case_cast_regexp_operators() {
+        let lines = explain_lines(
+            "SELECT CASE WHEN a = 1 THEN 'x' ELSE 'y' END, CAST(a AS CHAR(2)), \
+             a REGEXP '^x', a <=> 1, a & 3, a << 1, a XOR 1 FROM t \
+             WHERE a NOT REGEXP 'z'",
+        );
+        let project = lines.last().unwrap();
+        assert!(
+            project.contains("CASE WHEN a = 1 THEN 'x' ELSE 'y' END"),
+            "{project}"
+        );
+        assert!(project.contains("CAST(a AS CHAR(2))"), "{project}");
+        assert!(project.contains("a REGEXP '^x'"), "{project}");
+        assert!(project.contains("a <=> 1"), "{project}");
+        assert!(project.contains("a & 3"), "{project}");
+        assert!(project.contains("a << 1"), "{project}");
+        assert!(project.contains("a XOR 1"), "{project}");
+        assert!(
+            lines.iter().any(|l| l.contains("a NOT REGEXP 'z'")),
+            "{lines:?}"
         );
     }
 

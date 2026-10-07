@@ -16,9 +16,11 @@ use crate::sql::exec::scan::{self, FromScope, Source};
 use crate::sql::exec::subquery::SubqCtx;
 use crate::sql::exec::{ColMeta, ExecOutcome, SqlSession};
 use crate::sql::parse::ast::{
-    AggFunc, BinOp, Expr, OrderKey, Query, SelectItem, Statement, TableRef,
+    AggFunc, BinOp, CorrelatedKind, CorrelatedOut, Expr, OrderKey, Query, SelectItem, Statement,
+    TableRef,
 };
 use crate::sql::parse::error::SqlResult;
+use crate::sql::parse::order_limit::limit_u64;
 use crate::sql::plan;
 use crate::sql::storage::schema::{SqlType, Value};
 use crate::sql::tx::latch;
@@ -74,11 +76,24 @@ pub async fn run_at(
         read_ts,
         txn,
         ctes,
+        outer: None,
     };
-    let q = &crate::sql::exec::subquery::rewrite_query(q, &subq).await?;
+    let rewritten = crate::sql::exec::subquery::rewrite_query(q, &subq).await?;
     // Multi-node clusters read scatter-gather (falls back to the local
     // scan path for joins / single-node topologies).
-    let src = gather::materialize(shared, &q.from, read_ts, txn, q.filter.as_ref(), ctes).await?;
+    let src = gather::materialize(
+        shared,
+        &rewritten.from,
+        read_ts,
+        txn,
+        rewritten.filter.as_ref(),
+        ctes,
+    )
+    .await?;
+    // Correlated subqueries deferred by the rewrite above bind here,
+    // per distinct outer-row binding (no cost when none deferred).
+    let bound = crate::sql::exec::correlated::bind_query(&rewritten, &src, &subq).await?;
+    let q: &Query = &bound;
     // ---- locking-read hook (isolated block; nothing below changes) ----
     // Explicit txn: latches carry the txn's id and release at COMMIT /
     // ROLLBACK (or ROLLBACK TO, keeping pre-savepoint ones). Autocommit:
@@ -212,10 +227,16 @@ pub fn execute_query(q: &Query, src: &Source) -> SqlResult<(Vec<ColMeta>, Vec<Ve
     }
     sort_pairs(&mut pairs, &q.order_by);
 
-    let take = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+    // LIMIT / OFFSET coerce once here: a bound `?` must be a
+    // non-negative integer, exactly like a numeric literal.
+    let take = match &q.limit {
+        Some(l) => limit_u64(l)? as usize,
+        None => usize::MAX,
+    };
+    let offset = limit_u64(&q.offset)? as usize;
     let rows = pairs
         .into_iter()
-        .skip(q.offset as usize)
+        .skip(offset)
         .take(take)
         .map(|(_, r)| r)
         .collect();
@@ -377,6 +398,22 @@ fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
     match e {
         Expr::Lit(v) => v.sql_type().unwrap_or(SqlType::VarChar),
         Expr::Subquery(_) | Expr::InSubquery { .. } => SqlType::VarChar, // rewritten pre-typing
+        Expr::Exists { .. } => SqlType::Int,                             // boolean result column
+        // Bound after rewrite; typed from the first pre-computed
+        // scalar result, else the safe text default.
+        Expr::Correlated { kind, cases, .. } => match kind {
+            CorrelatedKind::Exists { .. } | CorrelatedKind::In { .. } => SqlType::Int,
+            CorrelatedKind::Scalar => cases
+                .iter()
+                .find_map(|(_, out)| match out {
+                    CorrelatedOut::Scalar(v) => Some(v.sql_type().unwrap_or(SqlType::VarChar)),
+                    CorrelatedOut::Rows(_) => None,
+                })
+                .unwrap_or(SqlType::VarChar),
+        },
+        // VALUES(col) markers never appear in projections (parse-time
+        // rejection); a defensive default keeps typing total.
+        Expr::InsertValues(_) => SqlType::VarChar,
 
         Expr::Col { table, name } => scope
             .resolve_checked(table.as_deref(), name)
@@ -385,6 +422,9 @@ fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
             .unwrap_or(SqlType::VarChar),
         Expr::Agg { func, arg, .. } => match func {
             AggFunc::Count => SqlType::Int,
+            // GROUP_CONCAT joins text with the separator -> a string
+            // column regardless of the argument type.
+            AggFunc::GroupConcat => SqlType::VarChar,
             // SUM keeps its integer width; a DECIMAL argument sums to
             // an exact decimal at the column scale (agg.rs decimal_sum)
             // and AVG divides at scale+4 (avg_values -> div_decimal
@@ -423,15 +463,34 @@ fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
         | Expr::InList { .. }
         | Expr::Between { .. }
         | Expr::Like { .. } => SqlType::Bool,
+        // REGEXP answers 1/0 on the wire (MySQL LONGLONG).
+        Expr::Regexp { .. } => SqlType::Int,
+        // CASE types as its first THEN (the value path only ever
+        // produces one branch's type per row); ELSE-only or empty
+        // falls back to the string default.
+        Expr::Case {
+            branches,
+            else_expr,
+            ..
+        } => branches
+            .first()
+            .map(|(_, t)| result_type(t, scope))
+            .or_else(|| else_expr.as_deref().map(|e| result_type(e, scope)))
+            .unwrap_or(SqlType::VarChar),
+        Expr::Cast { to, .. } => cast_result_type(to),
         Expr::BinaryOp { left, op, right } => match op {
             BinOp::And
             | BinOp::Or
+            | BinOp::LogicalXor
             | BinOp::Eq
+            | BinOp::NullSafeEq
             | BinOp::NotEq
             | BinOp::Lt
             | BinOp::LtEq
             | BinOp::Gt
             | BinOp::GtEq => SqlType::Bool,
+            // Bitwise ops are 64-bit unsigned on the Int domain.
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => SqlType::Int,
             _ => {
                 let (lt, rt) = (result_type(left, scope), result_type(right, scope));
                 if lt == SqlType::Double || rt == SqlType::Double {
@@ -469,18 +528,27 @@ fn result_type(e: &Expr, scope: &FromScope) -> SqlType {
                 }
             }
         },
-        // Scalar functions are heterogeneous (strings dominate), so an
-        // unknown one types as VarChar; the few typed builtins are
-        // pinned here. Metadata only -- evaluation stays dynamic.
-        Expr::Func { name, .. } => match name.to_lowercase().as_str() {
-            "last_insert_id" | "length" | "char_length" => SqlType::Int,
-            "now" | "current_timestamp" | "sysdate" | "localtime" | "localtimestamp" => {
-                SqlType::DateTime
-            }
-            "curdate" | "current_date" => SqlType::Date,
-            _ => SqlType::VarChar,
-        },
+        // Scalar function result types live in the pure lookup table
+        // (`func::meta`, shared with nothing else -- metadata only,
+        // evaluation stays dynamic). Unknown names type as VarChar.
+        Expr::Func { name, args } => {
+            crate::sql::exec::func::meta::result_type(name, args, &|a| result_type(a, scope))
+        }
         Expr::Placeholder => SqlType::VarChar, // unknown until bind
+    }
+}
+
+/// Result-column type of a CAST target: integers stay Int, CHAR is a
+/// string, DECIMAL reports the declared (precision, scale).
+fn cast_result_type(to: &crate::sql::parse::ast::CastSpec) -> SqlType {
+    use crate::sql::parse::ast::CastSpec;
+    match to {
+        CastSpec::Signed | CastSpec::Unsigned => SqlType::Int,
+        CastSpec::Char(_) => SqlType::VarChar,
+        CastSpec::Decimal { precision, scale } => SqlType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        },
     }
 }
 

@@ -10,88 +10,10 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
-
-use common::{
-    spawn_node_mysql, start_sql_cluster, wait_leader, wait_mysql_ready, wait_resp_ready, ProcNode,
-};
+use common::mysql::{connect_root, ddl, wait_table, ER_NOT_SUPPORTED_YET, ER_NO_SUCH_TABLE};
+use common::{spawn_node_mysql, start_sql_cluster, wait_leader, wait_mysql_ready, wait_resp_ready};
 use mysql_async::prelude::*;
-use mysql_async::{OptsBuilder, Value as MVal};
-
-const PASS: &str = "e2e-sql-pass";
-/// MySQL errno of `ErrorCode::NotSupported` (ER_NOT_SUPPORTED_YET).
-const ER_NOT_SUPPORTED_YET: u16 = 1235;
-/// MySQL errno of `ErrorCode::NoSuchTable` (ER_NO_SUCH_TABLE).
-const ER_NO_SUCH_TABLE: u16 = 1146;
-
-async fn connect(node: &ProcNode) -> mysql_async::Conn {
-    let port = node
-        .mysql
-        .rsplit(':')
-        .next()
-        .expect("mysql port")
-        .parse::<u16>()
-        .expect("mysql port digits");
-    let opts = || {
-        OptsBuilder::default()
-            .ip_or_hostname("127.0.0.1")
-            .tcp_port(port)
-            .user(Some("root"))
-            .pass(Some(PASS))
-    };
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        match mysql_async::Conn::new(opts()).await {
-            Ok(c) => return c,
-            Err(mysql_async::Error::Io(_)) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("mysql connect: {e}"),
-        }
-    }
-}
-
-/// DDL needs the raft leader; retry while the executing node forwards.
-async fn ddl(conn: &mut mysql_async::Conn, sql: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        match conn.query_drop(sql).await {
-            Ok(()) => return,
-            Err(e) => {
-                if Instant::now() < deadline && e.to_string().contains("leader") {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    continue;
-                }
-                panic!("ddl {sql}: {e}")
-            }
-        }
-    }
-}
-
-/// Poll SHOW TABLES until the raft-replicated catalog reaches `want`
-/// (true = table listed, false = dropped everywhere).
-async fn poll_catalog(conn: &mut mysql_async::Conn, table: &str, node: &ProcNode, want: bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let rs: Vec<mysql_async::Row> = conn.query("SHOW TABLES").await.expect("show tables");
-        let names: Vec<String> = rs
-            .into_iter()
-            .map(|r| match r.get::<MVal, _>(0) {
-                Some(MVal::Bytes(b)) => String::from_utf8(b).unwrap(),
-                v => panic!("non-bytes table cell {v:?}"),
-            })
-            .collect();
-        if names.iter().any(|n| n == table) == want {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "table {table} never reached want={want} on {} (have {names:?})",
-            node.resp
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
+use mysql_async::Value as MVal;
 
 /// All cells of a resultset as strings (NULL as "NULL").
 async fn grid(conn: &mut mysql_async::Conn, sql: &str) -> Vec<Vec<String>> {
@@ -139,8 +61,8 @@ async fn single_node_columnar_lifecycle() {
     let mut node = spawn_node_mysql(&dir, 0, true, None);
     wait_resp_ready(&mut node, 15).await;
     wait_mysql_ready(&node, 15).await;
-    let mut c = connect(&node).await;
-    let mut c2 = connect(&node).await;
+    let mut c = connect_root(&node).await;
+    let mut c2 = connect_root(&node).await;
 
     // ---- columnar DDL ----
     ddl(
@@ -267,7 +189,7 @@ async fn cluster_columnar_segments_spread_and_gather() {
     let leader = wait_leader(&nodes, 60).await;
     let mut conns = Vec::new();
     for n in &nodes {
-        conns.push(connect(n).await);
+        conns.push(connect_root(n).await);
     }
 
     // ---- columnar DDL on the raft leader, replicated everywhere ----
@@ -276,8 +198,8 @@ async fn cluster_columnar_segments_spread_and_gather() {
         "CREATE TABLE cd (id BIGINT PRIMARY KEY, v VARCHAR(64) NULL) ENGINE=columnar",
     )
     .await;
-    for (i, n) in nodes.iter().enumerate() {
-        poll_catalog(&mut conns[i], "cd", n, true).await;
+    for (i, _n) in nodes.iter().enumerate() {
+        wait_table(&mut conns[i], "cd", true).await;
     }
 
     // ---- autocommit INSERTs DIRECTLY on every node: each commit
@@ -302,8 +224,8 @@ async fn cluster_columnar_segments_spread_and_gather() {
         "CREATE TABLE adv (k BIGINT PRIMARY KEY)",
     )
     .await;
-    for (i, n) in nodes.iter().enumerate() {
-        poll_catalog(&mut conns[i], "adv", n, true).await;
+    for (i, _n) in nodes.iter().enumerate() {
+        wait_table(&mut conns[i], "adv", true).await;
     }
     for (i, conn) in conns.iter_mut().enumerate() {
         let base = (i as i64 + 1) * 1_000_000;
@@ -350,8 +272,8 @@ async fn cluster_columnar_segments_spread_and_gather() {
         .query_drop("DROP TABLE cd")
         .await
         .expect("drop");
-    for (i, n) in nodes.iter().enumerate() {
-        poll_catalog(&mut conns[i], "cd", n, false).await;
+    for (i, _n) in nodes.iter().enumerate() {
+        wait_table(&mut conns[i], "cd", false).await;
         assert_errno(&mut conns[i], "SELECT * FROM cd", ER_NO_SUCH_TABLE).await;
     }
     for mut n in nodes {

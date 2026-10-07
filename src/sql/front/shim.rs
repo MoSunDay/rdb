@@ -54,18 +54,44 @@ pub struct SqlShim<W> {
 }
 
 /// Build a shim for one connection. `seed` drives the handshake salt and
-/// connection id (see [`auth::salt_from_seed`]).
-pub fn new_shim<W>(shared: Arc<Shared>, user: String, password: String, seed: u64) -> SqlShim<W> {
+/// connection id (see [`auth::salt_from_seed`]); `peer_host` feeds the
+/// immutable session identity (`USER()` = `user@peer_host`,
+/// `CONNECTION_ID()` = the handshake's connection id).
+pub fn new_shim<W>(
+    shared: Arc<Shared>,
+    user: String,
+    password: String,
+    seed: u64,
+    peer_host: String,
+) -> SqlShim<W> {
+    let id = (seed as u32) | 1;
+    let login = serve_user_of(&user).to_string();
     SqlShim {
         shared,
         user,
         password,
-        sess: Arc::new(Mutex::new(SqlSession::default())),
+        sess: Arc::new(Mutex::new(SqlSession {
+            info: crate::sql::exec::SessionInfo {
+                user: format!("{}@{}", login, peer_host),
+                connection_id: i64::from(id),
+            },
+            ..SqlSession::default()
+        })),
         prepared: HashMap::new(),
         next_id: 1,
         salt: auth::salt_from_seed(seed),
-        id: (seed as u32) | 1,
+        id,
         _ph: PhantomData,
+    }
+}
+
+/// `USER()` renders the EFFECTIVE login user ("root" for the empty
+/// configured name), matching `serve::effective_user`.
+fn serve_user_of(user: &str) -> &str {
+    if user.is_empty() {
+        "root"
+    } else {
+        user
     }
 }
 

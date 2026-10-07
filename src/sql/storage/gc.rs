@@ -17,18 +17,22 @@
 //!   anchor for every possible reader -> deleted.
 //!
 //! One sweep deletes at most [`MAX_DELETES_PER_SWEEP`] versions (bounded
-//! work); [`run_gc_loop`] re-runs every ~30s and catches up. Deletes go
-//! out in one synced `WriteBatch`, mirroring the expire sampler.
+//! work); [`run_gc_loop`] re-runs every ~30s (env-tunable, see
+//! [`gc_period`]) and catches up. Deletes go out in one synced
+//! `WriteBatch`, mirroring the expire sampler.
 //!
 //! DROPPED TABLES: a DROP TABLE leaves its row versions and index
 //! entries physically behind (the catalog tombstone only makes them
 //! unreachable; ids are never reused, so nothing aliases them). Every
 //! node's background sweep also consults the replicated catalog's
-//! dropped-id set: all versions of a dropped table's pk groups are
-//! garbage regardless of the watermark (there are no readers by
-//! definition), and its 0x21/0x22 index entries are deleted as they are
-//! met. Columnar segments have their own sweep ([`crate::sql::columnar`]
-//! M5) with the same catalog-driven rule.
+//! dropped-id set -- the `sql_dropped/<id>` side entries Drop queues
+//! next to the id-less name tombstone (plus legacy decimal-valued
+//! tombstones under `sql_catalog/`, see `catalog::dropped_ids`): all
+//! versions of a dropped table's pk groups are garbage regardless of
+//! the watermark (there are no readers by definition), and its 0x21/
+//! 0x22 index entries are deleted as they are met. Columnar segments
+//! have their own sweep ([`crate::sql::columnar`] M5) with the same
+//! catalog-driven rule.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -47,8 +51,25 @@ use crate::store::Store;
 /// bounded; the periodic loop catches up on later rounds.
 pub const MAX_DELETES_PER_SWEEP: usize = 10_000;
 
-/// Background sweep period.
-const GC_PERIOD: Duration = Duration::from_secs(30);
+/// Default background sweep period (ms).
+const GC_PERIOD_DEFAULT_MS: u64 = 30_000;
+/// Floor for a configured period (ms): anything faster would spin the
+/// RocksDB sweep hot.
+const GC_PERIOD_MIN_MS: u64 = 100;
+
+/// Background sweep period: env `RDB_SQL_GC_PERIOD_MS`, default 30s,
+/// floored at 100ms. Read once per loop start -- never cached across
+/// restarts of the loop -- so e2e suites can shorten the rounds by
+/// exporting the var before spawning the node (the child inherits the
+/// parent env).
+fn gc_period() -> Duration {
+    let ms = std::env::var("RDB_SQL_GC_PERIOD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(GC_PERIOD_DEFAULT_MS)
+        .max(GC_PERIOD_MIN_MS);
+    Duration::from_millis(ms)
+}
 
 /// Streaming fold state over the newest-first version stream.
 #[derive(Default)]
@@ -192,7 +213,7 @@ pub fn sweep_capped(store: &Store, watermark: u64, dropped: &HashSet<u32>, cap: 
 /// Lite loops). Each round parks the sync RocksDB sweep on tokio's
 /// blocking pool; quiet rounds log nothing.
 pub async fn run_gc_loop(shared: Arc<Shared>) {
-    let mut ticker = tokio::time::interval(GC_PERIOD);
+    let mut ticker = tokio::time::interval(gc_period());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // consume the immediate first tick
     loop {
@@ -491,5 +512,75 @@ mod tests {
         })
         .unwrap();
         assert_eq!(leftovers, 0);
+    }
+
+    /// The current Drop shape retires the id via the
+    /// `sql_dropped/<id>` side entry alone: an id present ONLY there
+    /// must be fully swept -- rows and index entries alike.
+    #[test]
+    fn side_set_dropped_id_is_fully_swept() {
+        use crate::sql::index::keys::{secondary_key, unique_key};
+        let shared = shared();
+        let s = schema(7);
+        put(&shared, &s, 1, 1, Some("v1"));
+        put(&shared, &s, 1, 3, Some("v3"));
+        // One secondary and one unique entry under the same id.
+        let col_key = crate::sql::storage::codec::encode_key(&Value::Str("x".into())).unwrap();
+        let pk_key = pk_encode(&Value::Int(1)).unwrap();
+        let mut batch = WriteBatch::default();
+        batch.put(secondary_key(7, 0, &col_key, &pk_key), b"".as_slice());
+        batch.put(unique_key(7, 1, &col_key), &pk_key);
+        ops::batch_write(&shared.store, batch).unwrap();
+        // FSM: id-less "" name tombstone + the id-keyed marker.
+        {
+            let mut raft = shared.raft.write().unwrap();
+            raft.kv.insert(catalog::catalog_key("t"), String::new());
+            raft.kv.insert(catalog::dropped_id_key(7), "t".to_string());
+        }
+        let dropped: HashSet<u32> = catalog::dropped_ids(&shared).into_iter().collect();
+        assert_eq!(dropped, [7].into());
+        // Both row versions and both index entries die in one sweep.
+        assert_eq!(sweep(&shared.store, 1, &dropped), 4);
+        assert!(versions_of(&shared, &s, 1).is_empty());
+        let mut leftovers = 0usize;
+        ops::for_each_from(&shared.store, b"0/", false, &mut |key, _| {
+            if let Some((_, tid, _, _)) = keys::parse_index_key(key) {
+                if tid == 7 {
+                    leftovers += 1;
+                }
+            }
+            true
+        })
+        .unwrap();
+        assert_eq!(leftovers, 0);
+    }
+
+    /// The RENAME shape -- id-less "" tombstone at the old name, the
+    /// id live under the new name, NO side entry -- must never sweep
+    /// the id's data: only the ordinary MVCC rules apply.
+    #[test]
+    fn renamed_live_id_is_never_swept() {
+        let shared = shared();
+        let s = schema(7);
+        put(&shared, &s, 1, 1, Some("v1"));
+        put(&shared, &s, 1, 2, Some("v2"));
+        put(&shared, &s, 1, 3, Some("v3"));
+        let mut renamed = schema(7);
+        renamed.name = "renamed".into();
+        {
+            let mut raft = shared.raft.write().unwrap();
+            raft.kv.insert(catalog::catalog_key("t"), String::new());
+            raft.kv.insert(
+                catalog::catalog_key("renamed"),
+                serde_json::to_string(&renamed).unwrap(),
+            );
+        }
+        let dropped: HashSet<u32> = catalog::dropped_ids(&shared).into_iter().collect();
+        assert!(dropped.is_empty(), "rename must not retire the id");
+        // Normal sweep only: the shadowed ts1 goes, the ts2 anchor and
+        // the above-watermark ts3 stay (a mis-retired id would have
+        // deleted all three).
+        assert_eq!(sweep(&shared.store, 2, &dropped), 1);
+        assert_eq!(ts_of(&versions_of(&shared, &s, 1)), vec![3, 2]);
     }
 }
