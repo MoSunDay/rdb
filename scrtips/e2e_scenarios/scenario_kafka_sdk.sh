@@ -17,6 +17,12 @@
 #   6. rebalance       2nd consumer in the group forces revoke/assign
 #   7. compression     gzip/snappy/lz4 produce (compressed RecordBatches)
 #                      through the real SDK, then a consume roundtrip
+#   8. admin_lifecycle AdminClient topic trio end-to-end: CreateTopics
+#                      (2 partitions) -> list_topics shows 2 ->
+#                      DescribeConfigs stub entries -> CreatePartitions
+#                      to 3 -> produce/consume on partition 2 ->
+#                      DeleteTopics -> metadata forgets it (and RESP
+#                      EXISTS confirms the stream family really folded)
 #
 # SKIP policy (exit 0): no confluent-kafka importable AND no network to
 # pip-install it. The rdb binary itself must exist (same as other
@@ -324,6 +330,77 @@ def s7_compression():
         return 'SKIP'                     # default build: kafka-codecs off
     return 'produced+consumed ' + ' '.join(parts)
 
+def s8_admin_lifecycle():
+    # The topic-admin trio (P3 backfill W1) through the real SDK's
+    # AdminClient: CreateTopics(v4)/DescribeConfigs(v1)/CreatePartitions
+    # (v1)/DeleteTopics(v3) -- every future gets .result(timeout), the
+    # confluent-kafka idiom for "raise on error code".
+    from confluent_kafka import OFFSET_BEGINNING
+    from confluent_kafka.admin import ConfigResource, NewPartitions, NewTopic
+    a = AdminClient({'bootstrap.servers': BOOT, 'socket.timeout.ms': 10000})
+    t = 'sdkadmin'
+
+    def settle(fs):
+        for _, f in fs.items():
+            f.result(timeout=15)
+
+    settle(a.create_topics([NewTopic(t, num_partitions=2,
+                                     replication_factor=1)]))
+    md = a.list_topics(timeout=10)
+    assert t in md.topics, f'{t} missing from metadata after CreateTopics'
+    assert sorted(md.topics[t].partitions) == [0, 1], \
+        sorted(md.topics[t].partitions)
+
+    fs = a.describe_configs([ConfigResource(ConfigResource.Type.TOPIC, t)])
+    cfg = next(iter(fs.values())).result(timeout=15)
+    vals = {k: (v.value if hasattr(v, 'value') else v) for k, v in cfg.items()}
+    assert len(vals) >= 3, f'describe_configs parsed empty: {vals}'
+    assert vals.get('cleanup.policy') == 'delete', vals
+
+    settle(a.create_partitions([NewPartitions(t, 3)]))
+    assert sorted(a.list_topics(timeout=10).topics[t].partitions) == [0, 1, 2]
+
+    # The grown family is live: one keyed message onto the NEW partition.
+    drs = []
+    def dr(err, msg):
+        drs.append((err.code() if err else None, msg.partition() if msg else -1,
+                    msg.value() if msg else None))
+    p = Producer({'bootstrap.servers': BOOT, 'socket.timeout.ms': 10000,
+                  'message.timeout.ms': 15000})
+    p.produce(t, b'admin-v', key=b'admin-k', partition=2, on_delivery=dr)
+    if p.flush(15): raise RuntimeError('partition-2 produce not delivered')
+    assert drs and drs[0][0] is None and drs[0][1] == 2, drs
+    c = Consumer({'bootstrap.servers': BOOT, 'group.id': 'probe-admin',
+                  'enable.auto.commit': False, 'auto.offset.reset': 'earliest',
+                  'socket.timeout.ms': 10000})
+    c.assign([TopicPartition(t, 2, OFFSET_BEGINNING)])
+    m, t0 = None, time.time()
+    while m is None and time.time() - t0 < 15:
+        got = c.poll(0.5)
+        if got is None: continue
+        if got.error(): raise RuntimeError(f'admin consume {got.error()}')
+        m = got
+    c.close()
+    assert m is not None and m.partition() == 2 and m.value() == b'admin-v', m
+
+    settle(a.delete_topics([t]))
+    gone, t0 = False, time.time()
+    while time.time() - t0 < 15:
+        if t not in a.list_topics(timeout=10).topics:
+            gone = True
+            break
+        time.sleep(0.5)
+    assert gone, 'topic still served by metadata after DeleteTopics'
+    # Cross-check the family fold server-side: every partition stream
+    # the trio materialized must be physically gone (topic delete folds
+    # entries + ledger + nested DLQ through the DEL family path).
+    s2 = socket.create_connection((RESP_HOST, int(RESP_PORT)))
+    assert resp_cmd(s2, 'AUTH', TOKEN) == ('+', 'OK'), 'AUTH gate'
+    for part in ('p0', 'p1', 'p2'):
+        assert resp_cmd(s2, 'EXISTS', f'{t}/{part}') == 0, f'{t}/{part} survived'
+    s2.close()
+    return f'{t}: 2p->configs({len(vals)})->3p->p2 roundtrip->deleted'
+
 step('1.metadata', s1_metadata)
 step('2.produce', s2_produce)
 step('3.assign_consume', s3_assign_consume)
@@ -331,6 +408,7 @@ step('4.group_consume', s4_group_consume)
 step('5.commit_resume', s5_commit_resume)
 step('6.rebalance', s6_rebalance)
 step('7.compression', s7_compression)
+step('8.admin_lifecycle', s8_admin_lifecycle)
 ok = sum(results)
 print(f'== {ok}/{len(results)} steps OK ==')
 sys.exit(0 if ok == len(results) else 1)

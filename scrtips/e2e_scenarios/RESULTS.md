@@ -8,6 +8,40 @@ vector_search + the 2026-09-26 additions ha_failover / lite_mq / migrate).
 Prior full green: 2026-09-16, git `5b67c47`, 4 pass (suite has grown
 since -- see the audit note below).
 
+2026-10-07: MQ P3 W1/W2 backfill closeout (W4) -- both MQ scenarios
+grew against the newly landed surface (release binary rebuilt at
+commit 17979dd; confluent-kafka 2.15.1 at /tmp/kfkvenv).
+`scenario_kafka_sdk.sh` gained step 8 (admin_lifecycle): the real
+AdminClient topic trio end-to-end -- NewTopic('sdkadmin', 2 partitions)
+-> list_topics shows exactly [0, 1] -> describe_configs parses the
+TOPIC stub entry set (4 entries incl. cleanup.policy=delete) ->
+NewPartitions to 3 -> list_topics shows [0, 1, 2] -> one keyed produce
+onto the NEW partition 2 (delivery report asserts partition=2),
+consumed back via assign(..., OFFSET_BEGINNING) -> delete_topics ->
+metadata forgets the topic (bounded 15s poll) and a RESP EXISTS
+cross-check confirms the family really folded (all three partition
+streams physically gone). Every future resolved via .result(timeout=15);
+the SDK negotiates CreateTopics v4 / DeleteTopics v3 / CreatePartitions
+v1 / DescribeConfigs v1 against the advertised 20-api surface.
+`scenario_lite_mq.sh` gained section (j) (+27 assertions): XADD
+NOMKSTREAM on a missing key replies nil and leaves NOTHING (XLEN 0 and
+the whitelisted KEYS oracle finds no key; the in-section contrast --
+plain XADD then KEYS-redis-<name> -- keeps the negative airtight),
+while on a live stream NOMKSTREAM appends normally; XINFO STREAM <key>
+FULL flattened layout pinned (length / last-generated-id / entries /
+groups with group-consumer-pending nesting, and COUNT 1 caps the tail
+entries to the newest); XCLAIM ... RETRYCOUNT 3 REPLACES the PEL
+delivery counter (XPENDING range 4th column reads 3, summary total
+unchanged) and a later hint-less claim BUMPS from it to 4. Deviation
+from the task sketch, documented in the script header: slot-routed
+EXISTS can never observe a lite stream -- physical keying is under the
+PARENT topic's slot (src/lite/model.rs::stream_prefix), so EXISTS
+answers 0 even after creation (or MOVED when the child slot is another
+node's); the "EXISTS 0" absence proof is therefore realized as
+XLEN+KEYS. Results: kafka_sdk **PASS, 7/7 steps** (step 7 compression
+self-SKIPs on the default feature-less build, as documented), lite_mq
+**PASS, 126 assertions** (was 99).
+
 2026-09-26: `scenario_redis_session.sh` grew step (h), a redis-py
 `RedisCluster()` probe -- the long-standing gap entry ("RedisCluster()
 cannot connect: COMMAND unimplemented") is RESOLVED. Constructed with
