@@ -33,6 +33,19 @@ impl Query {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
+
+    /// Build from already-decoded pairs (the batch routes re-encode
+    /// JSON elements into single-route queries without a round-trip
+    /// through the percent-escaping grammar). Pure constructor.
+    pub fn of(pairs: Vec<(String, String)>) -> Query {
+        Query { pairs }
+    }
+
+    /// Append one decoded pair (batch assembly only; a duplicate key
+    /// keeps [`Query::get`]'s first-wins rule).
+    pub fn push(&mut self, key: &str, value: String) {
+        self.pairs.push((key.to_string(), value));
+    }
 }
 
 /// `+` -> space, `%XX` -> byte; a malformed escape is an error.

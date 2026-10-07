@@ -1,5 +1,7 @@
 //! RocksMQ-style minimal HTTP API (P4+WP4): `/produce`, `/consume`
-//! (long-poll capable), `/ack`, `/pending` over a hand-rolled
+//! (long-poll capable), `/ack`, `/pending`, plus the P3 additions
+//! `/produce_batch`, `/ack_batch` (`batch.rs`) and the read-only
+//! `/range` replay (`range.rs`) -- all over a hand-rolled
 //! HTTP/1.1 listener (the `rcache/http.rs` / `es/http.rs` school; no
 //! hyper, no new crates). An independent front, not an rcache import:
 //! it talks to the Lite engine through `command::dispatch` (see
@@ -26,9 +28,12 @@
 
 pub mod api;
 pub mod auth;
+pub mod batch;
 pub mod consume_wait;
+pub mod guard;
 pub mod pending;
 pub mod query;
+pub mod range;
 pub mod respv;
 
 use std::sync::Arc;
@@ -82,8 +87,14 @@ pub async fn serve(listener: TcpListener, shared: Arc<Shared>) -> ! {
 }
 
 /// Keep-alive requests until the peer closes, times out or asks for
-/// `Connection: close`.
+/// `Connection: close`. One live-connection slot (`guard.rs`, the
+/// kafka `ConnGuard` posture) is held for the connection's lifetime.
 async fn handle_conn(sock: TcpStream, shared: Arc<Shared>) {
+    let cap = guard::cap_of(shared.conf.rocksmq_max_connections);
+    let Some(_guard) = guard::ConnGuard::enter(cap) else {
+        eprintln!("[rocksmq] connection refused: at cap {cap}");
+        return;
+    };
     let (mut rd, mut wr) = sock.into_split();
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     loop {
@@ -186,7 +197,10 @@ async fn route(shared: &Shared, head: &Head, body: &[u8]) -> HttpReply {
     if !auth::is_public(path) && !auth::authorized(&head.headers, &shared.conf.rocksmq_token) {
         return auth::deny();
     }
-    if !matches!(path, "/produce" | "/consume" | "/ack" | "/pending") {
+    if !matches!(
+        path,
+        "/produce" | "/consume" | "/ack" | "/pending" | "/produce_batch" | "/ack_batch" | "/range"
+    ) {
         return HttpReply::text(404, "not found");
     }
     if head.method != "POST" {
@@ -205,6 +219,9 @@ async fn route(shared: &Shared, head: &Head, body: &[u8]) -> HttpReply {
         "/produce" => api::produce(shared, &query, body).await,
         "/consume" => consume_wait::consume(shared, &query).await,
         "/pending" => pending::pending(shared, &query).await,
+        "/produce_batch" => batch::produce_batch(shared, body).await,
+        "/ack_batch" => batch::ack_batch(shared, body).await,
+        "/range" => range::range(shared, &query).await,
         _ => api::ack(shared, &query).await,
     }
 }

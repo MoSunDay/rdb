@@ -7,7 +7,9 @@
 - 手写 HTTP（`rcache/http.rs` / `es/http.rs` 一派，零新增 crate）：keep-alive
   默认（`Connection: close` 或 HTTP/1.0 则关），head 上限 32 KiB（431），body
   上限 4 MiB（413），chunked 请求体 501，`Expect: 100-continue` 先应答再读 body。
-- 接线：`rocksmq_bind`（空=关闭，backup 监听器不含）。鉴权与 es/s3 前置同姿态：
+- 接线：`rocksmq_bind`（空=关闭，backup 监听器不含）；并发连接上限
+  `rocksmq_max_connections`（0=内建 4096，见下文连接上限节）。鉴权与 es/s3
+  前置同姿态：
   `rocksmq_token`（默认空 = 不鉴权；非空 = 全路由要求 `Authorization: Bearer
   <token>`，否则 401，见下文鉴权节）。
 - 复用路径：HTTP 层构造 argv 走 `command::dispatch`（XADD/XREADGROUP/XGROUP/
@@ -38,7 +40,69 @@
 错误：缺/空参数、非法名、空 body、`n`/`wait_ms`/`delay_ms` 越界 → 400；未知
 路径 → 404；已知路径非 POST → 405（带 `Allow: POST`）；ack/pending 组不存在 →
 404（先以 XPENDING 概要探组，因 XACK/XPENDING 对未知组的回包无法直接区分）。
-查询值做 URL-decode（`+` 与 `%XX`）。
+查询值做 URL-decode（`+` 与 `%XX`）；下文三个 P3 新路由遵循同一错误表
+（非 POST 405、未知路径 404、token 门禁一致）。
+
+## 批量与回放（P3：`/produce_batch`、`/ack_batch`、`/range`）
+
+| 接口 | 语义 | 成功响应 |
+|---|---|---|
+| `POST /produce_batch`，body=JSON 数组 | 每元素一次 `/produce` | `200` JSON：逐元素结果数组（请求序） |
+| `POST /ack_batch`，body=JSON 数组 | 每元素一次 `/ack` | 同上 |
+| `POST /range?channel=NAME[&begin=B][&end=E][&limit=K]`（`topic=` 为别名） | 只读回放 XRANGE | `200` JSON `{"msgs":[{"id":"..","body":"<base64>"}]}` |
+
+请求元素 = 单路由入参的 JSON 重组；逐项结果 = 单路由回复原文（`status` +
+`body`）的 JSON 落位：
+
+```json
+// /produce_batch 元素（"delay_ms" 可为 number 或 string，缺省/null = 不带；
+//  "body" 为标准 base64——单路由 body 是 raw bytes，JSON 内以 base64 保真，
+//  与 /consume 回包同一字母表，消费→重产 byte-exact）
+{"channel":"NAME","delay_ms":0,"body":"aGVsbG8="}
+// /ack_batch 元素（= /ack 的三个查询参数）
+{"channel":"NAME","group":"G","id":"1760000000000-0"}
+// 逐项结果（两批量路由同形）
+{"status":200,"body":"1760000000000-0"}
+{"status":400,"body":"invalid channel name"}
+```
+
+- 实现路径（`src/rocksmq/batch.rs`）：每元素重组单路由 `Query`
+  （`query.rs::Query::of`）后**调用既有单项处理器**（`api::produce` /
+  `api::ack`）——逐项语义与单路由字节一致（校验顺序、400/404 文案、200 body
+  出自同一份代码，非复刻）。元素相互独立：一项失败不中断其余，失败就地可见。
+- 元素按请求序顺序执行（批量 produce 的 id 因此单调递增）；缺 `body` 字段 =
+  空 body，由单路由处理器自身回 400（与单路由一致）。
+- 整请求 400 仅三种：body 非合法 JSON / 非数组 / 超过 `MAX_BATCH`=100 个元素
+  （与 `/consume` 的 `n` 同一常量）；空数组合法，回 `[]`。元素非对象、字段
+  类型错、base64 非法均为**逐项** 400。
+- 批量路由照常过 token 门禁（路由层单点注入，新路由默认进门禁）。
+
+### `/range`（只读回放）
+- 参数：`channel`（别名 `topic`）、`begin`（默认 `-`）、`end`（默认 `+`）、
+  `limit`（默认 100，1..=100）。边界语法 = Lite XRANGE 约定
+  （`src/lite/model.rs::parse_bound`）：`-`/`+` 哨兵、前缀 `(` 排他、
+  `<ms>-<seq>` 含端点；非法边界 HTTP 层先行 400。
+- 复用路径：`run` → `command::dispatch(XRANGE ...)` → `src/lite/append.rs::xrange`
+  （`src/command/readonly.rs` 只读命令表内），entry 前缀扫描
+  （`model::entry_base` + `ops::for_each_from`），按 id 升序。
+- **只读保证**：无 PEL 登记、无可见性/重投副作用、不建组不记进度（XRANGE 不
+  触碰组状态）。回放后无组 channel 的 `/pending` 依旧 404；组消费照旧可取全部
+  未确认消息（e2e 断言）。回包解码/形状复用 `consume_wait.rs` 的 `msg_of` /
+  `msgs_json`，与 `/consume` 回包同构。
+- 延迟消息在到期交换前不是 entry，`/range` 不可见（与一切读路径一致）；
+  不存在的 channel → `{"msgs":[]}`。
+
+### 连接上限（`rocksmq_max_connections`）
+- 配置项（W0 加入，`src/conf.rs`）：rocksmq HTTP 前置并发 TCP 连接上限；
+  `0`（默认）= 内建 4096（`src/rocksmq/guard.rs::DEFAULT_MAX_CONNS`，与 kafka
+  front `src/kafka/conn.rs::DEFAULT_MAX_CONNS` 同值）；负值一律回落 4096。
+- 实现：进程级 `AtomicI64` 在场计数 + RAII `ConnGuard`（accept 起计，连接
+  关闭即释放；任何提前返回——对端关闭/畸形头/超限/空闲超时——都归还槽位），
+  镜像 kafka front 的同名模式；单位测试覆盖计数算术与拒纳回滚。
+- 拒绝行为与 kafka 逐字一致：达到上限时新 TCP 连接**静默关闭**（处理任务
+  直接返回、不写任何 HTTP 字节，socket 随之 drop），仅 stderr 记一行
+  `[rocksmq] connection refused: at cap <N>`（kafka 先例：
+  `[kafka] connection refused: at cap <N>`）。
 
 ## channel 映射
 - 裸名 `NAME` → `NAME/q0`（RESP XADD 自动队列与 Kafka front partition 0 同一流）；
@@ -112,6 +176,13 @@
   **延迟到期交换**两种唤醒（延迟唤醒断言新 id）；`/pending` 摘要（计数/min/max/
   消费者分布、ack 后递减、空 PEL 形状、400/404/405）；`delay_ms` 到期前不可消/
   到期后可消、`0` 即时、非法 400；`rocksmq_token` 401/通过矩阵（FAKE token）。
-- 单测：`src/rocksmq/{mod,api,query,respv,auth,consume_wait,pending}.rs` 内嵌
-  （头部解析/keep-alive、channel 映射、`n`/`wait_ms`/`delay_ms` 边界与 clamp、
-  base64 向量、XPENDING 摘要→JSON、Bearer 矩阵、query 解码、RESP 解析）。
+- `tests/rocksmq_batch_range_e2e.rs`（进程级，fixture 取自 `tests/common/mq.rs`）：
+  批量 produce 有序 id；混合批量（一项非法）其余成功且逐项错误可见；批量 ack
+  子集后 pending 相应收缩；`/range` 界内回放 id 升序 + `limit` 截断；`/range`
+  只读（随后组消费仍见全部未确认消息、pending 不增长）；三新路由 token 门禁
+  401/通过；`rocksmq_max_connections: 1` 时第二条并发连接被静默拒绝。
+- 单测：`src/rocksmq/{mod,api,query,respv,auth,consume_wait,pending,batch,range,
+  guard}.rs` 内嵌（头部解析/keep-alive、channel 映射、`n`/`wait_ms`/`delay_ms`
+  边界与 clamp、base64 向量与解码、XPENDING 摘要→JSON、Bearer 矩阵、query
+  解码、RESP 解析、批量元素/上限形状、XRANGE 边界语法与 limit、ConnGuard 计数
+  算术与拒纳回滚）。

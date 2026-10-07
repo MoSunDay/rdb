@@ -32,17 +32,21 @@ pub const MAX_WAIT_MS: u64 = 60_000;
 
 // ---- shared helpers (moved from api.rs with the consume flow) ------------
 
-/// One consumed message of the JSON reply.
-struct Msg {
+/// One consumed message of the JSON reply. Shared with `/range`
+/// (`range.rs`), which replays XRANGE frames through the same decode +
+/// JSON shape so the two surfaces cannot drift.
+pub(crate) struct Msg {
     id: String,
     body: Vec<u8>,
 }
 
-/// Decode one XREAD/XREADGROUP/XREVRANGE entry frame
+/// Decode one XREAD/XREADGROUP/XREVRANGE/XRANGE entry frame
+/// (`[id, [f1, v1, ...]]`): the body is the `v` field (the 1-pair rule
+/// the Kafka front's produce also writes); entries without a `v` field
 /// (`[id, [f1, v1, ...]]`): the body is the `v` field (the 1-pair rule
 /// the Kafka front's produce also writes); entries without a `v` field
 /// (hand-written RESP entries) yield an empty body.
-fn msg_of(frame: &Value) -> Option<Msg> {
+pub(crate) fn msg_of(frame: &Value) -> Option<Msg> {
     let arr = frame.as_array()?;
     let id = String::from_utf8(arr.first()?.as_bulk()?.to_vec()).ok()?;
     let fields = arr.get(1)?.as_array()?;
@@ -56,7 +60,7 @@ fn msg_of(frame: &Value) -> Option<Msg> {
     Some(Msg { id, body })
 }
 
-fn msgs_json(msgs: Vec<Msg>) -> HttpReply {
+pub(crate) fn msgs_json(msgs: Vec<Msg>) -> HttpReply {
     let items: Vec<_> = msgs
         .iter()
         .map(|m| json!({"id": m.id, "body": base64(&m.body)}))

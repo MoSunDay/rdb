@@ -20,6 +20,7 @@ use mysql_async::prelude::Queryable;
 /// Fake raft token for the e2e configs (NEVER the real one from
 /// /root/rdb/config -- no secrets in the repo).
 pub mod lite;
+pub mod mq;
 
 pub const TOKEN: &str = "e2e-fake-token-0123456789abcdef0123456789abcdef";
 
