@@ -66,6 +66,12 @@ pub struct Config {
     /// Shared-secret for kafka SASL PLAIN auth (empty = auth disabled).
     #[serde(default, rename = "kafka_token")]
     pub kafka_token: String,
+    /// Create missing topics with a single default partition on
+    /// produce (Kafka-like auto-create). Default false = produce to
+    /// an unknown topic keeps answering error 3 (zero behavior
+    /// change).
+    #[serde(default, rename = "kafka_auto_create_topics")]
+    pub kafka_auto_create_topics: bool,
     /// RocksMQ-style HTTP front (P4; empty = disabled), see
     /// `src/rocksmq/` + features/rocksmq-http.md.
     #[serde(default, rename = "rocksmq_bind")]
@@ -73,6 +79,11 @@ pub struct Config {
     /// Bearer token for the RocksMQ HTTP API (empty = auth disabled).
     #[serde(default, rename = "rocksmq_token")]
     pub rocksmq_token: String,
+    /// Max concurrent rocksmq HTTP-front TCP connections
+    /// (0 = built-in default 4096). New connections beyond the cap
+    /// are closed immediately (mirrors `kafka_max_connections`).
+    #[serde(default, rename = "rocksmq_max_connections")]
+    pub rocksmq_max_connections: i64,
     /// Elasticsearch-compatible HTTP frontend on the search kernel
     /// (empty = disabled).
     #[serde(default, rename = "es_bind")]
@@ -152,6 +163,11 @@ pub struct LiteConfig {
     /// (0 = scan disabled, the upgrade default: zero behavior change).
     #[serde(default, rename = "delay_sweep_ms")]
     pub delay_sweep_ms: u64,
+    /// Idle threshold, ms, for the background consumer GC that
+    /// reclaims dead group members (0 = GC disabled, the upgrade
+    /// default: zero behavior change).
+    #[serde(default, rename = "consumer_gc_ms")]
+    pub consumer_gc_ms: u64,
 }
 
 /// Read and parse the YAML config file at `path`.
@@ -227,12 +243,14 @@ backup_target_map:
         let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1").unwrap();
         assert_eq!(cfg.lite.redelivery_idle_ms, 0);
         assert_eq!(cfg.lite.delay_sweep_ms, 0);
+        assert_eq!(cfg.lite.consumer_gc_ms, 0);
         assert_eq!(cfg.lite, Config::default().lite);
         // Section present, key omitted -> still off; explicit value
         // parses under the section's own name.
         let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1\nlite: {}\n").unwrap();
         assert_eq!(cfg.lite.redelivery_idle_ms, 0);
         assert_eq!(cfg.lite.delay_sweep_ms, 0);
+        assert_eq!(cfg.lite.consumer_gc_ms, 0);
         let cfg: Config =
             serde_yaml::from_str("bind: 1.2.3.4:1\nlite:\n  redelivery_idle_ms: 30000\n").unwrap();
         assert_eq!(cfg.lite.redelivery_idle_ms, 30000);
@@ -241,6 +259,45 @@ backup_target_map:
             serde_yaml::from_str("bind: 1.2.3.4:1\nlite:\n  delay_sweep_ms: 5000\n").unwrap();
         assert_eq!(cfg.lite.redelivery_idle_ms, 0);
         assert_eq!(cfg.lite.delay_sweep_ms, 5000);
+        let cfg: Config =
+            serde_yaml::from_str("bind: 1.2.3.4:1\nlite:\n  consumer_gc_ms: 300000\n").unwrap();
+        assert_eq!(cfg.lite.redelivery_idle_ms, 0);
+        assert_eq!(cfg.lite.delay_sweep_ms, 0);
+        assert_eq!(cfg.lite.consumer_gc_ms, 300000);
+    }
+
+    /// P3 backfill knobs (W0 lane C): `kafka_auto_create_topics`,
+    /// `rocksmq_max_connections`, `lite.consumer_gc_ms`. Defaults are
+    /// false / 0 / 0 (zero behavior change on upgrade); each key
+    /// parses from a yaml string with the value set.
+    #[test]
+    fn mq_p3_knobs_defaults_and_parse() {
+        let cfg: Config = serde_yaml::from_str("").expect("empty yaml parses");
+        assert!(!cfg.kafka_auto_create_topics);
+        assert_eq!(cfg.rocksmq_max_connections, 0);
+        assert_eq!(cfg.lite.consumer_gc_ms, 0);
+
+        let cfg: Config = serde_yaml::from_str("bind: 1.2.3.4:1").unwrap();
+        assert!(!cfg.kafka_auto_create_topics);
+        assert_eq!(cfg.rocksmq_max_connections, 0);
+        assert_eq!(cfg.lite.consumer_gc_ms, 0);
+
+        let cfg: Config = serde_yaml::from_str(
+            "bind: 1.2.3.4:1\nkafka_auto_create_topics: true\nrocksmq_max_connections: 128\nlite:\n  consumer_gc_ms: 60000\n",
+        )
+        .unwrap();
+        assert!(cfg.kafka_auto_create_topics);
+        assert_eq!(cfg.rocksmq_max_connections, 128);
+        assert_eq!(cfg.lite.consumer_gc_ms, 60000);
+
+        // Explicit off survives a round-trip too (upgrade path).
+        let cfg: Config = serde_yaml::from_str(
+            "bind: 1.2.3.4:1\nkafka_auto_create_topics: false\nrocksmq_max_connections: 0\nlite:\n  consumer_gc_ms: 0\n",
+        )
+        .unwrap();
+        assert!(!cfg.kafka_auto_create_topics);
+        assert_eq!(cfg.rocksmq_max_connections, 0);
+        assert_eq!(cfg.lite.consumer_gc_ms, 0);
     }
 
     /// Batch 2 MQ auth tokens: absent -> empty (auth disabled); present

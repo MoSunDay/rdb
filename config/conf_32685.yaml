@@ -17,6 +17,10 @@ es_token: ""
 # MQ 前端鉴权 token（空 = 不鉴权）
 #kafka_token: ""        # kafka SASL PLAIN 共享密钥（空 = 不鉴权）
 #rocksmq_token: ""      # RocksMQ HTTP API Bearer token（空 = 不鉴权）
+# MQ 面连接与自动建 topic（P3 补齐）
+#kafka_auto_create_topics: false  # produce 到未知 topic 按开关建默认单分区（false=回 error 3）
+#rocksmq_max_connections: 0       # RocksMQ HTTP 前端 TCP 连接数上限（0=内建默认 4096）
 #lite:
 #  redelivery_idle_ms: 0  # idle 自动重投阈值 ms（0=关，默认）
 #  delay_sweep_ms: 0      # 延迟消息到期扫描周期 ms（0=关，默认）
+#  consumer_gc_ms: 0      # 消费者注册行 idle GC 阈值 ms（0=关，默认）
