@@ -3,9 +3,12 @@
 //! verbs; this front translates the Kafka handshakes onto it.
 //!
 //! Mapping (see `features/kafka-front.md`): topic = Lite parent,
-//! partition = Lite child queue, offset = entry ordinal. P0 implements
-//! the bootstrap pair ApiVersions (18) + Metadata (3); produce/fetch/
-//! group coordination land in P1-P3.
+//! partition = Lite child queue, offset = entry ordinal. The front now
+//! spans the bootstrap pair (ApiVersions 18 + Metadata 3), the data
+//! plane (Produce/Fetch/ListOffsets/OffsetCommit/OffsetFetch), group
+//! coordination, and the P3 backfill admin set (CreateTopics/
+//! DeleteTopics/CreatePartitions/DescribeConfigs/OffsetForLeaderEpoch)
+//! -- the advertised surface grew 15 -> 20 apis (22 with SASL).
 //!
 //! Lifecycle mirrors `resp::serve`/`sql::front::serve`: [`bind`] the
 //! configured `kafka_bind`, [`serve`] accepts and spawns one task per
@@ -13,6 +16,14 @@
 //! `kafka_bind` disables the front; the backup listener never wires it.
 
 pub mod admin;
+pub mod admin_configs;
+#[cfg(test)]
+#[path = "admin_configs_tests.rs"]
+mod admin_configs_tests;
+pub mod admin_topics;
+#[cfg(test)]
+#[path = "admin_topics_tests.rs"]
+mod admin_topics_tests;
 pub mod catalog;
 #[cfg(feature = "kafka-codecs")]
 pub mod codec;
@@ -42,6 +53,7 @@ pub mod produce;
 mod produce_tests;
 pub mod record;
 pub mod sasl;
+pub mod topic_store;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,7 +79,12 @@ pub const API_KEY_DESCRIBE_GROUPS: i16 = 15; // P3
 pub const API_KEY_LIST_GROUPS: i16 = 16; // admin (Batch 2)
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17; // SASL PLAIN (Batch 2)
 pub const API_KEY_API_VERSIONS: i16 = 18; // P0
+pub const API_KEY_CREATE_TOPICS: i16 = 19; // topic admin (P3 backfill)
+pub const API_KEY_DELETE_TOPICS: i16 = 20; // topic admin (P3 backfill)
+pub const API_KEY_OFFSET_FOR_LEADER_EPOCH: i16 = 23; // constant answer (P3)
+pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32; // stub (P3 backfill)
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36; // SASL PLAIN (Batch 2)
+pub const API_KEY_CREATE_PARTITIONS: i16 = 37; // topic admin (P3 backfill)
 pub const API_KEY_DELETE_GROUPS: i16 = 42; // admin (Batch 2)
 
 /// Implemented api keys with their supported version ranges, sorted by
@@ -91,6 +108,11 @@ pub fn implemented_apis() -> Vec<(i16, i16, i16)> {
         (API_KEY_DESCRIBE_GROUPS, 0, 3),
         (API_KEY_LIST_GROUPS, 0, 1),
         (API_KEY_API_VERSIONS, 0, 3),
+        (API_KEY_CREATE_TOPICS, 0, 4),
+        (API_KEY_DELETE_TOPICS, 0, 3),
+        (API_KEY_OFFSET_FOR_LEADER_EPOCH, 0, 3),
+        (API_KEY_DESCRIBE_CONFIGS, 0, 3),
+        (API_KEY_CREATE_PARTITIONS, 0, 1),
         (API_KEY_DELETE_GROUPS, 0, 1),
     ]
 }
@@ -128,9 +150,13 @@ pub fn api_supported(key: i16, version: i16) -> bool {
 /// (Metadata caps below its flexible v9), SyncGroup v4+ and Heartbeat
 /// v4+ (canonical gates from the Kafka message schemas; JoinGroup
 /// turns flexible at v6, LeaveGroup v4, FindCoordinator v3,
-/// DescribeGroups v5 -- all above our caps). Note ApiVersions v3
-/// still answers with the CLASSIC v0 response header (KIP-511), see
-/// conn.rs.
+/// DescribeGroups v5 -- all above our caps). The P3 admin set is
+/// deliberately all-classic: ListOffsets v6+, CreateTopics v5+,
+/// DeleteTopics v4+, OffsetForLeaderEpoch v4+, DescribeConfigs v4+,
+/// CreatePartitions v2+ are the flexible gates, every cap sits below
+/// its gate (librdkafka negotiates 5 / 4 / 3 / 2 / 1 / 1 here). Note
+/// ApiVersions v3 still answers with the CLASSIC v0 response header
+/// (KIP-511), see conn.rs.
 pub fn api_flexible(key: i16, version: i16) -> bool {
     (key == API_KEY_API_VERSIONS && version >= 3)
         || (key == API_KEY_SYNC_GROUP && version >= 4)
@@ -153,9 +179,14 @@ pub fn api_name(key: i16) -> &'static str {
         API_KEY_SYNC_GROUP => "SyncGroup",
         API_KEY_DESCRIBE_GROUPS => "DescribeGroups",
         API_KEY_LIST_GROUPS => "ListGroups",
+        API_KEY_CREATE_TOPICS => "CreateTopics",
+        API_KEY_DELETE_TOPICS => "DeleteTopics",
         API_KEY_SASL_HANDSHAKE => "SaslHandshake",
         API_KEY_API_VERSIONS => "ApiVersions",
         API_KEY_SASL_AUTHENTICATE => "SaslAuthenticate",
+        API_KEY_OFFSET_FOR_LEADER_EPOCH => "OffsetForLeaderEpoch",
+        API_KEY_DESCRIBE_CONFIGS => "DescribeConfigs",
+        API_KEY_CREATE_PARTITIONS => "CreatePartitions",
         API_KEY_DELETE_GROUPS => "DeleteGroups",
         _ => "UnknownApi",
     }
@@ -204,7 +235,7 @@ mod tests {
         assert_eq!(api_range(API_KEY_API_VERSIONS), Some((0, 3)));
         assert_eq!(api_range(API_KEY_METADATA), Some((0, 8)));
         assert_eq!(api_range(API_KEY_PRODUCE), Some((0, 3)));
-        assert_eq!(api_range(API_KEY_LIST_OFFSETS), Some((0, 1)));
+        assert_eq!(api_range(API_KEY_LIST_OFFSETS), Some((0, 5)));
         assert_eq!(api_range(API_KEY_FETCH), Some((0, 10)), "v11 is flexible");
         assert_eq!(api_range(API_KEY_OFFSET_COMMIT), Some((0, 2)));
         assert_eq!(api_range(API_KEY_OFFSET_FETCH), Some((0, 7)));
@@ -215,11 +246,18 @@ mod tests {
         assert!(api_supported(API_KEY_PRODUCE, 3), "v3 unlocks MSGVER2");
         assert!(!api_supported(API_KEY_PRODUCE, 4));
         assert!(api_supported(API_KEY_LIST_OFFSETS, 1));
-        assert!(!api_supported(API_KEY_LIST_OFFSETS, 2));
+        assert!(
+            api_supported(API_KEY_LIST_OFFSETS, 5),
+            "v5 = librdkafka pick"
+        );
+        assert!(!api_supported(API_KEY_LIST_OFFSETS, 6), "v6 is flexible");
         assert!(api_flexible(API_KEY_API_VERSIONS, 3));
         assert!(!api_flexible(API_KEY_METADATA, 8));
         assert!(!api_flexible(API_KEY_PRODUCE, 2), "produce stays classic");
-        assert!(!api_flexible(API_KEY_LIST_OFFSETS, 1));
+        assert!(
+            !api_flexible(API_KEY_LIST_OFFSETS, 5),
+            "listoffsets stays classic"
+        );
         assert!(api_supported(API_KEY_FETCH, 0));
         assert!(api_supported(API_KEY_FETCH, 10), "v10 = kmsg-era max");
         assert!(!api_supported(API_KEY_FETCH, 11), "v11 is flexible");
@@ -249,13 +287,25 @@ mod tests {
         assert_eq!(api_range(API_KEY_DELETE_GROUPS), Some((0, 1)));
         assert!(!api_flexible(API_KEY_LIST_GROUPS, 1));
         assert!(!api_flexible(API_KEY_DELETE_GROUPS, 1));
+        // Topic-admin set (P3 backfill): all-classic caps chosen against
+        // the canonical flexible gates (CreateTopics v5+, DeleteTopics
+        // v4+, OffsetForLeaderEpoch v4+, DescribeConfigs v4+,
+        // CreatePartitions v2+).
+        assert_eq!(api_range(API_KEY_CREATE_TOPICS), Some((0, 4)));
+        assert_eq!(api_range(API_KEY_DELETE_TOPICS), Some((0, 3)));
+        assert_eq!(api_range(API_KEY_OFFSET_FOR_LEADER_EPOCH), Some((0, 3)));
+        assert_eq!(api_range(API_KEY_DESCRIBE_CONFIGS), Some((0, 3)));
+        assert_eq!(api_range(API_KEY_CREATE_PARTITIONS), Some((0, 1)));
+        assert!(!api_flexible(API_KEY_CREATE_TOPICS, 4));
+        assert!(!api_flexible(API_KEY_DELETE_TOPICS, 3));
+        assert!(!api_flexible(API_KEY_DESCRIBE_CONFIGS, 3));
         // SASL pair: dispatched/advertised only with kafka_token set,
         // so it never enters the base registry/api_range.
         assert_eq!(api_range(API_KEY_SASL_HANDSHAKE), None);
         assert_eq!(api_range(API_KEY_SASL_AUTHENTICATE), None);
-        assert_eq!(advertised_apis(false).len(), 15);
+        assert_eq!(advertised_apis(false).len(), 20);
         let with_sasl = advertised_apis(true);
-        assert_eq!(with_sasl.len(), 17);
+        assert_eq!(with_sasl.len(), 22);
         assert!(
             with_sasl.contains(&(API_KEY_SASL_HANDSHAKE, 0, 1))
                 && with_sasl.contains(&(API_KEY_SASL_AUTHENTICATE, 0, 1)),

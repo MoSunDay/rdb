@@ -45,9 +45,10 @@ pub fn validate_topic(name: &[u8]) -> Result<(), i16> {
 }
 
 /// The child queue backing partition `partition` of `parent`: `p<N>` if
-/// present, else `q<N>`, else `None` (unknown partition -- this front
-/// never auto-creates partitions, matching allow_auto_topic_creation=
-/// false).
+/// present, else `q<N>`, else `None` (unknown partition; the produce
+/// path materializes the topic's default partition only when
+/// `kafka_auto_create_topics` is set -- elsewhere `None` behaves like
+/// allow_auto_topic_creation=false).
 pub fn partition_queue(
     store: &Store,
     prefix: &[u8],

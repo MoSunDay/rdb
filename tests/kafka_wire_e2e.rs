@@ -45,10 +45,11 @@ async fn api_versions_and_metadata_over_the_wire() {
     let mut r = Reader::new(&payload);
     assert_eq!(r.i32(), Some(100), "correlation id echo");
     assert_eq!(r.i16(), Some(0), "error NONE");
-    // 15 rows after Batch 2 added ListGroups(16)/DeleteGroups(42); the
-    // SASL pair (17/36) joins only when kafka_token is configured
-    // (pinned on the token-on node in tests/kafka_admin_e2e.rs).
-    assert_eq!(r.array_len(), Some(Some(15)));
+    // 20 rows after Batch 2 added ListGroups(16)/DeleteGroups(42) and
+    // the P3 backfill added 19/20/23/32/37; the SASL pair (17/36)
+    // joins only when kafka_token is configured (pinned on the
+    // token-on node in tests/kafka_admin_e2e.rs).
+    assert_eq!(r.array_len(), Some(Some(20)));
     assert_eq!(
         [r.i16(), r.i16(), r.i16()],
         [Some(0), Some(0), Some(3)],
@@ -121,6 +122,31 @@ async fn api_versions_and_metadata_over_the_wire() {
     );
     assert_eq!(
         [r.i16(), r.i16(), r.i16()],
+        [Some(19), Some(0), Some(4)],
+        "CreateTopics v0-v4"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(20), Some(0), Some(3)],
+        "DeleteTopics v0-v3"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(23), Some(0), Some(3)],
+        "OffsetForLeaderEpoch v0-v3"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(32), Some(0), Some(3)],
+        "DescribeConfigs v0-v3"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
+        [Some(37), Some(0), Some(1)],
+        "CreatePartitions v0-v1"
+    );
+    assert_eq!(
+        [r.i16(), r.i16(), r.i16()],
         [Some(42), Some(0), Some(1)],
         "DeleteGroups v0-v1"
     );
@@ -133,7 +159,7 @@ async fn api_versions_and_metadata_over_the_wire() {
     // ApiVersions pins its response header to v0/classic (Kafka's
     // ApiKeys.responseHeaderVersion: no tagged byte even for flexible).
     assert_eq!(r.i16(), Some(0));
-    assert_eq!(r.compact_array_len(), Some(Some(15)));
+    assert_eq!(r.compact_array_len(), Some(Some(20)));
     for (key, lo, hi) in [
         (0, 0, 3),
         (1, 0, 10),
@@ -149,6 +175,11 @@ async fn api_versions_and_metadata_over_the_wire() {
         (15, 0, 3),
         (16, 0, 1),
         (18, 0, 3),
+        (19, 0, 4),
+        (20, 0, 3),
+        (23, 0, 3),
+        (32, 0, 3),
+        (37, 0, 1),
         (42, 0, 1),
     ] {
         assert_eq!(
@@ -169,8 +200,8 @@ async fn api_versions_and_metadata_over_the_wire() {
     let mut r = Reader::new(&payload);
     assert_eq!(r.i32(), Some(102));
     assert_eq!(r.i16(), Some(35), "UNSUPPORTED_VERSION");
-    assert_eq!(r.array_len(), Some(Some(15)), "v0 body still lists apis");
-    let apis: Vec<[Option<i16>; 3]> = (0..15).map(|_| [r.i16(), r.i16(), r.i16()]).collect();
+    assert_eq!(r.array_len(), Some(Some(20)), "v0 body still lists apis");
+    let apis: Vec<[Option<i16>; 3]> = (0..20).map(|_| [r.i16(), r.i16(), r.i16()]).collect();
     // Spot-check the P3 + Batch 2 additions made the fallback table too.
     assert!(apis.contains(&[Some(11), Some(0), Some(4)]), "JoinGroup");
     assert!(

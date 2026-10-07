@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod groups;
+pub mod topics;
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};

@@ -42,6 +42,15 @@ pub const SASL_AUTHENTICATION_FAILED: i16 = 58;
 /// DeleteGroups: the group id has no runtime membership, no ledger
 /// (0x20) rows -- nothing to delete.
 pub const GROUP_ID_NOT_FOUND: i16 = 69;
+/// Topic-admin trio (P3 backfill): CreateTopics on an existing name,
+/// INVALID_PARTITIONS (CreatePartitions shrink / bad counts),
+/// INVALID_REPLICATION_FACTOR (single-node broker: only 1 or the -1
+/// unset default), INVALID_REPLICA_ASSIGNMENT (per-topic assignments
+/// are rejected outright -- there is exactly one broker to place).
+pub const TOPIC_ALREADY_EXISTS: i16 = 36;
+pub const INVALID_PARTITIONS: i16 = 37;
+pub const INVALID_REPLICATION_FACTOR: i16 = 38;
+pub const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
 pub const UNSUPPORTED_VERSION: i16 = 35;
 pub const INVALID_REQUEST: i16 = 42;
 /// Registry anchor (a common off-by-one): 76, NOT 29 (that is
@@ -81,6 +90,10 @@ pub fn error_name(code: i16) -> &'static str {
         UNSUPPORTED_SASL_MECHANISM => "UNSUPPORTED_SASL_MECHANISM",
         SASL_AUTHENTICATION_FAILED => "SASL_AUTHENTICATION_FAILED",
         GROUP_ID_NOT_FOUND => "GROUP_ID_NOT_FOUND",
+        TOPIC_ALREADY_EXISTS => "TOPIC_ALREADY_EXISTS",
+        INVALID_PARTITIONS => "INVALID_PARTITIONS",
+        INVALID_REPLICATION_FACTOR => "INVALID_REPLICATION_FACTOR",
+        INVALID_REPLICA_ASSIGNMENT => "INVALID_REPLICA_ASSIGNMENT",
         UNSUPPORTED_VERSION => "UNSUPPORTED_VERSION",
         INVALID_REQUEST => "INVALID_REQUEST",
         UNSUPPORTED_COMPRESSION_TYPE => "UNSUPPORTED_COMPRESSION_TYPE",
@@ -121,5 +134,10 @@ mod tests {
         assert_eq!(UNSUPPORTED_SASL_MECHANISM, 33);
         assert_eq!(SASL_AUTHENTICATION_FAILED, 58);
         assert_eq!(GROUP_ID_NOT_FOUND, 69);
+        // Topic-admin trio anchors (registry): 36/37/38/39.
+        assert_eq!(TOPIC_ALREADY_EXISTS, 36);
+        assert_eq!(INVALID_PARTITIONS, 37);
+        assert_eq!(INVALID_REPLICATION_FACTOR, 38);
+        assert_eq!(INVALID_REPLICA_ASSIGNMENT, 39);
     }
 }

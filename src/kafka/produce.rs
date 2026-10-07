@@ -6,6 +6,11 @@
 //! Request bodies are identical across v0-v2; the v2 response adds
 //! log_append_time (always -1: arrival ids carry no Kafka append time).
 //!
+//! Unknown topics: with `kafka_auto_create_topics` (default false) the
+//! broker materializes the topic (one default partition, the
+//! CreateTopics path in `topic_store`) and proceeds; with the default
+//! the partition answers UNKNOWN_TOPIC_OR_PARTITION(3) byte-for-byte.
+//!
 //! Durability: acks 1/-1 both mean ONE synchronous batched fsync of the
 //! whole request's records (meta + entries together) -- there is no ISR
 //! (single node; documented divergence in features/kafka-front.md).
@@ -112,9 +117,24 @@ async fn produce_one(
     mapping::validate_topic(topic.as_bytes())?;
     let parent = topic.as_bytes().to_vec();
     let prefix = hash::slot_with_prefix(&parent).1;
-    let child = mapping::partition_queue(&shared.store, &prefix, &parent, target.partition)
-        .map_err(|_| errors::UNKNOWN_SERVER_ERROR)?
-        .ok_or(errors::UNKNOWN_TOPIC_OR_PARTITION)?;
+    let lookup = || {
+        mapping::partition_queue(&shared.store, &prefix, &parent, target.partition)
+            .map_err(|_| errors::UNKNOWN_SERVER_ERROR)
+    };
+    let child = match lookup()? {
+        Some(child) => child,
+        None => {
+            // Unknown topic: with `kafka_auto_create_topics` the broker
+            // materializes it (one default partition) and retries the
+            // mapping; the default (false) keeps the historical
+            // UNKNOWN_TOPIC_OR_PARTITION(3) byte-for-byte.
+            if !shared.conf.kafka_auto_create_topics {
+                return Err(errors::UNKNOWN_TOPIC_OR_PARTITION);
+            }
+            super::topic_store::ensure_topic(shared, &parent).await?;
+            lookup()?.ok_or(errors::UNKNOWN_TOPIC_OR_PARTITION)?
+        }
+    };
     let raw = target.records.as_deref().ok_or(errors::CORRUPT_MESSAGE)?; // null records: nothing to append
     let batch = parse_batch(raw).map_err(classify_parse_err)?;
     let fields: Vec<Vec<(Vec<u8>, Vec<u8>)>> = batch.records.iter().map(record_fields).collect();
