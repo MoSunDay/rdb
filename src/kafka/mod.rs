@@ -79,7 +79,7 @@ pub fn implemented_apis() -> Vec<(i16, i16, i16)> {
     vec![
         (API_KEY_PRODUCE, 0, 3),
         (API_KEY_FETCH, 0, 10),
-        (API_KEY_LIST_OFFSETS, 0, 1),
+        (API_KEY_LIST_OFFSETS, 0, 5),
         (API_KEY_METADATA, 0, 8),
         (API_KEY_OFFSET_COMMIT, 0, 2),
         (API_KEY_OFFSET_FETCH, 0, 7),
