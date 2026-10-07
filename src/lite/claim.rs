@@ -8,8 +8,13 @@
 //! and shares this file's PEL-rewrite helpers.
 //!
 //! Lite subset of the Redis flags (anything else is "ERR syntax error"):
-//! XCLAIM takes JUSTID and FORCE -- full Redis's TIME / RETRYCOUNT /
-//! IDLE delivery hints are not carried by the PEL record.
+//! XCLAIM takes JUSTID, FORCE and the delivery hints IDLE / TIME /
+//! RETRYCOUNT (any order, interleaved with the id list like Redis).
+//! The hints rewrite the claimed PEL rows' delivery clock / counter
+//! (JUSTID claims carry them too -- an ownership move is still a PEL
+//! write); XPENDING's idle/deliveries columns and the idle sweep read
+//! the same `delivered_ms` field, so a backdated claim (large IDLE or
+//! a past TIME) becomes min-idle eligible that much sooner.
 
 use crate::command::Ctx;
 use crate::ds::expire;
@@ -90,11 +95,34 @@ pub(crate) fn read_entry(
         .map(|v| v.and_then(|raw| model::decode_entry(&raw)))
 }
 
+/// Where a claim's IDLE/TIME hint parks the delivery clock. The PEL's
+/// `delivered_ms` stays the single source of truth for every idle
+/// computation (XPENDING columns, the min-idle gate, the redelivery
+/// sweep): the hint only chooses WHICH timestamp lands there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryAt {
+    /// `IDLE <ms>`: delivered_ms = now - idle (backdated).
+    Idle(u64),
+    /// `TIME <unix-ms>`: delivered_ms = the given wall clock.
+    Time(u64),
+}
+
+/// XCLAIM's delivery-hint overrides, applied to every successfully
+/// claimed row: `delivery` (last-specified of IDLE/TIME wins, like
+/// Redis) and `retrycount` (replaces the delivery counter outright).
+#[derive(Default)]
+pub(crate) struct ClaimHints {
+    pub delivery: Option<DeliveryAt>,
+    pub retrycount: Option<u64>,
+}
+
 /// The claimed-row rewrite: ownership moves to `consumer` and the
 /// delivery clock refreshes; `times_delivered` bumps unless the claim is
 /// JUSTID-only (an ownership move is not a delivery, the old count
 /// stays). FORCE-created rows have no prior count and start at 1.
 /// `epoch` stamps the ordered-group ownership generation (0 = unordered).
+/// Claim hints (IDLE/TIME/RETRYCOUNT) override the clock/counter they
+/// target; with no hint the historical behavior is byte-identical.
 pub(crate) fn claimed_state(
     old_times: u64,
     fresh: bool,
@@ -102,14 +130,22 @@ pub(crate) fn claimed_state(
     consumer: &[u8],
     now: u64,
     epoch: u64,
+    hints: &ClaimHints,
 ) -> pel::PendState {
     pel::PendState {
         consumer: consumer.to_vec(),
-        delivered_ms: now,
-        times_delivered: match (fresh, justid) {
-            (true, _) => 1,
-            (false, false) => old_times + 1,
-            (false, true) => old_times,
+        delivered_ms: match hints.delivery {
+            Some(DeliveryAt::Idle(idle)) => now.saturating_sub(idle),
+            Some(DeliveryAt::Time(t)) => t,
+            None => now,
+        },
+        times_delivered: match hints.retrycount {
+            Some(n) => n,
+            None => match (fresh, justid) {
+                (true, _) => 1,
+                (false, false) => old_times + 1,
+                (false, true) => old_times,
+            },
         },
         epoch,
     }
@@ -150,20 +186,49 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
     let Some(min_idle) = parse_u64(&ctx.args[3]) else {
         return resp::append_error(ctx.out, "ERR value is not an integer or out of range");
     };
-    // Lite flags interleaved with the id list; every other token must be
-    // a plain id (TIME/RETRYCOUNT/IDLE & co. are not supported here).
+    // Flags and delivery hints interleave with the id list (Redis's own
+    // grammar): JUSTID / FORCE are toggles, IDLE / TIME / RETRYCOUNT
+    // take one integer value, everything else must be a plain id.
     let (mut justid, mut force) = (false, false);
+    let mut hints = ClaimHints::default();
     let mut ids = Vec::with_capacity(ctx.args.len() - 4);
-    for a in &ctx.args[4..] {
+    let mut i = 4;
+    while i < ctx.args.len() {
+        let a = ctx.args[i].as_slice();
         if a.eq_ignore_ascii_case(b"JUSTID") {
             justid = true;
+            i += 1;
         } else if a.eq_ignore_ascii_case(b"FORCE") {
             force = true;
+            i += 1;
+        } else if a.eq_ignore_ascii_case(b"IDLE") || a.eq_ignore_ascii_case(b"TIME") {
+            let idle = a.eq_ignore_ascii_case(b"IDLE");
+            let Some(v) = ctx.args.get(i + 1).and_then(|x| parse_u64(x)) else {
+                return resp::append_error(ctx.out, "ERR value is not an integer or out of range");
+            };
+            hints.delivery = Some(if idle {
+                DeliveryAt::Idle(v)
+            } else {
+                DeliveryAt::Time(v)
+            });
+            i += 2;
+        } else if a.eq_ignore_ascii_case(b"RETRYCOUNT") {
+            match ctx.args.get(i + 1).and_then(|x| parse_u64(x)) {
+                Some(n) => hints.retrycount = Some(n),
+                None => {
+                    return resp::append_error(
+                        ctx.out,
+                        "ERR value is not an integer or out of range",
+                    )
+                }
+            }
+            i += 2;
         } else {
             match model::parse_id(a) {
                 Some(id) => ids.push(id),
                 None => return resp::append_error(ctx.out, "ERR Invalid stream ID specified"),
             }
+            i += 1;
         }
     }
     if group_absent(ctx, &prefix, &stream, &group) {
@@ -327,6 +392,7 @@ pub async fn xclaim(ctx: &mut Ctx<'_>) {
                 &consumer,
                 now,
                 epoch,
+                &hints,
             )),
         );
         match fields {
@@ -386,19 +452,92 @@ mod tests {
 
     #[test]
     fn claimed_state_bumps_unless_justid_and_starts_fresh_at_one() {
-        let st = claimed_state(4, false, false, b"c2", 1234, 0);
+        let no_hints = ClaimHints::default();
+        let st = claimed_state(4, false, false, b"c2", 1234, 0, &no_hints);
         assert_eq!(st.consumer, b"c2".to_vec());
         assert_eq!(st.delivered_ms, 1234);
         assert_eq!(st.times_delivered, 5); // plain claim: 4 -> 5
                                            // JUSTID moves ownership only: count and delivery stay untouched.
-        let st = claimed_state(4, false, true, b"c2", 1234, 0);
+        let st = claimed_state(4, false, true, b"c2", 1234, 0, &no_hints);
         assert_eq!(st.times_delivered, 4);
         assert_eq!(st.delivered_ms, 1234);
         // FORCE-created rows have no prior count: always 1, JUSTID or not.
         assert_eq!(
-            claimed_state(0, true, false, b"c2", 1, 0).times_delivered,
+            claimed_state(0, true, false, b"c2", 1, 0, &no_hints).times_delivered,
             1
         );
-        assert_eq!(claimed_state(0, true, true, b"c2", 1, 0).times_delivered, 1);
+        assert_eq!(
+            claimed_state(0, true, true, b"c2", 1, 0, &no_hints).times_delivered,
+            1
+        );
+    }
+
+    #[test]
+    fn claim_hints_rewrite_clock_and_counter() {
+        // IDLE backdates: delivered = now - idle (clamped at 0).
+        let st = claimed_state(
+            4,
+            false,
+            false,
+            b"c2",
+            10_000,
+            0,
+            &ClaimHints {
+                delivery: Some(DeliveryAt::Idle(6_000)),
+                retrycount: None,
+            },
+        );
+        assert_eq!(st.delivered_ms, 4_000);
+        assert_eq!(st.times_delivered, 5); // no RETRYCOUNT: still bumps
+        assert_eq!(
+            claimed_state(
+                4,
+                false,
+                false,
+                b"c2",
+                100,
+                0,
+                &ClaimHints {
+                    delivery: Some(DeliveryAt::Idle(u64::MAX)),
+                    retrycount: None,
+                }
+            )
+            .delivered_ms,
+            0,
+            "IDLE beyond now clamps to epoch 0"
+        );
+        // TIME parks the wall clock verbatim; idle derives from now.
+        let st = claimed_state(
+            4,
+            false,
+            false,
+            b"c2",
+            10_000,
+            0,
+            &ClaimHints {
+                delivery: Some(DeliveryAt::Time(1_000)),
+                retrycount: None,
+            },
+        );
+        assert_eq!(st.delivered_ms, 1_000);
+        // RETRYCOUNT replaces the counter, JUSTID or not, fresh or not.
+        for (fresh, justid) in [(false, false), (false, true), (true, false)] {
+            assert_eq!(
+                claimed_state(
+                    4,
+                    fresh,
+                    justid,
+                    b"c2",
+                    10_000,
+                    0,
+                    &ClaimHints {
+                        delivery: None,
+                        retrycount: Some(42),
+                    }
+                )
+                .times_delivered,
+                42
+            );
+        }
     }
 }

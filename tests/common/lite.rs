@@ -261,3 +261,76 @@ pub async fn pending_rows(a: &str, s: &[u8], g: &[u8], n: usize) -> Vec<(String,
     rows.sort();
     rows
 }
+
+// ---- in-process helpers shared by the claim-options / xinfo-full suites ----
+
+use rdb::state::Shared;
+
+/// XADD with an explicit id, asserting the echoed id reply (keeps every
+/// later assertion byte-deterministic).
+pub fn add(shared: &Shared, stream: &[u8], id: &str) {
+    assert_eq!(
+        call(shared, "xadd", &[stream, id.as_bytes(), b"f", b"v"]),
+        format!("${}\r\n{id}\r\n", id.len()).into_bytes(),
+        "xadd {id}"
+    );
+}
+
+/// XGROUP CREATE ... MKSTREAM from 0-0, asserted OK.
+pub fn mk_group(shared: &Shared, stream: &[u8], g: &[u8]) {
+    assert_eq!(
+        call(
+            shared,
+            "xgroup",
+            &[b"create", stream, g, b"0-0", b"MKSTREAM"]
+        ),
+        b"+OK\r\n".to_vec(),
+        "xgroup create {g:?}"
+    );
+}
+
+/// One `>` delivery for `c`; asserts the reply mentions `last`.
+pub fn deliver(shared: &Shared, stream: &[u8], g: &[u8], c: &[u8], last: &str) {
+    let t = text(&call(
+        shared,
+        "xreadgroup",
+        &[b"group", g, c, b"streams", stream, b">"],
+    ));
+    assert!(t.contains(last), "delivery missing {last}: {t}");
+}
+
+/// XPENDING range rows as `(id, consumer, idle-ms, deliveries)`, id
+/// order (row[4]/row[5] are `:<int>` tokens; see [`pel_rows`]).
+pub fn pending_rows4(
+    shared: &Shared,
+    stream: &[u8],
+    g: &[u8],
+    n: usize,
+) -> Vec<(String, String, u64, u64)> {
+    let n_arg = n.to_string();
+    let mut rows: Vec<(String, String, u64, u64)> = pel_rows(&call(
+        shared,
+        "xpending",
+        &[stream, g, b"-", b"+", n_arg.as_bytes()],
+    ))
+    .into_iter()
+    .filter(|r| r.len() > 5)
+    .map(|r| {
+        (
+            r[1].clone(),
+            r[3].clone(),
+            r[4].trim_start_matches(':').parse().unwrap_or(0),
+            r[5].trim_start_matches(':').parse().unwrap_or(0),
+        )
+    })
+    .collect();
+    rows.sort();
+    rows
+}
+
+/// XCLAIM reply text (trimmed of the trailing CRLF).
+pub fn claim(shared: &Shared, stream: &[u8], args: &[&[u8]]) -> String {
+    let mut argv = vec![stream];
+    argv.extend(args.iter().copied());
+    text(&call(shared, "xclaim", &argv)).trim_end().to_string()
+}

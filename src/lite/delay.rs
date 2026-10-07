@@ -46,37 +46,9 @@ use crate::store::ops;
 
 use super::model::{self, EntryId, MetaRead};
 
-/// Reply for a non-numeric / out-of-range DELAY argument (Redis style).
-const NOT_INT: &str = "ERR value is not an integer or out of range";
 /// Rows exchanged per sweep round; leftovers stay staged and ride the
 /// next round (the sweep is stateless and rescans from the head).
 pub const ROUND_BUDGET: usize = 128;
-
-/// Split a leading `DELAY <ms>` option off an XADD field-value tail:
-/// `Ok((0, pairs))` when absent (the plain path, byte-for-byte
-/// unchanged), `Ok((ms, rest))` when present (`DELAY 0` = no delay, per
-/// the plan). `Err` = reply text for a malformed option. The keyword
-/// matches case-insensitively and must sit directly after the id --
-/// a first field literally named DELAY is therefore unreachable
-/// (accepted surface ambiguity, same tradeoff as Redis's own XADD
-/// keyword options).
-pub(crate) fn split_delay(pairs: &[Vec<u8>]) -> Result<(u64, &[Vec<u8>]), &'static str> {
-    if !pairs
-        .first()
-        .is_some_and(|p| p.eq_ignore_ascii_case(b"DELAY"))
-    {
-        return Ok((0, pairs));
-    }
-    let Some(arg) = pairs.get(1) else {
-        return Err(NOT_INT);
-    };
-    let text = std::str::from_utf8(arg).map_err(|_| NOT_INT)?;
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(NOT_INT); // signs, floats and garbage all refuse alike
-    }
-    let ms: u64 = text.parse().map_err(|_| NOT_INT)?;
-    Ok((ms, &pairs[2..]))
-}
 
 /// Stage one delayed message into `batch` (the same commit that carries
 /// the XADD reply's meta maintenance). `locked` is the reserved id.
@@ -288,47 +260,6 @@ pub fn spawn_delay_sweep(shared: Arc<state::Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn split_delay_absent_keeps_pairs() {
-        let pairs = vec![b"f".to_vec(), b"v".to_vec()];
-        let (ms, rest) = split_delay(&pairs).unwrap();
-        assert_eq!((ms, rest.len()), (0, 2));
-    }
-
-    #[test]
-    fn split_delay_parses_leading_option() {
-        let pairs: Vec<Vec<u8>> = vec![
-            b"delay".to_vec(),
-            b"250".to_vec(),
-            b"f".to_vec(),
-            b"v".to_vec(),
-        ];
-        let (ms, rest) = split_delay(&pairs).unwrap();
-        assert_eq!(ms, 250);
-        assert_eq!(rest, [b"f".to_vec(), b"v".to_vec()]);
-    }
-
-    #[test]
-    fn split_delay_rejects_malformed() {
-        for bad in [
-            vec![b"DELAY".to_vec()],
-            vec![b"DELAY".to_vec(), b"-1".to_vec()],
-            vec![b"DELAY".to_vec(), b"x".to_vec()],
-            vec![b"DELAY".to_vec(), b"+5".to_vec()],
-            vec![
-                b"DELAY".to_vec(),
-                format!("{}", u128::from(u64::MAX) + 1).into_bytes(),
-            ],
-        ] {
-            assert_eq!(split_delay(&bad), Err(NOT_INT), "{bad:?}");
-        }
-        // DELAY 0 is valid (means "no delay").
-        assert_eq!(
-            split_delay(&[b"DELAY".to_vec(), b"0".to_vec()]).unwrap(),
-            (0, &[][..])
-        );
-    }
 
     #[test]
     fn delay_row_key_orders_by_due_and_roundtrips() {
