@@ -28,7 +28,9 @@
   reflected；标准向量 `"123456789" -> 0xE3069283` 已覆盖）。P1 起接入 Produce 写路径；
   `build_batch`/`BatchRecord` 为测试/e2e 侧编码器（broker 写路径不用它）。
 - API：ApiVersions(18) v0-v3、Metadata(3) v0-v8、Produce(0) v0-v3（v3 由 P5a 解锁，
-  初版 v0-v2）、ListOffsets(2) v0-v1（版本注册表在 `mod.rs`，未实现 api 回 error 35）。
+  初版 v0-v2）、ListOffsets(2) v0-v1（初版；v2–v5 于 2026-10-07 P3 回填补齐，见
+  下文「ListOffsets v2–v5」；版本注册表在 `mod.rs`，未实现 api 回 error 35；
+  现行广告面全表 20 个 API、22 with SASL，见「Topic 管理与常量应答」节）。
   - ApiVersions 版本不支持时按规范回退 **v0 body + error 35 + 支持版本列表**；
     未知 api_key 同样回 ApiVersions v0 error 35。
   - Metadata v8 广告为最高版（刻意低于 flexible 的 v9+，避开 UUID topic id）；
@@ -242,6 +244,7 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
 | P5c | rdb-bench 工况 `kafka-prod`/`kafka-fetch`（手写 Produce v2/Fetch v4 客户端压 front）+ `scenario_kafka_bench.sh` | 已落地 |
 | P5 | ~~压缩 codec~~（zstd 刻意排除，见偏差清单）、性能打磨 | 已落地（经 P5a/P5b/P5c 收口） |
 | B2 | 组管理 API：ListGroups(16)/DeleteGroups(42)（runtime ∪ ledger-only，复用 lite 拆除）+ SASL PLAIN（`kafka_token`，空=关闭）；MQ Batch 2 | 已落地（2026-10-06） |
+| P3R | Topic 管理三件套 + 常量应答：CreateTopics(19)/DeleteTopics(20)/CreatePartitions(37)、DescribeConfigs(32) 桩、OffsetForLeaderEpoch(23)、ListOffsets v2–v5、produce auto-create（`kafka_auto_create_topics`）；广告面 15→20（22 with SASL）；MQ P3 按需池回填 | 已落地（2026-10-07） |
 
 ## 偏差清单（对标准 Kafka）
 - **单 broker，无 ISR**：Metadata 恒报 node 1；replicas=isr={1}，offline 恒空，
@@ -296,6 +299,15 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
   与 kafka 面 `DeleteGroups(42)`（Batch 2）走同一条 lite 拆除路径（含 0x20 折叠）。
   历史注记（修复前缺口）：P2 交付时该守卫顺延 P3，
   kafka 面流可被 XTRIM/XDEL 撕裂 ordinal 映射。
+- **topic admin 的单节点收窄（2026-10-07，P3 回填）**：CreateTopics 的
+  replication_factor 只接受 1/-1（38）、副本分配数组直接拒（39）、分区数上限
+  10000（37）——单 broker 无第二副本位；topic configs 解析后忽略。
+- **DescribeConfigs 是静态桩**：TOPIC 资源只回 4 个 Kafka 默认常量
+  （`retention.ms=604800000` 等，非活配置——Lite 流无保留策略），其他资源类型
+  42；无 AlterConfigs。
+- **OffsetForLeaderEpoch / ListOffsets v4+ / Fetch 的 leader_epoch 恒 -1**：本
+  broker 全程不报 epoch（单节点无 leader 交替），KIP-320 客户端按 unknown 跳过
+  截断检测。
 
 ## 上线修复（2026-09-22，P0 三项）
 订阅/消费能力上线评估后修的阻断项（详见 `features/changelog/2026-09-22/kafka-launch-p0.md`）：
@@ -398,6 +410,101 @@ OffsetCommit、从未 JoinGroup，无 lite 0x0E 组记录）。两端语义：
   全矩阵——预认证 ApiVersions、未认证断连、错机制 33、错密码 58+断连、正确 token
   后 produce+fetch+commit+ListGroups 全通）。
 
+## Topic 管理与常量应答（MQ P3 回填，2026-10-07）
+
+P3 按需池（`plans/2026-10-07-mq-p3-backfill/`）的 kafka 车道：topic 管理三件套 +
+两个常量应答 API + ListOffsets 版本补齐。这是本批**唯一默认可见的 wire 面增量**：
+ApiVersions 广告集 15 → **20 行**（`kafka_token` 非空时 22 行，17/36 照旧条件加入），
+新增 key = 19/20/23/32/37（`mod.rs::implemented_apis`，key 升序排列不变）。
+
+### 版本表（全部 classic 帧；flexible 起点即上限之上）
+
+| API | 广告版本 | 上限理由 / librdkafka 落点 |
+| --- | --- | --- |
+| CreateTopics(19) | v0–v4 | v5 转 flexible，高于上限；librdkafka 落 v4 |
+| DeleteTopics(20) | v0–v3 | v4 转 flexible；librdkafka 落 v3 |
+| CreatePartitions(37) | v0–v1 | v2 转 flexible；librdkafka 落 v1 |
+| DescribeConfigs(32) | v0–v3 | v4 转 flexible/tagged；librdkafka 落 v1 |
+| OffsetForLeaderEpoch(23) | v0–v3 | v4 转 flexible；librdkafka 落 v2 |
+| ListOffsets(2) | v0–v5（原 v0–v1） | v6 转 flexible；librdkafka 落 v5 |
+
+### 校验阶梯（`src/kafka/admin_topics.rs`）
+
+CreateTopics 逐 topic 按固定顺序判定，首个失配即回该 topic 的错误码（批内其余
+照常）：
+
+1. topic 名合法性（`mapping::validate_topic`，与 produce 同一规则）；
+2. 副本分配数组非空 → 39 `INVALID_REPLICA_ASSIGNMENT`（单节点没有第二个 broker
+   可放副本）；
+3. `replication_factor` **必须为 1 或 -1**（-1 = KIP-464 未设默认），其余 →
+   38 `INVALID_REPLICATION_FACTOR`；
+4. 分区数：-1 = broker 默认 **1**（`topic_store::DEFAULT_NUM_PARTITIONS`）；
+   非 1..=10000 → 37 `INVALID_PARTITIONS`（镜像 Kafka 上限，`MAX_PARTITIONS`）；
+5. 存在性：已存在 → 36 `TOPIC_ALREADY_EXISTS`；CreateTopics 的 `validate_only`
+   只走阶梯不落盘。
+
+- **CreatePartitions 收缩拒绝**：请求给的是**新总数**（Kafka 语义）；小于现有分区数
+  → 37 `INVALID_PARTITIONS`（只增不减），未知 topic → 3；扩出的分区逐个建
+  `T/p<N>` 空流（已存在的跳过，可重入补齐）。
+- **DeleteTopics**：未知 topic → 3 `UNKNOWN_TOPIC_OR_PARTITION`；存储失败 → -1
+  （批内其余继续）。
+- 建 topic 落盘 = `src/kafka/topic_store.rs::create_partitions`：分区 N 是 parent 槽
+  前缀下的 Lite 流 `T/p<N>`（与 XADD 产出的物理形状一致，catalog/mapping 零迁移
+  即可见），meta 键排序后逐流 latch + 单 WriteBatch/fsync（死锁约定）。
+- 请求携带的 topic configs 解析后**忽略**（无 topic 配置存储；DescribeConfigs 回
+  默认）。
+
+### ListOffsets v2–v5（`src/kafka/offsets_query.rs`）
+
+- v0–v1 字节与 P1 实现完全一致；v2 增 `isolation_level`（解析并忽略：单节点无
+  可隔离物）与响应首字段 `throttle_time_ms`；v4 增 per-partition
+  `current_leader_epoch`（解析后忽略）与响应 `leader_epoch`。
+- **响应 leader_epoch 恒 -1**（"unknown epoch"）：本 broker 与 Fetch 一样任何地方都
+  不报 epoch，-1 让 KIP-320 客户端跳过截断检测；未知分区 = error 3 + epoch -1 +
+  offset -1。
+- 时间戳语义不变：-1 latest、-2 earliest、-3 max_timestamp **按 latest 应答**
+  （到达时钟 id 无 per-record max），其余 by-timestamp 查询；查过 log 末端回
+  offset -1 / timestamp -1（broker 行为）。v0 的 `max_num_offsets` 仍按数组形态回。
+
+### DescribeConfigs(32) 桩（`src/kafka/admin_configs.rs`）
+
+AdminClient 启动期探测的最小应答，**STUB 定位**（Lite 流没有 topic 配置，没有
+动态可报之物）：
+
+- resource_type = TOPIC(2)：回**静态最小集**（Kafka 默认值，`TOPIC_DEFAULT_CONFIGS`）
+  ——`cleanup.policy=delete`、`retention.ms=604800000`（7 天，**常量而非活配置**：
+  Lite 流无保留策略，这是文档化默认）、`retention.bytes=-1`、
+  `min.insync.replicas=1`；config_source=5（DEFAULT_CONFIG），v0 直接回
+  `is_default`。请求带 `keys[]` 过滤时按 key 子集应答。
+- 其他 resource type → 42 `INVALID_REQUEST`；未知 topic → 3。
+- 读写方向：DescribeConfigs 只读；AdminClient 想改配置（AlterConfigs 未广告）在
+  本面不存在。
+
+### OffsetForLeaderEpoch(23)（常量应答）
+
+单节点语义下 epoch 恒定：每个分区回 **error 0 + leader_epoch = -1（unknown）+
+end_offset = 当前 log 末端**（与 Fetch 高水位同源的 meta `len`）。-1 epoch 让
+KIP-320 感知的客户端跳过截断；与 Fetch 响应的 `leader_epoch` 姿态一致。
+
+### `kafka_auto_create_topics`（默认 false）
+
+- **默认（false）零行为变化**：Produce 到未知 topic 照旧回 error 3
+  `UNKNOWN_TOPIC_OR_PARTITION`（面规范不变）。
+- 置 true：produce 路径先走 `topic_store::ensure_topic`（无效名/存储失败照常回
+  错误），建默认**单分区**后正常写入——与 CreateTopics `-1/-1` 同一落点。
+
+### 删 topic 的键族折叠（`src/kafka/topic_store.rs::delete_topic`）
+
+DeleteTopics 走 **DEL/闲置收割的同一条 family-delete 路径**
+（`command::keys_core::delete_records` → `ds::expire::family_delete_entries`），
+对每个物理子流折叠：entries 与 meta（STREAM_FAMILY 0x0C–0x0F）、**kafka 提交账本
+0x20**（组 committed offset 行随流死，等于批量释放 XTRIM/XDEL 守卫）、**延迟暂存
+0x1D**（到期前删 topic 不留幽灵行）、以及分区流的嵌套子流（默认 DLQ
+`T/pN/dlq`——它本身是完整流）。RENAME 随搬 0x20/0x1D 的既有行为（Batch 1/2）不
+受影响。e2e 断言删后 DLQ/延迟/账本齐消（`tests/kafka_topics_e2e.rs::
+delete_topics_folds_family_collateral`）。
+
+
 ## 风险注记（显式接受）
 - **单节点持久性是既知风险**：当年否决 Kafka front 的理由仍然成立——Kafka 客户端
   默认预期 acks=all/ISR/幂等，而 rdb 数据面（含 Lite 元数据）不经 raft 复制。接受
@@ -432,6 +539,7 @@ OffsetCommit、从未 JoinGroup，无 lite 0x0E 组记录）。两端语义：
 - 配置：`kafka_bind`、`kafka_advertised_host/port`（Metadata/FindCoordinator 广告
   覆盖，空/0=由 bind 推导）、`kafka_max_connections`（0=默认 4096）、
   `kafka_token`（非空启用 SASL PLAIN，见 Batch 2 节）、
+  `kafka_auto_create_topics`（默认 false = 未知 topic 仍回 error 3，见 P3 回填节）、
   `rocksmq_bind`（`conf.rs`，空=关闭）。
 - 指标：`rdb_kafka_api_latency`（`monitor.rs`；conn 侧观测排除 Fetch park 时长、
   覆盖 acks=0 无响应路径）。
@@ -448,6 +556,10 @@ OffsetCommit、从未 JoinGroup，无 lite 0x0E 组记录）。两端语义：
   （headers 真回放 + envelope 兜底标记头）与 `tests/kafka_rename_ledger_e2e.rs`
   （RENAME 随搬 0x20 账本 + 旧名 commit 回 3，MQ Batch 1）；
   `tests/kafka_admin_e2e.rs`（Batch 2：ListGroups 并集/守卫释放/69+重建/
-  SASL 矩阵，admin+SASL wire helpers 在 `kafka_front_common/groups.rs`）；场景脚本
+  SASL 矩阵，admin+SASL wire helpers 在 `kafka_front_common/groups.rs`）；
+  `tests/kafka_topics_e2e.rs`（2026-10-07 P3 回填：建/删/扩分区全 wire 往返、
+  键族折叠（DLQ/延迟/0x20 账本齐消）、auto-create 开关两态、ListOffsets v2–v5、
+  DescribeConfigs/OffsetForLeaderEpoch；topic-admin wire helpers 在
+  `kafka_front_common/topics.rs`）；场景脚本
   `scrtips/e2e_scenarios/scenario_kafka_sdk.sh`（P5a 真实 SDK，7/7）与
   `scenario_kafka_bench.sh`（P5c bench 工况）。
