@@ -50,6 +50,7 @@ Commit: 90e8c9b
 | 计划目录 | 状态 | 文档数 | 一句话简介 |
 | --- | --- | --- | --- |
 | `2026-10-06-mq-gap/` | 部分落地 | 8 | MQ 能力完备差距对比 + 新能力 e2e 计划（A/B 级入执行批次，C 级入按需池） |
+| `2026-10-07-mq-p3-backfill/` | proposed | 1 | P3 按需池全池补齐（总览即 README.md）：#1–#15 分诊（13 立项、#3 观望、#9 LIMIT 语义收缩），W0 conf → W1 三车道（kafka/lite/http）→ W2 消费者 idle GC → W4 台账收尾 |
 
 `2026-10-06-mq-gap/` 背景：以常用 MQ 功能清单为尺，对 Lite（RESP 动词面）、
 Kafka（wire 面）、HTTP（rocksmq 面）三面做只读差距复核，产出分级处置矩阵；
