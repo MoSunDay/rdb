@@ -11,7 +11,11 @@
 # the DLQ as a plain stream, (h) XTRIM MINID threshold trim (exact id,
 # LIMIT cap, <ms>-0 time-window form), (i) delayed messages (XADD DELAY
 # staging invisible before due, due exchange with a FRESH id, a parked
-# BLOCK reader woken by the exchange, RENAME carrying the staged row).
+# BLOCK reader woken by the exchange, RENAME carrying the staged row),
+# (j) P3 W2 backfill verbs: XADD NOMKSTREAM (nil on a missing key, no
+# stream materialized), XINFO STREAM <key> FULL [COUNT n] deep view
+# (entries + groups nesting), XCLAIM RETRYCOUNT replacing the PEL
+# delivery counter (visible in XPENDING's deliveries column).
 # Semantics verified against source/tests BEFORE writing this script:
 # - Every X-command is cluster-whitelisted => NODE-LOCAL (src/router.rs:96
 #   is_whitelisted; src/command/mod.rs:437 skips slot routing). The
@@ -66,6 +70,21 @@
 #   (XADD-parity notify on the stream + parent keys). The sweep exists
 #   only when `lite.delay_sweep_ms` > 0 (default 0 = OFF); family
 #   delete/RENAME fold/carry the staged rows (tests/lite_delay_e2e.rs).
+# - P3 W2 (section j), verified against source before writing it:
+#   NOMKSTREAM is a LEADING XADD option; on a FRESH key the nil bulk is
+#   the whole reply -- no meta, no entry, no stats (src/lite/append.rs,
+#   checked BEFORE id resolution) -- while an existing stream appends
+#   normally. Lite streams are keyed under the PARENT topic's slot
+#   (src/lite/model.rs::stream_prefix) so slot-routed EXISTS can never
+#   see one (0 even after creation, or MOVED when the child slot is
+#   another node's): the node-local absence oracle is the whitelisted
+#   KEYS (empty <-> the exact key). XINFO STREAM <s> FULL =
+#   [length, last-generated-id, entries[][], groups[][]] where each
+#   group nests name/last-delivered-id/pending[]/consumers[]
+#   (src/lite/xinfo_full.rs; entries and PEL lists cap at COUNT n,
+#   default 10). XCLAIM ... RETRYCOUNT n REPLACES the PEL delivery
+#   counter outright (a hint-less claim then bumps from it,
+#   src/lite/claim.rs) -- XPENDING's 4th range column reads it.
 
 # env.sh installs `set -uo pipefail` and the assertion helpers. Deliberately
 # NO `set -e`: assertion failures count into E2E_FAILS so the scenario
@@ -430,6 +449,70 @@ main () {
     assert_eq "a DELAY past the u64 deadline is refused, not wrapped" \
         "ERR delay deadline overflow" \
         "$(rc "$mq" XADD "$dly" '*' DELAY 18446744073709551615 sku x)"
+
+    # ---- (j) P3 W2: NOMKSTREAM / XINFO FULL / XCLAIM RETRYCOUNT -------
+    # NB: lite streams are physically keyed under the PARENT topic's
+    # CRC16 slot (src/lite/model.rs::stream_prefix), while EXISTS/TYPE
+    # route on the FULL stream name's slot -- a slot-routed EXISTS can
+    # never observe a lite stream: it answers 0 even after creation
+    # (verified on a scratch node), or MOVED when another node owns the
+    # child slot. The node-local existence oracle is the whitelisted
+    # KEYS (local keyspace scan): absent -> empty output, created ->
+    # the key itself; the contrast below keeps the negative airtight.
+    local nm=nmk1 fs=full/q0 si cl pend
+    assert_eq "XADD NOMKSTREAM on a missing key replies nil" "" \
+        "$(rc "$mq" XADD "$nm/q0" NOMKSTREAM '*' sku ghost)"
+    assert_eq "the missing key stays absent (XLEN 0)" "0" \
+        "$(rc "$mq" XLEN "$nm/q0")"
+    assert_eq "no physical key materialized (KEYS finds nothing)" "" \
+        "$(rc "$mq" KEYS "$nm/q0")"
+    assert_eq "plain XADD creates the stream (echoes the id)" "5-1" \
+        "$(rc "$mq" XADD "$nm/q0" 5-1 sku real)"
+    assert_eq "NOMKSTREAM only suppresses CREATION: it appends on a live stream" \
+        "5-2" "$(rc "$mq" XADD "$nm/q0" NOMKSTREAM 5-2 sku real2)"
+    assert_eq "KEYS now sees the stream (the oracle is not vacuous)" "$nm/q0" \
+        "$(rc "$mq" KEYS "$nm/q0")"
+    assert_eq "the created stream holds both entries" "2" \
+        "$(rc "$mq" XLEN "$nm/q0")"
+
+    # XINFO STREAM FULL: the Redis-7 deep view, entries + groups nested.
+    rc "$mq" XADD "$fs" 7-1 sku v1 >/dev/null
+    rc "$mq" XADD "$fs" 7-2 sku v2 >/dev/null
+    rc "$mq" XADD "$fs" 7-3 sku v3 >/dev/null
+    assert_eq "XGROUP CREATE for the FULL-view probe" "OK" \
+        "$(rc "$mq" XGROUP CREATE "$fs" fg 0-0 MKSTREAM)"
+    cl="$(rc "$mq" XREADGROUP GROUP fg fc1 COUNT 1 STREAMS "$fs" '>')"
+    assert_contains "one entry read unacked (PEL seeded at fc1)" "v1" "$cl"
+    si="$(rc "$mq" XINFO STREAM "$fs" FULL)"
+    assert_contains "FULL carries the length field" "length" "$si"
+    assert_eq "FULL length value (flattened pair layout)" "3" "$(nth 2 "$si")"
+    assert_eq "FULL last-generated-id is the newest entry" "7-3" \
+        "$(nth 4 "$si")"
+    assert_contains "FULL carries the entries list" "entries" "$si"
+    assert_contains "the entries list nests the oldest entry frame" "v1" "$si"
+    assert_contains "the entries list nests the newest entry frame" "v3" "$si"
+    assert_contains "FULL carries the groups list" "groups" "$si"
+    assert_contains "the groups section nests the group name" "fg" "$si"
+    assert_contains "the group nests its consumer roster" "fc1" "$si"
+    assert_contains "the group nests its pending list" "pending" "$si"
+    si="$(rc "$mq" XINFO STREAM "$fs" FULL COUNT 1)"
+    assert_contains "FULL COUNT keeps the newest entry" "v3" "$si"
+    assert_not_contains "FULL COUNT caps the tail entries (older dropped)" \
+        "v1" "$si"
+
+    # XCLAIM RETRYCOUNT replaces the PEL delivery counter outright; a
+    # later hint-less claim BUMPS from the replaced value (claim.rs).
+    cl="$(rc "$mq" XCLAIM "$fs" fg fc2 0 7-1 RETRYCOUNT 3)"
+    assert_contains "XCLAIM hands the full entry frame to the claimant" "v1" "$cl"
+    pend="$(rc "$mq" XPENDING "$fs" fg - + 10)"
+    assert_eq "the claim moved the PEL row to fc2" "fc2" "$(nth 2 "$pend")"
+    assert_eq "RETRYCOUNT 3 replaced the delivery counter" "3" "$(nth 4 "$pend")"
+    assert_eq "XPENDING summary total unchanged by the claim" "1" \
+        "$(nth 1 "$(rc "$mq" XPENDING "$fs" fg)")"
+    cl="$(rc "$mq" XCLAIM "$fs" fg fc1 0 7-1)"
+    assert_contains "a hint-less claim still delivers the entry" "v1" "$cl"
+    assert_eq "a later hint-less claim BUMPS from the replaced value" "4" \
+        "$(nth 4 "$(rc "$mq" XPENDING "$fs" fg - + 10)")"
 
     e2e_finish "$scenario"
 }

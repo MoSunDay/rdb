@@ -180,8 +180,15 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     remembered — such ids may be redelivered; duplicates, never loss). The group
     record (kind 0x0E) is persisted synchronously only when the committed watermark
     actually advances.
-  - XCLAIM supports only the FORCE / JUSTID options (IDLE/TIME/RETRYCOUNT/LASTID are
-    syntax errors); XAUTOCLAIM returns the Redis>=7 3-element reply (with deleted-ids),
+  - XCLAIM supports FORCE / JUSTID plus the delivery hints IDLE/TIME/RETRYCOUNT in any
+    order interleaved with the id list (P3 backfill, 2026-10-07; LASTID remains a syntax
+    error): each hint applies to every successfully claimed PEL row (a JUSTID claim
+    writes them too — an ownership move is still a PEL write); IDLE backdates
+    delivered_ms = now-idle (clamped at 0), TIME parks it at the given wall clock,
+    RETRYCOUNT overwrites times_delivered; delivered_ms stays the single source of the
+    idle clock (XPENDING columns, the min-idle gate, the idle redelivery sweep), so a
+    backdated row becomes min-idle eligible that much sooner. XAUTOCLAIM returns the
+    Redis>=7 3-element reply (with deleted-ids),
     COUNT defaults to 100 with a 10x scan cap. For ORDERED groups both are HEAD-ONLY:
     only the PEL head (smallest pending id) can transfer queue ownership; a failed
     min-idle claim does not flip ownership, and FORCE on an id beyond the head is
@@ -221,6 +228,38 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   - XTRIM accepts `MINID [<~|=>] <id> [LIMIT <n>]` (Redis-aligned, orthogonal to
     MAXLEN): drops entries strictly below `<id>` (boundary survives); `~`/`=` behave
     identically (exact victims), LIMIT after both; `<ms>-0` ids = time-window retention.
+    LIMIT-semantics ledger (P3 #9, resolved-as-covered): the `LIMIT <n>` clause means
+    exactly the XTRIM parameter — a per-call budget on victims this round, budgeted
+    BEFORE victims are chosen (LIMIT 0 = nothing trimmed); XADD-carried trims share the
+    same parser and executor (`src/lite/append_opts.rs` trim_at/trim_victims), so no
+    private LIMIT syntax exists. Pinned by `tests/lite_trim_minid_e2e.rs` (XTRIM
+    LIMIT segmentation/LIMIT 0) and `tests/lite_xinfo_full_e2e.rs::
+    xadd_trim_pins_xtrim_limit_semantics` (XADD `MINID ... LIMIT`).
+  - XADD options (P3 backfill, 2026-10-07; parsing centralized in
+    `src/lite/append_opts.rs`, shared with XTRIM): `NOMKSTREAM` (a missing stream does
+    not create the key, replies nil — RESP2 `$-1`), `MAXLEN [~|=] <n>` /
+    `MINID [~|=] <id> [LIMIT <n>]` trim in the SAME latched fsync batch as the append
+    (the new entry itself is a victim when the plan reaches it, e.g. MAXLEN 0); options
+    may precede or follow the id (once an option block precedes it the id is required),
+    repeats override; XADD-carried trims pass the kind-0x20 ledger guard like XTRIM.
+  - `XINFO STREAM <s> FULL [COUNT <n>]` (P3 backfill; Redis 7 shape, encoded in
+    `src/lite/xinfo_full.rs`): stream level = length, last-generated-id, entries
+    (newest `n`, id-ascending), groups; group level = name, last-delivered-id, pending
+    rows `[id, consumer, ms-since-delivery, delivery-count]`, consumers; consumer
+    level = name, seen-time (approximation: latest PEL delivery time, else registry
+    time), pending (exact, never truncated), pel rows. Omitted-by-design fields (no
+    engine data, never faked): radix-tree-keys/radix-tree-nodes, entries-added,
+    max-deleted-entry-id, recorded-first-entry-id, group entries-read/lag. The non-FULL
+    reply is unchanged.
+  - Idle consumer GC (`lite.consumer_gc_ms`, default 0 = no background task at all,
+    zero upgrade-visible change): a 1s-pace rotating reclaim of dead group members
+    collectable only when ALL THREE hold — no PEL rows, no active lease (not parked in
+    a waiting XREADGROUP, not the leased owner of an ordered queue), and idle past the
+    threshold on the `seen_ms` registry clock (stamped by writes that already sync:
+    delivery, XCLAIM/XAUTOCLAIM, XACK of owned rows; legacy rows fall back to
+    created_ms). Removal reuses the XGROUP DELCONSUMER path in one synced batch
+    (kill -9 durable — a collected member never reappears), at most 32 groups per
+    round; an ordered owner's exemption is lease-scoped, not permanent.
   - XTRIM/XDEL ledger guard: a stream with ANY kind-0x20 committed-offset ledger row
     rejects both commands with `ERR stream <name> has committed consumer-group
     offsets; delete the groups first`; RENAME moves the rows with the stream family,
@@ -241,8 +280,9 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     stages as a protocol adapter mapping parent/child to topic/partition exactly the way
     a sql/front does for MySQL — see the next bullet. Decision record and living Lite-MQ
     spec: [features/mq-lite.md](../features/mq-lite.md).
-- **Kafka wire frontend (`kafka_bind`, rdb extension)**: 15 wire APIs over the same Lite
-  engine — topic=parent stream, partition=child `p<N>`/`q<N>` queue, offset=ACTIVE-entry
+- **Kafka wire frontend (`kafka_bind`, rdb extension)**: 20 wire APIs over the same Lite
+  engine (22 with SASL) — topic=parent stream, partition=child `p<N>`/`q<N>` queue,
+  offset=ACTIVE-entry
   ordinal (not a physical offset), committed offsets in a separate kind-0x20 ledger.
   Single broker: Metadata always returns one node; acks=all = one synchronous fsync (no
   ISR/replicas). Compression is rejected by default (error 76); the optional
@@ -255,6 +295,29 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   lite teardown `XGROUP DESTROY` uses (folding its 0x20 ledger rows — the wire-side
   release for the XTRIM/XDEL ledger guard) and evicts runtime state; a group with
   neither runtime entry nor ledger rows answers 69 while the rest of the batch proceeds.
+  Topic-admin APIs (P3 backfill, 2026-10-07; classic framing only, all caps at the
+  flexible boundary): CreateTopics(19) v0-v4 / DeleteTopics(20) v0-v3 /
+  CreatePartitions(37) v0-v1 create the partition streams `T/p<N>` via one latched
+  batch (`src/kafka/topic_store.rs`); validation ladder = name, assignments
+  (any → 39 INVALID_REPLICA_ASSIGNMENT), replication_factor (only 1 or the -1 unset
+  default; else 38 INVALID_REPLICATION_FACTOR — single node), partitions (-1 = broker
+  default 1, else 1..=10000 or 37 INVALID_PARTITIONS), existence (36
+  TOPIC_ALREADY_EXISTS / 3 UNKNOWN_TOPIC_OR_PARTITION); CreatePartitions takes the NEW
+  total and a shrink answers 37; DeleteTopics folds the whole family per partition
+  stream through the DEL family-delete path (entries+meta, kind-0x20 ledger, kind-0x1D
+  delay rows, nested DLQ streams), request configs parsed and ignored.
+  DescribeConfigs(32) v0-v3 is a stub: TOPIC resources answer a static minimal
+  Kafka-default set (cleanup.policy=delete, retention.ms=604800000 — a documented
+  constant, Lite streams carry no live retention, retention.bytes=-1,
+  min.insync.replicas=1; config_source=DEFAULT), other resource types 42 INVALID_REQUEST;
+  no AlterConfigs. OffsetForLeaderEpoch(23) v0-v3 is a constant answer: error 0,
+  leader_epoch -1 (unknown — this broker reports no epochs anywhere; KIP-320 clients
+  skip truncation), end_offset = the log end Fetch's high watermark uses. ListOffsets(2)
+  is v0-v5 (was v0-v1): v2 adds parsed-and-ignored isolation_level + throttle field,
+  v4+ decodes current_leader_epoch and answers leader_epoch -1; -3 max_timestamp
+  answers latest (arrival ids keep no per-record max). `kafka_auto_create_topics`
+  (default false = produce to an unknown topic still answers error 3, zero behavior
+  change; true = a default single partition is created on first produce).
   Optional SASL PLAIN via `kafka_token` (empty = off, the default; when set, ApiVersions
   additionally advertises 17/36): SaslHandshake/SaslAuthenticate once per connection,
   constant-time password compare, wrong password = fixed-message 58 + close (no token
@@ -798,7 +861,17 @@ the request until a message lands or the budget expires — long-poll semantics)
 channel/group). Optional `rocksmq_token` (empty = off, the default) requires
 `Authorization: Bearer <token>` on every route (401 otherwise). A bare channel name maps
 to `NAME/q0`; the body is the `v` field pair, byte-identical with the Kafka front's
-keyless/headerless records, so the two fronts read each other's messages. Remaining
+keyless/headerless records, so the two fronts read each other's messages. Batch + replay
+routes (P3 backfill, 2026-10-07): `POST /produce_batch` and `POST /ack_batch` take a
+JSON array (max 100 elements, the same `MAX_BATCH` as `/consume`'s `n`) and re-dispatch
+each element through the single-route handler (per-item `status`+`body` results in
+request order, one bad item never aborts the rest; batch-level 400 only for non-JSON /
+non-array / over-cap bodies); `GET /range?channel[&begin][&end][&limit]` is a read-only
+XRANGE replay (no PEL registration, no group state, invisible-to-delayed rows like every
+read path; unknown channel → `{"msgs":[]}`); all three pass the bearer gate.
+`rocksmq_max_connections` (default 0 = built-in 4096, negative falls back to it) caps
+concurrent front connections — at cap a new TCP connection is closed silently (no HTTP
+bytes written), mirroring the kafka front's guard. Remaining
 deviations vs real RocksMQ (`<ms>-<seq>` ids not integer offsets, no topic create/delete/
 seek): [features/rocksmq-http.md](../features/rocksmq-http.md).
 

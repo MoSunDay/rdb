@@ -52,9 +52,77 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
     带 headers、无 headers 不变、exotic 形状回退 envelope + `rdb-envelope` 标记头。
   - `kafka_rename_ledger_e2e`（2）：RENAME 随搬 0x20 账本（守卫跟新名）+ 旧名
     OffsetCommit 回 3 `UNKNOWN_TOPIC_OR_PARTITION`；同 slot 配对形状单测。
+- **延迟消息（2026-10-06 Batch 2 / WP2，首次入台账）**：
+  - `lite_delay_e2e`（9）：XADD DELAY 到期前全读路径不可见（XLEN/XRANGE/XREADGROUP）
+    → 到期交换、乱序提交按 due 升序交换且读序=到期序、BLOCK 读者被交换唤醒、
+    **三连泄漏回归**（XIDLE 惰性清除/主动采样、RENAME 随搬 0x1D 段、FLUSHDB 清空
+    ——暂存行必须随流族死/搬，已删流不得被复活投递）、选项负矩阵（非整数/0=不延迟/
+    悬空选项/溢出拒绝）、同路径重开两态持久。
+  - `lite_delay_proc_e2e`（3）：真二进制 + `lite.delay_sweep_ms` 的**spawn 扫描器**
+    进程级（注册教训：扫描器 spawn 路径必须有进程 e2e）、BLOCK 读者被 spawned 交换
+    唤醒、kill -9 双态持久（已交换 entry 存活 + 未到期暂存行重启后经扫描器交换）。
+- **MQ Batch 1.5/2 补齐（2026-10-06，首次入台账；changelog
+  `changelog/2026-10-06/mq-batch2.md`）**：
+  - `lite_group_dlq_e2e`（4）：XGROUP CREATE `DLQ` 选项负矩阵——目标==源流（原地
+    覆写 + len 虚涨）、跨 slot 显式目标（集群形态落错节点窗口）、空名（不静默回退
+    默认目标）各专用报错且不留组；隐式默认与合法同 slot 显式目标仍可用。
+  - `lite_dlq_triggers_e2e`（3）：进程级补齐后两个 MAXDELIVERY 触发面——XGROUP
+    SETID 回卷后 `>` 重投越限转移（崩溃重投路径）、XAUTOCLAIM 反复交付越限转移；
+    JUSTID 仅移所有权永不触发（四个触发面至此全覆盖）。
+  - `lite_redeliver_proc_e2e`（1）：真二进制 + `lite.redelivery_idle_ms=800` 的
+    spawn 重投 sweep——被弃 PEL 行交付次数无客户端干预上升、同窗未达 idle 阈值
+    行不被碰。
+  - `kafka_headers_fidelity_e2e`（3）：header **名字**字节保真（含协议禁止但未强制
+    的非法 UTF-8）produce→存储→Fetch 两条回放路径（native "h" JSON hex 名 /
+    envelope 回退值）均字节精确；`rdb-envelope` 撞名真用户头胜出、原样回放。
+  - `kafka_admin_e2e`（4）：ListGroups = runtime ∪ 仅账本组（Empty 占位态）；
+    DeleteGroups 走 lite 拆除折 0x20 行并逐出 runtime（XTRIM/XDEL 账本守卫的
+    wire 出口）；未知组 69 且批内其余照常；SASL 全矩阵（pre-auth ApiVersions、
+    未认证断连、错口令 58+close、PLAIN 通过后全生产面）。
+  - `rocksmq_wait_pending_e2e`（4）：`wait_ms` 长轮询（超时空回保默认值 / 唤醒 /
+    延迟消息到期可见）、`POST /pending` 汇总与错误面、`delay_ms` 透传、
+    `rocksmq_token` Bearer 矩阵。
+- **MQ P3 按需池回填（2026-10-07，首次入台账；计划 `plans/2026-10-07-mq-p3-backfill/`，
+  摘要 `changelog/2026-10-07/mq-p3-backfill.md`）**：6 个新 e2e 文件 + 1 个新公共
+  harness（`tests/common/mq.rs`，rocksmq HTTP 进程级夹具，`tests/common/mod.rs` 冻结
+  在 799 行不加一行）+ 2 个 wire/unit 侧新文件（`src/kafka/admin_topics_tests.rs`、
+  `admin_configs_tests.rs`）。
+  - `kafka_topics_e2e`（3，进程级，helpers 在 `tests/kafka_front_common/topics.rs`）：
+    topic 全 wire 生命周期（CreateTopics 建流→Metadata/Fetch 可见→CreatePartitions
+    扩容→DeleteTopics 删净）、删 topic 键族折叠（entries+0x20 账本+0x1D 延迟行+嵌套
+    DLQ 齐消，Resp 侧佐证）、`kafka_auto_create_topics` 两态（默认 false = produce
+    未知 topic 回 3 不建流；true = 建默认单分区后写入）；ListOffsets v5（latest/
+    earliest + -1 leader_epoch）、DescribeConfigs 桩、OffsetForLeaderEpoch 常量应答
+    断言随生命周期用例展开（v2–v4 帧形态由 `src/kafka/offsets_query.rs` 单测钉住，
+    广告面 15→20 由 `kafka_wire_e2e` 版本注册断言更新）。
+  - `lite_claim_opts_e2e`（7）：XCLAIM IDLE 回拨 / TIME 停墙钟 / RETRYCOUNT 改写
+    计数（JUSTID claim 同样落 PEL 写）、回拨行即刻满足 min-idle、FORCE/JUSTID 与
+    提示任意交错、坏值负矩阵——XPENDING idle/deliveries 列读侧同步回归。
+  - `lite_xinfo_full_e2e`（5）：`XINFO STREAM FULL` 形状（entries/组 pending/消费者
+    pel）与 COUNT 截断（消费者 pending 精确不截断）、非 FULL 输出不变、语法矩阵、
+    NOMKSTREAM 不建键回 nil、`xadd_trim_pins_xtrim_limit_semantics`（XADD
+    `MINID ... LIMIT` = XTRIM 参数语义钉死，P3 #9 收缩结论的证据）。
+  - `rocksmq_batch_range_e2e`（7，fixture `tests/common/mq.rs`）：批量 produce
+    有序 id、混合批量逐项隔离（一项非法其余成功且错误就地可见）、批量 ack 子集
+    收缩 pending、`/range` 界内回放 + limit 截断、`/range` 只读（组消费仍见全部
+    未确认消息）、三新路由 token 门禁、`rocksmq_max_connections: 1` 第二条并发
+    连接被静默拒纳。
+  - `lite_consumer_gc_e2e`（6，in-proc 直调 GC 轮）：无 PEL 空闲成员回收而带 PEL
+    成员保全、XACK 刷新 seen 时钟（未超时不回收）、parked XREADGROUP 读者保全
+    （活跃租约判据）、有序 owner 在租豁免而同组旁观者照常回收、`0` 默认关零回收、
+    GC 与重投 sweep 交错互不干扰（各自游标独立）。
+  - `lite_consumer_gc_proc_e2e`（4，真二进制 + `lite.consumer_gc_ms` spawn 后台
+    GC）：spawned GC 回收幽灵成员、活跃成员保全而空闲成员消失、kill -9 后已回收
+    成员**不重现**（同步批写持久；幸存者及其 PEL 完整、未 ack 行按 at-least-once
+    重投）、默认关（0）无后台任务零行为变化。
+  - 场景覆盖（`scrtips/e2e_scenarios/`，由并行收尾车道扩展中）：`scenario_kafka_sdk.sh`
+    增 AdminClient 建/删 topic 步（真实 SDK 走 CreateTopics/DeleteTopics wire）、
+    `scenario_lite_mq.sh` 增 XINFO FULL / NOMKSTREAM 步——作为场景层回归入口计入
+    本批覆盖，脚本断言随收尾合入。
 - **Shell 场景**：新增 `scenario_ha_failover.sh`（首次启用 `e2e_kill_node`，kill→MOVED-backup ~4-5s、
   回切 ~5s）、`scenario_lite_mq.sh`（XADD/XREADGROUP/XPENDING/XACK/XAUTOCLAIM + ORDERED/INFLIGHT，
-  2026-10-06 增 (g) DLQ/MAXDELIVERY 死信+DLQ 独立消费与 (h) XTRIM MINID/LIMIT/时间窗两段）、
+  2026-10-06 增 (g) DLQ/MAXDELIVERY 死信+DLQ 独立消费、(h) XTRIM MINID/LIMIT/时间窗
+  与 (i) 延迟消息（DELAY 暂存到期交换/全新 id/BLOCK 唤醒/RENAME 随搬）三段）、
   `scenario_migrate.sh`（`migrate task` 全流程 + 反向回迁）；`scenario_redis_session.sh` 增
   redis-py `RedisCluster()` 探针（**已连接成功**：protocol=2 跳过未实现的 HELLO；无 redis-py 自跳过）。
 - **漂移与卫生**：RESULTS.md/soak.yml 的“4 场景”漂移改为 glob 措辞；soak.yml 补装 confluent-kafka；
