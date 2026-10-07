@@ -378,24 +378,81 @@ async fn createconsumer(ctx: &mut Ctx<'_>) {
     let (group, consumer) = (ctx.args[2].clone(), ctx.args[3].clone());
     let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
     let ckey = super::pel::consumer_key(&prefix, &stream, &group, &consumer);
-    let existed = ops::get_physical(&ctx.shared.store, &ckey)
+    let existing = ops::get_physical(&ctx.shared.store, &ckey)
         .ok()
         .flatten()
-        .is_some();
-    if !existed {
+        .and_then(|raw| super::pel::decode_consumer(&raw));
+    if existing.is_none() {
+        let now = crate::ds::expire::now_ms();
         let mut batch = WriteBatch::default();
         batch.put(
             &ckey,
             super::pel::encode_consumer(&super::pel::ConsumerState {
-                created_ms: crate::ds::expire::now_ms(),
+                created_ms: now,
+                seen_ms: now,
             }),
         );
         if let Err(e) = ctx.commit(batch).await {
             return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
         }
     }
-    ctx.shared.lite.ensure_consumer(&stream, &group, &consumer);
-    resp::append_int(ctx.out, i64::from(!existed));
+    // Remembered either way -- with the SURVIVING on-disk creation time
+    // when the row predates this process, so later seen refreshes never
+    // drift `created_ms`.
+    let was_new = existing.is_none();
+    let created = existing
+        .as_ref()
+        .map_or_else(crate::ds::expire::now_ms, |s| s.created_ms);
+    ctx.shared
+        .lite
+        .ensure_consumer(&stream, &group, &consumer, created);
+    resp::append_int(ctx.out, i64::from(was_new));
+}
+
+/// Batch plan of one or more consumer removals of a group -- the shared
+/// body of `XGROUP DELCONSUMER` and the idle consumer GC (see
+/// [`super::consumer_gc`]): delete every PEL row the consumer owns
+/// (ownership lives in the row value, so it is a filtered pass over the
+/// caller's pre-scanned `rows`, not a range delete) plus the registry
+/// row itself. Returns the purged pending-row count (the DELCONSUMER
+/// reply; the GC path only ever passes PEL-empty names, so it sees 0).
+pub(crate) fn plan_consumer_removals(
+    prefix: &[u8],
+    stream: &[u8],
+    group: &[u8],
+    consumers: &[&[u8]],
+    rows: &[super::pel::PendRow],
+) -> (WriteBatch, usize) {
+    let mut purged = 0usize;
+    let mut batch = WriteBatch::default();
+    for row in rows {
+        if consumers.iter().any(|c| row.state.consumer == *c) {
+            batch.delete(super::pel::pend_key(prefix, stream, group, row.id));
+            purged += 1;
+        }
+    }
+    for c in consumers {
+        batch.delete(super::pel::consumer_key(prefix, stream, group, c));
+    }
+    (batch, purged)
+}
+
+/// Post-commit effects of a consumer removal, shared by XGROUP
+/// DELCONSUMER and the idle consumer GC: cached backlog unwind, ordered
+/// ownership release and the runtime registry forget -- so the two
+/// removal paths can never disagree on counters or registries.
+pub(crate) fn consumer_removal_effects(
+    shared: &crate::state::Shared,
+    stream: &[u8],
+    group: &[u8],
+    consumer: &[u8],
+    purged: usize,
+) {
+    offset::bump_pending(&shared.lite.offsets, stream, group, -(purged as i64));
+    // An ordered queue owned by the departing consumer becomes free NOW
+    // (no lease wait): the next `>` reader takes it over.
+    super::ordered::release_consumer(&shared.lite.owners, stream, group, consumer);
+    shared.lite.forget_consumer(stream, group, consumer);
 }
 
 /// `XGROUP DELCONSUMER <stream> <group> <consumer>`: drop the registry
@@ -413,8 +470,8 @@ async fn delconsumer(ctx: &mut Ctx<'_>) {
     };
     let (group, consumer) = (ctx.args[2].clone(), ctx.args[3].clone());
     let _guard = latch::lock(&ctx.shared.latch, &model::meta_key(&prefix, &stream)).await;
-    // Purge every PEL row owned by this consumer (ownership lives in the
-    // row value, so it is a filtered scan, not a range delete).
+    // Purge every PEL row owned by this consumer plus the registry row,
+    // through the shared removal plan (the idle GC reuses it verbatim).
     let rows = super::pel::scan_pend(
         &ctx.shared.store,
         &prefix,
@@ -426,25 +483,11 @@ async fn delconsumer(ctx: &mut Ctx<'_>) {
     let Ok(rows) = rows else {
         return resp::append_error(ctx.out, "ERR: xgroup failed: pel scan");
     };
-    let mut purged = 0usize;
-    let mut batch = WriteBatch::default();
-    for row in &rows {
-        if row.state.consumer == consumer {
-            batch.delete(super::pel::pend_key(&prefix, &stream, &group, row.id));
-            purged += 1;
-        }
-    }
-    batch.delete(super::pel::consumer_key(
-        &prefix, &stream, &group, &consumer,
-    ));
+    let (batch, purged) = plan_consumer_removals(&prefix, &stream, &group, &[&consumer], &rows);
     if let Err(e) = ctx.commit(batch).await {
         return resp::append_error(ctx.out, &format!("ERR: xgroup failed: {e}"));
     }
-    offset::bump_pending(&ctx.shared.lite.offsets, &stream, &group, -(purged as i64));
-    // An ordered queue owned by the departing consumer becomes free NOW
-    // (no lease wait): the next `>` reader takes it over.
-    super::ordered::release_consumer(&ctx.shared.lite.owners, &stream, &group, &consumer);
-    ctx.shared.lite.forget_consumer(&stream, &group, &consumer);
+    consumer_removal_effects(ctx.shared, &stream, &group, &consumer, purged);
     resp::append_int(ctx.out, purged as i64);
 }
 

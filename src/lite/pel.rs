@@ -51,9 +51,16 @@ pub struct PendState {
 }
 
 /// Consumer-registry record (XGROUP CREATECONSUMER / first delivery).
+/// `seen_ms` is the idle-GC activity clock (see `lite::consumer_gc`):
+/// stamped at creation and refreshed by every activity that already
+/// writes a batch (delivery / claim / autoclaim / ack of owned rows);
+/// `#[serde(default)]` keeps rows written before the field existing
+/// decodable (they read as 0 = "only created_ms is known").
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ConsumerState {
     pub created_ms: u64,
+    #[serde(default)]
+    pub seen_ms: u64,
 }
 
 /// A PEL row as scanned from disk.
@@ -66,6 +73,9 @@ pub struct PendRow {
 pub struct ConsumerRow {
     pub name: Vec<u8>,
     pub created_ms: u64,
+    /// 0 on rows written before the field existed (fall back to
+    /// `created_ms`, the conservative pre-GC approximation).
+    pub seen_ms: u64,
 }
 
 // ---- key constructors ----------------------------------------------------
@@ -151,6 +161,43 @@ pub fn decode_consumer(raw: &[u8]) -> Option<ConsumerState> {
     decode(raw)
 }
 
+/// Refresh one consumer's `seen_ms` inside the CALLER's write batch (no
+/// extra commit, no new fsync: the row rides the delivery / claim / ack
+/// writes that already sync). Refresh-only: a consumer neither in the
+/// process registry nor on disk is NOT created -- an ack of stale ids
+/// after a removal (XGROUP DELCONSUMER or the idle GC) must not
+/// resurrect a collected member.
+pub fn touch_seen(
+    shared: &crate::state::Shared,
+    batch: &mut rocksdb::WriteBatch,
+    prefix: &[u8],
+    stream: &[u8],
+    group: &[u8],
+    consumer: &[u8],
+    now_ms: u64,
+) {
+    let created = match shared.lite.consumer_created(stream, group, consumer) {
+        Some(c) => c,
+        None => {
+            let key = consumer_key(prefix, stream, group, consumer);
+            match ops::get_physical(&shared.store, &key) {
+                Ok(Some(raw)) => match decode_consumer(&raw) {
+                    Some(state) => state.created_ms,
+                    None => return, // corrupt row: never rewrite it blind
+                },
+                _ => return, // unknown name: nothing to refresh
+            }
+        }
+    };
+    batch.put(
+        consumer_key(prefix, stream, group, consumer),
+        encode_consumer(&ConsumerState {
+            created_ms: created,
+            seen_ms: now_ms,
+        }),
+    );
+}
+
 // ---- scans ---------------------------------------------------------------
 
 /// PEL rows of the group with id >= `from` (inclusive), id order; `limit`
@@ -220,6 +267,7 @@ pub fn scan_consumers(
             out.push(ConsumerRow {
                 name,
                 created_ms: state.created_ms,
+                seen_ms: state.seen_ms,
             });
         }
         true

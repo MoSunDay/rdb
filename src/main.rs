@@ -585,6 +585,9 @@ async fn do_main() {
     // Lite Mode: staged delayed-message due sweep (no-op unless
     // `lite.delay_sweep_ms` is configured).
     rdb::lite::delay::spawn_delay_sweep(Arc::clone(&shared));
+    // Lite Mode: idle consumer GC (no-op unless `lite.consumer_gc_ms`
+    // is configured).
+    rdb::lite::consumer_gc::spawn_consumer_gc(Arc::clone(&shared));
     // M2: periodic MVCC version GC below the snapshot watermark.
     sql::storage::gc::spawn_gc(Arc::clone(&shared));
     // M5: periodic columnar segment orphan/garbage sweep.

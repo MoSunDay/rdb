@@ -152,8 +152,10 @@ pub(crate) fn claimed_state(
 }
 
 /// Register the claiming consumer: the runtime registry answers in
-/// memory; `false` = first sighting, so the consumer's persisted record
-/// rides the caller's claim batch (restarts keep XINFO CONSUMERS whole).
+/// memory; `None` = first sighting, so the consumer's persisted record
+/// is created (`created_ms = now`), `Some(created)` rewrites it with a
+/// fresh `seen_ms` -- either way the row rides the caller's claim batch
+/// (restarts keep XINFO CONSUMERS whole; claims feed the idle-GC clock).
 pub(crate) fn register_consumer(
     ctx: &Ctx<'_>,
     batch: &mut rocksdb::WriteBatch,
@@ -163,12 +165,18 @@ pub(crate) fn register_consumer(
     consumer: &[u8],
     now: u64,
 ) {
-    if !ctx.shared.lite.ensure_consumer(stream, group, consumer) {
-        batch.put(
-            pel::consumer_key(prefix, stream, group, consumer),
-            pel::encode_consumer(&pel::ConsumerState { created_ms: now }),
-        );
-    }
+    let created = ctx
+        .shared
+        .lite
+        .ensure_consumer(stream, group, consumer, now)
+        .unwrap_or(now);
+    batch.put(
+        pel::consumer_key(prefix, stream, group, consumer),
+        pel::encode_consumer(&pel::ConsumerState {
+            created_ms: created,
+            seen_ms: now,
+        }),
+    );
 }
 
 /// `XCLAIM <stream> <group> <consumer> <min-idle-time> <id> [id ...] [JUSTID] [FORCE]`.
