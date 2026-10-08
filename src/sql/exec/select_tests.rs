@@ -386,6 +386,72 @@ async fn group_by_ordinal_groups_by_output_column() {
 }
 
 #[tokio::test]
+async fn group_by_resolves_select_aliases() {
+    let shared = testutil::shared_with(testutil::test_config());
+    ddl::run(
+        &shared,
+        parse_statement("CREATE TABLE g (id BIGINT PRIMARY KEY, score BIGINT NOT NULL)").unwrap(),
+    )
+    .await
+    .unwrap();
+    write::insert(
+        &shared,
+        &mut SqlSession::default(),
+        parse_statement("INSERT INTO g (id, score) VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)")
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // A GROUP BY key naming a select alias groups by the projected
+    // expression (score + 1): keys 2,2,3,3,4 -> counts 2,2,1.
+    let (_, rows) = select_all(
+        &shared,
+        "SELECT score + 1 AS s, COUNT(*) AS n FROM g GROUP BY s ORDER BY s",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Int(3), Value::Int(2)],
+            vec![Value::Int(4), Value::Int(1)],
+        ]
+    );
+    // Alias lookup is case-insensitive.
+    let upper = col(
+        &shared,
+        "SELECT score + 1 AS s FROM g GROUP BY S ORDER BY 1",
+    )
+    .await;
+    assert_eq!(upper, vec![Value::Int(2), Value::Int(3), Value::Int(4)]);
+
+    // Column precedence: when the bare name is BOTH a FROM column and
+    // an alias, the column wins (MySQL's GROUP BY rule). The constant
+    // alias would collapse everything to ONE group (count 5); the
+    // column groups 1,1,2,2,3 -> counts 2,2,1.
+    let (_, rows) = select_all(
+        &shared,
+        "SELECT COUNT(*) AS n, 0 AS score FROM g GROUP BY score",
+    )
+    .await;
+    let mut counts: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
+    counts.sort_by_key(|v| format!("{v:?}"));
+    assert_eq!(counts, vec![Value::Int(1), Value::Int(2), Value::Int(2)]);
+
+    // An unknown name that is neither column nor alias stays 1054.
+    let Statement::Select(q) =
+        parse_statement("SELECT score + 1 AS s FROM g GROUP BY nope").unwrap()
+    else {
+        panic!("select");
+    };
+    let err = run(&shared, &SqlSession::default(), q)
+        .await
+        .expect_err("unknown group key");
+    assert_eq!(err.code, ErrorCode::BadField, "{}", err.msg);
+}
+
+#[tokio::test]
 async fn order_by_alias_sorts_by_projection() {
     let shared = setup().await;
     let got = col(&shared, "SELECT id * id AS sq FROM t ORDER BY sq DESC").await;

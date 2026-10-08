@@ -84,18 +84,33 @@ pub fn civil_from_days(z: i64) -> Option<(i64, u32, u32)> {
     Some((y, m, d))
 }
 
-/// Parse `YYYY-MM-DD` or `YYYYMMDD` into days since the epoch.
-/// Strictly two-digit month/day (the MySQL canonical spellings).
+/// Parse `YYYY-MM-DD` (one- or two-digit month/day -- MySQL's lenient
+/// text spellings, so `'2020-1-1'` == `'2020-01-01'`) or `YYYYMMDD`
+/// into days since the epoch. Calendar validity stays strict.
 pub fn parse_date(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    let (y, m, d) = match b.len() {
-        10 if b[4] == b'-' && b[7] == b'-' => {
-            (digits(&b[..4])?, digits(&b[5..7])?, digits(&b[8..10])?)
-        }
-        8 => (digits(&b[..4])?, digits(&b[4..6])?, digits(&b[6..8])?),
-        _ => return None,
+    // An 8-digit run is the compact form; a same-length dashed
+    // spelling (`2020-1-1`) falls through to the lenient parser.
+    if b.len() == 8 && digits(b).is_some() {
+        return parse_compact_digits(b);
+    }
+    dashed_date_days(s)
+}
+
+/// Dashed `YYYY-M-D` (year exactly 4 digits, month/day 1..=2 digits,
+/// dashes as the only separators) into days. Range and calendar
+/// checks stay in `days_from_civil`.
+fn dashed_date_days(s: &str) -> Option<i64> {
+    let mut fields = s.split('-');
+    let (y, m, d) = (fields.next()?, fields.next()?, fields.next()?);
+    if fields.next().is_some() || y.len() != 4 {
+        return None;
+    }
+    let field = |f: &str| match f.len() {
+        1..=2 => digits(f.as_bytes()).map(|n| n as u32),
+        _ => None,
     };
-    days_from_civil(y, m as u32, d as u32)
+    days_from_civil(digits(y.as_bytes())?, field(m)?, field(d)?)
 }
 
 /// Canonical `YYYY-MM-DD` of a day count. Out-of-range days have no
@@ -108,55 +123,60 @@ pub fn format_date(days: i64) -> String {
     )
 }
 
-/// Parse `YYYY-MM-DD[ T]HH:MM:SS[.1-6 frac]`, `YYYYMMDDHHMMSS[.frac]`
-/// or a bare date form (midnight) into microseconds since the epoch.
-/// Fraction digits beyond six are rejected, not truncated.
+/// Parse `YYYY-MM-DD[ T]HH:MM:SS[.frac]`, `YYYYMMDDHHMMSS[.frac]` or a
+/// bare date form (midnight) into microseconds since the epoch. Month,
+/// day and time-of-day fields take 1..=2 digits (the lenient text
+/// spellings); a fraction longer than six digits truncates to
+/// microseconds instead of rejecting.
 pub fn parse_datetime(s: &str) -> Option<i64> {
     let (int_part, frac_micros) = match s.split_once('.') {
-        // 1..=6 digits, zero-padded on the right to microseconds.
+        // All-digit fraction, right-padded to microseconds; digits
+        // past the sixth drop (truncation, MySQL's text-form read).
         Some((i, f)) => {
             let fb = f.as_bytes();
-            if fb.is_empty() || fb.len() > 6 || digits(fb).is_none() {
+            if fb.is_empty() || digits(fb).is_none() {
                 return None;
             }
             let mut padded = [b'0'; 6];
-            padded[..fb.len()].copy_from_slice(fb);
+            let keep = &fb[..fb.len().min(6)];
+            padded[..keep.len()].copy_from_slice(keep);
             (i, digits(&padded)?)
         }
         None => (s, 0),
     };
-    let b = int_part.as_bytes();
-    let (days, secs) = match b.len() {
-        8 => (parse_compact_digits(&b[..8])?, 0),
-        14 => {
-            let days = parse_compact_digits(&b[..8])?;
-            (
-                days,
-                hhmmss(digits(&b[8..10])?, digits(&b[10..12])?, digits(&b[12..14])?)?,
-            )
-        }
-        19 if b[10] == b' ' || b[10] == b'T' => {
-            if b[4] != b'-' || b[7] != b'-' || b[13] != b':' || b[16] != b':' {
-                return None;
+    let (days, secs) = match int_part.find([' ', 'T']) {
+        // `date<sep>time`: lenient dashed date plus an `H:M:S` part.
+        Some(p) => (
+            dashed_date_days(&int_part[..p])?,
+            time_secs(&int_part[p + 1..])?,
+        ),
+        None => match int_part.as_bytes() {
+            b if b.len() == 14 => {
+                let days = parse_compact_digits(&b[..8])?;
+                (
+                    days,
+                    hhmmss(digits(&b[8..10])?, digits(&b[10..12])?, digits(&b[12..14])?)?,
+                )
             }
-            let days = days_from_civil(
-                digits(&b[..4])?,
-                digits(&b[5..7])? as u32,
-                digits(&b[8..10])? as u32,
-            )?;
-            (
-                days,
-                hhmmss(
-                    digits(&b[11..13])?,
-                    digits(&b[14..16])?,
-                    digits(&b[17..19])?,
-                )?,
-            )
-        }
-        10 => (parse_date(int_part)?, 0),
-        _ => return None,
+            b if b.len() == 8 && digits(b).is_some() => (parse_compact_digits(b)?, 0),
+            _ => (dashed_date_days(int_part)?, 0),
+        },
     };
     Some(days * MICROS_PER_DAY + secs * 1_000_000 + frac_micros)
+}
+
+/// Seconds-of-day of an `H:M:S` string, 1..=2 digits per field.
+fn time_secs(t: &str) -> Option<i64> {
+    let mut fields = t.split(':');
+    let (h, m, s) = (fields.next()?, fields.next()?, fields.next()?);
+    if fields.next().is_some() {
+        return None;
+    }
+    let field = |f: &str| match f.len() {
+        1..=2 => digits(f.as_bytes()),
+        _ => None,
+    };
+    hhmmss(field(h)?, field(m)?, field(s)?)
 }
 
 /// Seconds-of-day of an HH:MM:SS triple (None outside 00:00:00..

@@ -198,7 +198,10 @@ pub fn status_value(name: &str) -> Option<Value> {
 /// (any run) wildcards over a CASE-INSENSITIVE compare (SHOW-only;
 /// data LIKE stays bytewise, gap-matrix decision 3).
 pub fn show_like_match(name: &str, pattern: &str) -> bool {
-    crate::sql::exec::expr::like_match(&name.to_ascii_lowercase(), &pattern.to_ascii_lowercase())
+    crate::sql::exec::expr_like::like_match(
+        &name.to_ascii_lowercase(),
+        &pattern.to_ascii_lowercase(),
+    )
 }
 
 /// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pat']`: the whole sysvar

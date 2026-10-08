@@ -387,7 +387,10 @@ fn translate_function(f: &sqlparser::ast::Function) -> SqlResult<Expr> {
         let arg = match args.len() {
             0 if matches!(func, AggFunc::Count) => None,
             1 => args.into_iter().next(),
-            _ => return Err(SqlError::unsupported(format!("{name} arity"))),
+            // Wrong argument count is MySQL 1582, the same error the
+            // scalar signature table raises (prepare-time, per native
+            // function); genuinely-unsupported shapes stay 1235.
+            _ => return Err(crate::sql::exec::func::wrong_param_count(&name)),
         };
         return Ok(Expr::Agg {
             func,

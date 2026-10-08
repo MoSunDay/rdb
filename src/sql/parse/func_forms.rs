@@ -54,7 +54,9 @@ pub(crate) fn translate_trim(
         });
     }
     // `TRIM('x' FROM s)` (no keyword) is BOTH; a keyword without a
-    // remstr does not parse under the MySQL dialect, but stay loud.
+    // remstr never survives to here with a FROM (the pre-parse pass
+    // injects the ' ' default) -- only the MySQL-invalid FROM-less
+    // `TRIM(LEADING s)` spelling lands keyword-without-remstr, loud.
     let remstr = translate_expr(
         trim_what
             .as_deref()
@@ -222,7 +224,9 @@ pub(crate) fn translate_group_concat(
         }
     }
     let arg = match args.len() {
-        0 => return Err(SqlError::parse("GROUP_CONCAT needs an argument")),
+        // Zero arguments is the native-function arity error (MySQL
+        // 1582), matching the other aggregates.
+        0 => return Err(crate::sql::exec::func::wrong_param_count("group_concat")),
         1 => args.into_iter().next().expect("len checked"),
         // MySQL concatenates each row's comma-separated arguments with
         // the same separator; wrapping in CONCAT keeps that exactly.

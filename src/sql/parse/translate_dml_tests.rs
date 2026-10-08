@@ -188,6 +188,72 @@ fn row_arity_still_rejects_at_parse() {
 }
 
 #[test]
+fn update_delete_order_by_and_limit_placeholders_count_and_bind() {
+    // SET -> WHERE -> ORDER BY -> LIMIT is the statement text order;
+    // every `?` counts and binds positionally.
+    let mut s = stmt("UPDATE t SET v = ? WHERE id > ? ORDER BY id DESC LIMIT ?");
+    assert_eq!(placeholder_count(&s), 3);
+    bind_placeholders(&mut s, &[Value::Int(9), Value::Int(1), Value::Int(2)]).expect("bind");
+    let Statement::Update {
+        assignments,
+        filter,
+        order_by,
+        limit,
+        ..
+    } = &s
+    else {
+        panic!("update");
+    };
+    assert_eq!(assignments[0].1, Expr::Lit(Value::Int(9)));
+    let Expr::BinaryOp { right, .. } = filter.as_ref().unwrap() else {
+        panic!("filter");
+    };
+    assert_eq!(**right, Expr::Lit(Value::Int(1)));
+    // ORDER BY key bound to a literal (a constant key: no reordering).
+    assert_eq!(
+        order_by[0].expr,
+        Expr::Col {
+            table: None,
+            name: "id".into()
+        }
+    );
+    // The bound LIMIT stays a Param holding the literal; limit_u64
+    // (the execution-time coercion) reads through it.
+    let crate::sql::parse::ast::LimitValue::Param(bound) = limit.as_ref().unwrap() else {
+        panic!("param limit");
+    };
+    assert_eq!(bound.as_ref(), &Expr::Lit(Value::Int(2)));
+
+    let mut s = stmt("DELETE FROM t WHERE id < ? ORDER BY ? LIMIT ?");
+    assert_eq!(placeholder_count(&s), 3);
+    bind_placeholders(&mut s, &[Value::Int(3), Value::Int(1), Value::Int(1)]).expect("bind");
+    let Statement::Delete {
+        filter,
+        order_by,
+        limit,
+        ..
+    } = &s
+    else {
+        panic!("delete");
+    };
+    assert!(filter.is_some());
+    assert_eq!(order_by[0].expr, Expr::Lit(Value::Int(1)));
+    let crate::sql::parse::ast::LimitValue::Param(bound) = limit.as_ref().unwrap() else {
+        panic!("param limit");
+    };
+    assert_eq!(bound.as_ref(), &Expr::Lit(Value::Int(1)));
+
+    // A bound LIMIT must be a non-negative integer, same as a literal.
+    let mut s = stmt("DELETE FROM t LIMIT ?");
+    bind_placeholders(&mut s, &[Value::Str("x".into())]).expect("bind");
+    let Statement::Delete { limit, .. } = s else {
+        panic!("delete");
+    };
+    let err = crate::sql::parse::order_limit::limit_u64(limit.as_ref().unwrap()).expect_err("bad");
+    assert!(err.msg.contains("non-negative"), "{err}");
+}
+
+#[test]
 fn sqlite_upsert_and_row_alias_reject() {
     let err = parse_statement("INSERT OR REPLACE INTO t (a) VALUES (1)").expect_err("or");
     assert_eq!(err.code, ErrorCode::NotSupported, "{err}");

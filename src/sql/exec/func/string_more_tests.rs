@@ -64,6 +64,57 @@ fn lpad_rpad_truncate_repeat_and_null_pad() {
 }
 
 #[test]
+fn lpad_rpad_caps_the_result_at_the_packet_maximum() {
+    let f = |name: &str, args: &[Value]| eval(name, args).unwrap();
+    // Exactly 1 << 24 result bytes is the last legal size; one byte
+    // more is NULL, decided before the buffer is built.
+    let cap: usize = 1 << 24;
+    assert_eq!(
+        f("lpad", &[s("x"), Value::Int(cap as i64), s("a")]),
+        Ok(Value::Str(format!("{}{}", "a".repeat(cap - 1), "x")))
+    );
+    assert_eq!(
+        f("lpad", &[s("x"), Value::Int(cap as i64 + 1), s("a")]),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        f("rpad", &[s("x"), Value::Int(cap as i64 + 1), s("a")]),
+        Ok(Value::Null)
+    );
+    // Huge requests (and multi-byte pads) are NULL without allocating.
+    assert_eq!(
+        f("lpad", &[s("x"), Value::Int(1 << 30), s("?")]),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        f("rpad", &[s("x"), Value::Int(1 << 30), s("?")]),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        f("lpad", &[s("x"), Value::Int((cap / 2 + 2) as i64), s("é")]),
+        Ok(Value::Null)
+    );
+    // The truncation side of the cap: cutting a giant input short but
+    // still past the cap is NULL too.
+    let giant = "y".repeat(cap + 10);
+    assert_eq!(
+        f(
+            "lpad",
+            &[
+                Value::Str(giant.clone()),
+                Value::Int((cap + 1) as i64),
+                s("?")
+            ]
+        ),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        f("rpad", &[Value::Str(giant), Value::Int(cap as i64), s("?")]),
+        Ok(Value::Str("y".repeat(cap)))
+    );
+}
+
+#[test]
 fn locate_and_instr_are_one_search() {
     let f = |name: &str, args: &[Value]| eval(name, args).unwrap();
     assert_eq!(f("locate", &[s("bar"), s("foarbar")]), Ok(Value::Int(5)));
@@ -81,6 +132,11 @@ fn locate_and_instr_are_one_search() {
     assert_eq!(
         f("locate", &[s("a"), s("abc"), Value::Int(0)]),
         Ok(Value::Int(0))
+    );
+    // A NULL start position is NULL, never a coercion error.
+    assert_eq!(
+        f("locate", &[s("bar"), s("barbar"), Value::Null]),
+        Ok(Value::Null)
     );
     // INSTR flips the arguments.
     assert_eq!(f("instr", &[s("foarbar"), s("bar")]), Ok(Value::Int(5)));
@@ -116,6 +172,10 @@ fn trim_spaces_and_remstr_forms() {
     assert_eq!(f(&[s("ababfoo"), s("ab"), s("LEADING")]), Ok(s("foo")));
     // A remstr of spaces behaves like the plain form.
     assert_eq!(f(&[s("  bar"), s(" "), s("LEADING")]), Ok(s("bar")));
+    // The no-remstr `TRIM(KW FROM s)` forms arrive (after the
+    // pre-parse expansion) as that same space-remstr call.
+    assert_eq!(f(&[s("  bar  "), s(" "), s("BOTH")]), Ok(s("bar")));
+    assert_eq!(f(&[s("  bar  "), s(" "), s("TRAILING")]), Ok(s("  bar")));
     assert!(eval("trim", &[s("a"), s("b")]).unwrap().is_err());
     assert!(eval("trim", &[s("a"), s("b"), s("NOPE")]).unwrap().is_err());
 }

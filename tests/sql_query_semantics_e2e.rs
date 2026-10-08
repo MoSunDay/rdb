@@ -457,3 +457,117 @@ async fn agg_wrappers_and_session_funcs_in_dml() {
 
     node.kill_now();
 }
+
+#[tokio::test]
+async fn group_by_resolves_select_aliases() {
+    let (mut node, mut c) = qsem_node("galias").await;
+    ddl(
+        &mut c,
+        "CREATE TABLE g (id BIGINT PRIMARY KEY, score BIGINT NOT NULL)",
+    )
+    .await;
+    c.query_drop("INSERT INTO g (id, score) VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)")
+        .await
+        .expect("seed g");
+
+    // GROUP BY <alias> groups by the projected expression (MySQL
+    // resolves select aliases in GROUP BY).
+    let mut got = rows(
+        &mut c,
+        "SELECT score + 1 AS s, COUNT(*) AS n FROM g GROUP BY s",
+    )
+    .await;
+    got.sort_by_key(|r| int_key(r));
+    assert_eq!(
+        got,
+        vec![
+            vec![int(2), int(2)],
+            vec![int(3), int(2)],
+            vec![int(4), int(1)]
+        ]
+    );
+
+    // Column precedence: `score` is both a FROM column and an alias
+    // here; the column wins (the constant alias would collapse all
+    // rows into one group of 5).
+    let mut got = rows(
+        &mut c,
+        "SELECT COUNT(*) AS n, 0 AS score FROM g GROUP BY score",
+    )
+    .await;
+    got.sort_by_key(|r| int_key(r));
+    assert_eq!(
+        got,
+        vec![
+            vec![int(1), int(0)],
+            vec![int(2), int(0)],
+            vec![int(2), int(0)]
+        ]
+    );
+
+    // a name that is neither column nor alias stays ER 1054
+    let e = server_error(&mut c, "SELECT score + 1 AS s FROM g GROUP BY nope").await;
+    assert_eq!(e.code, ER_BAD_FIELD_ERROR, "{}", e.message);
+    assert!(
+        e.message.to_lowercase().contains("unknown column"),
+        "{}",
+        e.message
+    );
+
+    node.kill_now();
+}
+
+#[tokio::test]
+async fn update_delete_order_by_and_limit_placeholders() {
+    let (mut node, mut c) = qsem_node("dmllimit").await;
+    ddl(
+        &mut c,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
+    c.query_drop("INSERT INTO u (id, v) VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+        .await
+        .expect("seed u");
+
+    // Prepared UPDATE: SET ? -> WHERE ? -> ORDER BY ? -> LIMIT ? bind
+    // in statement-text order. The bound ORDER BY key is a constant
+    // (MySQL semantics: a parameter is never a column), so LIMIT 2
+    // takes the first two WHERE matches in scan order -- ids 2, 3.
+    let stmt = c
+        .prep("UPDATE u SET v = ? WHERE id > ? ORDER BY ? DESC LIMIT ?")
+        .await
+        .expect("prep update");
+    c.exec_drop(&stmt, (99i64, 1i64, 4i64, 2i64))
+        .await
+        .expect("exec update");
+    assert_eq!(c.affected_rows(), 2);
+    assert_eq!(
+        col(&mut c, "SELECT id FROM u WHERE v = 99 ORDER BY id").await,
+        vec![2, 3]
+    );
+
+    // Prepared DELETE with LIMIT ?: removes exactly the top-2 by id.
+    let stmt = c
+        .prep("DELETE FROM u WHERE id < ? ORDER BY id DESC LIMIT ?")
+        .await
+        .expect("prep delete");
+    c.exec_drop(&stmt, (99i64, 2i64))
+        .await
+        .expect("exec delete");
+    assert_eq!(c.affected_rows(), 2);
+    assert_eq!(
+        col(&mut c, "SELECT id FROM u ORDER BY id").await,
+        vec![1, 2]
+    );
+
+    // A bound LIMIT that is not a non-negative integer rejects loudly
+    // (the same LIMIT coercion a literal goes through).
+    let stmt = c.prep("DELETE FROM u LIMIT ?").await.expect("prep bad");
+    let e = match c.exec_drop(&stmt, ("x".to_string(),)).await {
+        Err(mysql_async::Error::Server(e)) => e,
+        other => panic!("expected server error for LIMIT 'x', got {other:?}"),
+    };
+    assert!(e.message.to_lowercase().contains("limit"), "{}", e.message);
+
+    node.kill_now();
+}

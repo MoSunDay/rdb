@@ -29,8 +29,9 @@ use crate::sql::exec::write_probe;
 use crate::sql::exec::{ExecOutcome, SqlSession};
 use crate::sql::index::maintain::{self, Transition};
 use crate::sql::index::{self, RowSide};
-use crate::sql::parse::ast::{ConflictAction, Expr, InsertSource, OrderKey, Statement};
+use crate::sql::parse::ast::{ConflictAction, Expr, InsertSource, LimitValue, OrderKey, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
+use crate::sql::parse::order_limit::limit_u64;
 use crate::sql::storage::catalog;
 use crate::sql::storage::row;
 use crate::sql::storage::schema::{KeyModel, TableSchema, Value};
@@ -305,7 +306,7 @@ pub async fn update(
         &scope,
         filter.as_ref(),
         &order_by,
-        limit,
+        limit.as_ref(),
         sess.txn.as_ref(),
     )
     .await?;
@@ -398,7 +399,7 @@ pub async fn delete(
         &scope,
         filter.as_ref(),
         &order_by,
-        limit,
+        limit.as_ref(),
         sess.txn.as_ref(),
     )
     .await?;
@@ -434,7 +435,7 @@ async fn matched_rows(
     scope: &FromScope,
     filter: Option<&Expr>,
     order_by: &[OrderKey],
-    limit: Option<u64>,
+    limit: Option<&LimitValue>,
     txn: Option<&crate::sql::tx::Txn>,
 ) -> SqlResult<Vec<Vec<Value>>> {
     let mut rows = visible_live_rows(shared, schema, txn).await?;
@@ -442,8 +443,11 @@ async fn matched_rows(
     if !order_by.is_empty() {
         order_rows(&mut rows, order_by, scope)?;
     }
+    // A placeholder LIMIT binds to a literal first; the u64 coercion
+    // (non-negative integer, exactly like a parse-time literal) runs
+    // once per execution here.
     if let Some(l) = limit {
-        rows.truncate(l as usize);
+        rows.truncate(limit_u64(l)? as usize);
     }
     Ok(rows)
 }

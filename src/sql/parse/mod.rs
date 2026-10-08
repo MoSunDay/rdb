@@ -18,6 +18,8 @@ pub(crate) mod translate;
 pub(crate) mod translate_ddl;
 pub(crate) mod translate_dml;
 pub(crate) mod translate_type;
+/// Pre-parse TRIM default-remstr expansion (sqlparser grammar gap).
+pub(crate) mod trim_default;
 
 pub use ast::*;
 pub use error::{ErrorCode, SqlError, SqlResult};

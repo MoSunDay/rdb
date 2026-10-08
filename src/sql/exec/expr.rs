@@ -628,42 +628,13 @@ fn cmp_unsupported(l: &Value, r: &Value) -> SqlError {
     )
 }
 
+/// SQL LIKE matching lives in [`crate::sql::exec::expr_like`] (an
+/// iterative DP; this module's `Expr::Like` arm and the SHOW metadata
+/// surface share it).
+pub(crate) use super::expr_like::like_match;
+
 fn eq_values(l: &Value, r: &Value) -> SqlResult<bool> {
     Ok(cmp_values(l, r)?.is_eq())
-}
-
-/// SQL LIKE with `%` (any run) and `_` (one char); `\` escapes.
-/// Case sensitivity follows storage (bytewise), like MySQL's binary collation.
-/// Shared with the SHOW metadata surface, which case-folds its inputs
-/// FIRST (MySQL SHOW ... LIKE convention) -- the matcher itself stays
-/// bytewise.
-pub(crate) fn like_match(s: &str, pattern: &str) -> bool {
-    fn go(s: &[char], p: &[char]) -> bool {
-        match (p.first(), p.get(1)) {
-            (Some('%'), Some('%')) => go(s, &p[1..]), // collapse %%
-            (Some('%'), _) => {
-                // try matching remainder at every suffix
-                let mut i = 0;
-                loop {
-                    if go(&s[i..], &p[1..]) {
-                        return true;
-                    }
-                    if i >= s.len() {
-                        return false;
-                    }
-                    i += 1;
-                }
-            }
-            (Some('_'), _) => !s.is_empty() && go(&s[1..], &p[1..]),
-            (Some('\\'), Some(c)) => !s.is_empty() && s[0] == *c && go(&s[1..], &p[2..]),
-            (Some(c), _) => !s.is_empty() && s[0] == *c && go(&s[1..], &p[1..]),
-            (None, _) => s.is_empty(),
-        }
-    }
-    go(
-        &s.chars().collect::<Vec<_>>(),
-        &pattern.chars().collect::<Vec<_>>(),
-    )
 }
 
 /// Coerce a value for a typed column on write (INSERT/UPDATE payload).

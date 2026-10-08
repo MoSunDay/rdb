@@ -6,7 +6,7 @@
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::schema::Value;
 
-use super::string::{int_arg, text_arg};
+use super::string::{int_arg, text_arg, MAX_FUNC_RESULT_BYTES};
 use super::wrong_param_count;
 
 /// Evaluate one string_more function; `None` = name not owned here.
@@ -62,6 +62,9 @@ fn substring(name: &str, args: &[Value]) -> SqlResult<Value> {
 
 /// LPAD/RPAD(s, len, pad): len < s truncates; the pad repeats; NULL
 /// pad (or an empty pad that would be needed) is NULL, like MySQL.
+/// The result is exactly `len` characters, and its byte length is
+/// decided BEFORE any buffer is built: past MAX_FUNC_RESULT_BYTES the
+/// call is NULL (a huge `len` must not become a huge allocation).
 fn pad(name: &str, args: &[Value], left: bool) -> SqlResult<Value> {
     let [s, len, pad] = args else {
         return Err(wrong_param_count(name));
@@ -73,18 +76,35 @@ fn pad(name: &str, args: &[Value], left: bool) -> SqlResult<Value> {
     if len < 0 {
         return Ok(Value::Null);
     }
-    let len = len as usize;
+    let want = len as usize;
     let s: Vec<char> = text_arg(s)?.chars().collect();
-    let pad: Vec<char> = text_arg(pad)?.chars().collect();
-    if s.len() >= len {
-        // Truncate to exactly `len` characters (MySQL keeps the head).
-        return Ok(Value::Str(s[..len].iter().collect()));
+    if s.len() >= want {
+        // Truncate to exactly `want` characters (MySQL keeps the head).
+        let bytes: usize = s[..want].iter().map(|c| c.len_utf8()).sum();
+        if bytes > MAX_FUNC_RESULT_BYTES {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Str(s[..want].iter().collect()));
     }
+    let pad: Vec<char> = text_arg(pad)?.chars().collect();
     if pad.is_empty() {
         return Ok(Value::Null);
     }
-    let mut filled: Vec<char> = Vec::with_capacity(len);
-    let need = len - s.len();
+    // Exact result bytes without building it: the kept text plus pad
+    // cycles (u128 -- `want - s.len()` can approach i64 range).
+    let need = want as u128 - s.len() as u128;
+    let cycle: u128 = pad.iter().map(|c| c.len_utf8() as u128).sum();
+    let head: u128 = pad
+        .iter()
+        .take((need % pad.len() as u128) as usize)
+        .map(|c| c.len_utf8() as u128)
+        .sum();
+    let bytes = s.len() as u128 + need / pad.len() as u128 * cycle + head;
+    if bytes > MAX_FUNC_RESULT_BYTES as u128 {
+        return Ok(Value::Null);
+    }
+    let mut filled: Vec<char> = Vec::with_capacity(want);
+    let need = want - s.len();
     while filled.len() < need {
         let take = (need - filled.len()).min(pad.len());
         filled.extend_from_slice(&pad[..take]);
@@ -104,7 +124,9 @@ fn pad(name: &str, args: &[Value], left: bool) -> SqlResult<Value> {
 fn locate(name: &str, args: &[Value]) -> SqlResult<Value> {
     let (needle, hay, from) = match args {
         [n, h] => (n, h, 1),
-        [n, h, from] => (n, h, int_arg(from)?),
+        // NULL start position is NULL before the count coercion.
+        [_, _, Value::Null] => return Ok(Value::Null),
+        [n, h, f] => (n, h, int_arg(f)?),
         _ => return Err(wrong_param_count(name)),
     };
     if matches!(needle, Value::Null) || matches!(hay, Value::Null) {

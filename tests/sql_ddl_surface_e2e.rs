@@ -15,7 +15,8 @@
 //!   WHERE rejected), STATUS (Uptime);
 //! - session funcs bound per execution: USER family, CONNECTION_ID
 //!   (stable per conn, distinct across conns), DATABASE()/SCHEMA()
-//!   tracking USE across prepared re-executes.
+//!   answering across a prepared re-execute; USE of any database but
+//!   the canonical one 1049s.
 
 mod common;
 
@@ -342,10 +343,12 @@ async fn show_create_table_databases_variables_and_status() {
     assert!(uptime.1.parse::<i64>().unwrap() >= 0);
     assert_eq!(text(&mut c, "SHOW STATUS LIKE 'Up%'").await, "Uptime");
 
-    // SHOW DATABASES: the implicit db plus the session's USE target
+    // SHOW DATABASES: the one hosted database; any other USE target is
+    // MySQL's 1049 (the engine registers no other database)
     assert_eq!(text(&mut c, "SHOW DATABASES").await, "rdb");
-    run(&mut c, "USE probe_db").await; // accepted: no registry to check
-    assert_eq!(text(&mut c, "SHOW DATABASES").await, "rdb,probe_db");
+    let e = server_error(&mut c, "USE probe_db").await;
+    // 1049 = ER_BAD_DB_ERROR
+    assert_eq!(e.code, 1049, "{}", e.message);
     run(&mut c, "USE rdb").await;
     node.kill_now();
 }
@@ -366,17 +369,19 @@ async fn session_functions_bind_per_execution() {
     let mut c2 = connect_root(&node).await;
     assert_ne!(one(&mut c2, "SELECT CONNECTION_ID()").await, id);
 
-    // DATABASE()/SCHEMA(): the implicit db until USE changes it
+    // DATABASE()/SCHEMA(): the default db; only the canonical name USEs
     assert_eq!(grid(&mut c, "SELECT DATABASE()").await, "rdb");
     assert_eq!(grid(&mut c, "SELECT SCHEMA()").await, "rdb");
-    // Per-EXECUTION binding: prepared BEFORE the USE, executed after
-    // it, the statement reads the CURRENT database (no stale bind).
+    // Per-EXECUTION binding: prepared BEFORE the USE attempt, executed
+    // after it -- the rejected USE leaves the default db in place and
+    // the exec still answers (this shape once hung).
     let stmt = c.prep("SELECT DATABASE()").await.expect("prep db");
-    run(&mut c, "USE moved_db").await;
+    let e = server_error(&mut c, "USE moved_db").await;
+    assert_eq!(e.code, 1049, "{}", e.message);
     let got: Vec<(String,)> = tokio::time::timeout(Duration::from_secs(10), c.exec(stmt, ()))
         .await
         .expect("exec after USE must answer, not hang")
         .expect("exec database");
-    assert_eq!(got, vec![("moved_db".to_string(),)]);
+    assert_eq!(got, vec![("rdb".to_string(),)]);
     node.kill_now();
 }

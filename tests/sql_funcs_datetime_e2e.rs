@@ -303,6 +303,35 @@ async fn datetime_functions_in_where_and_group_by() {
         got,
         vec![vec![s("2024-03-05"), i(2)], vec![s("2024-03-06"), i(1)]]
     );
+
+    // Lenient text spellings read in the temporal domain: 1-digit
+    // month/day/time fields and over-long fractions (truncated past
+    // the microsecond) match their canonical forms.
+    let got = col(&mut c, "SELECT id FROM ev WHERE at = '2024-3-5 8:0:0'").await;
+    assert_eq!(got, vec![i(1)]);
+    let got = col(&mut c, "SELECT id FROM ev WHERE at = '2024-3-5'").await;
+    assert_eq!(got, vec![], "a bare date is midnight; 08:00:00 != 00:00:00");
+    assert_eq!(
+        one(&mut c, "SELECT DATE('2020-1-1')").await,
+        s("2020-01-01")
+    );
+
+    // The write path accepts the same spellings and truncates the
+    // fraction at the sixth digit; the stored canonical form reads
+    // back through a lenient literal comparison.
+    c.query_drop("INSERT INTO ev (id, at) VALUES (9, '2024-3-6 7:0:0.1234567')")
+        .await
+        .expect("lenient insert");
+    assert_eq!(
+        one(&mut c, "SELECT at FROM ev WHERE id = 9").await,
+        s("2024-03-06 07:00:00.123456")
+    );
+    let got = col(
+        &mut c,
+        "SELECT id FROM ev WHERE at = '2024-03-06 07:00:00.1234567'",
+    )
+    .await;
+    assert_eq!(got, vec![i(9)], "fraction truncates on both sides of =");
     node.kill_now();
 }
 
