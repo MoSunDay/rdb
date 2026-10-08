@@ -17,8 +17,10 @@ M0-M5 **全部执行完毕**：P0/P1 共 41 行标记 `landed M<n>`（各里程�
   2PC）。
 - e2e 发现的两个计划外缺口：**CEIL/FLOOR 关键字形态**（`CEIL(x)` 专用 AST 节点
   曾 1235）——已在 M1 窗口补齐；**prepared 二进制协议数值绑定进文本型占位符列**
-  （如 `COALESCE(NULL, ?)` 静态定型 VAR_STRING）编码器 io 错断连——**开放跟进项**
-  （兼容编码或响亮错误），记录于 `COMPAT.sql.md` deviation ledger。
+  （如 `COALESCE(NULL, ?)` 静态定型 VAR_STRING）编码器 io 错断连——原开放跟进项
+  已于 2026-10-08 收口（按公告列型的兼容编码 + 结果集前预检响亮 1292 ERR，
+  `src/sql/front/conv_bin.rs`，摘要见
+  `features/changelog/2026-10-08/mysql-m5-prepared-numeric-bind.md`）。
 - 偏差按计划固化：plain INSERT pk 重复静默 upsert（决策 2）、byte-wise 大小写
   （决策 3）、GROUP_CONCAT 无内层 ORDER BY（决策 4）、TRUNCATE 按 DDL 语义
   （决策 5，实现为同名换 table_id）。

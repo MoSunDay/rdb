@@ -17,14 +17,10 @@
 
 use std::io::{self, Write};
 
-use opensrv_mysql::{
-    Column, ColumnFlags, ColumnType, ParamValue, RowWriter, ToMysqlValue, ValueInner,
-};
-use tokio::io::AsyncWrite;
-
 use crate::sql::exec::ColMeta;
 use crate::sql::storage::schema::{format_decimal, SqlType, Value};
 use crate::sql::temporal::{self, MICROS_PER_DAY};
+use opensrv_mysql::{Column, ColumnFlags, ColumnType, ParamValue, ToMysqlValue, ValueInner};
 
 /// Engine type of one decoded parameter, or a human-readable rejection
 /// reason for the temporal types the engine cannot store.
@@ -208,35 +204,11 @@ pub fn placeholder_columns(n: usize) -> Vec<Column> {
         .collect()
 }
 
-/// Write one cell of a resultset row.
-///
-/// Null rides on `Option`'s `is_null` (null bitmap; never touches the
-/// per-type encoder), Bool goes out as a signed TINY 0/1 (the `bool`
-/// `ToMysqlValue` impl does not exist; `i8` is the TINY encoder whose
-/// signedness assertion matches our empty column flags), and temporal
-/// cells ride the typed local encoders below.
-pub fn write_value<W>(w: &mut RowWriter<'_, W>, v: &Value) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    match v {
-        Value::Null => w.write_col(None::<i64>),
-        Value::Bool(b) => w.write_col(i8::from(*b)),
-        Value::Int(i) => w.write_col(*i),
-        Value::Double(f) => w.write_col(*f),
-        Value::Decimal(m, s) => w.write_col(DecimalCell(*m, *s)),
-        Value::Date(d) => w.write_col(DateCell(*d)),
-        Value::DateTime(us) => w.write_col(DateTimeCell(*us)),
-        Value::Str(s) => w.write_col(s.as_str()),
-        Value::Bytes(b) => w.write_col(b.as_slice()),
-    }
-}
-
 /// One DATE cell: days since 1970-01-01. Text protocol emits the
 /// canonical `YYYY-MM-DD`; binary requires a MYSQL_TYPE_DATE column
 /// (mirrors opensrv's own chrono `NaiveDate` impl).
 #[derive(Debug)]
-struct DateCell(i64);
+pub(super) struct DateCell(pub i64);
 
 impl ToMysqlValue for DateCell {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -262,7 +234,7 @@ impl ToMysqlValue for DateCell {
 /// is omitted from both wire forms when zero (opensrv's `NaiveDateTime`
 /// behavior).
 #[derive(Debug)]
-struct DateTimeCell(i64);
+pub(super) struct DateTimeCell(pub i64);
 
 impl ToMysqlValue for DateTimeCell {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -302,7 +274,7 @@ impl ToMysqlValue for DateTimeCell {
 /// how MySQL ships NEWDECIMAL -- the binary protocol also embeds the
 /// length-prefixed string.
 #[derive(Debug)]
-struct DecimalCell(i128, u8);
+pub(super) struct DecimalCell(pub i128, pub u8);
 
 impl ToMysqlValue for DecimalCell {
     fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -323,7 +295,7 @@ impl ToMysqlValue for DecimalCell {
 /// spellings are at most 26 bytes and decimal cells at most ~41, well
 /// inside the one-byte lenenc range (< 252), which is exactly what
 /// opensrv's `write_lenenc_str` emits for our sizes.
-fn write_lenenc_text<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn write_lenenc_text<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() >= 252 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -335,7 +307,7 @@ fn write_lenenc_text<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// opensrv's own value/column-type mismatch error style (encode.rs).
-fn bad_col(v: &impl std::fmt::Debug, c: &Column) -> io::Error {
+pub(super) fn bad_col(v: &impl std::fmt::Debug, c: &Column) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!("tried to use {v:?} as {:?}", c.coltype),

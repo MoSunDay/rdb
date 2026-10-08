@@ -33,6 +33,7 @@
 
 pub mod auth;
 pub mod conv;
+pub mod conv_bin;
 pub mod serve;
 pub mod shim;
 pub mod vars;
