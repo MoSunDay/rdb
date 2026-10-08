@@ -197,6 +197,13 @@ pub async fn join_group(
             // somebody else's call): the resolver returns immediately.
             let deadline = session::now_ms() + req.rebalance_timeout_ms + DEADLINE_SLACK_MS;
             wait_state(rt, &req.group, deadline, |st| {
+                let Some(st) = st else {
+                    // Group entry gone under the parked waiter
+                    // (DeleteGroups / FLUSHDB runtime eviction): the
+                    // member is unknown in a group that no longer
+                    // exists; the client re-joins natively.
+                    return Some(err_reply(errors::UNKNOWN_MEMBER_ID, &req.member_id));
+                };
                 let Some(m) = st.members.get(&req.member_id) else {
                     return Some(err_reply(errors::UNKNOWN_MEMBER_ID, &req.member_id));
                 };
@@ -267,6 +274,10 @@ pub async fn sync_group(
                 }
             };
             wait_state(rt, group, deadline, |st| {
+                let Some(st) = st else {
+                    // Same as above: the whole entry was evicted.
+                    return Some(fenced(errors::UNKNOWN_MEMBER_ID));
+                };
                 let Some(m) = st.members.get(member_id) else {
                     return Some(fenced(errors::UNKNOWN_MEMBER_ID));
                 };
@@ -292,16 +303,19 @@ pub async fn sync_group(
     }
 }
 
-/// Park until `resolve` sees a settled answer in the group state.
-/// Registration happens (`enable()`) before the state read, so a
-/// concurrent notify cannot slip between read and await; a permit that
-/// was already stored is consumed by `enable()` and handled by
-/// re-reading the state (never awaited, it would sleep forever).
+/// Park until `resolve` sees a settled answer in the group state; the
+/// closure receives `None` when the group ENTRY itself is gone
+/// (DeleteGroups / FLUSHDB eviction) so it can fence the waiter
+/// instead of parking out its deadline. Registration happens
+/// (`enable()`) before the state read, so a concurrent notify cannot
+/// slip between read and await; a permit that was already stored is
+/// consumed by `enable()` and handled by re-reading the state (never
+/// awaited, it would sleep forever).
 async fn wait_state<T>(
     rt: &Arc<CoordRuntime>,
     group: &str,
     deadline_ms: i64,
-    resolve: impl Fn(&GroupState) -> Option<T>,
+    resolve: impl Fn(Option<&GroupState>) -> Option<T>,
 ) -> Option<T> {
     let remaining = (deadline_ms - session::now_ms()).max(1) as u64;
     let deadline = Instant::now() + Duration::from_millis(remaining);
@@ -315,7 +329,7 @@ async fn wait_state<T>(
                 .groups
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            groups.get(group).and_then(&resolve)
+            resolve(groups.get(group))
         };
         if got.is_some() {
             return got;
@@ -335,6 +349,68 @@ async fn wait_state<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JoinGroup waiter parked in PreparingRebalance must not outlive
+    /// a runtime wipe (FLUSHDB / DeleteGroups): `clear_groups` notifies
+    /// the group, the waiter re-reads an ABSENT entry and answers
+    /// UNKNOWN_MEMBER_ID promptly -- the 5s cap here is far below the
+    /// member's 62s deadline parking, so the pass proves the wakeup
+    /// path (the deadline stays as the no-notify safety net).
+    #[tokio::test]
+    async fn parked_waiter_is_fenced_promptly_by_clear_groups() {
+        let shared = crate::state::testutil::shared_with(crate::state::testutil::test_config());
+        let rt = Arc::new(CoordRuntime::new());
+        let req = |member: &str| JoinReq {
+            group: "g1".into(),
+            member_id: member.into(),
+            candidate_member_id: member.into(),
+            instance_id: None,
+            client_id: "c".into(),
+            client_host: "h".into(),
+            session_timeout_ms: 30_000,
+            rebalance_timeout_ms: 60_000,
+            protocol_type: "consumer".into(),
+            protocol_name: "range".into(),
+            metadata: b"sub".to_vec(),
+        };
+        // m1 completes the first barrier alone (gen 1, Stable); m2's
+        // join kicks PreparingRebalance and parks as Waiting.
+        let r = join_group(&rt, req("m1"), &shared.store).await;
+        assert_eq!(r.error, errors::NONE);
+        let rt2 = Arc::clone(&rt);
+        let store = std::sync::Arc::clone(&shared.store);
+        let waiter = tokio::spawn(async move { join_group(&rt2, req("m2"), &store).await });
+        for _ in 0..500 {
+            if rt
+                .groups
+                .read()
+                .unwrap()
+                .get("g1")
+                .is_some_and(|st| st.members.contains_key("m2"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let groups = rt.groups.read().unwrap();
+        let st = groups.get("g1").expect("m2 joined the table");
+        assert_eq!(
+            st.stage,
+            GroupStage::PreparingRebalance,
+            "m2's join kicked the rebalance"
+        );
+        drop(groups);
+
+        let evicted = crate::kafka::coordinator::clear_groups(&rt);
+        assert_eq!(evicted, vec!["g1".to_string()]);
+
+        let r = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must not park out its 62s deadline")
+            .expect("task alive");
+        assert_eq!(r.error, errors::UNKNOWN_MEMBER_ID);
+        assert!(rt.groups.read().unwrap().is_empty());
+    }
 
     /// A group's first join of this process seeds its generation from
     /// the durable ledger high-water mark: the reply generation is
