@@ -7,7 +7,7 @@ use rocksdb::WriteBatch;
 
 use crate::command::keys_core;
 use crate::command::Ctx;
-use crate::ds::{dump, expire, latch};
+use crate::ds::{codec, dump, expire, latch};
 use crate::hash;
 use crate::resp::client::{self, Reply};
 use crate::resp::codec::{append_error, append_string};
@@ -156,10 +156,42 @@ pub(super) async fn migrate_data(ctx: &mut Ctx<'_>) {
         }
         if !copy {
             let mut batch = WriteBatch::default();
-            crate::command::string::clear_key_family(&mut batch, &prefix, k, &state);
+            // Source removal mirrors `keys_core::delete_records`: the
+            // Enveloped arm passes the STORE through, because stream
+            // deletes must fold the staged 0x1D delay rows in (due-major
+            // keys, stream-matched by scan) -- the batch-only
+            // `clear_key_family` cannot, and a migrated stream would
+            // leave its outstanding delayed messages behind on the
+            // source (the transport now carries them to the target, so
+            // the fold there deletes the last remaining copy).
+            let mut stream_gone = false;
+            match &state {
+                keys_core::KeyState::Missing => {}
+                keys_core::KeyState::RawString { .. } => {
+                    crate::command::string::clear_key_family(&mut batch, &prefix, k, &state);
+                }
+                keys_core::KeyState::Enveloped { kind, expire_ms, .. } => {
+                    let family = codec::family_of(*kind).unwrap_or(codec::STRING_FAMILY);
+                    stream_gone = family == codec::STREAM_FAMILY;
+                    expire::family_delete_entries(
+                        &mut batch,
+                        Some(&ctx.shared.store),
+                        &prefix,
+                        family,
+                        k,
+                        *expire_ms,
+                    );
+                }
+            }
             if let Err(e) = ctx.commit(batch).await {
                 append_error(ctx.out, &format!("ERR: migrate key failed ({e})"));
                 return;
+            }
+            if stream_gone {
+                // Same designed protection as DEL: drop the cached group
+                // offsets with the family, or the 200ms flusher writes
+                // orphan ledger records onto the deleted family.
+                ctx.shared.lite.stream_reaped(&prefix, k);
             }
         }
     }
