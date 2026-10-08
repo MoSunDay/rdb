@@ -84,6 +84,33 @@ pub fn dump_key(store: &Arc<Store>, prefix: &[u8], key: &[u8], now: u64) -> Opti
                     true
                 })
                 .ok()?;
+                // ...and the staged delay rows (kind 0x1D): they are part
+                // of the stream's logical content -- an outstanding
+                // delayed message -- so a transport without them silently
+                // drops it. The delete path folds the same rows
+                // (`expire::family_delete_entries`); the dump must carry
+                // them too or that fold deletes the only copy. Collected,
+                // not deleted: MIGRATE removes the source family only
+                // after the target acked the RESTORE. Same scan-not-range
+                // rationale as the delete fold (rows are due-major, so
+                // stream-keyed collection cannot be a window span).
+                let (dlower, dupper) = codec::delay_window(prefix);
+                ops::for_each_from(store, &dlower, false, &mut |pk, v| {
+                    if pk >= dupper.as_slice() {
+                        return false; // left the 0x1D window
+                    }
+                    if codec::decode_delay_row_key(pk, prefix.len())
+                        .map(|(_, s, _)| s == key)
+                        .unwrap_or(false)
+                    {
+                        records.push(Record {
+                            body: pk[prefix.len()..].to_vec(),
+                            value: v.to_vec(),
+                        });
+                    }
+                    true
+                })
+                .ok()?;
             }
             if records.is_empty() {
                 // Envelope read raced a purge: ship the resolved payload.
@@ -188,11 +215,25 @@ pub fn restore_key(
     let fam = codec::family_of(kind).ok_or_else(bad_payload)?;
     for (i, r) in records.iter().enumerate() {
         let (k, rest) = take(&r.body, 1).ok_or_else(bad_payload)?;
-        let (olen, rest) = be32(rest).ok_or_else(bad_payload)?;
         // Stream dumps also carry Kafka ledger rows: their kind lives in
         // OFFSET_FAMILY (a deliberate outlier -- see KIND_STREAM_OFFSET),
         // accepted here for stream restores.
         let ledger_row = fam == codec::STREAM_FAMILY && k[0] == codec::KIND_STREAM_OFFSET;
+        // ...and staged delay rows (kind 0x1D): due-major layout, NOT
+        // data_key-shaped, so the generic kind|len|key re-root below
+        // cannot parse them. Decode (due, stream, locked id) and
+        // re-encode at the TARGET stream name: same-name restores (and
+        // MIGRATE, which keeps the key name) round-trip byte-identical,
+        // a renamed RESTORE re-targets the row so the exchange lands in
+        // the renamed stream instead of the dead source name.
+        let delay_row = i > 0 && fam == codec::STREAM_FAMILY && k[0] == codec::KIND_STREAM_DELAY;
+        if delay_row {
+            let (due, _src, locked) =
+                codec::decode_delay_row_key(&r.body, 0).ok_or_else(bad_payload)?;
+            batch.put(codec::delay_row_key(prefix, due, key, locked), &r.value);
+            continue;
+        }
+        let (olen, rest) = be32(rest).ok_or_else(bad_payload)?;
         if (i == 0 && k[0] != kind)
             || (codec::family_of(k[0]) != Some(fam) && !ledger_row)
             || rest.len() < olen
