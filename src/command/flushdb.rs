@@ -84,6 +84,15 @@ pub async fn flushdb(ctx: &mut Ctx<'_>) {
     // so the next flush round must not write them back.
     crate::lite::offset::clear_all(&ctx.shared.lite.offsets);
     crate::lite::ordered::clear(&ctx.shared.lite.owners);
+    // Same batch, coordinator half: the kafka group runtime is pure
+    // memory and holds no RocksDB rows, so the wipe above never touched
+    // it -- without this eviction ListGroups (runtime UNION ledger)
+    // would keep answering groups whose ledger rows just died. Purely
+    // local: parked join/sync waiters are notified and re-join (see
+    // `coordinator::clear_groups`). This does NOT disturb the ordering
+    // argument above: any group RECORD still lands-before-wipe via the
+    // latches held since the top. No-op when the kafka front is off.
+    crate::kafka::coordinator::evict_all_groups();
     drop(guards);
     append_string(ctx.out, "OK");
 }

@@ -210,6 +210,10 @@ pub fn bind(addr: &str) -> Result<TcpListener, String> {
 /// and every connection task shares it by Arc.
 pub async fn serve(listener: TcpListener, shared: Arc<state::Shared>) -> ! {
     let coord = Arc::new(coordinator::CoordRuntime::new());
+    // Publish the runtime BEFORE the first accept so RESP-side wipes
+    // (FLUSHDB evicts stale membership through the weak slot) can see
+    // it from the very first connection onward.
+    coordinator::publish(&coord);
     tokio::spawn(coordinator::session::run_sweep(Arc::clone(&coord)));
     loop {
         match listener.accept().await {

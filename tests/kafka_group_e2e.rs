@@ -10,7 +10,7 @@ mod common;
 mod kafka_front_common;
 
 use kafka_front_common::groups::{
-    commit_v2, describe_v0, fetch_offset_v0, heartbeat_v0, join_v1, leave_v0, sync_v1,
+    commit_v2, describe_v0, fetch_offset_v0, heartbeat_v0, join_v1, leave_v0, list_groups, sync_v1,
 };
 use kafka_front_common::{resp_one_shot, spawn_kafka_node, wait_accepting};
 use rdb::kafka::errors;
@@ -238,4 +238,75 @@ async fn leave_and_describe_unknown_member_and_group() {
     assert_eq!(d.protocol_type, "consumer");
     assert_eq!(d.protocol.as_deref(), Some("range"));
     assert_eq!(d.member_ids, vec![id.clone()]);
+}
+
+/// FLUSHDB takes the coordinator's in-memory runtime groups with the
+/// keyspace: the kind-0x20 ledger rows die in the chunked wipe, so a
+/// runtime-only membership left behind would have ListGroups (runtime
+/// UNION ledger) answer a ghost group of a wiped db (regression:
+/// FLUSHDB could not reach the runtime `kafka::serve` owns). After the
+/// wipe the group is gone everywhere, and a rejoin rebuilds it from
+/// scratch at generation 1 -- the ledger high-water was wiped too.
+#[tokio::test]
+async fn flushdb_evicts_runtime_groups_and_rejoin_rebuilds() {
+    let dir = std::env::temp_dir().join(format!("rdb-kafka-flush-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut node = spawn_kafka_node(&dir);
+    let (resp, kafka) = (node.resp.clone(), node.kafka.clone());
+    wait_accepting(&resp, &mut node, "resp").await;
+    seed_stream(&resp).await;
+    wait_accepting(&kafka, &mut node, "kafka").await;
+    let mut m = TcpStream::connect(&kafka).await.expect("connect");
+
+    // Stable runtime group with a committed (ledger) offset on top.
+    let r = join_v1(&mut m, 1, "g-ghost", SESSION_MS, 60_000, "", b"sub[t0]").await;
+    assert_eq!(r.error, errors::MEMBER_ID_REQUIRED);
+    let id = r.member_id.clone();
+    let r = join_v1(&mut m, 2, "g-ghost", SESSION_MS, 60_000, &id, b"sub[t0]").await;
+    assert_eq!(r.error, errors::NONE);
+    let (err, _) = sync_v1(&mut m, 3, "g-ghost", &id, r.generation, &[(id.as_str(), b"[t0p0]")]).await;
+    assert_eq!(err, errors::NONE);
+    assert_eq!(
+        commit_v2(&mut m, 4, "g-ghost", 1, &id, "t", 0, 4).await,
+        errors::NONE
+    );
+    let listed = list_groups(&mut m, 5, 1, &[]).await;
+    assert_eq!(listed.len(), 1, "one group before the wipe: {listed:?}");
+    assert_eq!(
+        (listed[0].0.as_str(), listed[0].2.as_str()),
+        ("g-ghost", "Stable")
+    );
+
+    // FLUSHDB over RESP: data plane, ledger rows and runtime
+    // membership all go in one wipe.
+    let flushed = resp_one_shot(&resp, &[b"FLUSHDB"]).await;
+    // (AUTH's +OK leads the buffer; the LAST frame is FLUSHDB's.)
+    assert!(
+        flushed.ends_with(b"+OK\r\n"),
+        "flushdb reply: {flushed:?}"
+    );
+    assert!(
+        list_groups(&mut m, 6, 1, &[]).await.is_empty(),
+        "no ghost group may outlive the wipe"
+    );
+    assert_eq!(describe_v0(&mut m, 7, "g-ghost").await.state, "Dead");
+
+    // Rejoin rebuilds natively: fresh member id, generation 1 (the
+    // pre-wipe ledger row no longer fences it); once the producer
+    // re-seeds the stream, commits land and read back again.
+    let r = join_v1(&mut m, 8, "g-ghost", SESSION_MS, 60_000, "", b"sub[t0]").await;
+    assert_eq!(r.error, errors::MEMBER_ID_REQUIRED);
+    let id2 = r.member_id.clone();
+    assert_ne!(id2, id, "a fresh member id, not the wiped one");
+    let r = join_v1(&mut m, 9, "g-ghost", SESSION_MS, 60_000, &id2, b"sub[t0]").await;
+    assert_eq!(r.error, errors::NONE);
+    assert_eq!(r.generation, 1, "ledger high-water was wiped");
+    let (err, _) = sync_v1(&mut m, 10, "g-ghost", &id2, 1, &[(id2.as_str(), b"[t0p0]")]).await;
+    assert_eq!(err, errors::NONE);
+    seed_stream(&resp).await;
+    assert_eq!(
+        commit_v2(&mut m, 11, "g-ghost", 1, &id2, "t", 0, 2).await,
+        errors::NONE
+    );
+    assert_eq!(fetch_offset_v0(&mut m, 12, "g-ghost", "t", 0).await, 2);
 }

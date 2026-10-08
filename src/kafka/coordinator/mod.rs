@@ -31,7 +31,7 @@ mod state_tests;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use crate::kafka::errors;
 
@@ -123,6 +123,53 @@ pub fn remove_group(rt: &CoordRuntime, group: &str) -> bool {
     existed
 }
 
+/// The runtime `kafka::serve` created, as a Weak: the slot never keeps
+/// a torn-down front's runtime alive. `serve` is the only writer (one
+/// kafka listener per process, so first writer wins); every other
+/// plane reaches the coordinator through [`evict_all_groups`] and
+/// no-ops when the front never came up.
+static RUNTIME_SLOT: OnceLock<Weak<CoordRuntime>> = OnceLock::new();
+
+/// `kafka::serve` publishes its fresh runtime right after constructing
+/// it, BEFORE the first accept: RESP-side wipes (FLUSHDB) that race the
+/// listener startup then already see the live coordinator.
+pub fn publish(rt: &Arc<CoordRuntime>) {
+    let _ = RUNTIME_SLOT.set(Arc::downgrade(rt));
+}
+
+/// Wipe EVERY runtime group entry (the plural of [`remove_group`]):
+/// FLUSHDB after the keyspace chunks are gone, because the kind-0x20
+/// ledger rows die with the data plane and a runtime-only membership
+/// left behind would have ListGroups answer ghost groups. The notify
+/// map is NOT drained (see [`session::notify_of`]: entries are one per
+/// group name and removal could strand a waiter holding a stale Arc);
+/// parked JoinGroup/SyncGroup waiters are notified per group, re-read
+/// an absent entry and answer UNKNOWN_MEMBER_ID -- and even without the
+/// wakeup `wait_state` parks on a bounded deadline, so nobody waits
+/// forever. Returns the evicted group names.
+pub fn clear_groups(rt: &CoordRuntime) -> Vec<String> {
+    let names: Vec<String> = {
+        let mut groups = rt
+            .groups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        groups.drain().map(|(name, _)| name).collect()
+    };
+    for name in &names {
+        session::notify_group(rt, name);
+    }
+    names
+}
+
+/// RESP-side entry: clear the published runtime's groups, no-op when
+/// the kafka front is disabled (empty `kafka_bind`) or already gone.
+pub fn evict_all_groups() -> Vec<String> {
+    match RUNTIME_SLOT.get().and_then(Weak::upgrade) {
+        Some(rt) => clear_groups(&rt),
+        None => Vec::new(),
+    }
+}
+
 /// Generation/member fencing for OffsetCommit v1+ (the FIRST fence
 /// layer; the ledger's stored generation is the second). Returns the
 /// error code to answer EVERY partition with, or `None` to proceed:
@@ -160,6 +207,57 @@ pub fn commit_fence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_groups_empties_the_table_but_keeps_notify_handles() {
+        let rt = CoordRuntime::new();
+        let mut st = state::new_group("consumer");
+        let args = state::JoinArgs {
+            member_id: "m1",
+            instance_id: None,
+            client_id: "c",
+            client_host: "h",
+            session_timeout_ms: 1000,
+            rebalance_timeout_ms: 4000,
+            protocol_type: "consumer",
+            protocol_name: "range",
+            metadata: b"",
+            now_ms: 0,
+        };
+        let (st2, _, _) = state::join(st.clone(), &args);
+        st = st2;
+        {
+            let mut groups = rt.groups.write().unwrap();
+            groups.insert("g1".into(), st);
+            groups.insert("g2".into(), state::new_group("consumer"));
+        }
+        let handle = session::notify_of(&rt, "g1");
+        let mut evicted = clear_groups(&rt);
+        evicted.sort(); // HashMap drain order is unspecified
+        assert_eq!(evicted, vec!["g1".to_string(), "g2".to_string()]);
+        assert!(rt.groups.read().unwrap().is_empty());
+        // The notify map is deliberately NOT drained: a waiter parked
+        // on g1 still holds a live Arc and the next lookup must hand
+        // out the SAME channel (removal would strand it).
+        assert!(std::sync::Arc::ptr_eq(&handle, &session::notify_of(&rt, "g1")));
+    }
+
+    /// `evict_all_groups` with no published runtime (kafka front off)
+    /// is a plain no-op -- the Weak upgrade fails, nothing panics.
+    /// Nothing in this test binary ever calls `kafka::serve`, so the
+    /// slot is guaranteed empty when this runs.
+    #[test]
+    fn evict_all_groups_noops_without_a_published_runtime() {
+        assert!(evict_all_groups().is_empty());
+        let rt = CoordRuntime::new();
+        rt.groups
+            .write()
+            .unwrap()
+            .insert("g1".into(), state::new_group("consumer"));
+        // Still empty: an UNPUBLISHED runtime is invisible to the slot.
+        assert!(evict_all_groups().is_empty());
+        assert_eq!(rt.groups.read().unwrap().len(), 1);
+    }
 
     #[test]
     fn member_ids_are_unique_and_safe() {
