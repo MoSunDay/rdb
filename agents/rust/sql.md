@@ -12,9 +12,15 @@ Commit: b0d81c9
 ## 模块地图
 - `front/`：MySQL 接入——握手/auth（`auth.rs`，用户密码取自 `mysql_*` 配置）、
   shim（query/prepare/execute 到 `exec::execute` 的桥，按语句是否 INSERT 决定 OK 包
-  是否携带会话 last_insert_id）、线协议值转换（`conv.rs`：文本/二进制 cell 双向，
-  含 DATE/DATETIME 二进制 cell、DECIMAL 的 NEWDECIMAL 文本 cell 与预编译参数解码；
-  列定义按 ColMeta 置 `NOT_NULL_FLAG`/`PRI_KEY_FLAG`）、
+  是否携带会话 last_insert_id）、线协议值转换（`conv.rs`：预编译参数解码（含
+  DATE/DATETIME 二进制参数）、Date/DateTime/Decimal cell 编码器与列定义
+  （按 ColMeta 置 `NOT_NULL_FLAG`/`PRI_KEY_FLAG`）；`conv_bin.rs`：结果集 cell 按公告列型编码——
+  文本协议逐字节委托 opensrv 原实现（NULL 为 0xFB 单字节），二进制路径对静态/
+  运行期类型错配做兼容编码（`?` 定型 VAR_STRING、数值/DATE 绑定出规范文本，
+  与文本协议一致；数值进 DOUBLE/FLOAT、Date↔DateTime 互转、整型列宽收窄），
+  无忠实拼法的组合（字符串对数值列/NULL 对 NOT NULL 列/行长不齐）由
+  `preflight_binary` 在结果集开始前响亮回 1292，shim 的 `write_outcome` 仅
+  prepared 路径启用预检——2026-10-08 收口 M5 开放跟进项，二进制协议不再断连）、
   会话变量拦截（`vars.rs`：`SELECT @@var` 形状识别 + 25 项 sysvar 表，M4 起
   `SHOW [GLOBAL|SESSION] VARIABLES [LIKE]` 与 `SHOW STATUS` 复用同一张表——LIKE
   为 SHOW 专用大小写不敏感匹配，数据 LIKE 保持 bytewise）、连接收尾回滚未决

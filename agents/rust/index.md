@@ -1,4 +1,4 @@
-Commit: 6c8047b
+Commit: 5717168
 # rust（Rust 重写实现）
 
 ## 职责
@@ -74,7 +74,7 @@ Commit: 6c8047b
   - `expire/`：全类型统一 TTL——`mod.rs` 公共谓词/时间/batch 维护与再导出，`lazy.rs` 读路径惰性判定（Arc 场景脱离 worker 的 revalidate 清除），`active.rs` `spawn_active_expire` 后台旋转游标采样（`main.rs` 装配）；测试按 lazy/active 分置 `tests/`；
   - `latch.rs`：用户键分片读写锁（读改写串行化）；`wait.rs`：阻塞命令 WaitHub（BLPOP 族备用）；
   - `hash_ds.rs`/`set_ds.rs`/`setops.rs`：Hash/Set 的派生键读写与集合代数；`json_ds.rs`：JSON 单记录存取（kind 0x10，整文档 envelope+compact body，preserve_order 保序）。`vectorset_ds.rs`：向量集双记录存取（meta=kind 0x11 存 LEB128 dim/count，elem=kind 0x12 存 dim×f64 LE 向量+LEB128 长度前缀属性）与手写 FP16→f64 解码。`search` 家族 kind 0x13–0x18（meta/doc/posting/termstat/ann_centroid/ann_posting，单键族整删）。
-- `sql/`：SQL 数据面（MySQL 接入、MVCC 快照事务、二级/唯一索引与计划器、raft 全局时间戳、跨节点 2PC 写与 scatter-gather 读）——模块地图见 [sql.md](./sql.md)。
+- `sql/`：SQL 数据面（MySQL 接入、MVCC 快照事务、二级/唯一索引与计划器、raft 全局时间戳、跨节点 2PC 写与 scatter-gather 读；mysql-gap M0–M5 后补齐表达式函数族（含 REGEXP）、相关子查询/集合操作/外连接、ODKU/REPLACE/INSERT..SELECT 冲突路径、TRUNCATE/RENAME/ALTER 与 SHOW 会话面——契约与偏差台账 [COMPAT.sql.md](../../COMPAT.sql.md)）——模块地图见 [sql.md](./sql.md)。
 - `router.rs`：MOVED 路由纯函数（`slot <= (index+1)*per_node_slots`，保留 Go 越界本地兜底）、白名单判断。
 - `hash.rs`：CRC-16/XMODEM（与 Go `crc16tab` 同表）与 hash tag 解析。
 - `state.rs`：`Shared`/`RaftState` 共享状态、apply loop（`spawn_apply_loop`，5s apply 超时对齐 Go）、openraft metrics → leader 状态同步。
