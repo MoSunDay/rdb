@@ -170,7 +170,9 @@ pub(super) async fn migrate_data(ctx: &mut Ctx<'_>) {
                 keys_core::KeyState::RawString { .. } => {
                     crate::command::string::clear_key_family(&mut batch, &prefix, k, &state);
                 }
-                keys_core::KeyState::Enveloped { kind, expire_ms, .. } => {
+                keys_core::KeyState::Enveloped {
+                    kind, expire_ms, ..
+                } => {
                     let family = codec::family_of(*kind).unwrap_or(codec::STRING_FAMILY);
                     stream_gone = family == codec::STREAM_FAMILY;
                     expire::family_delete_entries(

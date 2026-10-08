@@ -239,7 +239,10 @@ mod tests {
         // The notify map is deliberately NOT drained: a waiter parked
         // on g1 still holds a live Arc and the next lookup must hand
         // out the SAME channel (removal would strand it).
-        assert!(std::sync::Arc::ptr_eq(&handle, &session::notify_of(&rt, "g1")));
+        assert!(std::sync::Arc::ptr_eq(
+            &handle,
+            &session::notify_of(&rt, "g1")
+        ));
     }
 
     /// `evict_all_groups` with no published runtime (kafka front off)

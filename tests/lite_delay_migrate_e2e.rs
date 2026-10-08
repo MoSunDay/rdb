@@ -177,8 +177,16 @@ fn dump_restore_rename_retargets_the_staged_delay_row() {
         b"+OK\r\n".to_vec()
     );
     assert_eq!(staged_rows(&shared, src), 0, "old name stays vacated");
-    assert_eq!(staged_rows(&shared, dst), 1, "row re-encoded at the new name");
-    assert_eq!(sweep(&shared, later(700_000)), (1, 0), "exchanged, not dropped");
+    assert_eq!(
+        staged_rows(&shared, dst),
+        1,
+        "row re-encoded at the new name"
+    );
+    assert_eq!(
+        sweep(&shared, later(700_000)),
+        (1, 0),
+        "exchanged, not dropped"
+    );
     assert_eq!(call(&shared, "xlen", &[dst]), b":1\r\n".to_vec());
     let range = text(&call(&shared, "xrange", &[dst, b"-", b"+"]));
     assert!(range.contains("moved"), "{range}");
@@ -201,7 +209,15 @@ async fn migrate_moves_outstanding_delay_rows_across_nodes() {
     // deleted stream and revive it -- asserted absent below).
     let id = resp_text(
         &src,
-        &[b"xadd", stream, b"*", b"DELAY", DELAY_MS.to_string().as_bytes(), b"evt", b"moved"],
+        &[
+            b"xadd",
+            stream,
+            b"*",
+            b"DELAY",
+            DELAY_MS.to_string().as_bytes(),
+            b"evt",
+            b"moved",
+        ],
     )
     .await;
     assert!(id.starts_with('$'), "id reply: {id}");
@@ -210,7 +226,15 @@ async fn migrate_moves_outstanding_delay_rows_across_nodes() {
     let r = cmd_one_shot(
         &src,
         TOKEN,
-        &[b"migrate", host.as_bytes(), port.as_bytes(), stream, b"0", b"10000", b"REPLACE"],
+        &[
+            b"migrate",
+            host.as_bytes(),
+            port.as_bytes(),
+            stream,
+            b"0",
+            b"10000",
+            b"REPLACE",
+        ],
     )
     .await;
     assert_eq!(r, b"+OK", "migrate reply: {r:?}");
