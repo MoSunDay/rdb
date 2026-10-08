@@ -149,6 +149,12 @@ Commit: b0d81c9
 - **e2e 盲区（M5）**：`tests/common/mysql.rs` 统一 MySQL e2e 脚手架；LEFT/RIGHT
   OUTER JOIN 与 SQL 面三进程 leader failover 首次 e2e——台账见
   `e2e-coverage.md`。
+- **prepared 二进制协议断连收口（2026-10-08，原 M5 开放跟进项）**：二进制结果集
+  按公告列型打标而静态结果类型是尽力而为（`?` 定型 VAR_STRING），运行期 cell 与
+  公告列不符时原编码器 io 错断连；现按公告列型兼容编码（数值/DATE 绑进文本
+  占位符列出规范文本，如 `COALESCE(NULL, ?)` + 42 绑定 → `"42"`，与文本协议
+  逐字节一致），无忠实拼法的组合在结果集开始前响亮回 1292、连接存活
+  （`src/sql/front/conv_bin.rs`，摘要 `changelog/2026-10-08/mysql-m5-prepared-numeric-bind.md`）。
 - 偏差与 P2 延期（byte-wise 大小写、`Int/Int` 整除、集群 ODKU/REPLACE 1235、
   GROUP_CONCAT 内层排序、复合/前缀索引、ALTER COLUMN、WITH RECURSIVE、KILL 等）
   集中记录于 `COMPAT.sql.md` 的 "MySQL-gap deviation ledger" 条目。
