@@ -66,9 +66,20 @@ C 级与"显式不做"进入按需池固化，避免无触发条件的功能蔓�
 > `features/changelog/2026-10-06/mysql-m{0..5}-*.md`，SQL 契约与偏差台账拆出为
 > `COMPAT.sql.md`，e2e 台账见 `features/e2e-coverage.md`。
 
-> 2026-10-06 注记：Batch 1（WP1 引擎可靠性全部 + WP3 headers 真回放）已落地，
-> 摘要归档 `features/changelog/2026-10-06/mq-engine-batch1.md`；Batch 2
-> （延迟消息/HTTP parity/kafka admin）未开工，计划继续有效。
+> 2026-10-08 注记：P3 池入池三条台账外盲点（#16 服务端消息过滤 / #17 KIP-429
+> 协作式 rebalance / #18 按 key 回查；登记非立项，触发条件见 `05-p3-pool.md` §2），
+> 分诊依据见 `features/changelog/2026-10-08/mq-p3-intake.md`；池内另存 #3 观望行。
+> 同日第二轮复核（换尺子：客户端运维工具 + 横切面）再入池六条并扩显式不做 +5 行
+> （ElectLeaders/PartitionReassignments/DescribeQuorum/UnregisterBroker/KIP-848
+> 新组协议）——#19 kafka admin 运维四件（合并条目）/ #20 XSETID / #21 XREADGROUP
+> NOACK / #22 Fetch 消费计数 / #23 深度-lag-组数 gauge / #24 `allow_ip_list`
+> 死键处置；两轮合计 #16–#24，分诊依据见同 changelog 第二轮节。
+
+> 2026-10-06 注记：Batch 1（WP1 引擎可靠性全部 + WP3 headers 真回放）已落地，摘要
+> 归档 `features/changelog/2026-10-06/mq-engine-batch1.md`；Batch 1.5 评审修复批次
+> 已合入（fda8098 DLQ 水位提交后结算/sweep 批作废、80a3bc2 headers 存储形态、
+> d043311 组语义：DLQ 校验/有序接管/续读游标/DESTROY 折叠账本）；Batch 2
+> （延迟消息/HTTP parity/kafka admin+SASL）为下一批次，推进中。
 
 内部文档：
 

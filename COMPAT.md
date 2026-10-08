@@ -158,7 +158,7 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   without needing a read; previously only the normal listener's store was swept.
 - **Lite Mode (RocketMQ-style, rdb extension)**: parent topics with dynamic per-group queues
   exposed through Streams-verb commands (XADD/XLEN/XRANGE/XTRIM/XDEL/XIDLE/XREAD/XREADGROUP/
-  XACK/XGROUP [CREATE|DESTROY|CREATECONSUMER|DELCONSUMER]/XPENDING/XCLAIM/XAUTOCLAIM/
+  XACK/XGROUP [CREATE|SETID|DESTROY|CREATECONSUMER|DELCONSUMER]/XPENDING/XCLAIM/XAUTOCLAIM/
   XINFO [STREAM|GROUPS|CONSUMERS|TOPICS|LITE]/XPICK). This is not a Redis Streams emulator:
   - PEL is persisted on the reserved KIND_STREAM_PEND (0x0F) window: pend rows
     (`group ++ 0x00 ++ id16BE`, id-ordered) plus a consumer registry
@@ -205,6 +205,14 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
   - XINFO GROUPS replies 7 field/value pairs (14 elements): name, last-delivered-id,
     committed-id, ordered, inflight, owner (nil when unowned), epoch (0 for unordered
     groups). PEL rows carry the owning epoch for observability.
+  - XGROUP SETID (`XGROUP SETID <stream> <group> <id>`, `src/lite/group.rs:495`): resets
+    the group's delivered AND committed watermark in one persist and wakes parked `>`
+    readers (a rewind makes previously consumed entries deliverable again). Deviation:
+    the Redis 7 `ENTRIESREAD` argument is not taken — the arity gate rejects a 5th
+    argument (`wrong number of arguments`); the ledger ignores the parameter rather
+    than faking a counter (2026-10-08 doc catch-up; the verb set itself was missing
+    from this enumeration). The standalone `XSETID` verb is NOT implemented (P3 pool
+    #20 — the last-id rewind half of this pairing).
   - XGROUP CREATE additionally accepts `MAXDELIVERY <n>=1` and `DLQ <name>` (orthogonal
     to ORDERED; DLQ requires MAXDELIVERY): the delivery that would push times_delivered
     past `n` dead-letters the row in ONE WAL batch — PEL row deleted, entry re-queued

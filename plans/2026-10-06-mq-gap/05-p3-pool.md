@@ -53,9 +53,9 @@
 
 | 信号类别 | 形态示例 | 对应条目 |
 |---|---|---|
-| 客户端侧 | SDK 默认行为变化（新版本只发 v2+ 请求）、AdminClient 启动期强依赖、迁移脚本显式使用某子句 | 1–9 |
-| 运维侧 | 长期运行后组查询 / XINFO 输出膨胀、公网暴露后的资源保护诉求 | 8、13、14 |
-| 业务侧 | 按时间戳回溯、审计回填、多播消费问询 | 3、12、15 |
+| 客户端侧 | SDK 默认行为变化（新版本只发 v2+ 请求）、AdminClient 启动期强依赖、迁移脚本显式使用某子句 | 1–9、17、20 |
+| 运维侧 | 长期运行后组查询 / XINFO 输出膨胀、公网暴露后的资源保护诉求 | 8、13、14、19、22–24 |
+| 业务侧 | 按时间戳回溯、审计回填、多播消费问询、订阅子集/按 key 回查 | 3、12、15、16、18、21 |
 
 信号没出现 = 不立项；任一条命中 = 走 §1.3 立项流程。**不允许**以"顺手实现"为由
 绕过触发条件（这正是池与工作包的纪律差异）。
@@ -108,11 +108,35 @@
 > 复核结论"已覆盖、不造私有语法"（证据链在计划 §1），台账注记落在 `COMPAT.md`
 > MQ 节；本表不再单列。
 
+**2026-10-08 入池注记（#16–#18）**：台账复核发现三条池与不做清单均未登记的
+盲点（服务端消息过滤、KIP-429 协作式 rebalance、按 key 回查），按 §5.1 分诊入池。
+性质是**盲点登记**而非立项：复核没有触发信号原文，三条仍按触发条件等信号；
+分诊依据与逐条评估见 `features/changelog/2026-10-08/mq-p3-intake.md`。入池三件套：
+00 号矩阵 C 级入池注记 + 本文 §2/§2.2/§3.5 + 该 changelog 条目。
+
+**2026-10-08 第二轮入池注记（#19–#24）**：同日第二轮完备性复核（换尺子：客户端
+运维工具 + 横切面）发现六条新盲点（kafka admin 运维四件、XSETID、XREADGROUP
+NOACK、fetch 消费计数、深度/lag/组数 gauge、`allow_ip_list` 死键处置），同样按
+§5.1 分诊入池。性质仍是**盲点登记**而非立项（无触发信号原文，六条回到等信号
+状态）；分诊依据与逐条评估见 `features/changelog/2026-10-08/mq-p3-intake.md`
+第二轮节。#19–#23 是能力缺口；#24 例外——登记的是**死键处置**（补执行点或
+评审删键，登记结论即可），不是能力补齐。入池三件套同上：00 号矩阵 C 级第二轮
+入池注记 + 本文 §2/§2.2/§3.6 + 该 changelog 第二轮节。
+
 存留条目：
 
 | # | 条目 | 内容 | 触发条件 | 预估落点 | 预估规模 |
 |---|---|---|---|---|---|
 | 3 | produce timestamp 保留 | ListOffsets by-ts 改用事件时间（现落库即丢弃、按到达时钟） | 下游依赖按时间戳回溯 offset（再评条件：出现按事件时间检索/回放的真实诉求；唯一动存储格式项） | `src/kafka/produce.rs` / `offsets_query.rs` | 中（写入格式 + 存量兼容） |
+| 16 | 服务端消息过滤 | 投递路径无任何过滤（Lite 面定位 RocketMQ 风格，tag/SQL92 语义缺位）；现仅 XPENDING 的 IDLE/consumer 查询过滤 | 消费方工单给出"客户端全量拉取后本地丢弃"的带宽/延迟数据与订阅子集占比，诉求服务端按 tag/属性过滤投递（附消费拓扑） | 新 `src/lite/filter.rs`（表达式解析）+ `src/lite/read_xread.rs` 投递判定；过滤属性载体若需动 envelope，立项时先定格式 | 中（新表达式面 + 投递判定 + 独立 e2e；若动 envelope 接近规模上限） |
+| 17 | KIP-429 协作式 rebalance | 组协调器仅 eager：成员变动全组 rejoin（stop-the-world），JoinGroup 只携带成员单策略、非协商集 | 消费端以 cooperative 策略（如 CooperativeStickyAssignor）上线后出现重平衡停顿或 eager/cooperative 混编报错，附客户端配置与复现步骤（触发后先复核服务端必须改的部分，见 §3.5） | `src/kafka/coordinator/`（`join.rs` 协商、`state.rs` 状态机、`session.rs` 通知）+ `features/kafka-front.md` | 中（状态机分支 + 长等待路径 + e2e） |
+| 18 | 按 key 的消息回查 | 回查仅有按 id（rocksmq `/range`）与按时间（ListOffsets by-ts，且 #3 未决时按到达时钟）；按业务 key 无任何索引 | 对账/排障工单只有业务单号（消息 key），需要定位所在 id/offset，附工单样例与消息保留窗口 | 新二级索引 kind（key → id，族删除登记参照 0x20 账本先例）+ `src/rocksmq/query.rs` 查询面 | 中（写入路径索引维护 + 新 kind + 查询面 + e2e） |
+| 19 | kafka admin 运维四件（合并条目） | OffsetDelete(47)/DeleteRecords(21)/DescribeLogDirs(35)/DescribeCluster(60) 均未广告，Java AdminClient 对应方法即 UnsupportedVersionException；援引 §3.1 admin 面"一并立项"先例，四件合并一行（见 §3.6） | 运维侧引入 Kafka-UI/AKHQ/CMAK 或官方脚本（`--delete-offsets`/`kafka-delete-records`/`kafka-log-dirs.sh`）的工单，附工具版本与报错摘录 | 新 `src/kafka/admin_ops.rs` + conn 分发 | 中（4 个 wire 面 + 独立 e2e） |
+| 20 | XSETID | 动词缺失；与 XGROUP SETID 联动的语义洞——外部重建流后 last_id 不回退，新条目可低于组回退水位（`>` 读者永久不可见，同族问题见延迟消息预约 id 注记） | 迁移/复制工具（redis-shake 等）接入或外部重建流运维诉求，附工具名与复现步骤 | `src/lite/append.rs` / 新 `src/lite/setid.rs` | 小 |
+| 21 | XREADGROUP NOACK | 选项缺失（`src/lite/read.rs:564-574` 文法无此分支）；现投递一律写 PEL 行 | 火焰/旁路免 PEL 消费的工单（临时排查消费不占 PEL、不进重投），附消费拓扑 | `src/lite/read.rs` | 小 |
+| 22 | kafka Fetch 消费计数 | produce 计入 `rdb_lite_messages{op=add}` 但 fetch 零打点（`src/kafka/fetch_records.rs` 无 observe），消费侧速率在 metrics 不可见 | 吞吐对账/消费侧速率监控工单（produce/fetch 计数对不上） | `src/kafka/fetch_records.rs` + `src/monitor.rs`（复用 op=read 或新 label，立项时与 produce 口径对齐定名） | 小 |
+| 23 | 队列深度/consumer-lag/组数量 gauge | 现有仅 PEL backlog 与 DLQ depth（`src/monitor.rs:24-30`），无 entry 深度、lag、组数；**并入** 02 号计划"暂存深度 gauge"未收尾意图（`02-delay-messages.md:177-178`，随本条一并收编） | 容量规划/消费滞后告警工单（需要按流/组的深度与 lag 曲线） | `src/monitor.rs` + `src/lite/mod.rs` 刷新循环 | 中（多 gauge + 刷新成本定界） |
+| 24 | `allow_ip_list` 死键处置 | `src/conf.rs:40-41` 解析但无执行点、文档零登记（与 Go 归档实现的静默偏差） | 公网暴露后的访问控制诉求（或评审决定删键——登记处置结论即可） | `src/conf.rs` + 接入层或删除 | 小 |
 
 列口径：
 
@@ -145,6 +169,15 @@
 | #10–#12 | 04 号交付的 `src/rocksmq/api.rs`、`query.rs` | token 门与 `wait_ms` 语义叠加 |
 | #14 | 01/02 号涉及的 Lite 组模型一线 | GC 判据不得误伤活跃成员 |
 | #2 / #13 | `src/conf.rs` 配置段 | 键名唯一、默认值评审、无敏感默认值 |
+| #16 | 03 号交付的 produce/headers 面；#3 的 envelope 议题 | 过滤属性载体与 headers 存储形态复用优先，动 envelope 须与 #3 同批定演进 |
+| #17 | 03 号交付的组协调器（Batch 2） | join/sync 长等待与世代 fencing 是基线，increment 语义不得破坏既有 e2e |
+| #18 | 04 号交付的 `/range` 与 `src/rocksmq/query.rs` | 查询面叠加 token 门与既有路由，写路径索引维护评估写放大 |
+| #19 | 03 号/P3 回填交付的 admin 面（`admin_topics.rs`/`admin_configs.rs`） | 援引 §3.1"一并立项"先例集中在新 `admin_ops.rs`，conn 分发与版本注册（ApiVersions 广告集）同批，不拆两次起停 |
+| #20 | 01 号交付的 append 面 + 既有 XGROUP SETID（`src/lite/group.rs`） | last_id 回退与组回退水位**联动定界**（只补动词不定界会留"新条目低于组水位"洞），BLOCK 唤醒语义对齐 setid 既有通知 |
+| #21 | 03 号（Batch 2）涉及的 XREADGROUP 投递路径（`src/lite/read.rs`） | NOACK 分支不得写 PEL 行、不进重投 sweep；组语义/有序接管既有 e2e 不回退 |
+| #22 | 03 号交付的 produce 计数（`op=add`） | fetch 侧计数口径（复用 op=read 还是新 label）立项时与 produce 对齐一次定名，避免两套单位 |
+| #23 | 01/02 号的 `src/monitor.rs` gauge 一线 + 02 号未收尾意图（`02:177-178`） | gauge 刷新挂 `src/lite/mod.rs` 既有 200ms 循环；点读聚合（DLQ depth 同款）须评估扫描成本 |
+| #24 | `src/conf.rs` 配置段（#2/#13 同段） | 键名唯一、无敏感默认值；处置可能为**删键**——评审结论只登记去向，不承诺实现 |
 
 ## 3. 分组备注
 
@@ -205,6 +238,42 @@
 - 条目 13 与既有接入面的资源保护策略对齐（与 `src/conf.rs` 现有配置段同一风格），
   不为单一前端发明新语义。
 
+### 3.5 台账外盲点（条目 16–18，2026-10-08 入池）
+
+- 三条同源于台账复核：池与不做清单均未登记，属 Lite 面定位（RocketMQ 风格语义模型）
+  与 Kafka 组面对照下的缺口，**不是**已落地面的缺陷，不走缺陷流程；
+- #16 与 #3 的耦合：若过滤属性需落 envelope，与 #3 同为动存储格式项，立项时**一并**
+  定 envelope 演进方案，避免两次格式迁移；
+- #17 先复核后立项：KIP-429 的增量指派大头在客户端 assignor，触发时先确认服务端
+  必须改的部分（策略协商集、协作式会话/通知语义），确认纯客户端可解则按附录 A 登记
+  分诊结论后关闭，不做客户端侧工作；
+- #18 的索引在写入热路径：立项计划必须带写放大评估、kind 编号与族删除登记
+  （`src/ds/expire/mod.rs` 的 `family_delete_ranges`），且 DLQ/RENAME/delay 搬迁
+  路径同步登记，复用 01/02 号已建立的族登记纪律；
+- 三条均不占 Batch 车道：入池即回到"等信号"状态，§5.3 季度复核将其与 #3 同批检查
+  触发条件是否仍成立。
+
+### 3.6 台账外盲点第二轮（条目 19–24，2026-10-08 同日入池）
+
+- 六条同源于同日第二轮完备性复核，尺子与第一轮不同：**客户端运维工具 + 横切面**
+  （Kafka-UI/AKHQ/CMAK、redis-shake 等迁移工具、metrics/告警/配置面），不是三面
+  语义对照；复核同时收编一条**计划内未收尾意图**——02 号"暂存深度 gauge"
+  （`02-delay-messages.md:177-178`）随 #23 并入，不再单独立项；
+- #19 援引 §3.1 admin 面"一并立项"先例：四个 API 合并为一行、一个计划、一个新
+  模块（`admin_ops.rs`），落点不与既有 `admin_topics.rs`/`admin_configs.rs` 拆两次
+  起停；广告集扩展须同步 `kafka_wire_e2e` 版本注册断言；
+- #20 是**语义洞**而非纯动词补齐：XSETID 回退流 last_id 必须与 XGROUP SETID 回退
+  组水位联动定界——外部重建流后只回组水位不回 last_id，新条目可低于组回退水位而
+  被 `>` 读者永久跳过（与延迟消息"预约 id 低于水位不可见"同族，决策记录见
+  `src/lite/delay.rs` ID POLICY）；立项时两处回退语义一并定；
+- #21/#22/#23 是三条"补线"条目：#21 补文法分支（投递不写 PEL 行，天然不进
+  重投/DLQ 链路）；#22 补 counter（与 produce 的 `op=add` 口径对齐）；#23 补
+  gauge 族（entry 深度/lag/组数，刷新挂既有 200ms 循环，点读聚合须评估成本）；
+- #24 是**处置条目**：触发条件自带两个出口（补执行点或评审删键），结论只需登记
+  处置去向；这是池内唯一不以"实现能力"为默认出口的条目；
+- 六条均不占 Batch 车道，入池即回"等信号"状态；§5.3 季度复核将其与 #3、#16–#18
+  同批检查触发条件是否仍成立。
+
 ## 4. 显式不做清单（终局）
 
 以下各项为**终局决策**：不是"暂缓"，而是除非 `features/mq-lite.md` 路线决策
@@ -224,6 +293,11 @@
 | 消费限流/配额 | fetch 响应 throttle 时间恒 0；限流交客户端侧 | 同上 |
 | TLS | 部署面由 LB / 代理承担 | 同上 |
 | 全量 Redpanda 兼容 | 以 Kafka 官方客户端兼容为准 | 同上 |
+| ElectLeaders(43) | 单节点无 leader election 对象 | 00 号矩阵；单节点定位（`features/kafka-front.md`） |
+| Alter/ListPartitionReassignments(45/46) | 无副本重分配对象——与 ISR 挂起同类，前置是数据面复制（§4.1） | `features/mq-lite.md` 路线决策（final）+ §4.1「C-挂起」 |
+| DescribeQuorum(55) | 控制面是 openraft，不作为 kafka API 暴露 | 同上 |
+| UnregisterBroker(64) | 单 broker 无注销对象 | 同上 |
+| KIP-848 新组协议（ConsumerGroupHeartbeat(65)/ConsumerGroupDescribe(66)） | 经典组协议已覆盖目标客户端，新协议面不开放（与 flexible 版本 / Metadata v8 封顶同口径） | 同上 |
 
 使用口径：
 

@@ -9,7 +9,8 @@ Commit: 5717168
 - 集群路由：key 计算 CRC16 slot，物理存储带 `{slot}/` 前缀；跨节点请求返回 `MOVED` 重定向。
 - 高可用：Raft 心跳观察 + `backup_target_map` 实现故障节点与备份实例的槽位切换；另起只读备份实例（`backup_bind`）。
 - 可观测性：Prometheus metrics（`rdb_command_latency` 直方图、`raft_stats` gauge）。
-- Rust 实现的架构/行为差异见 `COMPAT.md`。
+- Rust 实现的架构/行为差异见 `COMPAT.md`；SQL 数据面（MySQL wire）契约与偏差台账见
+  `COMPAT.sql.md`（2026-10-06 mysql-gap M0-M5 起自 COMPAT.md 拆出）。
 
 ## Agent 模块索引
 - [rust](./agents/rust/index.md) — 当前实现（RESP + openraft + RocksDB，cargo workspace）
@@ -29,4 +30,4 @@ Commit: 5717168
 - [features/index.md](./features/index.md)
 
 ## Plans 索引
-- [plans/index.md](./plans/index.md) — 前瞻计划目录（proposed→accepted→landed/archived，落地后摘要归档 features/changelog/）；在案：`2026-10-06-mq-gap`（MQ 能力差距与分批实施计划；Batch 1 引擎可靠性已落地，见 `features/changelog/2026-10-06/mq-engine-batch1.md`；Batch 1.5/2 已落地，见 `features/changelog/2026-10-06/mq-batch2.md`；P3 按需池已经 `2026-10-07-mq-p3-backfill`（landed）出池收尾，见 `features/changelog/2026-10-07/mq-p3-backfill.md`，#3 timestamp 观望留池）；`2026-10-06-mysql-gap`（MySQL 常用功能缺口对照与补齐，M0–M5 已全量落地，摘要见 `features/changelog/2026-10-06/mysql-m{0..5}-*.md`，契约与偏差台账 `COMPAT.sql.md`，P2 暂缓项回写计划矩阵）
+- [plans/index.md](./plans/index.md) — 前瞻计划目录（proposed→accepted→landed/archived，落地后摘要归档 features/changelog/）；在案：`2026-10-06-mq-gap`（MQ 能力差距与分批实施计划；Batch 1 引擎可靠性已落地，见 `features/changelog/2026-10-06/mq-engine-batch1.md`；Batch 1.5/2 已落地，见 `features/changelog/2026-10-06/mq-batch2.md`；P3 按需池已经 `2026-10-07-mq-p3-backfill`（landed）出池收尾，见 `features/changelog/2026-10-07/mq-p3-backfill.md`，#3 观望留池；2026-10-08 复核两轮共将九条台账外盲点入池登记（#16–#24：#16 服务端消息过滤 / #17 KIP-429 协作式 rebalance / #18 按 key 回查 / #19 kafka admin 运维四件 / #20 XSETID / #21 XREADGROUP NOACK / #22 Fetch 消费计数 / #23 深度-lag-组数 gauge / #24 `allow_ip_list` 死键处置，同轮显式不做 +5 行），见 `features/changelog/2026-10-08/mq-p3-intake.md`）；`2026-10-06-mysql-gap`（MySQL 常用功能缺口对照与补齐，M0–M5 已全量落地，摘要见 `features/changelog/2026-10-06/mysql-m{0..5}-*.md`，契约与偏差台账 `COMPAT.sql.md`，P2 暂缓项回写计划矩阵）

@@ -171,6 +171,34 @@ B 级共性：均为"常用 MQ 客户端开箱即用"所需的最小面补齐；
 - 消费者注册行 idle GC —— ✅ 已落地（三重判据 + kill -9 持久，默认关）
 - 广播消费客户端模式文档化 —— ✅ 已落地（`features/mq-lite.md` 广播节）
 
+**2026-10-08 入池注记**：台账复核发现三条池外盲点，按 `05` §5.1 入池（登记
+**非立项**，无触发信号原文，逐条触发条件见 `05` §2 存留行；分诊依据见
+`features/changelog/2026-10-08/mq-p3-intake.md`）：
+
+- 服务端消息过滤（RocketMQ tag/SQL92 语义缺位）—— ❌ 入池 #16，等信号
+- KIP-429 协作式 rebalance（现仅 eager，全量 stop-the-world）—— ❌ 入池 #17，
+  偏差补记 `features/kafka-front.md` 风险注记
+- 按 key 的消息回查（现仅按 id `/range` 与 ListOffsets by-ts）—— ❌ 入池 #18，
+  等信号
+
+**2026-10-08 第二轮入池注记**：同日第二轮完备性复核（换尺子：客户端运维工具 +
+横切面）再入池六条，按 `05` §5.1 分诊（登记**非立项**，无触发信号原文，逐条触发
+条件见 `05` §2 存留行；分诊依据见 `features/changelog/2026-10-08/mq-p3-intake.md`
+第二轮节）：
+
+- kafka admin 运维四件（OffsetDelete(47)/DeleteRecords(21)/DescribeLogDirs(35)/
+  DescribeCluster(60)，均未广告）—— ❌ 入池 #19（合并条目，援引 `05` §3.1 admin
+  面"一并立项"先例）
+- XSETID 动词缺失（与 XGROUP SETID 联动的 last_id 回退语义洞）—— ❌ 入池 #20
+- XREADGROUP NOACK 选项缺失 —— ❌ 入池 #21
+- kafka Fetch 消费零打点（produce 有 `op=add`、fetch 无 observe）—— ❌ 入池 #22
+- 队列深度/consumer-lag/组数量 gauge（现仅 PEL backlog + DLQ depth；并入 02 号
+  "暂存深度 gauge"未收尾意图）—— ❌ 入池 #23
+- `allow_ip_list` 死键处置（`src/conf.rs` 解析无执行点、文档零登记）—— ❌ 入池
+  #24（处置条目：补执行点或删键，登记结论即可）
+
+同轮显式不做清单 +5 行（见下节表末五行），两轮合计池内存留 #3 + #16–#24。
+
 ## 显式不做
 
 决策依据为 `features/mq-lite.md` 路线决策（final，不再复议）与三面语义边界；
@@ -189,6 +217,11 @@ B 级共性：均为"常用 MQ 客户端开箱即用"所需的最小面补齐；
 | 消费限流 / 配额（throttle 恒 0） | 协议字段保留 0 值，不实现限流语义 |
 | TLS | 传输安全面另案 |
 | 全量 Redpanda 兼容 | 以主流 Kafka 客户端面为准，不做全兼容承诺 |
+| ElectLeaders(43) | 单节点无 leader election 对象（2026-10-08 第二轮入列） |
+| Alter/ListPartitionReassignments(45/46) | 无副本重分配对象——与 ISR 挂起同类，前置是数据面复制 |
+| DescribeQuorum(55) | 控制面是 openraft，不作为 kafka API 暴露 |
+| UnregisterBroker(64) | 单 broker 无注销对象 |
+| KIP-848 新组协议（ConsumerGroupHeartbeat(65)/ConsumerGroupDescribe(66)） | 经典组协议已覆盖目标客户端，新协议面不开放（与 flexible 版本 / Metadata v8 封顶同口径） |
 
 ## 三面覆盖视图
 
@@ -262,7 +295,9 @@ wire 语义，强行映射会破坏 Fetch 的 ordinal 稳定性假设），跨�
   `kafka_rename_ledger_e2e.rs`）+ `tests/kafka_produce_e2e.rs` 既有断言更新。
 - 回归门槛：`tests/lite_ordered_e2e.rs`、`tests/lite_pel_e2e.rs`、
   `tests/flushdb_lite_e2e.rs`、`tests/kafka_offsets_e2e.rs` 全绿，
-  `backup_surface_common` 备份只读面相等断言不回退。
+  `backup_surface_common` 备份只读面相等断言不回退（2026-10-08 复核加注：该
+  断言实为 **allowlist 集合相等**——backup store 现无数据面写入路径，多副本
+  数据面的根因挂 `05` §4.1「C-挂起」）。
 
 ### Batch 2：常用语义补齐
 
