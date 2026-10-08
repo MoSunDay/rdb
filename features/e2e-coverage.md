@@ -119,6 +119,14 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
     增 AdminClient 建/删 topic 步（真实 SDK 走 CreateTopics/DeleteTopics wire）、
     `scenario_lite_mq.sh` 增 XINFO FULL / NOMKSTREAM 步——作为场景层回归入口计入
     本批覆盖，脚本断言随收尾合入。
+- **MQ 缺陷修复（2026-10-08，首次入台账；DUMP 折 0x1D 与 FLUSHDB 逐出协调器，
+  另见同日缺陷修复条目）**：
+  - `lite_delay_migrate_e2e`（3，新文件）：DUMP/RESTORE **同名**还原折 0x1D 暂存行
+    （延迟行随流族搬运、due 语义不丢）、DUMP/RESTORE **改名**搬 0x1D 段（延迟行
+    跟新名，旧名不得复活）、MIGRATE 不丢延迟行（跨节点搬运后仍按 due 交换）。
+  - `kafka_group_e2e`（+1，**追加进既有文件，非新文件**）：flushdb 清库后
+    ListGroups 无幽灵组（流族删除须同步逐出组协调器内存态，组面查询不得残留
+    已删流上的组）。
 - **SQL 兼容收敛（2026-10-06 MySQL-gap M0-M5，首次入台账；计划
   `plans/2026-10-06-mysql-gap/`，逐里程碑 `changelog/2026-10-06/mysql-m*.md`）**：
   - `sql_query_semantics_e2e`（6）：ORDER BY/GROUP BY 序数（`'1'`/`-1`/`1+1` 常量键
@@ -162,6 +170,10 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
     与 UPDATE ORDER BY 中的会话函数绑定。
   - `sql_e2e`：+prepared `LIMIT ? OFFSET ?` 参数序（换位即错的数据）与
     `LIMIT ?, ?` 双占位符 1064。
+  - `sql_e2e`（2026-10-08）：+prepared 数值/DATE 绑定进文本定型占位符列
+    （`COALESCE(NULL, ?)` 出规范文本、DOUBLE 定型投影吃 Int 运行 cell、同一连接
+    后续查询存活——二进制协议断连回归；暂存 src 重跑以 `connection closed`
+    失败验证过用例真实覆盖）。
   - `sql_funcs_numeric_e2e`（8）/`sql_funcs_string_e2e`（7）：+整型溢出 1690 措辞
     负矩阵 ×5（Add/Sub/Mul/Div/Neg）、CONCAT_WS 空串参数分隔符矩阵。
   - 既有套件更新：`mysql_compat_e2e`（M3 增 INTERSECT/EXCEPT DISTINCT/ALL 与混合链

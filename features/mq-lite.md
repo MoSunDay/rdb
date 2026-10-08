@@ -114,8 +114,12 @@
 ### 可观测性与基准
 - `rdb_lite_backlog` gauge：各组缓存 pending 计数之和；首次加载组时从盘上重算。
 - `rdb_lite_dlq_depth` gauge：全部在册 DLQ 目标流的条目深度之和（点读聚合）。
+- `rdb_lite_streams{kind=live|reaped}` gauge：活跃 / 被收割（XIDLE 到期等）流的计数，
+  随 200ms 后台循环刷新（2026-10-08 补登——指标既有、文档漏记）。
+- `rdb_lite_offset_dirty` gauge：等待 200ms 批量刷盘的组水位条数（同上补登）。
 - `rdb_lite_messages{op=...}` counter：按操作计数，新增 `dlq`（死信转移条数）与
-  `redeliver`（空闲重投条数）两个 op。
+  `redeliver`（空闲重投条数）两个 op；另有 `dlq_fail`（重投/DLQ sweep 批次作废——
+  无人值守路径以 stderr 留痕并计数，`src/lite/redeliver.rs`；同上补登）。
 - bench 新增工况：`xadd` / `xreadgroup` / `xack`。
 
 ### DLQ 与 MAXDELIVERY（死信队列）
@@ -405,3 +409,5 @@ owner 与普通成员一样回收（队列由下一个询问者接管）。
 - 本批落地：[changelog 2026-09-09](./changelog/2026-09-09/mq-ordered-groups.md)
 - 引擎可靠性批次：[changelog 2026-10-06](./changelog/2026-10-06/mq-engine-batch1.md)
 - P3 按需池回填（XADD 选项/XCLAIM 提示/XINFO FULL/GC/广播）：[changelog 2026-10-07](./changelog/2026-10-07/mq-p3-backfill.md)
+- 服务端消息过滤（#16）与按 key 回查（#18）未提供——2026-10-08 盲点入池登记（非
+  立项，触发条件见 [plans 05-p3-pool §2](../plans/2026-10-06-mq-gap/05-p3-pool.md)）

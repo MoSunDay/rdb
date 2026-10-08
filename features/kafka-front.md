@@ -506,6 +506,11 @@ delete_topics_folds_family_collateral`）。
 
 
 ## 风险注记（显式接受）
+- **rebalance 仅 eager（KIP-429 协作式未支持，2026-10-08 补记）**：组协调器按 eager
+  语义应答——成员单策略随 JoinGroup 转发（非协商集），任何成员变动触发全组 rejoin
+  （stop-the-world），协作式 assignor 依赖的增量指派/会话语义未实现；协作者混编
+  eager 组的行为不在承诺内。已登记按需池 #17，触发条件见
+  `plans/2026-10-06-mq-gap/05-p3-pool.md` §2。
 - **单节点持久性是既知风险**：当年否决 Kafka front 的理由仍然成立——Kafka 客户端
   默认预期 acks=all/ISR/幂等，而 rdb 数据面（含 Lite 元数据）不经 raft 复制。接受
   Kafka 连接意味着"看起来像 Kafka、故障时没有 ISR"。本路线以**协议前置 + 显式偏差
