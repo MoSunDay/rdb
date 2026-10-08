@@ -264,7 +264,15 @@ async fn flushdb_evicts_runtime_groups_and_rejoin_rebuilds() {
     let id = r.member_id.clone();
     let r = join_v1(&mut m, 2, "g-ghost", SESSION_MS, 60_000, &id, b"sub[t0]").await;
     assert_eq!(r.error, errors::NONE);
-    let (err, _) = sync_v1(&mut m, 3, "g-ghost", &id, r.generation, &[(id.as_str(), b"[t0p0]")]).await;
+    let (err, _) = sync_v1(
+        &mut m,
+        3,
+        "g-ghost",
+        &id,
+        r.generation,
+        &[(id.as_str(), b"[t0p0]")],
+    )
+    .await;
     assert_eq!(err, errors::NONE);
     assert_eq!(
         commit_v2(&mut m, 4, "g-ghost", 1, &id, "t", 0, 4).await,
@@ -281,10 +289,7 @@ async fn flushdb_evicts_runtime_groups_and_rejoin_rebuilds() {
     // membership all go in one wipe.
     let flushed = resp_one_shot(&resp, &[b"FLUSHDB"]).await;
     // (AUTH's +OK leads the buffer; the LAST frame is FLUSHDB's.)
-    assert!(
-        flushed.ends_with(b"+OK\r\n"),
-        "flushdb reply: {flushed:?}"
-    );
+    assert!(flushed.ends_with(b"+OK\r\n"), "flushdb reply: {flushed:?}");
     assert!(
         list_groups(&mut m, 6, 1, &[]).await.is_empty(),
         "no ghost group may outlive the wipe"

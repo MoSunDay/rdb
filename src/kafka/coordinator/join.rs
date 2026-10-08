@@ -392,14 +392,18 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let groups = rt.groups.read().unwrap();
-        let st = groups.get("g1").expect("m2 joined the table");
-        assert_eq!(
-            st.stage,
-            GroupStage::PreparingRebalance,
-            "m2's join kicked the rebalance"
-        );
-        drop(groups);
+        // Scoped read: a lexically-ended block keeps the guard's
+        // borrow region clear of the await below (clippy
+        // await_holding_lock).
+        {
+            let groups = rt.groups.read().unwrap();
+            let st = groups.get("g1").expect("m2 joined the table");
+            assert_eq!(
+                st.stage,
+                GroupStage::PreparingRebalance,
+                "m2's join kicked the rebalance"
+            );
+        }
 
         let evicted = crate::kafka::coordinator::clear_groups(&rt);
         assert_eq!(evicted, vec!["g1".to_string()]);
