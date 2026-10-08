@@ -119,7 +119,9 @@
 
 ## P3 已落地范围
 - **组协调器**（`coordinator/`）：**纯内存 membership**（重启即失，客户端原生
-  rejoin 即恢复；committed offsets 在 0x20 账本持久，不受影响）+ eager rebalance。
+  rejoin 即恢复；committed offsets 在 0x20 账本持久，不受影响。2026-10-08 起
+  **FLUSHDB 同批逐出** runtime 组——清库后 ListGroups 不再报幽灵组，parked
+  join/sync 等待者即回 UNKNOWN_MEMBER_ID，rejoin 按新世代重建）+ eager rebalance。
   - 状态机（`state.rs`，纯函数）：`Empty → PreparingRebalance(JoinGroup 阻塞或
     session 超时) → CompletingSync(SyncGroup 屏障) → Stable(Heartbeat) →(leave/
     expire/rebalance)→ …`；组转 Empty 时 generation+1。事件经 `Event` 列表由

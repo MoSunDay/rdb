@@ -192,7 +192,10 @@
   覆盖目标）显式**扫描折叠**该 slot 0x1D 窗口中目标流的行；`move_family`（RENAME）
   同法把 0x1D 段搬到新名；FLUSHDB 经 `classify`（0x1D 记为 typed family member）
   随全库清除。漏登记 = 已删流被暂存行复活投递（P0）——`lite_delay_e2e` 三连回归
-  （XIDLE/RENAME/FLUSHDB）逐一断言。
+  （XIDLE/RENAME/FLUSHDB）逐一断言。**搬运路径同折**（2026-10-08 缺陷
+  修复）：DUMP 流载荷携带 0x1D 行、RESTORE 落地时重定根到目标流名（改名恢复
+  due/locked_id 保真）、MIGRATE 源删镜像删除路径折删——延迟消息经
+  DUMP/RESTORE/MIGRATE **不丢**（`lite_delay_migrate_e2e` 三连断言）。
 - **兜底守卫**：sweep 交换前在 latch 下重读流 meta——meta 缺失（族已被删/搬走）时
   **只删暂存行、不投递**，任何竞态漏出的孤儿行不可能复活已删流。
 - **kafka 面不暴露**：Produce 面无延迟参数；Fetch 只见到期后的普通 entry。RESP
