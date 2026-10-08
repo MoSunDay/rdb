@@ -337,11 +337,20 @@ contract; module map lives in `agents/rust/sql.md`.
   stays available); (5) GROUP_CONCAT has no inner ORDER BY. Deferred on purpose (P2,
   tracked in `plans/2026-10-06-mysql-gap/gap-matrix.md`): composite/prefix secondary
   indexes, ALTER ADD/MODIFY/DROP COLUMN (schema migration is its own project), WITH
-  RECURSIVE, window functions, KILL, multi-statement batches. Known protocol
-  limitation (open follow-up): in the prepared binary protocol, binding a NUMERIC
-  value into a text-typed placeholder column (e.g. `COALESCE(NULL, ?)` statically
-  types as VAR_STRING) fails the server encoder with an io error and drops the
-  connection — bind text until compatible coercion or a loud error lands.
+  RECURSIVE, window functions, KILL, multi-statement batches. Protocol follow-up
+  CLOSED (2026-10-08, was the M5 open follow-up — see
+  `features/changelog/2026-10-08/mysql-m5-prepared-numeric-bind.md`): the prepared
+  binary protocol is type-tagged by the announced column while the static result
+  typing is best-effort (a `?` placeholder types as VAR_STRING until EXECUTE binds),
+  so a runtime cell can disagree with the promised column. Such cells now encode IN
+  the announced column's wire form wherever a faithful spelling exists
+  (`src/sql/front/conv_bin.rs` compatible coercion: a numeric bound into a
+  text-typed placeholder column ships as its canonical text, byte-identical to the
+  text protocol; numerics into DOUBLE/FLOAT, Date<->DateTime cross forms, integer
+  width narrowing likewise). A combination with no faithful spelling (e.g. a string
+  cell against a numeric column, NULL against an announced NOT NULL column) is
+  pre-flighted before the resultset starts and answers a loud 1292 ERR packet —
+  the connection survives instead of dying on a mid-row encoder io error.
 - **Numeric overflow & integer widths** (2026-10-07, mysql-hardening H0 review 问五 —
   intentional deviations, marked; numbering continues the ledger above): (6) integer
   overflow travels the WRONG error channel: engine integer arithmetic — Add/Sub/Mul/

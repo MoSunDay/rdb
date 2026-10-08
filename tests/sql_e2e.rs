@@ -154,6 +154,45 @@ async fn ddl_dml_select_full_flow() {
     let got = rows(&mut c, "SELECT name FROM users WHERE id = 10").await;
     assert_eq!(got, vec![vec![s("eva")]]);
 
+    // mysql-gap open follow-up (2026-10-08 landed): the binary protocol
+    // is type-tagged by the announced column, and a `?` placeholder
+    // statically types as VAR_STRING -- binding a NUMERIC (or DATE)
+    // value used to fail the encoder with an io error and DROP the
+    // connection. The cell now coerces compatibly (canonical text,
+    // exactly what the text protocol ships) and the connection lives.
+    let got: Vec<(String, String)> = c
+        .exec(
+            "SELECT COALESCE(NULL, ?), COALESCE(NULL, ?)",
+            (42i64, 1.5f64),
+        )
+        .await
+        .expect("numeric bind into text-typed placeholder");
+    assert_eq!(got, vec![("42".to_string(), "1.5".to_string())]);
+
+    let got: Vec<(String,)> = c
+        .exec(
+            "SELECT COALESCE(NULL, ?)",
+            (mysql_async::Value::Date(2024, 2, 29, 0, 0, 0, 0),),
+        )
+        .await
+        .expect("date bind into text-typed placeholder");
+    // (the param may arrive as DATE or midnight DATETIME; either way the
+    // cell ships as canonical text instead of dropping the connection)
+    assert_eq!(got.len(), 1);
+    assert!(got[0].0.starts_with("2024-02-29"), "{}", got[0].0);
+
+    // A projection statically typed DOUBLE surviving an Int runtime
+    // cell (CASE types from its first THEN) coerces to the f64 wire form.
+    let got: Vec<(f64,)> = c
+        .exec("SELECT CASE WHEN ? > 0 THEN 0.5 ELSE 1 END", (-1i64,))
+        .await
+        .expect("int runtime cell in a double-typed column");
+    assert_eq!(got, vec![(1.0,)]);
+
+    // The same connection still works afterwards (no dropped conn).
+    let got = rows(&mut c, "SELECT COUNT(*) FROM users").await;
+    assert_eq!(got, vec![vec![int(4)]]);
+
     // LIMIT ? OFFSET ? binds limit-then-offset (the text order):
     // ids > 1 are 2, 3, 10; offset 1 skips 2, limit 2 takes 3 and 10.
     let got: Vec<(i64,)> = c

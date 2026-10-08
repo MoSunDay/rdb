@@ -20,7 +20,7 @@ use tokio::io::AsyncWrite;
 use tokio::sync::Mutex;
 
 use crate::sql::exec::{self, ExecOutcome, SqlSession};
-use crate::sql::front::{auth, conv, vars};
+use crate::sql::front::{auth, conv, conv_bin, vars};
 use crate::sql::parse::ast::Statement;
 use crate::sql::parse::error::SqlResult;
 use crate::sql::parse::{bind_placeholders, parse_statement, placeholder_count};
@@ -159,7 +159,7 @@ where
             let insert_id = if is_insert { wire_insert_id(&sess) } else { 0 };
             (out, insert_id)
         };
-        write_outcome(results, out, insert_id).await
+        write_outcome(results, out, insert_id, false).await
     }
 
     async fn on_prepare<'a>(
@@ -228,7 +228,7 @@ where
             let insert_id = if is_insert { wire_insert_id(&sess) } else { 0 };
             (out, insert_id)
         };
-        write_outcome(results, out, insert_id).await
+        write_outcome(results, out, insert_id, true).await
     }
 
     async fn on_close(&mut self, stmt: u32) {
@@ -294,10 +294,20 @@ fn wire_insert_id(sess: &SqlSession) -> u64 {
 /// Encode one executor outcome (or error) as a MySQL response. Shared by
 /// the text and binary (prepared) paths. `insert_id` rides the OK
 /// packet's `last_insert_id` field (0 for non-INSERT statements).
+///
+/// `binary` marks the prepared path: the binary resultset is
+/// type-tagged by the announced columns, so before any resultset bytes
+/// go out every cell is pre-flighted against its column (see
+/// `conv_bin::preflight_binary`) -- a runtime value without a faithful
+/// spelling (the static result typing is best-effort) answers a loud
+/// 1292 ERR instead of an encoder io error dropping the connection;
+/// encodable mismatches coerce compatibly (an Int bound into a
+/// VAR_STRING placeholder column ships as the text "42").
 async fn write_outcome<W>(
     results: QueryResultWriter<'_, W>,
     out: SqlResult<ExecOutcome>,
     insert_id: u64,
+    binary: bool,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Send + Unpin,
@@ -322,10 +332,21 @@ where
         }
         Ok(ExecOutcome::Rows { columns, rows }) => {
             let cols = conv::colmetas_to_columns(&columns);
+            if binary {
+                if let Err(e) = conv_bin::preflight_binary(&rows, &cols) {
+                    results
+                        .error(
+                            ErrorKind::ER_TRUNCATED_WRONG_VALUE,
+                            e.to_string().as_bytes(),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
             let mut w = results.start(&cols).await?;
             for row in rows {
                 for cell in &row {
-                    conv::write_value(&mut w, cell)?;
+                    conv_bin::write_value(&mut w, cell)?;
                 }
                 w.end_row().await?;
             }
