@@ -10,8 +10,7 @@ mod common;
 
 use common::mysql::{
     assert_exprs, col, col_types, ddl, funcs_node, i, one, rows, s, server_error,
-    ER_NOT_SUPPORTED_YET, ER_PARSE_ERROR, ER_TRUNCATED_WRONG_VALUE,
-    ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+    ER_NOT_SUPPORTED_YET, ER_TRUNCATED_WRONG_VALUE, ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
 };
 use mysql_async::consts::ColumnType::*;
 use mysql_async::prelude::*;
@@ -55,6 +54,10 @@ async fn string_family_spot_checks() {
             ("TRIM(BOTH 'x' FROM 'xxxbarxxx')", s("bar")),
             ("TRIM(LEADING 'x' FROM 'xxxbarxxx')", s("barxxx")),
             ("TRIM(TRAILING 'x' FROM 'xxxbarxxx')", s("xxxbar")),
+            // Keyword with no remstr: remstr defaults to one space.
+            ("TRIM(BOTH FROM '  bar  ')", s("bar")),
+            ("TRIM(LEADING FROM '  bar  ')", s("bar  ")),
+            ("TRIM(TRAILING FROM '  bar  ')", s("  bar")),
             ("REVERSE('abc')", s("cba")),
             ("HEX('abc')", s("616263")),
             ("HEX(255)", s("00000000000000FF")),
@@ -332,9 +335,30 @@ async fn string_negative_matrix() {
         other => panic!("expected prepare error for LPAD, got {other:?}"),
     };
     assert_eq!(e.code, ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT, "{}", e.message);
-    // GROUP_CONCAT with no argument is a parse error.
+    // GROUP_CONCAT with no argument is the native-function arity
+    // error (MySQL 1582), same as the other aggregates.
     let e = server_error(&mut c, "SELECT GROUP_CONCAT()").await;
-    assert_eq!(e.code, ER_PARSE_ERROR, "{}", e.message);
+    assert_eq!(e.code, ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT, "{}", e.message);
+    // Aggregate wrong-arity is 1582 too (MySQL's native-function
+    // code), not the 1235 unsupported shape.
+    for sql in [
+        "SELECT SUM(1, 2)",
+        "SELECT COUNT(1, 2)",
+        "SELECT AVG(1, 2)",
+        "SELECT MIN()",
+        "SELECT MAX()",
+        "SELECT SUM()",
+    ] {
+        let e = match c.prep(sql).await {
+            Err(mysql_async::Error::Server(e)) => e,
+            other => panic!("expected prepare error for {sql}, got {other:?}"),
+        };
+        assert_eq!(
+            e.code, ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+            "{sql}: {}",
+            e.message
+        );
+    }
     // Unknown function names stay loud (1235), never NULL.
     let e = server_error(&mut c, "SELECT NO_SUCH_FN(1)").await;
     assert_eq!(e.code, ER_NOT_SUPPORTED_YET, "{}", e.message);
@@ -343,5 +367,25 @@ async fn string_negative_matrix() {
         "{}",
         e.message
     );
+    node.kill_now();
+}
+
+#[tokio::test]
+async fn oversized_string_results_are_null() {
+    // REPEAT/LPAD/RPAD cap the RESULT at 16 MiB (the max MySQL wire
+    // packet): a request past the cap is NULL (like MySQL against
+    // max_allowed_packet), never an unbounded allocation.
+    let (mut node, mut c) = funcs_node("caps").await;
+    assert_exprs(
+        &mut c,
+        &[
+            ("REPEAT('x', 1073741824)", MVal::NULL),
+            ("LPAD('x', 1073741824, '?')", MVal::NULL),
+            ("RPAD('x', 1073741824, '?')", MVal::NULL),
+            // Small shapes keep their answers.
+            ("REPEAT('x', 3)", s("xxx")),
+        ],
+    )
+    .await;
     node.kill_now();
 }

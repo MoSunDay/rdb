@@ -16,6 +16,9 @@ pub mod ddl;
 pub(crate) mod ddl_alter;
 pub mod expr;
 mod expr_decimal;
+/// SQL LIKE wildcard matcher (iterative DP; shared by `Expr::Like`
+/// and the SHOW metadata surface).
+pub(crate) mod expr_like;
 /// Scalar-function family dispatch (pure, stateless): the single
 /// `eval_func` entry plus the CASE/CAST/bit-op helpers the expression
 /// executor routes through.

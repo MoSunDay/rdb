@@ -13,6 +13,14 @@ use crate::sql::temporal;
 
 use super::wrong_param_count;
 
+/// Hard cap on one string-function RESULT: 16 MiB (1 << 24), the
+/// maximum MySQL wire packet. A result that would exceed it is NULL --
+/// mirroring MySQL returning NULL when a function result outgrows
+/// max_allowed_packet -- and the decision is always made BEFORE the
+/// buffer is built (REPEAT/LPAD/RPAD share this bound; string_more
+/// re-uses it via `super::string`).
+pub(super) const MAX_FUNC_RESULT_BYTES: usize = 1 << 24;
+
 /// Evaluate one string-family function; `None` = name not owned here.
 pub fn eval(name: &str, args: &[Value]) -> Option<SqlResult<Value>> {
     match name {
@@ -125,6 +133,13 @@ fn repeat(name: &str, args: &[Value]) -> SqlResult<Value> {
     }
     let s = text_arg(s)?;
     let n = int_arg(n)?.max(0);
+    // Decide on the exact byte length FIRST (u128: the product of the
+    // two i64-ish inputs can far exceed usize on paper): a repeat
+    // whose result would pass the cap is NULL without ever building
+    // the oversized buffer.
+    if n as u128 * s.len() as u128 > MAX_FUNC_RESULT_BYTES as u128 {
+        return Ok(Value::Null);
+    }
     Ok(Value::Str(s.repeat(n as usize)))
 }
 

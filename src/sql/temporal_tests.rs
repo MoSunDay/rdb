@@ -57,9 +57,14 @@ fn date_parse_rejects_non_canonical_forms() {
         "",
         "2024-02-29 ",
         " 2024-02-29",
-        "2024-2-29",
-        "2024-02-9",
+        // Lenient fields stay 1..=2 digits with dashes as separators.
+        "2024-123-01",
+        "2024-1-100",
+        "2024-1--1",
         "2024/02/29",
+        "2024_1_1",
+        "202-1-1",
+        "12024-1-1",
         "2024-00-15",
         "2024-13-15",
         "2024-01-00",
@@ -73,6 +78,33 @@ fn date_parse_rejects_non_canonical_forms() {
         "2024-01-15T00:00:00",
     ] {
         assert_eq!(parse_date(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn lenient_month_day_spellings_match_canonical() {
+    // One-digit month/day are the same civil dates as zero-padded.
+    for (lenient, canonical) in [
+        ("2020-1-1", "2020-01-01"),
+        ("2020-12-1", "2020-12-01"),
+        ("2020-1-31", "2020-01-31"),
+        ("2024-2-29", "2024-02-29"),
+        ("0999-9-9", "0999-09-09"),
+    ] {
+        assert_eq!(parse_date(lenient), parse_date(canonical), "{lenient}");
+        assert_eq!(parse_datetime(lenient), parse_datetime(canonical));
+    }
+    // Calendar checks do not relax: month 0/13, day 0/32, Feb 30.
+    for bad in [
+        "2020-0-1",
+        "2020-13-1",
+        "2020-1-0",
+        "2020-1-32",
+        "2021-2-29",
+        "2020-4-31",
+    ] {
+        assert_eq!(parse_date(bad), None, "{bad}");
+        assert_eq!(parse_datetime(bad), None, "{bad}");
     }
 }
 
@@ -105,9 +137,18 @@ fn datetime_accepts_canonical_forms() {
         day * MICROS_PER_DAY + (13 * 3600 + 45 * 60 + 59) * 1_000_000
     );
     assert_eq!(d("20240229134559"), d("2024-02-29 13:45:59"));
-    // Fractions are micros, 1..=6 digits, right-padded.
+    // Fractions are micros, 1..=6 digits, right-padded; a longer one
+    // truncates past the sixth digit instead of rejecting.
     assert_eq!(d("2024-02-29 00:00:00.5"), d("2024-02-29 00:00:00.500000"));
     assert_eq!(d("2024-02-29 00:00:00.000001") % 1_000_000, 1);
+    assert_eq!(
+        d("2024-02-29 13:45:59.1234567"),
+        d("2024-02-29 13:45:59.123456")
+    );
+    assert_eq!(d("2024-02-29 13:45:59.9999999") % 1_000_000, 999_999);
+    // Lenient time-of-day fields ride the same parser.
+    assert_eq!(d("2024-2-29 1:2:3"), d("2024-02-29 01:02:03"));
+    assert_eq!(d("2024-02-29T1:2:3"), d("2024-02-29 01:02:03"));
     assert!(d("1969-12-31 23:59:59") < 0);
 }
 
@@ -121,8 +162,9 @@ fn datetime_parse_rejects_non_canonical_forms() {
         "2024-02-29 13:60:59",
         "2024-02-29 13:45:60",
         "2024-02-29 13:45:59.",
-        "2024-02-29 13:45:59.1234567",
         "2024-02-29 13:45:59.12.34",
+        "2024-02-29 13:45:59.12a",
+        "2024-2-29 13:455:59",
         "2024022913455",
         "202402291345599",
         "2024-13-01 00:00:00",

@@ -232,6 +232,14 @@ async fn ddl_dml_select_full_flow() {
 
     // ---- USE / cosmetic SET tolerated (session settings rejected) ----
     c.query_drop("USE rdb").await.expect("use");
+    // Single-database engine: any other name is MySQL's 1049.
+    let err = c.query_drop("USE nodb").await.expect_err("use nodb");
+    let mysql_async::Error::Server(e) = err else {
+        panic!("expected server error for USE nodb");
+    };
+    // 1049 = ER_BAD_DB_ERROR ("Unknown database 'x'")
+    assert_eq!(e.code, 1049, "errno: {}", e.code);
+    assert!(e.message.contains("nodb"), "{}", e.message);
     c.query_drop("SET sql_mode = ''").await.expect("set");
     let got = rows(&mut c, "SHOW TABLES").await;
     assert_eq!(got, vec![vec![s("users")]]);

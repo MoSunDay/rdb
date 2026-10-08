@@ -5,8 +5,8 @@
 //! executor only ever sees runnable shapes.
 
 use sqlparser::ast::{
-    CreateTableOptions, Expr as SqlExpr, FromTable, ObjectName, ObjectNamePart, SqlOption,
-    Statement as SqlStatement, TableConstraint, TableFactor, TableWithJoins,
+    CreateTableOptions, Expr as SqlExpr, ObjectName, ObjectNamePart, SqlOption,
+    Statement as SqlStatement, TableConstraint,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -23,6 +23,10 @@ use crate::sql::storage::schema::{Engine, KeyModel, Value};
 /// StarRocks table-model clauses lift out first (see `parse::starrocks`).
 pub fn parse_statement(sql: &str) -> SqlResult<Statement> {
     let (text, model) = crate::sql::parse::starrocks::preparse(sql)?;
+    // Legal MySQL `TRIM([BOTH|LEADING|TRAILING] FROM x)` gets its
+    // implicit ' ' remstr made explicit: sqlparser's TRIM grammar
+    // cannot take the keyword straight before FROM.
+    let text = crate::sql::parse::trim_default::expand(&text);
     let stmts =
         Parser::parse_sql(&MySqlDialect {}, &text).map_err(|e| SqlError::parse(e.to_string()))?;
     match stmts.len() {
@@ -143,17 +147,35 @@ pub fn placeholder_count(stmt: &Statement) -> usize {
                 .unwrap_or(0)
         }
         Statement::Update {
+            table: _,
             assignments,
             filter,
-            ..
+            order_by,
+            limit,
         } => {
             assignments
                 .iter()
                 .map(|(_, x)| count_expr(x))
                 .sum::<usize>()
                 + filter.as_ref().map(count_expr).unwrap_or(0)
+                // ORDER BY / LIMIT trail the assignments and WHERE in
+                // the statement text (positional bind order).
+                + order_by
+                    .iter()
+                    .map(|k| count_expr(&k.expr))
+                    .sum::<usize>()
+                + limit.as_ref().map(count_limit).unwrap_or(0)
         }
-        Statement::Delete { filter, .. } => filter.as_ref().map(count_expr).unwrap_or(0),
+        Statement::Delete {
+            table: _,
+            filter,
+            order_by,
+            limit,
+        } => {
+            filter.as_ref().map(count_expr).unwrap_or(0)
+                + order_by.iter().map(|k| count_expr(&k.expr)).sum::<usize>()
+                + limit.as_ref().map(count_limit).unwrap_or(0)
+        }
         _ => 0,
     }
 }
@@ -341,9 +363,11 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
             }
         }
         Statement::Update {
+            table: _,
             assignments,
             filter,
-            ..
+            order_by,
+            limit,
         } => {
             for (_, x) in assignments {
                 bind(x, &mut next, values);
@@ -351,11 +375,24 @@ pub fn bind_placeholders(stmt: &mut Statement, values: &[Value]) -> SqlResult<()
             if let Some(f) = filter.as_mut() {
                 bind(f, &mut next, values);
             }
+            for k in order_by.iter_mut() {
+                bind(&mut k.expr, &mut next, values);
+            }
+            bind_limit(limit.as_mut(), &mut next, values);
         }
-        Statement::Delete { filter, .. } => {
+        Statement::Delete {
+            table: _,
+            filter,
+            order_by,
+            limit,
+        } => {
             if let Some(f) = filter.as_mut() {
                 bind(f, &mut next, values);
             }
+            for k in order_by.iter_mut() {
+                bind(&mut k.expr, &mut next, values);
+            }
+            bind_limit(limit.as_mut(), &mut next, values);
         }
         _ => {}
     }
@@ -397,8 +434,8 @@ fn translate(stmt: SqlStatement, sr: Option<&StarRocksModel>) -> SqlResult<State
             }
         }
         SqlStatement::Insert(i) => translate_insert(i),
-        SqlStatement::Update(u) => translate_update(u),
-        SqlStatement::Delete(d) => translate_delete(d),
+        SqlStatement::Update(u) => super::translate_dml::translate_update(u),
+        SqlStatement::Delete(d) => super::translate_dml::translate_delete(d),
         SqlStatement::CreateTable(c) => translate_create_table(c, sr),
         SqlStatement::Drop {
             object_type,
@@ -679,89 +716,6 @@ fn table_engine(opts: &CreateTableOptions) -> Engine {
 
 fn translate_insert(i: sqlparser::ast::Insert) -> SqlResult<Statement> {
     super::translate_dml::translate_insert(i)
-}
-
-fn translate_update(u: sqlparser::ast::Update) -> SqlResult<Statement> {
-    if u.from.is_some() || u.returning.is_some() || u.or.is_some() {
-        return Err(SqlError::unsupported("UPDATE with FROM/RETURNING/OR"));
-    }
-    let name = single_table(&u.table)?;
-    let assignments = u
-        .assignments
-        .iter()
-        .map(|a| {
-            let sqlparser::ast::AssignmentTarget::ColumnName(n) = &a.target else {
-                return Err(SqlError::unsupported("tuple assignment targets"));
-            };
-            let name = object_name(n)?;
-            Ok((name, translate_expr(&a.value)?))
-        })
-        .collect::<SqlResult<Vec<(String, Expr)>>>()?;
-    Ok(Statement::Update {
-        table: name,
-        assignments,
-        filter: u.selection.as_ref().map(translate_expr).transpose()?,
-        order_by: translate_order(&u.order_by)?,
-        limit: translate_limit(&u.limit)?,
-    })
-}
-
-fn translate_delete(d: sqlparser::ast::Delete) -> SqlResult<Statement> {
-    if d.using.as_ref().is_some_and(|u| !u.is_empty()) {
-        return Err(SqlError::unsupported("DELETE ... USING"));
-    }
-    if !d.tables.is_empty() || d.returning.is_some() {
-        return Err(SqlError::unsupported("multi-table DELETE / RETURNING"));
-    }
-    let name = match &d.from {
-        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
-            if tables.len() != 1 {
-                return Err(SqlError::unsupported("multi-table DELETE"));
-            }
-            single_table(&tables[0])?
-        }
-    };
-    Ok(Statement::Delete {
-        table: name,
-        filter: d.selection.as_ref().map(translate_expr).transpose()?,
-        order_by: translate_order(&d.order_by)?,
-        limit: translate_limit(&d.limit)?,
-    })
-}
-
-/// UPDATE/DELETE target: exactly one plain table, no alias.
-fn single_table(t: &TableWithJoins) -> SqlResult<String> {
-    if !t.joins.is_empty() {
-        return Err(SqlError::unsupported("DML across a JOIN"));
-    }
-    single_factor(&t.relation)
-}
-
-fn single_factor(f: &TableFactor) -> SqlResult<String> {
-    match f {
-        TableFactor::Table { name, alias, .. } => {
-            if alias.is_some() {
-                return Err(SqlError::unsupported("table aliases in DML"));
-            }
-            object_name(name)
-        }
-        other => Err(SqlError::unsupported(format!("table reference {other}"))),
-    }
-}
-
-/// `LIMIT <n>` on UPDATE/DELETE (plain Expr position).
-pub(crate) fn translate_limit(e: &Option<SqlExpr>) -> SqlResult<Option<u64>> {
-    match e {
-        None => Ok(None),
-        Some(SqlExpr::Value(v)) => match &v.value {
-            sqlparser::ast::Value::Number(n, _) => n
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| SqlError::parse("LIMIT must be a non-negative integer")),
-            _ => Err(SqlError::parse("LIMIT must be a non-negative integer")),
-        },
-        Some(_) => Err(SqlError::parse("LIMIT must be a non-negative integer")),
-    }
 }
 
 /// ORDER BY keys shared by UPDATE/DELETE.

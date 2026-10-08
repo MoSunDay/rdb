@@ -253,6 +253,10 @@ fn substring_and_trim_special_forms_translate() {
         ("SELECT TRIM(LEADING 'x' FROM a)", "LEADING"),
         ("SELECT TRIM(TRAILING 'x' FROM a)", "TRAILING"),
         ("SELECT TRIM('x' FROM a)", "BOTH"), // no keyword = BOTH
+        // Keyword without a remstr: MySQL defaults remstr to ' '.
+        ("SELECT TRIM(BOTH FROM a)", "BOTH"),
+        ("SELECT TRIM(LEADING FROM a)", "LEADING"),
+        ("SELECT TRIM(TRAILING FROM a)", "TRAILING"),
     ] {
         let Expr::Func { name, args } = first_expr(sql) else {
             panic!("{sql}: func");
@@ -262,6 +266,21 @@ fn substring_and_trim_special_forms_translate() {
         assert!(
             matches!(&args[2], Expr::Lit(Value::Str(m)) if m == mode),
             "{sql} mode literal"
+        );
+    }
+    // The no-remstr keyword forms carry the single-space default as
+    // their remstr literal (space, not empty string).
+    for sql in [
+        "SELECT TRIM(BOTH FROM a)",
+        "SELECT TRIM(LEADING FROM a)",
+        "SELECT TRIM(TRAILING FROM a)",
+    ] {
+        let Expr::Func { args, .. } = first_expr(sql) else {
+            panic!("{sql}: func");
+        };
+        assert!(
+            matches!(&args[1], Expr::Lit(Value::Str(r)) if r == " "),
+            "{sql} remstr default"
         );
     }
     // POSITION(x IN y) is LOCATE(x, y).

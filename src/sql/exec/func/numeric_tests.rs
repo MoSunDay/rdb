@@ -220,3 +220,25 @@ fn truncate_cuts_toward_zero() {
     );
     assert_eq!(f(&[Value::Null, Value::Int(1)]), Ok(Value::Null));
 }
+
+#[test]
+fn round_truncate_null_scale_is_null() {
+    // MySQL: a NULL digits argument is NULL, never a loud coercion
+    // error out of the count slot.
+    assert_eq!(
+        eval("round", &[Value::Double(2.5), Value::Null]).unwrap(),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        eval("round", &[Value::Decimal(123, 2), Value::Null]).unwrap(),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        eval("truncate", &[Value::Double(2.5), Value::Null]).unwrap(),
+        Ok(Value::Null)
+    );
+    assert_eq!(
+        eval("truncate", &[Value::Decimal(1223, 2), Value::Null]).unwrap(),
+        Ok(Value::Null)
+    );
+}

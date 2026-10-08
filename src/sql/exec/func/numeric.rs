@@ -56,6 +56,9 @@ fn abs(name: &str, args: &[Value]) -> SqlResult<Value> {
 fn round(name: &str, args: &[Value]) -> SqlResult<Value> {
     let (x, d) = match args {
         [x] => (x, 0),
+        // NULL digits is NULL before the count coercion (MySQL), so
+        // the loud int_arg error never fires on a NULL scale.
+        [_, Value::Null] => return Ok(Value::Null),
         [x, d] => (x, int_arg(d)?),
         _ => return Err(wrong_param_count(name)),
     };
@@ -165,7 +168,8 @@ fn truncate(name: &str, args: &[Value]) -> SqlResult<Value> {
     let [x, dv] = args else {
         return Err(wrong_param_count(name));
     };
-    if matches!(x, Value::Null) {
+    // NULL in either slot is NULL (MySQL) before any coercion.
+    if matches!(x, Value::Null) || matches!(dv, Value::Null) {
         return Ok(Value::Null);
     }
     let d = int_arg(dv)?;

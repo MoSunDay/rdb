@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -53,9 +54,10 @@ pub struct SqlShim<W> {
     _ph: PhantomData<W>,
 }
 
-/// Build a shim for one connection. `seed` drives the handshake salt and
-/// connection id (see [`auth::salt_from_seed`]); `peer_host` feeds the
-/// immutable session identity (`USER()` = `user@peer_host`,
+/// Build a shim for one connection. `seed` drives the handshake salt
+/// (see [`auth::salt_from_seed`]); the connection id comes from the
+/// process-wide allocator [`alloc_connection_id`]; `peer_host` feeds
+/// the immutable session identity (`USER()` = `user@peer_host`,
 /// `CONNECTION_ID()` = the handshake's connection id).
 pub fn new_shim<W>(
     shared: Arc<Shared>,
@@ -64,7 +66,7 @@ pub fn new_shim<W>(
     seed: u64,
     peer_host: String,
 ) -> SqlShim<W> {
-    let id = (seed as u32) | 1;
+    let id = alloc_connection_id();
     let login = serve_user_of(&user).to_string();
     SqlShim {
         shared,
@@ -85,6 +87,46 @@ pub fn new_shim<W>(
     }
 }
 
+/// Derive a connection id from the unix-epoch-second base and the
+/// connection's sequence number within that second. Connections in one
+/// second differ in `seq`; a restart at least one second later derives
+/// from a higher base, so pre-restart ids are never reissued while a
+/// second's connection burst stays below the restart gap in seconds
+/// (MySQL's own persisted counter is out of scope here). Wraps at
+/// u32::MAX; 0 is never handed out (MySQL ids start at 1).
+pub fn connection_id(epoch_secs: u32, seq: u32) -> u32 {
+    match epoch_secs.wrapping_add(seq) {
+        0 => 1,
+        id => id,
+    }
+}
+
+/// Last issued connection id: the compare-and-swap source of truth of
+/// [`alloc_connection_id`], keeping concurrent accepts strictly
+/// increasing (never a shared id) within the process.
+static LAST_CONN_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Fresh connection id for one incoming connection (see
+/// [`connection_id`]). A new epoch second rebases the sequence at 0,
+/// so ids hug the clock instead of drifting upwards with the
+/// process lifetime's connection count.
+fn alloc_connection_id() -> u32 {
+    let mut last = LAST_CONN_ID.load(Ordering::Relaxed);
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as u32);
+        // Ids already issued in this second occupy seq 0..gap; an id
+        // from an earlier second restarts the sequence.
+        let seq = last.checked_sub(now).map_or(0, |gap| gap + 1);
+        let next = connection_id(now, seq);
+        match LAST_CONN_ID.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(cur) => last = cur,
+        }
+    }
+}
+
 /// `USER()` renders the EFFECTIVE login user ("root" for the empty
 /// configured name), matching `serve::effective_user`.
 fn serve_user_of(user: &str) -> &str {
@@ -101,6 +143,13 @@ impl<W> SqlShim<W> {
     pub fn session_handle(&self) -> Arc<Mutex<SqlSession>> {
         Arc::clone(&self.sess)
     }
+}
+
+/// The single database this engine hosts is the executor's
+/// [`exec::DEFAULT_DB`]; a `USE` target exists iff it names that one
+/// database (case-blind, the way `SHOW DATABASES` dedupes it).
+fn is_known_db(db: &str) -> bool {
+    db.eq_ignore_ascii_case(exec::DEFAULT_DB)
 }
 
 /// Intermediary options: `USE` is routed to `on_init` (not parsed as a
@@ -174,6 +223,18 @@ where
                 return Ok(());
             }
         };
+        // The text form of USE is routed to the validated on_init by
+        // the intermediary options, and MySQL does not offer USE to
+        // the prepared-statement protocol either; admitting it here
+        // would bypass the 1049 database check on EXECUTE.
+        if matches!(stmt, Statement::Use(_)) {
+            info.error(
+                ErrorKind::ER_NOT_SUPPORTED_YET,
+                b"USE is not supported in the prepared statement protocol",
+            )
+            .await?;
+            return Ok(());
+        }
         // Output columns are unknown until EXECUTE (they depend on the
         // projection); the protocol allows an empty prepare-time list,
         // the execute response carries the real column set.
@@ -240,6 +301,14 @@ where
         db: &'a str,
         w: InitWriter<'a, W>,
     ) -> Result<(), Self::Error> {
+        // Single-database engine: only the canonical name exists, so
+        // any other USE target answers MySQL's 1049 instead of
+        // silently registering a phantom database.
+        if !is_known_db(db) {
+            let msg = format!("Unknown database '{db}'");
+            w.error(ErrorKind::ER_BAD_DB_ERROR, msg.as_bytes()).await?;
+            return Ok(());
+        }
         self.sess.lock().await.db = db.to_string();
         w.ok().await
     }
@@ -353,5 +422,67 @@ where
             w.finish().await
         }
         Err(e) => results.error(e.kind(), e.msg.as_bytes()).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_ids_within_one_second_are_distinct() {
+        let ids: Vec<u32> = (0..4)
+            .map(|seq| connection_id(1_700_000_000, seq))
+            .collect();
+        for i in 0..ids.len() {
+            for j in i + 1..ids.len() {
+                assert_ne!(ids[i], ids[j], "seq {i} vs {j}");
+            }
+        }
+    }
+
+    #[test]
+    fn connection_id_rebases_across_seconds_and_restarts() {
+        // Same sequence index, a second later: the base moves the id.
+        for seq in 0..4 {
+            assert_ne!(
+                connection_id(1_700_000_000, seq),
+                connection_id(1_700_000_001, seq),
+                "seq {seq}"
+            );
+        }
+        // One connection in the final pre-restart second, restart one
+        // second later: every new id sits strictly above it.
+        let pre = connection_id(1_700_000_000, 0);
+        for seq in 0..3 {
+            assert_ne!(connection_id(1_700_000_001, seq), pre);
+        }
+    }
+
+    #[test]
+    fn connection_id_is_never_zero_and_wraps() {
+        assert_eq!(connection_id(0, 0), 1, "the 0 slot skips to 1");
+        assert_eq!(connection_id(u32::MAX, 0), u32::MAX);
+        assert_eq!(connection_id(u32::MAX, 1), 1, "wrap skips 0 again");
+        assert_ne!(connection_id(u32::MAX, 7), 0);
+    }
+
+    #[test]
+    fn allocator_hands_out_distinct_nonzero_ids() {
+        let a = alloc_connection_id();
+        let b = alloc_connection_id();
+        assert_ne!(a, b);
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+    }
+
+    #[test]
+    fn use_accepts_only_the_canonical_database() {
+        assert!(is_known_db("rdb"));
+        // Case-blind, the way SHOW DATABASES dedupes the session db.
+        assert!(is_known_db("RDB"));
+        assert!(!is_known_db(""));
+        assert!(!is_known_db("nodb"));
+        assert!(!is_known_db("mydb"));
     }
 }

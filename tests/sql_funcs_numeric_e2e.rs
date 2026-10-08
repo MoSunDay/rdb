@@ -33,6 +33,9 @@ async fn numeric_family_spot_checks() {
             ("ROUND(15.00, -1)", s("20")),
             ("ROUND(-15.00, -1)", s("-20")),
             ("ROUND(NULL, 2)", MVal::NULL),
+            // A NULL scale/count slot is NULL too, never a coercion error.
+            ("ROUND(2.5, NULL)", MVal::NULL),
+            ("TRUNCATE(2.5, NULL)", MVal::NULL),
             // CEILING answers a scale-0 exact decimal.
             ("CEILING(-1.23)", s("-1")),
             // Widening: an Int winner over decimal args re-renders at
@@ -47,6 +50,12 @@ async fn numeric_family_spot_checks() {
             ("MOD(12.3, 2)", s("0.3")),
             ("POW(2, 10)", s("1024")),
             ("POWER(2, 10)", s("1024")),
+            // Exponents past the +/-30 bound are NULL (the double
+            // answer is not trustworthy that far out); the bound
+            // itself computes.
+            ("POW(2, 30)", s("1073741824")),
+            ("POW(2, 10000)", MVal::NULL),
+            ("POW(2, -10000)", MVal::NULL),
             ("SQRT(9)", s("3")),
             ("SQRT(-9)", MVal::NULL),
             ("SIGN(-42)", i(-1)),

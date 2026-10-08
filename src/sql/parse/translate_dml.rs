@@ -1,6 +1,8 @@
-//! DML translation: the INSERT family (M2). Owns plain INSERT,
-//! `REPLACE INTO`, `ON DUPLICATE KEY UPDATE`, `INSERT ... SET` and
-//! `INSERT ... SELECT` source shapes; `translate.rs` dispatches here so
+//! DML translation: the INSERT family (M2), plus UPDATE / DELETE.
+//! Owns plain INSERT, `REPLACE INTO`, `ON DUPLICATE KEY UPDATE`,
+//! `INSERT ... SET` and `INSERT ... SELECT` source shapes, and the
+//! single-table UPDATE/DELETE targets with their ORDER BY keys and
+//! `LIMIT <literal | ?>` operands; `translate.rs` dispatches here so
 //! the shared walker/translate surface stays narrow.
 //!
 //! MySQL semantics kept at parse time:
@@ -12,13 +14,14 @@
 //! - `REPLACE INTO` + `ON DUPLICATE KEY UPDATE` together is a parse
 //!   error (MySQL rejects the combination too).
 
-use sqlparser::ast::SetExpr;
+use sqlparser::ast::{FromTable, SetExpr, TableFactor, TableWithJoins};
 
 use crate::sql::parse::ast::{ConflictAction, Expr, InsertSource, Statement};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::parse::expr::translate_expr;
+use crate::sql::parse::order_limit::translate_limit_value;
 use crate::sql::parse::query::translate_compound;
-use crate::sql::parse::translate::object_name;
+use crate::sql::parse::translate::{object_name, translate_order};
 
 /// Translate one sqlparser `Insert` into the IR `Statement::Insert`.
 pub(crate) fn translate_insert(i: sqlparser::ast::Insert) -> SqlResult<Statement> {
@@ -295,6 +298,77 @@ fn reject_values_fn(e: &Expr) -> SqlResult<()> {
     rewrite_values(e, false).map(|_| ())
 }
 
+// ------------------------------------------------- UPDATE / DELETE
+/// Translate one sqlparser `Update` into the IR `Statement::Update`
+/// (shared with the INSERT family here: single-table target rules,
+/// ORDER BY keys, and the `LIMIT <literal | ?>` operand).
+pub(crate) fn translate_update(u: sqlparser::ast::Update) -> SqlResult<Statement> {
+    if u.from.is_some() || u.returning.is_some() || u.or.is_some() {
+        return Err(SqlError::unsupported("UPDATE with FROM/RETURNING/OR"));
+    }
+    let name = single_table(&u.table)?;
+    let assignments = u
+        .assignments
+        .iter()
+        .map(|a| {
+            let sqlparser::ast::AssignmentTarget::ColumnName(n) = &a.target else {
+                return Err(SqlError::unsupported("tuple assignment targets"));
+            };
+            let name = object_name(n)?;
+            Ok((name, translate_expr(&a.value)?))
+        })
+        .collect::<SqlResult<Vec<(String, Expr)>>>()?;
+    Ok(Statement::Update {
+        table: name,
+        assignments,
+        filter: u.selection.as_ref().map(translate_expr).transpose()?,
+        order_by: translate_order(&u.order_by)?,
+        limit: translate_limit_value(&u.limit)?,
+    })
+}
+
+pub(crate) fn translate_delete(d: sqlparser::ast::Delete) -> SqlResult<Statement> {
+    if d.using.as_ref().is_some_and(|u| !u.is_empty()) {
+        return Err(SqlError::unsupported("DELETE ... USING"));
+    }
+    if !d.tables.is_empty() || d.returning.is_some() {
+        return Err(SqlError::unsupported("multi-table DELETE / RETURNING"));
+    }
+    let name = match &d.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+            if tables.len() != 1 {
+                return Err(SqlError::unsupported("multi-table DELETE"));
+            }
+            single_table(&tables[0])?
+        }
+    };
+    Ok(Statement::Delete {
+        table: name,
+        filter: d.selection.as_ref().map(translate_expr).transpose()?,
+        order_by: translate_order(&d.order_by)?,
+        limit: translate_limit_value(&d.limit)?,
+    })
+}
+
+/// UPDATE/DELETE target: exactly one plain table, no alias.
+fn single_table(t: &TableWithJoins) -> SqlResult<String> {
+    if !t.joins.is_empty() {
+        return Err(SqlError::unsupported("DML across a JOIN"));
+    }
+    single_factor(&t.relation)
+}
+
+fn single_factor(f: &TableFactor) -> SqlResult<String> {
+    match f {
+        TableFactor::Table { name, alias, .. } => {
+            if alias.is_some() {
+                return Err(SqlError::unsupported("table aliases in DML"));
+            }
+            object_name(name)
+        }
+        other => Err(SqlError::unsupported(format!("table reference {other}"))),
+    }
+}
 #[cfg(test)]
 #[path = "translate_dml_tests.rs"]
 mod tests;

@@ -98,3 +98,35 @@ fn greatest_arity_errors() {
     let e = eval("greatest", &[]).unwrap().unwrap_err();
     assert!(e.msg.contains("Incorrect parameter count"), "{e}");
 }
+
+#[test]
+fn pow_bounds_large_exponents() {
+    // Exponents past the +/-30 bound are NULL (a finite double answer
+    // is not trustworthy that far out), the bound itself computes.
+    assert_eq!(
+        eval("pow", &[Value::Int(2), Value::Int(30)]),
+        Some(Ok(Value::Double(1_073_741_824.0)))
+    );
+    assert_eq!(
+        eval("pow", &[Value::Int(2), Value::Int(10_000)]),
+        Some(Ok(Value::Null))
+    );
+    assert_eq!(
+        eval("pow", &[Value::Int(2), Value::Int(-10_000)]),
+        Some(Ok(Value::Null))
+    );
+    assert_eq!(
+        eval("pow", &[Value::Int(2), Value::Int(-30)]),
+        Some(Ok(Value::Double(2.0f64.powi(-30))))
+    );
+    // A non-finite result inside the bound (huge base, 0 to a
+    // negative power) is NULL too, never +/-inf on the wire.
+    assert_eq!(
+        eval("pow", &[Value::Double(1e300), Value::Int(20)]),
+        Some(Ok(Value::Null))
+    );
+    assert_eq!(
+        eval("pow", &[Value::Int(0), Value::Int(-1)]),
+        Some(Ok(Value::Null))
+    );
+}

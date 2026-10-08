@@ -32,7 +32,12 @@ fn mod_(name: &str, args: &[Value]) -> SqlResult<Value> {
     eval_binop(&BinOp::Mod, a, b)
 }
 
-/// POW/POWER -> DOUBLE (MySQL never keeps these exact).
+/// POW/POWER -> DOUBLE (MySQL never keeps these exact). The exponent
+/// is bounded to [-30, 30]: past that a double answer is not
+/// trustworthy (2^10000 overflows to inf), so the call is NULL rather
+/// than a wrong or infinite value -- the ±30 clamp keeps every
+/// in-bound answer exact in double. Within the bound a still
+/// non-finite result (huge base, 0 to a negative power) is NULL too.
 fn pow(name: &str, args: &[Value]) -> SqlResult<Value> {
     let [a, b] = args else {
         return Err(wrong_param_count(name));
@@ -41,7 +46,16 @@ fn pow(name: &str, args: &[Value]) -> SqlResult<Value> {
         return Ok(Value::Null);
     }
     let (a, b) = (as_double(a)?, as_double(b)?);
-    Ok(Value::Double(a.powf(b)))
+    const EXPONENT_BOUND: f64 = 30.0;
+    if !(-EXPONENT_BOUND..=EXPONENT_BOUND).contains(&b) {
+        return Ok(Value::Null);
+    }
+    let v = a.powf(b);
+    Ok(if v.is_finite() {
+        Value::Double(v)
+    } else {
+        Value::Null
+    })
 }
 
 /// SQRT: negative input is NULL (MySQL), not an error.

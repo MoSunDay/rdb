@@ -13,8 +13,10 @@ contract; module map lives in `agents/rust/sql.md`.
 
 - **Access**: `mysql_bind` listener (opensrv-mysql; native-password only, `mysql_user`/
   `mysql_password` from config; any other account is rejected at handshake). `USE db`
-  sets the session default database (any name accepted — there is no database registry
-  to validate against; `DATABASE()` and `SHOW DATABASES` reflect it), and cosmetic SET
+  sets the session default database, validated against the known set (`rdb` — the
+  implicit default, case-insensitive; anything else fails with MySQL 1049 "Unknown
+  database 'x'"; a prepared USE rejects 1235). `DATABASE()` and `SHOW DATABASES`
+  reflect it, and cosmetic SET
   (`sql_mode`, `wait_timeout`, ...) are tolerated no-ops; SET statements
   that change session/transaction semantics (autocommit, NAMES, TIME_ZONE, ROLE, ...)
   are REJECTED loudly (MySQL 1235) rather than silently ignored. `SET [SESSION]
@@ -91,7 +93,9 @@ contract; module map lives in `agents/rust/sql.md`.
   SESSION_USER()/CONNECTION_ID() bind once per execution at the executor entry (a
   PREPARE before USE re-reads the new database on every EXECUTE; one snapshot per
   statement), keeping the expression evaluator session-free; `SessionInfo`
-  (user, connection id) is threaded from the handshake through `SqlSession`.
+  (user, connection id) is threaded from the handshake through `SqlSession`; ids come
+  from a per-process atomic counter seeded with epoch seconds (epoch + seq, wrapping,
+  skipping 0, nothing persisted — a restart >= 1s apart never re-issues an id).
 - **Locking reads**: `SELECT ... FOR UPDATE / FOR SHARE [OF tbl]` latches the matched
   (post-filter) rows in a node-local registry keyed `(table_id, pk)`. FOR UPDATE is
   exclusive, FOR SHARE composes; re-acquiring with the same owner — including a FOR
@@ -132,7 +136,8 @@ contract; module map lives in `agents/rust/sql.md`.
   microseconds (i64); TIMESTAMP is a plain DATETIME alias (no time-zone semantics) and
   `(fsp)` is parsed and ignored (full microsecond precision; the fraction renders only
   when nonzero). Literals accept canonical `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` and compact
-  digit-only forms; Str <-> temporal coercion applies at write and in comparisons, and
+  digit-only forms, plus MySQL's loose 1–2 digit month/day (`'2020-1-1'` works) with
+  fraction digits beyond 6 truncating; Str <-> temporal coercion applies at write and in comparisons, and
   an Int compares as the compact numeric value. Garbage (and the MySQL zero date
   `'0000-00-00'`, which is unrepresentable) rejects the whole statement loudly with
   "Incorrect DATE value: '...'" with MySQL's own errno 1292. No temporal
@@ -222,7 +227,8 @@ contract; module map lives in `agents/rust/sql.md`.
   `?` projection is a loud 1235; `'1'`, `-1`, `1+1` stay constant keys), and ORDER BY /
   HAVING bare identifiers resolve SELECT aliases first (case-insensitive, the alias
   beats a same-named FROM column, no chained substitution) before FROM scope (unknown
-  -> 1054). `LIMIT ?` / `OFFSET ?` placeholders are validated at bind time
+  -> 1054); GROUP BY bare identifiers do the inverse — the FROM column wins and the
+  SELECT alias is only a fallback. `LIMIT ?` / `OFFSET ?` placeholders are validated at bind time
   (non-negative integer, else 1064 — prepare does not check; the binary protocol binds
   limit-then-offset, the text order of `LIMIT ? OFFSET ?`). The ambiguous comma form
   `LIMIT ?, ?` with TWO placeholders is a loud 1064 (its text order is offset-first,
@@ -240,10 +246,12 @@ contract; module map lives in `agents/rust/sql.md`.
 - **Expressions & functions** (MySQL-gap M1): 51 scalar function entries (incl.
   aliases) behind a pure family dispatch `control -> string -> numeric -> datetime`
   (`exec/func/`, no registry state): strings CONCAT/CONCAT_WS/SUBSTRING/LEFT/RIGHT/
-  LPAD/RPAD/REPEAT/LOCATE/INSTR/POSITION/REPLACE/TRIM/REVERSE/HEX/UNHEX/UPPER/LOWER/
-  LENGTH/CHAR_LENGTH; numerics ROUND (exact half-away-from-zero on DECIMAL incl.
+  LPAD/RPAD/REPEAT (exact result byte length pre-checked against the 1<<24 wire
+  cap — over -> NULL, no allocation)/LOCATE (NULL-first)/INSTR/POSITION/REPLACE/TRIM
+  (no-remstr forms default to ' ')/REVERSE/HEX/UNHEX/UPPER/LOWER/LENGTH/CHAR_LENGTH; numerics ROUND (exact half-away-from-zero on DECIMAL incl.
   negative-digit scaling, f64 on Double)/CEIL/CEILING/FLOOR (call AND keyword forms;
-  the `TO <unit>` form rejects)/TRUNCATE/MOD/POW/POWER/SQRT (negative -> NULL)/SIGN/
+  the `TO <unit>` form rejects)/TRUNCATE/MOD/POW/POWER/SQRT (SQRT negative -> NULL; POW exponent outside
+  [-30, 30] or non-finite result -> NULL — never a clamped wrong value)/SIGN/
   GREATEST/LEAST/ABS; datetimes DATE/YEAR/MONTH/DAY/DAYOFMONTH/HOUR/MINUTE/SECOND
   (malformed spelling -> NULL)/DATE_ADD/DATE_SUB/ADDDATE/SUBDATE (INTERVAL units
   YEAR..MICROSECOND with month/leap-day clamping; time units promote DATE to DATETIME;
@@ -292,7 +300,9 @@ contract; module map lives in `agents/rust/sql.md`.
   decision, so an ODKU update branch still burns ids (MySQL's gap semantics). Columnar
   tables reject ODKU/REPLACE/INSERT..SELECT with 1235 (append-only, same gate as
   UPDATE/DELETE). Cluster mode rejects ODKU/REPLACE loudly — see the MySQL-gap ledger
-  below.
+  below. `UPDATE`/`DELETE` take trailing ORDER BY plus `LIMIT <n|?>` (a single value,
+  no OFFSET); their `?` placeholders bind in statement text order
+  SET -> WHERE -> ORDER BY -> LIMIT.
 - **2PC writes**: any node accepts DML; the coordinator groups the pre-encoded batch by
   slot-band owner, PREPAREs (0x02 headers + unique entries + durable participant marker,
   one atomic RocksDB batch per participant), durably records the decision, then DECIDEs

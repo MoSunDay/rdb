@@ -152,6 +152,30 @@ fn repeat_and_reverse() {
 }
 
 #[test]
+fn repeat_caps_the_result_at_the_packet_maximum() {
+    // The cap is the result BYTE length: exactly 1 << 24 bytes is the
+    // last legal size (MySQL's max wire packet), one byte more is NULL.
+    let cap = 1i64 << 24;
+    let ok = eval("repeat", &[s("x"), Value::Int(cap)]).unwrap().unwrap();
+    assert_eq!(ok, Value::Str("x".repeat(cap as usize)));
+    assert_eq!(
+        eval("repeat", &[s("x"), Value::Int(cap + 1)]),
+        Some(Ok(Value::Null))
+    );
+    // Multi-byte inputs count bytes, not chars: half the chars of a
+    // 2-byte char already pass the cap.
+    assert_eq!(
+        eval("repeat", &[s("é"), Value::Int((cap / 2) + 1)]),
+        Some(Ok(Value::Null))
+    );
+    // Far-past requests never allocate first.
+    assert_eq!(
+        eval("repeat", &[s("x"), Value::Int(1 << 30)]),
+        Some(Ok(Value::Null))
+    );
+}
+
+#[test]
 fn hex_unhex_roundtrip() {
     assert_eq!(eval("hex", &[s("abc")]), Some(Ok(s("616263"))));
     // MySQL prints uppercase hex letters.

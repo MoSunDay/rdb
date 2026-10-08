@@ -163,19 +163,23 @@ fn access_line(shared: &Shared, q: &Query) -> Option<String> {
 /// The whole query over a materialized source. Pure.
 pub fn execute_query(q: &Query, src: &Source) -> SqlResult<(Vec<ColMeta>, Vec<Vec<Value>>)> {
     let scope = &src.scope;
-    validate_refs(q, scope)?;
+    // GROUP BY may reference select aliases; resolve them against the
+    // FROM scope BEFORE validation (the raw key holds a name check_expr
+    // would reject as an unknown column).
+    let group_keys = group_keys_resolving_aliases(q, scope);
+    validate_refs(q, scope, &group_keys)?;
 
     let items = expand_items(&q.items, scope)?;
     let rows = filter_rows(&src.rows, scope, q.filter.as_ref())?;
 
-    let grouped = !q.group_by.is_empty()
+    let grouped = !group_keys.is_empty()
         || items.iter().any(|(e, _)| has_agg(e))
         || q.having.as_ref().is_some_and(has_agg)
         || q.order_by.iter().any(|k| has_agg(&k.expr));
 
     let mut units: Vec<Unit> = if grouped {
-        let mut groups = group_by_keys(rows, scope, &q.group_by)?;
-        if q.group_by.is_empty() && groups.is_empty() {
+        let mut groups = group_by_keys(rows, scope, &group_keys)?;
+        if group_keys.is_empty() && groups.is_empty() {
             // Aggregates without GROUP BY run as ONE global group, even
             // over zero rows: COUNT(*) = 0, SUM/MIN/... = NULL.
             groups.push(Vec::new());
@@ -244,12 +248,54 @@ pub fn execute_query(q: &Query, src: &Source) -> SqlResult<(Vec<ColMeta>, Vec<Ve
     Ok((columns, rows))
 }
 
+/// GROUP BY keys with select-list aliases resolved: MySQL lets GROUP
+/// BY reference an output alias, but only when the bare name is NOT a
+/// FROM column -- the column wins on a collision (the reverse of ORDER
+/// BY's alias-first rule, which parse-time substitution bakes in).
+/// Resolving here is what makes that precedence possible: the FROM
+/// scope only exists at execution. A name that is neither column nor
+/// alias stays untouched so check_expr reports it precisely.
+fn group_keys_resolving_aliases(q: &Query, scope: &FromScope) -> Vec<Expr> {
+    q.group_by
+        .iter()
+        .map(|k| match k {
+            Expr::Col { table: None, name } if !is_scope_column(scope, name) => {
+                alias_projection(&q.items, name).map_or_else(|| k.clone(), |e| e.clone())
+            }
+            _ => k.clone(),
+        })
+        .collect()
+}
+
+/// Whether any FROM side holds `name` (bare, case-insensitive). An
+/// ambiguous name counts too: it stays a column reference for
+/// check_expr to report instead of silently falling back to an alias.
+fn is_scope_column(scope: &FromScope, name: &str) -> bool {
+    scope
+        .sides
+        .iter()
+        .any(|s| s.columns.iter().any(|c| c.eq_ignore_ascii_case(name)))
+}
+
+/// The projected expression behind a select alias (first wins on
+/// duplicates, mirroring the ORDER BY alias resolver's rule).
+fn alias_projection<'a>(items: &'a [SelectItem], name: &str) -> Option<&'a Expr> {
+    items.iter().find_map(|i| match i {
+        SelectItem::Expr {
+            alias: Some(a),
+            expr,
+            ..
+        } if a.eq_ignore_ascii_case(name) => Some(expr),
+        _ => None,
+    })
+}
+
 /// Fail fast on unknown/ambiguous column references before evaluation.
-fn validate_refs(q: &Query, scope: &FromScope) -> SqlResult<()> {
+fn validate_refs(q: &Query, scope: &FromScope, group_keys: &[Expr]) -> SqlResult<()> {
     if let Some(f) = &q.filter {
         scan::check_expr(f, scope)?;
     }
-    for g in &q.group_by {
+    for g in group_keys {
         scan::check_expr(g, scope)?;
     }
     if let Some(h) = &q.having {

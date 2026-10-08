@@ -266,10 +266,10 @@ async fn prepared_params_feed_control_functions() {
     assert_eq!(got, vec![("hit".to_string(),), ("miss".to_string(),)]);
 
     // COALESCE over a bound parameter. The projection types as text
-    // (a placeholder's type is unknown until bind), so the bound value
-    // must be text for the binary encoder; a numeric bind against the
-    // VAR_STRING column is a server-side encoder defect, out of scope
-    // for this suite.
+    // (a placeholder's type is unknown until bind): a text bind passes
+    // through, and numeric binds coerce compatibly per the announced
+    // column type (fixed 2026-10-08, conv_bin) -- i64/f64 against the
+    // VAR_STRING column ship as their canonical text.
     let stmt = c
         .prep("SELECT COALESCE(NULL, ?)")
         .await
@@ -279,6 +279,10 @@ async fn prepared_params_feed_control_functions() {
         .await
         .expect("exec coalesce");
     assert_eq!(got, vec![("nine".to_string(),)]);
+    let got: Vec<(String,)> = c.exec(&stmt, (42i64,)).await.expect("coalesce i64 bind");
+    assert_eq!(got, vec![("42".to_string(),)]);
+    let got: Vec<(String,)> = c.exec(&stmt, (1.5f64,)).await.expect("coalesce f64 bind");
+    assert_eq!(got, vec![("1.5".to_string(),)]);
     node.kill_now();
 }
 
