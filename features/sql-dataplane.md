@@ -155,6 +155,15 @@ Commit: b0d81c9
   占位符列出规范文本，如 `COALESCE(NULL, ?)` + 42 绑定 → `"42"`，与文本协议
   逐字节一致），无忠实拼法的组合在结果集开始前响亮回 1292、连接存活
   （`src/sql/front/conv_bin.rs`，摘要 `changelog/2026-10-08/mysql-m5-prepared-numeric-bind.md`）。
+- **向量能力（2026-11-02，turso-ref）**：`VECTOR(N)` 类型（1..=4096，文本 `'[..]'`
+  wire，f32 最短渲染）、函数四件套（`STRING_TO_VECTOR`/`TO_VECTOR`、
+  `VECTOR_TO_STRING`/`VEC_TO_TEXT`、`VECTOR_DIM`）、精确 KNN
+  （`ORDER BY DISTANCE(v,q,'cosine'|'euclidean'|'dot') LIMIT k`，dot=负内积）、
+  ANN 索引（`CREATE/DROP VECTOR INDEX`，kmeans+SQ8 postings，同 batch 同步维护，
+  `rows_by_pks` 回表裁决可见性，metric 不匹配回退精确）；查询性能批次（自适应
+  前缀 seek、pk 点查、top-N、等值 hash join）。偏差台账
+  `COMPAT.sql.md` "Vector capability & deviations"；摘要
+  `changelog/2026-11-02/turso-vector-ann.md`。
 - 偏差与 P2 延期（byte-wise 大小写、`Int/Int` 整除、集群 ODKU/REPLACE 1235、
   GROUP_CONCAT 内层排序、复合/前缀索引、ALTER COLUMN、WITH RECURSIVE、KILL 等）
   集中记录于 `COMPAT.sql.md` 的 "MySQL-gap deviation ledger" 条目。

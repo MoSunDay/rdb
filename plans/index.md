@@ -55,6 +55,7 @@ Commit: b0d81c9
 | `2026-10-06-mysql-gap/` | landed | 8 | MySQL 常用功能缺口矩阵（A–G 域）+ M0–M5 里程碑：查询语义修复/表达式函数族/DML 冲突/子查询与集合操作/DDL 与会话面/e2e 补盲 |
 | `2026-10-06-mysql-hardening/` | 部分落地 | 6 | M0–M5 评审缺陷修复（H0 静默错误结果清零已落地，H1 协议会话/H2 唯一性索引/H3 P2 功能/H4 测试卫生 proposed） |
 | `2026-10-07-mq-p3-backfill/` | landed | 1 | P3 按需池全池补齐（总览即 README.md）：#1–#15 分诊（13 立项、#3 观望、#9 LIMIT 语义收缩），W0 conf → W1 三车道（kafka/lite/http）→ W2 消费者 idle GC → W4 台账收尾 |
+| `2026-11-02-turso-ref/` | landed | 5 | 以 tursodatabase/libsql（pin d8bc862d）为 1:1 参考：VECTOR(N) 类型/函数面 + 精确 KNN（V1）→ SQ8/SPANN ANN 索引（V2）+ SQL 引擎性能批次（前缀 seek/pk 点查/top-N/hash join）与 mysql bench 基线 |
 
 `2026-10-06-mq-gap/` 背景：以常用 MQ 功能清单为尺，对 Lite（RESP 动词面）、
 Kafka（wire 面）、HTTP（rocksmq 面）三面做只读差距复核，产出分级处置矩阵；

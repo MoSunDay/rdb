@@ -379,3 +379,59 @@ contract; module map lives in `agents/rust/sql.md`.
   domain anywhere — the silent part is only the width collapse, the UNSIGNED trim
   is an explicit reject.
 
+
+## Vector capability & deviations (VECTOR type, functions, KNN, ANN — 2026-11-02)
+
+MySQL-face only, modeled on libsql's reference behavior (turso pin d8bc862d) where
+MySQL 9.0's own semantics are unverified. Full decision ledger: `plans/2026-11-02-turso-ref/`.
+
+- **Type & literals** — `VECTOR(N)`, N in 1..=4096 (MySQL's exact cap unverified; narrowed
+  to the SQ8/SPANN pipeline's limit — deviation (a) below). Literals are text `'[x,y,...]'`;
+  element whitespace is stripped and concatenated (`'[1 2]'` = one element `12`, libsql
+  behavior); `inf`/`nan` spellings rejected; overflow to ±Inf accepted; `'[]'` rejected
+  (dims ≥ 1); dim mismatch at INSERT/compare → 1292. `DESCRIBE` renders lowercase
+  `vector(3)`.
+- **Functions** — `STRING_TO_VECTOR`/`TO_VECTOR` (aliases), `VECTOR_TO_STRING`/`VEC_TO_TEXT`
+  (aliases), `VECTOR_DIM` (also accepts vector literals). Rendering is f32
+  shortest-round-trip text (`[1,2,3]`, no forced `.0`). No libsql-only surface
+  (`vector()`, `vector_distance_cos`, `vector_top_k` TVF, blob literals, `FLOAT32(N)`).
+- **KNN** — exact via `ORDER BY DISTANCE(v, q, 'cosine'|'euclidean'|'dot') [ASC] LIMIT k`
+  (3-arg form only). `dot` = NEGATED inner product (HeatWave convention — larger inner
+  product sorts first). Cosine with a zero vector yields distance 1.0 (rdb `vecmath`
+  semantics; libsql yields NaN). VECTOR columns are never pk and never a b-tree index
+  key (plain `CREATE INDEX` on a VECTOR column rejects; use VECTOR INDEX below).
+- **ANN (P4)** — `CREATE [IF NOT EXISTS] VECTOR INDEX n ON t (col) [WITH (METRIC
+  'cosine'|'euclidean'|'dot', NPROBE n)]` and `DROP INDEX n ON t` (non-standard DDL,
+  SQL-ecosystem-external like libsql's own `libsql_vector_idx`). Implementation: k-means
+  (seed 7, 8 iters, centroid count = clamp(isqrt(rows),1,64)) + SQ8-quantized postings
+  per centroid; probe ranks centroids, opens `nprobe` partitions (default 4), SQ8 coarse
+  ranking into a shortlist capped at max(4·window, window+16), then re-reads candidate
+  rows by pk (`rows_by_pks`) so MVCC visibility adjudicates exactly like a scan.
+  DML maintains the index synchronously in the same write batch (libsql's same-transaction
+  discipline). A query takes the ANN path only when the KNN shape matches AND the index
+  metric literal matches; everything else falls back to the exact scan.
+
+### Vector deviation ledger (a)–(j) + ANN
+
+- (a) dim cap 4096 (MySQL's suspected 16383 unverified) — deliberate narrowing.
+- (b) wire: VECTOR returns as `MYSQL_TYPE_VAR_STRING` text `'[..]'`; binary protocol
+  `MYSQL_TYPE_VECTOR` (242?) never emitted.
+- (c) VECTOR not pk / not b-tree-indexable (MySQL-aligned restriction; rdb errno/wording
+  may differ: dup index → 1062, unknown column → 1054, non-VECTOR column → 1235).
+- (d) `'[]'` rejected (libsql accepts dims=0; MySQL unverified).
+- (e) inf/nan literals rejected; ±Inf overflow accepted (MySQL unverified).
+- (f) element whitespace stripping (`'[1 2]'` = `[12]`), libsql behavior.
+- (g) `dot` = negated inner product (HeatWave convention; flip on real-MySQL verification).
+- (h) cosine of zero vector = 1.0 (libsql = NaN).
+- (i) no libsql function surface / TVF / blob vectors — MySQL shape only.
+- (j) ANN DDL is non-standard `CREATE VECTOR INDEX` (replaces libsql's
+  `CREATE INDEX ... (libsql_vector_idx(...))`); decided by plan 02.
+- ANN deviations: **approximate recall** (shortlist truncation may drop true neighbors;
+  tested parity only on cluster-separable data); **local-batch backfill/drop** — the
+  build runs as a leader-local WriteBatch (`batch_write_async`), not the distributed
+  2PC route `backfill_index` uses (multi-node deployments must build per node until a
+  distributed backfill lands); postings are read-modify-write state, so DML
+  transitions, backfill, and the drop sweep serialize per index through the node's
+  key latches (`vector::lock_schema_indexes`) — no lost entries under concurrent
+  writers, but also no cross-node coordination; **NPROBE is DDL-fixed** (no runtime hint); EXPLAIN has
+  no dedicated ANN line (the access annotation lives in the access line only).

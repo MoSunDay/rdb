@@ -130,7 +130,10 @@ Commit: b0d81c9
   整张写集 + append 长度 + 当时 latch）、`latch.rs`（锁读注册表：`(table_id,pk)`
   进程级、all-or-nothing、同 owner 重入、冲突 1205 快败、多节点 veto）。
 - `index/`：二级/唯一索引键（`keys.rs`，索引 slot=`crc16(table_id++col_pos)`）、
-  行变迁→索引操作推导与维护（`maintain.rs`、`mod.rs` 查找/范围/唯一属主）。
+  行变迁→索引操作推导与维护（`maintain.rs`、`mod.rs` 查找/范围/唯一属主）；
+  向量 ANN 索引（2026-11-02 turso-ref）：`vector.rs` 物理 key/编解码（meta/
+  centroids/postings，kind 0x24–0x26）+ `vector_build.rs` 建回填/清扫/DML 变迁
+  （kmeans×8 + SQ8 标定，同 batch 同步维护），探测在 `exec/vector_ann.rs`。
 - `plan/`：单表访问路径（IndexLookup vs SeqScan，sargable =/IN/BETWEEN，>1000 pk 回退）。
 - `dist/`：节点间 SQL RPC（`sql_rpc_bind`，u32 长度前缀 JSON）——`mod.rs` 公共件含
   `row_probe`/`any_remote_owner`（行平面 slot 探测写集是否跨远端属主，strict 预约判定）、
