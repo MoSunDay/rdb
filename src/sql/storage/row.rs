@@ -298,6 +298,18 @@ fn encode_payload(out: &mut Vec<u8>, ty: SqlType, v: &Value) -> Result<(), Strin
             out.extend_from_slice(&(b.len() as u32).to_be_bytes());
             out.extend_from_slice(b);
         }
+        // Vector payload: `dim` little-endian f32s, no length prefix
+        // (the schema fixes the width, like the fixed-width scalars).
+        // The dimension is checked against the schema here too: a
+        // drifted catalog must fail loudly, not misread the row.
+        (SqlType::Vector { dim }, Value::Vector(v)) => {
+            if v.len() as u64 != u64::from(dim) {
+                return Err(format!("vector dimension mismatch: {} != {dim}", v.len()));
+            }
+            for f in v {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+        }
         (ty, v) => {
             return Err(format!("value {v:?} does not fit column type {ty:?}"));
         }
@@ -358,6 +370,22 @@ fn decode_payload(mut rest: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String
             } else {
                 Value::Bytes(raw.to_vec())
             }
+        }
+        // Vector payload: 4*dim little-endian f32s, width from the
+        // schema (never stored); DDL keeps dim >= 1, so a zero-width
+        // request is a corrupt catalog, not an empty vector.
+        SqlType::Vector { dim } => {
+            let need = 4 * dim as usize;
+            if need == 0 || need % 4 != 0 || rest.len() < need {
+                return Err("vector payload truncated".into());
+            }
+            let (raw, r) = rest.split_at(need);
+            rest = r;
+            Value::Vector(
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            )
         }
     };
     Ok((val, rest))
@@ -718,3 +746,8 @@ mod prepared_tests {
 #[cfg(test)]
 #[path = "row_pk_tests.rs"]
 mod pk_tests;
+
+/// VECTOR column payload/typed-codec tests (same reason as above).
+#[cfg(test)]
+#[path = "row_vector_tests.rs"]
+mod vector_tests;

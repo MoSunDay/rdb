@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "rt-multi-thread", "time", "macros", "io-util"] }
+# Pure-Rust SHA1 for the mysql_native_password handshake scramble (the
+# one place the MySQL wire protocol needs a hash; already in the
+# workspace lock via the rdb crate's optional SQL-front feature).
+sha1 = "0.10"

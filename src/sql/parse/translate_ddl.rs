@@ -12,7 +12,7 @@
 //! - SHOW ... [LIKE 'pat'] accepts the LIKE filter; the WHERE form
 //!   rejects (no expression engine over metadata rowsets).
 
-use sqlparser::ast::{Expr as SqlExpr, ObjectName, ShowStatementFilter};
+use sqlparser::ast::{Expr as SqlExpr, ObjectName, ShowStatementFilter, Value as SqlValue};
 
 use crate::sql::parse::ast::Statement;
 use crate::sql::parse::error::{SqlError, SqlResult};
@@ -56,6 +56,11 @@ pub(crate) fn translate_drop(
 
 /// `CREATE [UNIQUE] INDEX [name] ON t (col)`: one plain column key.
 pub(crate) fn translate_create_index(c: sqlparser::ast::CreateIndex) -> SqlResult<Statement> {
+    // The vector-DDL rewrite injected `vec_ann(col, 'metric', nprobe)`
+    // as the sole "column"; lift it back into CreateVectorIndex.
+    if let Some(v) = marker_vector_index(&c) {
+        return Ok(v);
+    }
     let column = single_index_column(&c.columns)?;
     Ok(Statement::CreateIndex {
         table: object_name(&c.table_name)?,
@@ -234,3 +239,75 @@ pub(crate) fn translate_show_filter(
 #[cfg(test)]
 #[path = "translate_ddl_tests.rs"]
 mod tests;
+
+/// Recognize the `vec_ann(col, 'metric', nprobe)` marker the
+/// vector-DDL pre-parser injects (see `parse::vector_ddl`). Returns
+/// None for every plain index -- the marker name is never a callable
+/// function, so a user cannot reach this arm by hand.
+fn marker_vector_index(c: &sqlparser::ast::CreateIndex) -> Option<Statement> {
+    if c.columns.len() != 1 {
+        return None;
+    }
+    let SqlExpr::Function(f) = &c.columns[0].column.expr else {
+        return None;
+    };
+    let name = f.name.to_string().to_ascii_lowercase();
+    if name != crate::sql::parse::vector_ddl::MARKER {
+        return None;
+    }
+    let list = match &f.args {
+        sqlparser::ast::FunctionArguments::List(l) => l,
+        _ => return None,
+    };
+    let plain: Vec<&SqlExpr> = list
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                Some(e)
+            }
+            _ => None,
+        })
+        .collect();
+    if plain.len() != 3 {
+        return None;
+    }
+    let args = &plain;
+    let column = match args[0] {
+        SqlExpr::Identifier(id) => id.value.clone(),
+        _ => return None,
+    };
+    let metric = match args[1] {
+        SqlExpr::Value(v) if matches!(&v.value, SqlValue::SingleQuotedString(_)) => {
+            let SqlValue::SingleQuotedString(m) = &v.value else {
+                return None;
+            };
+            crate::sql::index::vector::Metric::parse(m)?
+        }
+        _ => return None,
+    };
+    let nprobe = match args[2] {
+        SqlExpr::Value(v) if matches!(&v.value, SqlValue::Number(_, _)) => {
+            let SqlValue::Number(n, _) = &v.value else {
+                return None;
+            };
+            n.parse().ok()?
+        }
+        _ => return None,
+    };
+    Some(Statement::CreateVectorIndex {
+        table: object_name(&c.table_name).ok()?,
+        name: c
+            .name
+            .as_ref()
+            .map(object_name)
+            .transpose()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| format!("vec_{column}")),
+        column,
+        metric,
+        nprobe,
+        if_not_exists: c.if_not_exists,
+    })
+}

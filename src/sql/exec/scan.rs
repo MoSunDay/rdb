@@ -250,17 +250,104 @@ pub fn visible_versions_between(
     lo: u16,
     hi: u16,
 ) -> SqlResult<Vec<(Vec<u8>, Vec<u8>)>> {
-    // pk -> visible (ts, raw version). Versions of one pk arrive
-    // newest-first (inverted ts suffix in the key), so the FIRST entry
-    // with ts <= read_ts that is NOT a prepared (0x02) version is the
-    // visible version (`or_insert` keeps it); prepared versions are
-    // skipped so an in-flight 2PC write cannot shadow older commits.
+    // Adaptive walk shape (03-perf-study gap #1): a big shared keyspace
+    // pays one seek per slot interval and never touches other tables'
+    // keys; a small one is cheaper to filter on a single ordered pass
+    // (16k seeks would dwarf its key count). The estimate is a
+    // heuristic only -- both paths return the same rows.
+    if keyspace_estimate(store) >= INTERVAL_WALK_MIN_KEYS {
+        visible_versions_intervals(store, schema, read_ts, lo, hi)
+    } else {
+        visible_versions_walk(store, schema, read_ts, lo, hi)
+    }
+}
+
+/// Past this many live keys, seeking each of the 16384 slot intervals
+/// beats one ordered pass over the whole keyspace (the walk visits
+/// other tables' and RESP keys too); below it the pass is cheaper.
+const INTERVAL_WALK_MIN_KEYS: u64 = 65_536;
+
+/// RocksDB's approximate live-key count (default MAX: an unavailable
+/// property must not silently pick the isolation-losing path).
+fn keyspace_estimate(store: &Store) -> u64 {
+    store
+        .db
+        .property_value("rocksdb.estimate-num-keys")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Interval variant: one table's versions live in at most 16384
+/// disjoint key intervals (`slot_table_prefix`), each seeked in turn --
+/// other tables' keys are never touched. Inside an interval, versions
+/// of one pk are adjacent, newest first, so the FIRST entry with
+/// ts <= read_ts that is NOT a prepared (0x02) version is the visible
+/// one (`locked` keeps it, older siblings are skipped); prepared
+/// versions are skipped so an in-flight 2PC write cannot shadow older
+/// commits. A pk never spans slots (crc16 partition), so flushing on
+/// pk change is interval-safe. The per-interval runs are already
+/// pk-sorted; one stable sort merges them into the promised global pk
+/// order at k-way-merge cost.
+fn visible_versions_intervals(
+    store: &Store,
+    schema: &TableSchema,
+    read_ts: u64,
+    lo: u16,
+    hi: u16,
+) -> SqlResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    let prefixes: Vec<Vec<u8>> = (lo..=hi)
+        .map(|slot| row::slot_table_prefix(slot, schema.id))
+        .collect();
+    let mut runs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut cur_pk: Vec<u8> = Vec::new();
+    let mut cur_raw: Vec<u8> = Vec::new();
+    let mut locked = false;
+    ops::for_each_prefix(store, &prefixes, &mut |key, val| {
+        if let Some((_slot, table_id, pk, ts)) = row::parse_version_key(key) {
+            if table_id == schema.id && ts <= read_ts && !row::is_prepared(val) {
+                if locked && pk != cur_pk {
+                    runs.push((std::mem::take(&mut cur_pk), std::mem::take(&mut cur_raw)));
+                    locked = false;
+                }
+                if !locked {
+                    cur_pk = pk.to_vec();
+                    cur_raw = val.to_vec();
+                    locked = true;
+                }
+            }
+        }
+        true
+    })
+    .map_err(SqlError::from)?;
+    if locked {
+        runs.push((cur_pk, cur_raw));
+    }
+    runs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(runs
+        .into_iter()
+        // Tombstones stay invisible: the pk exists but has no live row.
+        .filter(|(_, raw)| raw.first() == Some(&HEADER_LIVE))
+        .collect())
+}
+
+/// Ordered-pass variant (the classic shape): one walk from the bottom
+/// of the keyspace, keeping the newest visible version per pk. Cheaper
+/// than 16k seeks whenever the store is small.
+fn visible_versions_walk(
+    store: &Store,
+    schema: &TableSchema,
+    read_ts: u64,
+    lo: u16,
+    hi: u16,
+) -> SqlResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut newest: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
     ops::for_each_from(store, b"0/", false, &mut |key, val| {
         if let Some((slot, table_id, pk, ts)) = row::parse_version_key(key) {
             // Slot keys are decimal strings, so byte order is NOT slot
-            // order ("1000/" < "999/"): no prefix seek is possible, the
-            // band is a numeric filter over the ordered walk.
+            // order ("1000/" < "999/"): the band stays a numeric filter
+            // over the ordered walk.
             if lo <= slot
                 && slot <= hi
                 && table_id == schema.id
@@ -275,7 +362,6 @@ pub fn visible_versions_between(
     .map_err(SqlError::from)?;
     let mut out = Vec::with_capacity(newest.len());
     for (pk, (_ts, raw)) in newest {
-        // Tombstones stay invisible: the pk exists but has no live row.
         if raw.first() == Some(&HEADER_LIVE) {
             out.push((pk, raw));
         }
@@ -305,7 +391,7 @@ pub fn band_rows(
 /// Live rows of exactly these pks (sorted, deduped) visible at
 /// `read_ts` -- the IndexLookup row fetch. Stale index entries and
 /// tombstoned/absent pks simply yield no row.
-fn rows_by_pks(
+pub(crate) fn rows_by_pks(
     store: &Store,
     schema: &TableSchema,
     pks: &[Vec<u8>],
@@ -361,6 +447,9 @@ pub async fn materialize(
             } else {
                 let rows = match plan::plan(&shared.store, &schema, alias.as_deref(), filter) {
                     plan::Path::IndexLookup { pks, .. } => {
+                        rows_by_pks(&shared.store, &schema, &pks, read_ts)?
+                    }
+                    plan::Path::PkLookup { pks } => {
                         rows_by_pks(&shared.store, &schema, &pks, read_ts)?
                     }
                     plan::Path::SeqScan => visible_rows(&shared.store, &schema, read_ts)?,
@@ -419,6 +508,15 @@ pub fn join_sources(
     let right_width = r.scope.row_width();
     if on.is_some() && !using.is_empty() {
         return Err(SqlError::unsupported("JOIN ... ON together with USING"));
+    }
+    // INNER equi-joins take the hash path (build right, probe left,
+    // emission order identical to the nested loop); anything not
+    // plannable -- no equi pair, Decimal keys, mixed types -- falls
+    // through to the loop below unchanged.
+    if kind == JoinKind::Inner {
+        if let Some(joined) = crate::sql::exec::join_hash::try_join(&l, &r, on, using)? {
+            return Ok(joined);
+        }
     }
     // Offsets address the COMBINED row (left cells, then right cells).
     let using_pairs = resolve_using(using, &l.scope, &r.scope, left_width)?;

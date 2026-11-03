@@ -376,6 +376,14 @@ async fn commit_inner(shared: &Shared, txn: &Txn) -> SqlResult<()> {
     // recovered from the store at the txn's own snapshot (the same
     // versions its reads would have seen), unique claims are validated
     // against them, and the entry ops ride in the same commit batch.
+    // Same vector-posting RMW window as apply_writes: latch every
+    // touched schema's vector indexes across ops-compute + commit batch
+    // (BTreeMap order = deterministic multi-table lock order).
+    let mut vec_guards = Vec::new();
+    for schema in schemas.values() {
+        vec_guards
+            .extend(crate::sql::index::vector::lock_schema_indexes(&shared.latch, schema).await);
+    }
     let idx = commit_index_ops(shared, txn, &schemas)?;
     // Strict when any row OR index write's slot owner is remote (the
     // commit will run as 2PC): an unreachable ts authority then vetoes

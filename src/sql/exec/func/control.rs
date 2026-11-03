@@ -206,6 +206,16 @@ fn int_out_of_range(target: &str, shown: &str) -> SqlError {
 fn cast_int(v: Value, unsigned: bool) -> SqlResult<Value> {
     let (m, shown) = match &v {
         Value::Bool(b) => (i128::from(i64::from(*b)), b.to_string()),
+        // Vectors have no numeric cast (equality-only domain).
+        Value::Vector(vec) => {
+            return Err(SqlError::new(
+                ErrorCode::NotSupported,
+                format!(
+                    "cannot cast {} to SIGNED",
+                    crate::sql::storage::vector::format_vector(vec)
+                ),
+            ))
+        }
         Value::Int(i) => (i128::from(*i), i.to_string()),
         // Rust's f64 Display/round: half away from zero both ways.
         Value::Double(d) => (int_from_double(*d, &v)?, format!("{d}")),

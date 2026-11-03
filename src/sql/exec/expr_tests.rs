@@ -663,3 +663,80 @@ fn coerce_decimal_precision_bounds() {
         Ok(Value::Decimal(268, 2))
     );
 }
+
+#[test]
+fn coerce_vector_literals_and_dimension_gate() {
+    let v3 = SqlType::Vector { dim: 3 };
+    // The '[e,e,...]' literal spelling parses (whitespace tolerated).
+    assert_eq!(
+        coerce(Value::Str("[1, 2.5, -3]".into()), v3),
+        Ok(Value::Vector(vec![1.0, 2.5, -3.0]))
+    );
+    // A Vector value passes through when the dimension matches.
+    assert_eq!(
+        coerce(Value::Vector(vec![0.0, 1.0, 2.0]), v3),
+        Ok(Value::Vector(vec![0.0, 1.0, 2.0]))
+    );
+    // Dimension mismatches and unparsable domains are WrongValue.
+    let dim = |v| {
+        let e = coerce(v, v3).unwrap_err();
+        (e.code, e.msg.clone())
+    };
+    let (c, m) = dim(Value::Str("[1,2]".into()));
+    assert_eq!(c, ErrorCode::WrongValue);
+    assert!(m.contains("2 dimensions"), "{m}");
+    let (c, _) = dim(Value::Vector(vec![1.0, 2.0]));
+    assert_eq!(c, ErrorCode::WrongValue);
+    let (c, _) = dim(Value::Str("nope".into()));
+    assert_eq!(c, ErrorCode::WrongValue);
+    let (c, _) = dim(Value::Int(3));
+    assert_eq!(c, ErrorCode::WrongValueCount);
+}
+
+#[test]
+fn vector_comparisons_equal_only() {
+    use crate::sql::parse::ast::BinOp::*;
+    let a = Value::Vector(vec![1.0, 2.0]);
+    let b = Value::Vector(vec![1.0, 2.0]);
+    let c = Value::Vector(vec![9.0, 9.0]);
+    // Equality (both directions) and the string-literal domain.
+    let bin = |op: BinOp, l: Value, r: Value| {
+        eval(
+            &Expr::BinaryOp {
+                left: Box::new(Expr::Lit(l)),
+                op,
+                right: Box::new(Expr::Lit(r)),
+            },
+            &Scope,
+            &[],
+        )
+    };
+    assert_eq!(bin(Eq, a.clone(), b.clone()), Ok(Value::Bool(true)));
+    assert_eq!(bin(NotEq, a.clone(), c.clone()), Ok(Value::Bool(true)));
+    assert_eq!(bin(Eq, a.clone(), c.clone()), Ok(Value::Bool(false)));
+    assert_eq!(
+        bin(Eq, a.clone(), Value::Str("[1, 2]".into())),
+        Ok(Value::Bool(true))
+    );
+    assert_eq!(
+        bin(Eq, Value::Str("[1, 2]".into()), a.clone()),
+        Ok(Value::Bool(true))
+    );
+    // NULL stays three-valued.
+    assert_eq!(bin(Eq, a.clone(), Value::Null), Ok(Value::Null));
+    // Ranges refuse between DIFFERENT vectors: no order exists to
+    // answer with. (An equal pair is Ordering::Equal, so the range
+    // operators answer false rather than erroring.)
+    for op in [Lt, LtEq, Gt, GtEq] {
+        let e = bin(op, a.clone(), c.clone()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotSupported);
+        assert!(e.msg.contains("cannot compare"), "{e}");
+    }
+    assert_eq!(bin(Lt, a.clone(), b.clone()), Ok(Value::Bool(false)));
+    // A malformed literal on the right side is a wrong value.
+    let e = bin(Eq, a, Value::Str("[1,".into())).unwrap_err();
+    assert_eq!(e.code, ErrorCode::WrongValue);
+    // Cross-domain comparisons refuse.
+    let e = cmp_values(&Value::Vector(vec![1.0]), &Value::Int(1)).unwrap_err();
+    assert!(e.msg.contains("cannot compare"), "{e}");
+}

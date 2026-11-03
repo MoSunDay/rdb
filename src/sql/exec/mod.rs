@@ -29,6 +29,7 @@ pub(crate) mod insert_common;
 /// INSERT ... SELECT source materialization: the source query runs to
 /// completion before any write of the statement.
 pub(crate) mod insert_select;
+mod join_hash;
 pub mod relation;
 pub mod render;
 pub mod scan;
@@ -43,6 +44,8 @@ pub mod show;
 pub mod subquery;
 /// Explicit INSERT conflict paths: ON DUPLICATE KEY UPDATE / REPLACE.
 pub(crate) mod upsert;
+mod vector_ann;
+mod vector_knn;
 pub mod write;
 mod write_probe;
 
@@ -187,7 +190,7 @@ async fn dispatch(
             stmt,
             Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
-                | Statement::CreateIndex { .. }
+                | Statement::CreateVectorIndex { .. } | Statement::CreateIndex { .. }
                 | Statement::DropIndex { .. }
                 // TRUNCATE/RENAME are DDL exactly like CREATE/DROP
                 // (decision point 5): reject in-txn, never stage.
@@ -228,6 +231,7 @@ async fn dispatch(
         Statement::CreateTable { .. }
         | Statement::DropTable { .. }
         | Statement::CreateIndex { .. }
+        | Statement::CreateVectorIndex { .. }
         | Statement::DropIndex { .. }
         | Statement::TruncateTable { .. }
         | Statement::RenameTable { .. } => ddl::run(shared, stmt).await,

@@ -32,10 +32,21 @@ pub enum SqlType {
     DateTime,
     VarChar,
     Blob,
+    /// Fixed-width float vector of exactly `dim` f32 elements
+    /// (1..=4096, validated at DDL time). Equality-only domain: no
+    /// pk/index membership, no ordering (see `storage::vector`).
+    Vector {
+        dim: u32,
+    },
 }
 
 /// A runtime value. `Null` is its own variant (SQL three-valued logic).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `PartialEq` is hand-rolled (not derived) so vectors compare
+/// BYTEWISE on their f32 payloads: two vectors are equal only when
+/// every element's bit pattern matches (0.0 != -0.0, NaN-vectors never
+/// equal). Every other variant keeps derived semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -50,6 +61,28 @@ pub enum Value {
     DateTime(i64),
     Str(String),
     Bytes(Vec<u8>),
+    /// Fixed-width float vector; the dimension lives in the column
+    /// schema, the value carries only the elements.
+    Vector(Vec<f32>),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Vector(a), Vector(b)) => super::vector::bits_equal(a, b),
+            (Null, Null) => true,
+            (Bool(a), Bool(b)) => a == b,
+            (Int(a), Int(b)) => a == b,
+            (Double(a), Double(b)) => a == b,
+            (Decimal(a, sa), Decimal(b, sb)) => a == b && sa == sb,
+            (Date(a), Date(b)) => a == b,
+            (DateTime(a), DateTime(b)) => a == b,
+            (Str(a), Str(b)) => a == b,
+            (Bytes(a), Bytes(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Render one fixed-point decimal in canonical SQL form: integer digits,
@@ -101,6 +134,11 @@ impl Value {
             Value::DateTime(_) => Some(SqlType::DateTime),
             Value::Str(_) => Some(SqlType::VarChar),
             Value::Bytes(_) => Some(SqlType::Blob),
+            // The nominal dimension of THIS value; column widths are
+            // checked where the schema is known (see `vector::coerce`).
+            Value::Vector(v) => Some(SqlType::Vector {
+                dim: v.len() as u32,
+            }),
         }
     }
 
@@ -174,6 +212,10 @@ pub struct IndexDef {
     pub name: String,
     pub column: String,
     pub unique: bool,
+    /// Present iff this is a vector (ANN) index: plain CREATE INDEX
+    /// rejects VECTOR columns, so the two families never overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<crate::sql::index::vector::VectorIndexParams>,
 }
 
 /// Table storage engine. Row = the MVCC row-store in RocksDB (the
@@ -356,6 +398,9 @@ impl TableSchema {
             SqlType::DateTime => T::MYSQL_TYPE_DATETIME,
             SqlType::VarChar => T::MYSQL_TYPE_VAR_STRING,
             SqlType::Blob => T::MYSQL_TYPE_BLOB,
+            // No MySQL wire type for vectors yet (the binary protocol
+            // layer lands later): cells ship as the '[e,e,...]' text.
+            SqlType::Vector { .. } => T::MYSQL_TYPE_BLOB,
         }
     }
 }

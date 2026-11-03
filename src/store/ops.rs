@@ -232,6 +232,36 @@ fn forward_iter<'a>(
 /// RocksDB iterator is consumed item-by-item (NOT via `forward_iter`,
 /// whose `map_while(Result::ok)` would swallow an error into a silent
 /// early stop and report `Ok`).
+/// Walk the union of disjoint, pre-sorted key `prefixes` with ONE raw
+/// iterator: seek each prefix in turn and relay pairs while the key
+/// still starts with it (an ordered walk never revisits an interval, so
+/// a mismatch ends that prefix). An empty prefix costs one seek.
+/// Callback semantics match [`for_each_from`]: false stops the walk.
+pub fn for_each_prefix(
+    store: &Store,
+    prefixes: &[Vec<u8>],
+    f: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+) -> Result<(), String> {
+    let mut iter = store.db.raw_iterator_opt(ReadOptions::default());
+    for prefix in prefixes {
+        iter.seek(prefix.as_slice());
+        while iter.valid() {
+            let (k, v) = match (iter.key(), iter.value()) {
+                (Some(k), Some(v)) => (k, v),
+                _ => break,
+            };
+            if !k.starts_with(prefix.as_slice()) {
+                break;
+            }
+            if !f(k, v) {
+                return Ok(());
+            }
+            iter.next();
+        }
+    }
+    Ok(())
+}
+
 pub fn for_each_from(
     store: &Store,
     from: &[u8],

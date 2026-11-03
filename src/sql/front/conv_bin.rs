@@ -51,6 +51,9 @@ impl ToMysqlValue for Cell<'_> {
             Value::DateTime(us) => DateTimeCell(*us).to_mysql_text(w),
             Value::Str(s) => s.to_mysql_text(w),
             Value::Bytes(b) => b.as_slice().to_mysql_text(w),
+            // Vector cells ship as the canonical '[e,e,...]' text (the
+            // dedicated binary vector wire type is future work).
+            Value::Vector(v) => crate::sql::storage::vector::format_vector(v).to_mysql_text(w),
         }
     }
 
@@ -178,6 +181,8 @@ fn value_text(v: &Value) -> Cow<'_, [u8]> {
         Value::Decimal(m, s) => Cow::Owned(format_decimal(*m, *s).into_bytes()),
         Value::Date(d) => Cow::Owned(temporal::format_date(*d).into_bytes()),
         Value::DateTime(us) => Cow::Owned(temporal::format_datetime(*us).into_bytes()),
+        // Canonical '[e,e,...]' text until the vector wire type lands.
+        Value::Vector(v) => Cow::Owned(crate::sql::storage::vector::format_vector(v).into_bytes()),
         // Null rides the null bitmap; it is never spelled as text.
         Value::Null => Cow::Borrowed(&[]),
     }

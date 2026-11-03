@@ -20,6 +20,7 @@ mod numeric;
 mod numeric_more;
 mod string;
 mod string_more;
+mod vector;
 
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::schema::Value;
@@ -29,6 +30,9 @@ use crate::sql::storage::schema::Value;
 pub(crate) use control::{eval_case, eval_cast, eval_lazy};
 pub(crate) use numeric::eval_bitop;
 pub(crate) use string::{regexp_match, value_text};
+// The KNN collector (exec::vector_knn) re-uses the vector family's
+// pure pieces so the ORDER BY form and the scalar call agree exactly.
+pub(crate) use vector::{distance, metric_arg, vector_arg, Metric};
 
 /// Evaluate scalar function `name` over already-evaluated `args`.
 pub fn eval_func(name: &str, args: &[Value]) -> SqlResult<Value> {
@@ -38,6 +42,7 @@ pub fn eval_func(name: &str, args: &[Value]) -> SqlResult<Value> {
         .or_else(|| string::eval(name, args))
         .or_else(|| numeric::eval(name, args))
         .or_else(|| datetime::eval(name, args))
+        .or_else(|| vector::eval(name, args))
         .unwrap_or_else(|| Err(unknown(name)))
 }
 

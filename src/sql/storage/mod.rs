@@ -7,3 +7,4 @@ pub mod gc;
 pub mod replicate;
 pub mod row;
 pub mod schema;
+pub mod vector;

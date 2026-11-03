@@ -21,6 +21,11 @@ pub const KIND_SQL_INDEX: u8 = 0x21;
 pub const KIND_SQL_UNIQUE_INDEX: u8 = 0x22;
 /// Columnar segment meta — JSON `SegmentMeta` value.
 pub const KIND_SQL_SEGMENT: u8 = 0x23;
+/// SQL vector-index family (02 doc §4.1): meta record, centroid table,
+/// per-centroid SQ8 postings. Derived state like 0x21/0x22 (no ts).
+pub const KIND_SQL_VEC_META: u8 = 0x24;
+pub const KIND_SQL_VEC_CENTROID: u8 = 0x25;
+pub const KIND_SQL_VEC_POSTING: u8 = 0x26;
 
 /// Encode a value with its type tag (self-describing; used for index
 /// payloads where the reader may only know the index column type later).
@@ -63,6 +68,14 @@ pub fn encode_typed(value: &Value) -> Vec<u8> {
             out.push(0x05);
             out.extend_from_slice(&(b.len() as u32).to_be_bytes());
             out.extend_from_slice(b);
+        }
+        // Vector: little-endian f32 array, no length prefix (the tag
+        // ends the value; dim is schema metadata elsewhere).
+        Value::Vector(v) => {
+            out.push(0x09);
+            for f in v {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
         }
     }
     out
@@ -147,6 +160,20 @@ pub fn decode_typed(bytes: &[u8]) -> Result<(Value, &[u8]), String> {
                 rest,
             ))
         }
+        // Vector: little-endian f32 array with no length prefix, so
+        // the value consumes the REST of the input (terminal); empty
+        // or non-multiple-of-4 payloads are malformed. The dim is
+        // schema metadata, never in the bytes.
+        0x09 => {
+            if rest.is_empty() || rest.len() % 4 != 0 {
+                return Err("vector payload must be a non-empty f32 array".into());
+            }
+            let vals = rest
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            Ok((Value::Vector(vals), &[]))
+        }
         other => Err(format!("unknown typed value tag 0x{other:02x}")),
     }
 }
@@ -180,6 +207,11 @@ pub fn encode_key(value: &Value) -> Result<Vec<u8>, String> {
         }
         Value::Str(s) => key_bytes(0x04, s.as_bytes())?,
         Value::Bytes(b) => key_bytes(0x05, b)?,
+        // Vectors have no order-preserving encoding (equality-only
+        // domain); DDL rejects vector pk/index columns before any
+        // key can reach here, so this is a loud invariant, not a
+        // silent wrong order.
+        Value::Vector(_) => return Err("vector values cannot be key components".into()),
     })
 }
 

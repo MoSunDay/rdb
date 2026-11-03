@@ -125,10 +125,11 @@ fn push_payload(out: &mut Vec<u8>, v: &Value) -> Result<(), String> {
             out.extend_from_slice(&(b.len() as u32).to_be_bytes());
             out.extend_from_slice(b);
         }
-        // Defensive: DDL rejects DECIMAL columns on columnar tables, so
-        // one reaching here means a schema/payload mismatch, never a
-        // supported path.
+        // Defensive: DDL rejects DECIMAL and VECTOR columns on
+        // columnar tables, so one reaching here means a schema/payload
+        // mismatch, never a supported path.
         Value::Decimal(..) => return Err("DECIMAL not supported on columnar tables".into()),
+        Value::Vector(..) => return Err("VECTOR not supported on columnar tables".into()),
     }
     Ok(())
 }

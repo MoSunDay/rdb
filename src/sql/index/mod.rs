@@ -10,6 +10,8 @@
 
 pub mod keys;
 pub mod maintain;
+pub mod vector;
+pub mod vector_build;
 
 use crate::sql::parse::error::SqlError;
 use crate::sql::storage::codec::KIND_SQL_UNIQUE_INDEX;
@@ -347,3 +349,5 @@ pub fn dup_entry(value: &Value, index: &str) -> SqlError {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vector_tests;

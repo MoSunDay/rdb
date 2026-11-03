@@ -52,6 +52,8 @@ pub fn value_text(v: &Value) -> SqlResult<String> {
         Value::Decimal(m, s) => format_decimal(*m, *s),
         Value::Date(d) => temporal::format_date(*d),
         Value::DateTime(us) => temporal::format_datetime(*us),
+        // Canonical '[e,e,...]' spelling (SELECT output rides this).
+        Value::Vector(v) => crate::sql::storage::vector::format_vector(v),
         Value::Null => {
             return Err(SqlError::new(
                 ErrorCode::NotSupported,

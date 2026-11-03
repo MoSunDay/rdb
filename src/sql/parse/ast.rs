@@ -35,6 +35,17 @@ pub enum Statement {
         unique: bool,
         if_not_exists: bool,
     },
+    /// `CREATE VECTOR INDEX name ON t (col) [WITH (...)`: the ANN
+    /// family (kind 0x24-0x26). metric defaults to 'cosine', nprobe
+    /// to 4.
+    CreateVectorIndex {
+        table: String,
+        name: String,
+        column: String,
+        metric: crate::sql::index::vector::Metric,
+        nprobe: u16,
+        if_not_exists: bool,
+    },
     DropIndex {
         table: String,
         name: String,

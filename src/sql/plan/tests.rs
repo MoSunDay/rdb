@@ -33,6 +33,7 @@ fn schema() -> TableSchema {
         key_model: KeyModel::MySql,
         distribution: None,
         indexes: vec![IndexDef {
+            vector: None,
             id: 1,
             name: "idx_v".into(),
             column: "v".into(),
@@ -241,5 +242,73 @@ fn in_between_and_wide_fallback() {
             Some(&filter_of("SELECT 1 FROM t WHERE n BETWEEN 0 AND 5000"))
         ),
         Path::SeqScan
+    ));
+}
+
+#[test]
+fn whole_pk_equality_takes_pk_lookup() {
+    let sh = shared();
+    seed(&sh, &[(1, "red"), (2, "red"), (3, "blue")]);
+    let s = schema();
+    // pk equality resolves without any index: one seek answers it
+    assert_eq!(
+        plan(
+            &sh.store,
+            &s,
+            None,
+            Some(&filter_of("SELECT n FROM t WHERE id = 3"))
+        ),
+        Path::PkLookup { pks: vec![pk(3)] }
+    );
+    // IN list dedups and sorts
+    assert_eq!(
+        plan(
+            &sh.store,
+            &s,
+            None,
+            Some(&filter_of("SELECT n FROM t WHERE id IN (3, 1, 1)"))
+        ),
+        Path::PkLookup {
+            pks: vec![pk(1), pk(3)]
+        }
+    );
+    // pk pinned among other conjuncts still wins over idx_v
+    assert_eq!(
+        plan(
+            &sh.store,
+            &s,
+            None,
+            Some(&filter_of("SELECT n FROM t WHERE v = 'red' AND id = 2"))
+        ),
+        Path::PkLookup { pks: vec![pk(2)] }
+    );
+    // OR stays one opaque conjunct; NULL pk matches nothing anyway
+    assert_eq!(
+        plan(
+            &sh.store,
+            &s,
+            None,
+            Some(&filter_of("SELECT n FROM t WHERE id = 3 OR v = 'x'"))
+        ),
+        Path::SeqScan
+    );
+    assert_eq!(
+        plan(
+            &sh.store,
+            &s,
+            None,
+            Some(&filter_of("SELECT n FROM t WHERE id = NULL"))
+        ),
+        Path::SeqScan
+    );
+    // non-pk equality keeps its index path
+    assert!(matches!(
+        plan(
+            &sh.store,
+            &s,
+            None,
+            Some(&filter_of("SELECT n FROM t WHERE v = 'red'"))
+        ),
+        Path::IndexLookup { .. }
     ));
 }

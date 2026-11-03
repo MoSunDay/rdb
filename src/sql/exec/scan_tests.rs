@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::sql::exec::relation::CteScope;
+use crate::sql::exec::scan::{visible_versions_intervals, visible_versions_walk};
 use crate::sql::storage::schema::{ColumnDef, Engine, KeyModel};
 use crate::state::testutil;
 
@@ -422,4 +423,68 @@ fn parse_filter(sql: &str) -> Expr {
         panic!("join with ON");
     };
     e.clone()
+}
+
+/// The per-slot interval walk (03-perf-study gap #1) must be isolated:
+/// another table's versions -- even with identical pk bytes and slots
+/// that interleave in the raw keyspace -- never leak into a scan, and
+/// the global pk-order contract survives the interval merge.
+#[test]
+fn interval_walk_isolates_tables_and_keeps_pk_order() {
+    let shared = shared();
+    let a = schema(11, "a");
+    let b = schema(22, "b");
+    // identical pk bytes on both tables; slots hash differently per
+    // table id, so the intervals interleave in the raw keyspace.
+    for pk in [5i64, 1, 9, 3] {
+        put_version(&shared, &a, pk, 2, Some(row_of(pk, "a")));
+        put_version(&shared, &b, pk, 2, Some(row_of(pk, "b")));
+    }
+    let want = |tag: &str| {
+        vec![
+            row_of(1, tag),
+            row_of(3, tag),
+            row_of(5, tag),
+            row_of(9, tag),
+        ]
+    };
+    assert_eq!(visible_rows(&shared.store, &a, 10).unwrap(), want("a"));
+    assert_eq!(visible_rows(&shared.store, &b, 10).unwrap(), want("b"));
+    // small store dispatches to the walk; assert the interval path
+    // yields the same isolation directly (it is what big stores take)
+    for s in [&a, &b] {
+        let x = visible_versions_intervals(&shared.store, s, 10, 0, u16::MAX).unwrap();
+        let y = visible_versions_walk(&shared.store, s, 10, 0, u16::MAX).unwrap();
+        assert_eq!(x, y);
+        assert_eq!(x.len(), 4);
+    }
+    // band scans (scatter-gather unit) stay disjoint and ordered
+    let mut seen = 0;
+    for band in 0..4u16 {
+        let rows =
+            visible_rows_between(&shared.store, &a, 10, band * 4096, band * 4096 + 4095).unwrap();
+        seen += rows.len();
+    }
+    assert_eq!(seen, 4);
+}
+
+#[test]
+fn walk_and_interval_paths_agree() {
+    let shared = shared();
+    let a = schema(11, "a");
+    let b = schema(22, "b"); // noise from another table
+    for pk in [7i64, 3, 9] {
+        put_version(&shared, &a, pk, 2, Some(row_of(pk, "a")));
+    }
+    put_version(&shared, &b, 5, 2, Some(row_of(5, "b")));
+    // delete + shadowing update for pk 7, both under ts <= read
+    put_version(&shared, &a, 3, 4, Some(row_of(3, "later")));
+    put_version(&shared, &a, 7, 6, None); // tombstone
+    for read_ts in [1u64, 3, 10] {
+        for (lo, hi) in [(0u16, u16::MAX), (0, 1), (16383, 16383)] {
+            let x = visible_versions_intervals(&shared.store, &a, read_ts, lo, hi).unwrap();
+            let y = visible_versions_walk(&shared.store, &a, read_ts, lo, hi).unwrap();
+            assert_eq!(x, y, "paths disagree ts={read_ts} band=({lo},{hi})");
+        }
+    }
 }

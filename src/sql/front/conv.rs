@@ -149,6 +149,10 @@ pub fn sql_type_to_mysql(t: SqlType) -> ColumnType {
         SqlType::DateTime => ColumnType::MYSQL_TYPE_DATETIME,
         SqlType::VarChar => ColumnType::MYSQL_TYPE_VAR_STRING,
         SqlType::Blob => ColumnType::MYSQL_TYPE_BLOB,
+        // No dedicated MySQL vector wire type yet: vector columns
+        // announce as BLOB and cells ride the canonical text form
+        // (see `conv_bin::Cell`); a typed binary form is future work.
+        SqlType::Vector { .. } => ColumnType::MYSQL_TYPE_BLOB,
     }
 }
 

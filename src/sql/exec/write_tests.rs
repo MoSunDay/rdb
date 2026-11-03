@@ -683,3 +683,43 @@ async fn create_unique_index_backfills_and_enforces_on_insert() {
     let owners = index::lookup_pks(&shared.store, &schema, &uv, &Value::Str("c".into())).unwrap();
     assert_eq!(owners, vec![row::pk_encode(&Value::Int(9)).unwrap()]);
 }
+
+#[tokio::test]
+async fn insert_coerces_vector_literals_and_dimension_gate() {
+    let shared = testutil::shared_with(testutil::test_config());
+    ddl::run(
+        &shared,
+        parse_statement("CREATE TABLE vt (id BIGINT PRIMARY KEY, e VECTOR(3) NULL)").unwrap(),
+    )
+    .await
+    .unwrap();
+    // The '[e,e,...]' literal coerces (whitespace tolerated).
+    assert!(matches!(
+        exec(&shared, "INSERT INTO vt (id, e) VALUES (1, '[1, 2.5, -3]')").await,
+        ExecOutcome::Affected(1)
+    ));
+    // Dimension mismatch and a malformed literal are loud WrongValues.
+    for sql in [
+        "INSERT INTO vt (id, e) VALUES (2, '[1,2]')",
+        "INSERT INTO vt (id, e) VALUES (3, 'not a vector')",
+        "INSERT INTO vt (id, e) VALUES (4, 7)",
+    ] {
+        let e = write(&shared, parse_statement(sql).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            e.code == crate::sql::parse::error::ErrorCode::WrongValue
+                || e.code == crate::sql::parse::error::ErrorCode::WrongValueCount,
+            "{sql}: {e}"
+        );
+    }
+    // The stored payload round trips through the physical version.
+    let schema = catalog::lookup(&shared, "vt").unwrap().unwrap();
+    let key = row::pk_encode(&Value::Int(1)).unwrap();
+    let raw = newest_raw(&shared, &schema, &key).expect("version present");
+    let (_, vals) = row::decode_version(&schema, &raw).unwrap();
+    assert_eq!(
+        vals,
+        vec![Value::Int(1), Value::Vector(vec![1.0, 2.5, -3.0])]
+    );
+}

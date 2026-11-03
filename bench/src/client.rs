@@ -87,6 +87,13 @@ fn append_op(
         Workload::KafkaProd | Workload::KafkaFetch => {
             unreachable!("kafka workloads use the kafka client")
         }
+        // The mysql workloads have their own client loops (mysql.rs).
+        Workload::MysqlPoint
+        | Workload::MysqlRange
+        | Workload::MysqlJoin
+        | Workload::MysqlKnnScan => {
+            unreachable!("mysql workloads use the mysql client")
+        }
         Workload::Mixed => unreachable!("op_kind never returns Mixed"),
     }
 }

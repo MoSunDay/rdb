@@ -39,7 +39,7 @@ pub fn index_slot(table_id: u32, col_pos: u32) -> u16 {
 }
 
 /// Shared head of both layouts: slot prefix + kind + table + col pos.
-fn head(slot: u16, kind: u8, table_id: u32, col_pos: u32) -> Vec<u8> {
+pub(crate) fn head(slot: u16, kind: u8, table_id: u32, col_pos: u32) -> Vec<u8> {
     let mut k = slot_prefix(slot);
     k.push(kind);
     k.extend_from_slice(&table_id.to_be_bytes());
@@ -126,6 +126,9 @@ pub fn split_tail(tail: &[u8], ty: SqlType) -> Option<(&[u8], &[u8])> {
         // Decimal keys are tag + 16B mantissa: fixed width, so the
         // split is deterministic without a terminator.
         SqlType::Decimal { .. } => 17,
+        // Vector columns are never indexed (DDL rejects key usage);
+        // one reaching here is a schema/entry mismatch.
+        SqlType::Vector { .. } => return None,
         SqlType::VarChar | SqlType::Blob => terminator_len(tail)?,
     };
     tail.split_at_checked(fixed)
@@ -176,6 +179,9 @@ pub fn value_display(v: &Value) -> String {
         Value::DateTime(us) => format!("'{}'", temporal::format_datetime(*us)),
         Value::Str(s) => format!("'{s}'"),
         Value::Bytes(b) => format!("x'{}'", hex::encode(b)),
+        // Canonical '[e,e,...]' spelling (vectors are never index keys;
+        // kept for message completeness).
+        Value::Vector(v) => format!("'{}'", crate::sql::storage::vector::format_vector(v)),
     }
 }
 

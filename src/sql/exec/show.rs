@@ -299,6 +299,7 @@ pub(crate) fn type_name(t: SqlType) -> String {
         SqlType::DateTime => "datetime".to_string(),
         SqlType::VarChar => "varchar".to_string(),
         SqlType::Blob => "blob".to_string(),
+        SqlType::Vector { dim } => format!("vector({dim})"),
     }
 }
 

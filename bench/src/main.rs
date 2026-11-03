@@ -8,15 +8,21 @@
 //! RTT; with larger pipelines every reported stat is a per-batch RTT.
 //!
 //! Modules: `cli` (argument parsing), `resp` (client-side RESP codec),
-//! `client` (the per-connection load loop), `stats` (pure aggregation)
-//! and `kafka`/`kafka_wire`/`kafka_reply` (the hand-rolled Produce v2 /
-//! Fetch v4 client for the kafka front).
+//! `client` (the per-connection load loop), `stats` (pure aggregation),
+//! `kafka`/`kafka_wire`/`kafka_reply` (the hand-rolled Produce v2 /
+//! Fetch v4 client for the kafka front) and `mysql`/`mysql_wire`/
+//! `mysql_reply`/`mysql_setup` (the hand-rolled MySQL text-protocol
+//! client and dataset prep for the SQL front).
 
 mod cli;
 mod client;
 mod kafka;
 mod kafka_reply;
 mod kafka_wire;
+mod mysql;
+mod mysql_reply;
+mod mysql_setup;
+mod mysql_wire;
 mod resp;
 mod stats;
 
@@ -47,6 +53,15 @@ async fn main() {
         }
     }
 
+    // Mysql workloads need their tables created and pre-filled before
+    // any client connects; setup runs once on its own connection.
+    if cfg.workload.is_mysql() {
+        if let Err(msg) = mysql_setup::ensure_dataset(&cfg).await {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
+    }
+
     // Shared deadline: tasks stop issuing batches after it and only drain
     // the replies of the batch already in flight.
     let deadline = Instant::now() + Duration::from_secs(cfg.duration);
@@ -57,6 +72,8 @@ async fn main() {
         handles.push(tokio::spawn(async move {
             if task_cfg.workload.is_kafka() {
                 kafka::run_kafka_client(&task_cfg, client_id, deadline).await
+            } else if task_cfg.workload.is_mysql() {
+                mysql::run_mysql_client(&task_cfg, client_id, deadline).await
             } else {
                 client::run_client(&task_cfg, client_id, deadline).await
             }

@@ -67,6 +67,12 @@ fn signature(name: &str) -> Option<Sig> {
         "datediff" | "date_format" => (2, 2),
         "from_unixtime" => (1, 2), // the format-argument spelling
         "unix_timestamp" => (0, 1),
+        // Vector family (01-vector-surface D5): MySQL-face names plus
+        // the two aliases; DISTANCE always spells its metric.
+        "string_to_vector" | "to_vector" | "vector_to_string" | "vec_to_text" | "vector_dim" => {
+            (1, 1)
+        }
+        "distance" => (3, 3),
         _ => return None,
     })
 }

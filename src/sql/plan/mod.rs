@@ -28,6 +28,11 @@ pub const MAX_INDEX_PKS: usize = 1000;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Path {
     SeqScan,
+    /// Fetch exactly these pk keys (sorted, deduped): whole-pk equality
+    /// needs no index -- the row IS the key (03-perf-study gap #2).
+    PkLookup {
+        pks: Vec<Vec<u8>>,
+    },
     /// Fetch exactly these pks (sorted, deduped) instead of a full walk.
     IndexLookup {
         index: IndexMeta,
@@ -65,6 +70,12 @@ pub fn plan(
     };
     let mut conjuncts = Vec::new();
     collect_conjuncts(filter, &mut conjuncts);
+    // Whole-pk equality resolves the physical keys directly -- one seek
+    // per pk, no index consulted. Falls through untouched when the pk
+    // is only partially pinned (or NULL, which matches nothing anyway).
+    if let Some(pks) = resolve_pk(schema, alias, &conjuncts) {
+        return Path::PkLookup { pks };
+    }
     for c in conjuncts {
         let Some((col_name, pred)) = sargable(c, schema, alias) else {
             continue;
@@ -93,6 +104,57 @@ pub fn plan(
         };
     }
     Path::SeqScan
+}
+
+/// Pk keys selected by whole-pk equality: every pk column pinned by
+/// `=`, or (single-column pk) an `IN` list. Coercion/encoding reuse the
+/// sargable parser, so literals already carry the column type. Output
+/// is deduped and sorted like `resolve` does.
+fn resolve_pk(
+    schema: &TableSchema,
+    alias: Option<&str>,
+    conjuncts: &[&Expr],
+) -> Option<Vec<Vec<u8>>> {
+    let mut eq = std::collections::HashMap::new();
+    let mut in_list: Option<(String, Vec<Value>)> = None;
+    for c in conjuncts {
+        match sargable(c, schema, alias) {
+            Some((name, Pred::Eq(v))) => {
+                eq.insert(name, v);
+            }
+            Some((name, Pred::In(vals))) if in_list.is_none() => {
+                in_list = Some((name, vals));
+            }
+            _ => {}
+        }
+    }
+    // Every pk component pinned: one key, components in pk order.
+    if schema.pk.iter().all(|c| eq.contains_key(c)) {
+        let mut key = Vec::new();
+        for col in &schema.pk {
+            let v = eq.get(col)?;
+            if matches!(v, Value::Null) {
+                return None;
+            }
+            key.extend_from_slice(&crate::sql::storage::codec::encode_key(v).ok()?);
+        }
+        return Some(vec![key]);
+    }
+    // Single-column pk with an IN list: one key per element.
+    if schema.pk.len() == 1 {
+        if let Some((name, vals)) = &in_list {
+            if name == &schema.pk[0] {
+                let mut set = std::collections::BTreeSet::new();
+                for v in vals {
+                    if !matches!(v, Value::Null) {
+                        set.insert(crate::sql::storage::codec::encode_key(v).ok()?);
+                    }
+                }
+                return Some(set.into_iter().collect());
+            }
+        }
+    }
+    None
 }
 
 /// Split `a AND b AND c` into [a, b, c] (AND binds tighter than OR, so

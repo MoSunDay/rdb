@@ -23,6 +23,9 @@ use crate::sql::storage::schema::{Engine, KeyModel, Value};
 /// StarRocks table-model clauses lift out first (see `parse::starrocks`).
 pub fn parse_statement(sql: &str) -> SqlResult<Statement> {
     let (text, model) = crate::sql::parse::starrocks::preparse(sql)?;
+    // CREATE VECTOR INDEX rewrites into a marker-function CREATE INDEX
+    // the grammar accepts; translate_ddl lifts it back out.
+    let text = crate::sql::parse::vector_ddl::rewrite(&text)?;
     // Legal MySQL `TRIM([BOTH|LEADING|TRAILING] FROM x)` gets its
     // implicit ' ' remstr made explicit: sqlparser's TRIM grammar
     // cannot take the keyword straight before FROM.

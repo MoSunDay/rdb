@@ -63,6 +63,26 @@ pub fn batch_ops(
 ) -> SqlResult<IndexOps> {
     let mut ops: IndexOps = Vec::new();
     for def in &schema.indexes {
+        // Vector indexes maintain postings instead of 0x21/0x22
+        // entries: assignment by nearest centroid, SQ8 codes, one
+        // partition rewrite per touched centroid (02 doc §4.2). An
+        // unbuilt index (no meta record) contributes nothing and the
+        // probe falls back to the exact scan.
+        if let Some(params) = &def.vector {
+            let col_pos = schema.column_index(&def.column).unwrap_or(usize::MAX);
+            if let Some(loaded) = super::vector_build::load(store, schema.id, col_pos as u32)? {
+                if loaded.params.metric == params.metric {
+                    ops.extend(super::vector_build::transition_ops(
+                        store,
+                        schema,
+                        col_pos,
+                        &loaded,
+                        transitions,
+                    )?);
+                }
+            }
+            continue;
+        }
         let index = IndexRef::of(def);
         let mut per_row: Vec<IndexOps> = Vec::with_capacity(transitions.len());
         for t in transitions {

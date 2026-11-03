@@ -34,12 +34,18 @@ pub fn report(cfg: &Config, wall_secs: f64, all: &[ClientStats]) -> i32 {
     samples.sort_by(f64::total_cmp);
 
     // Kafka workloads point at the kafka front and report the record
-    // batch size instead of the RESP pipeline depth; the RESP line
-    // format is unchanged byte for byte.
+    // batch size instead of the RESP pipeline depth; mysql workloads
+    // report the dataset shape instead. The line format is unchanged
+    // byte for byte.
     let (addr, tail) = if cfg.workload.is_kafka() {
         (
             cfg.host.as_str(),
             format!("topic={} batch={}", cfg.topic, cfg.batch),
+        )
+    } else if cfg.workload.is_mysql() {
+        (
+            cfg.addr.as_str(),
+            format!("rows={} span={}", cfg.rows, cfg.span),
         )
     } else {
         (cfg.addr.as_str(), format!("pipeline={}", cfg.pipeline))

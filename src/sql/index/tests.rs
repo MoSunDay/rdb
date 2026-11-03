@@ -37,12 +37,14 @@ fn schema() -> TableSchema {
         distribution: None,
         indexes: vec![
             IndexDef {
+                vector: None,
                 id: 1,
                 name: "idx_v".into(),
                 column: "v".into(),
                 unique: false,
             },
             IndexDef {
+                vector: None,
                 id: 2,
                 name: "uq_n".into(),
                 column: "n".into(),

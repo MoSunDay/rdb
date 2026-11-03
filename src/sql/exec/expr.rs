@@ -6,6 +6,7 @@
 use crate::sql::parse::ast::{BinOp, CorrelatedKind, CorrelatedOut, Expr};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::schema::{format_decimal, SqlType, Value};
+use crate::sql::storage::vector;
 use crate::sql::temporal::{self, MICROS_PER_DAY};
 
 use super::expr_decimal::{arith_decimal, decimal_out_of_range, decimal_to_f64, fit_column, pow10};
@@ -290,6 +291,15 @@ pub(crate) fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 return Ok(Value::Null);
             }
+            // VECTOR equality is bytewise and needs no order; an
+            // unequal pair must still answer `!=` (ranges keep
+            // refusing through `cmp_values` below).
+            if matches!(op, Eq | NotEq)
+                && (matches!(l, Value::Vector(_)) || matches!(r, Value::Vector(_)))
+            {
+                let b = eq_values(l, r)?;
+                return Ok(Value::Bool(if matches!(op, Eq) { b } else { !b }));
+            }
             let c = cmp_values(l, r)?;
             let b = match op {
                 Eq => c.is_eq(),
@@ -307,7 +317,7 @@ pub(crate) fn eval_binop(op: &BinOp, l: &Value, r: &Value) -> SqlResult<Value> {
             let b = match (l, r) {
                 (Value::Null, Value::Null) => true,
                 (Value::Null, _) | (_, Value::Null) => false,
-                (a, b) => cmp_values(a, b)?.is_eq(),
+                (a, b) => eq_values(a, b)?,
             };
             Ok(Value::Bool(b))
         }
@@ -513,6 +523,16 @@ pub fn cmp_values(l: &Value, r: &Value) -> SqlResult<std::cmp::Ordering> {
         (Bytes(a), Bytes(b)) => a.cmp(b),
         (Str(a), Bytes(b)) => a.as_bytes().cmp(b.as_slice()),
         (Bytes(a), Str(b)) => a.as_slice().cmp(b.as_bytes()),
+        // Vectors carry NO order: an equal pair reports Equal (IN,
+        // `<=>`, set-op dedup); every other pairing refuses -- ranges
+        // and ORDER BY never invent an ordering (see `storage::vector`).
+        (Vector(_), Vector(_)) | (Str(_), Vector(_)) | (Vector(_), Str(_)) => {
+            if eq_values(l, r)? {
+                Ordering::Equal
+            } else {
+                return Err(cmp_unsupported(l, r));
+            }
+        }
         // Same-domain temporals compare as their underlying integers.
         (Date(a), Date(b)) => a.cmp(b),
         (DateTime(a), DateTime(b)) => a.cmp(b),
@@ -634,7 +654,28 @@ fn cmp_unsupported(l: &Value, r: &Value) -> SqlError {
 pub(crate) use super::expr_like::like_match;
 
 fn eq_values(l: &Value, r: &Value) -> SqlResult<bool> {
+    // Vectors are equality-only; `cmp_values` would refuse an unequal
+    // pair (see `vector_eq`).
+    if matches!(l, Value::Vector(_)) || matches!(r, Value::Vector(_)) {
+        return vector_eq(l, r);
+    }
     Ok(cmp_values(l, r)?.is_eq())
+}
+
+/// Vector equality: bytewise on the f32 payloads; a string operand
+/// parses in the vector domain first (the temporal-vs-Str pattern of
+/// `cmp_values`). Other vector pairings refuse.
+fn vector_eq(l: &Value, r: &Value) -> SqlResult<bool> {
+    let parse = |s: &str| {
+        vector::parse_vector_literal(s).map_err(|e| SqlError::new(ErrorCode::WrongValue, e))
+    };
+    Ok(match (l, r) {
+        (Value::Vector(a), Value::Vector(b)) => vector::bits_equal(a, b),
+        (Value::Str(s), Value::Vector(b)) | (Value::Vector(b), Value::Str(s)) => {
+            vector::bits_equal(&parse(s)?, b)
+        }
+        _ => return Err(cmp_unsupported(l, r)),
+    })
 }
 
 /// Coerce a value for a typed column on write (INSERT/UPDATE payload).
@@ -723,6 +764,12 @@ pub fn coerce(v: Value, ty: SqlType) -> SqlResult<Value> {
         (Value::Bytes(b), SqlType::VarChar) => Value::Str(String::from_utf8(b).map_err(|_| {
             SqlError::new(ErrorCode::BadNull, "blob is not valid utf8".to_string())
         })?),
+        // VECTOR columns take the '[e,e,...]' literal spelling; an
+        // existing Vector value re-checks the dimension. Wrong values
+        // are loud (MySQL 1292), never silent truncation.
+        (vv @ (Value::Str(_) | Value::Vector(_)), SqlType::Vector { dim }) => Value::Vector(
+            vector::coerce_value(vv, dim).map_err(|e| SqlError::new(ErrorCode::WrongValue, e))?,
+        ),
         (v, t) if v.sql_type() == Some(t) => v,
         (v, t) => {
             return Err(SqlError::new(

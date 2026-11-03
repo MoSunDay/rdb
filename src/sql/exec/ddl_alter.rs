@@ -61,7 +61,7 @@ use crate::sql::index::{self, IndexOps, IndexRef};
 use crate::sql::parse::error::{ErrorCode, SqlError, SqlResult};
 use crate::sql::storage::catalog;
 use crate::sql::storage::row;
-use crate::sql::storage::schema::{IndexDef, TableSchema};
+use crate::sql::storage::schema::{IndexDef, SqlType, TableSchema};
 use crate::state::{self, Shared};
 use crate::store::ops;
 
@@ -112,6 +112,19 @@ pub(crate) async fn create_index(
                 format!("unknown column '{column}' in '{table}'"),
             ));
         }
+        // Vectors are an equality-only domain with no index key
+        // encoding (the same 1235 family as the vector pk guard in
+        // `ddl::build_schema`).
+        if matches!(
+            schema
+                .column(schema.column_index(&column).expect("checked"))
+                .sql_type,
+            SqlType::Vector { .. }
+        ) {
+            return Err(SqlError::unsupported(format!(
+                "index '{name}' on VECTOR column '{column}'"
+            )));
+        }
         // Multi-column indexes never reach here (translate rejects them),
         // but keep the guard local: M2 indexes exactly one column.
         // UNIQUE pre-check runs BEFORE the catalog entry exists, so a clean
@@ -127,6 +140,7 @@ pub(crate) async fn create_index(
             name,
             column,
             unique,
+            vector: None,
         });
         Ok(DdlPlan {
             mutations: vec![CatalogMutation::Put(schema)],
@@ -224,6 +238,31 @@ pub(crate) async fn drop_index(
     if_exists: bool,
 ) -> SqlResult<ExecOutcome> {
     let (table, needle) = (table.to_string(), name.to_string());
+    // Vector index: take the per-index latch BEFORE the catalog window --
+    // an in-flight DML statement that already read the old schema must
+    // finish its posting write before the definition (and then the
+    // records) disappear under it.
+    let vec_guard = catalog::lookup(shared, &table)
+        .ok()
+        .flatten()
+        .map(|schema| {
+            schema
+                .indexes
+                .iter()
+                .find(|d| d.name == *name && d.vector.is_some())
+                .map(|d| (schema.id, d.id))
+        })
+        .flatten();
+    let _vec_lock = match vec_guard {
+        Some((tid, iid)) => Some(
+            crate::ds::latch::lock(
+                &shared.latch,
+                &crate::sql::index::vector::latch_key(tid, iid),
+            )
+            .await,
+        ),
+        None => None,
+    };
     let plan = catalog_txn(shared, move |raft| {
         let name = needle;
         let mut schema =
@@ -284,7 +323,114 @@ pub(crate) async fn drop_index(
     let col_pos = snapshot
         .column_index(&snapshot.indexes[pos].column)
         .expect("dropped index column present in the pre-removal snapshot");
+    // A vector index's records live under the same slot rule but in
+    // dedicated kinds (0x24-0x26) invisible to the 0x21/0.22 parser:
+    // sweep them explicitly.
+    if snapshot.indexes[pos].vector.is_some() {
+        let ops =
+            crate::sql::index::vector_build::drop_ops(&shared.store, snapshot.id, col_pos as u32)
+                .map_err(SqlError::from)?;
+        let mut batch = WriteBatch::default();
+        index::maintain::apply_ops(&mut batch, ops);
+        ops::batch_write_async(Arc::clone(&shared.store), batch)
+            .await
+            .map_err(SqlError::from)?;
+    }
     index::drop_entries(Arc::clone(&shared.store), snapshot.id, col_pos as u32)
+        .await
+        .map_err(SqlError::from)?;
+    Ok(ExecOutcome::Ok)
+}
+
+/// `CREATE VECTOR INDEX name ON t (col) [WITH (METRIC .., NPROBE n)]`:
+/// catalog entry first (same window rules as CREATE INDEX), then a
+/// full local backfill of meta + centroids + postings. The physical
+/// records are derived state; a failed backfill leaves the declared
+/// index empty and queries fall back to the exact scan (the probe
+/// treats a missing meta record as "not built").
+pub(crate) async fn create_vector_index(
+    shared: &Shared,
+    table: &str,
+    name: &str,
+    column: &str,
+    metric: crate::sql::index::vector::Metric,
+    nprobe: u16,
+    if_not_exists: bool,
+) -> SqlResult<ExecOutcome> {
+    let (table, name, column) = (table.to_string(), name.to_string(), column.to_string());
+    let (target, col, idxname) = (table.clone(), column.clone(), name.clone());
+    let (metric_col, metric_nprobe) = (metric, nprobe);
+    let plan = catalog_txn(shared, move |raft| {
+        let mut schema =
+            catalog::lookup_state(raft, &table)?.ok_or_else(|| SqlError::no_such_table(&table))?;
+        if schema.engine.is_columnar() {
+            return Err(SqlError::new(
+                ErrorCode::NotSupported,
+                format!("vector indexes are not supported on columnar table '{table}'"),
+            ));
+        }
+        if schema.index(&name).is_some() {
+            if if_not_exists {
+                return Ok(DdlPlan::noop());
+            }
+            return Err(SqlError::new(
+                ErrorCode::DupEntry,
+                format!("index '{name}' already exists"),
+            ));
+        }
+        let col_pos = schema.column_index(&column).ok_or_else(|| {
+            SqlError::new(
+                ErrorCode::BadField,
+                format!("unknown column '{column}' in '{table}'"),
+            )
+        })?;
+        let dim =
+            crate::sql::index::vector_build::column_dim(&schema, col_pos).ok_or_else(|| {
+                SqlError::unsupported(format!("vector index on non-VECTOR column '{column}'"))
+            })?;
+        let id = catalog::next_index_id(&schema);
+        schema.indexes.push(IndexDef {
+            id,
+            name,
+            column,
+            unique: false,
+            vector: Some(crate::sql::index::vector::VectorIndexParams {
+                metric: metric_col,
+                dim,
+                nprobe: metric_nprobe,
+            }),
+        });
+        Ok(DdlPlan {
+            mutations: vec![CatalogMutation::Put(schema)],
+            schema: None,
+            changed: true,
+        })
+    })
+    .await?;
+    if !plan.changed {
+        return Ok(ExecOutcome::Ok);
+    }
+    let schema = lookup_table(shared, &target)?;
+    let col_pos = schema.column_index(&col).expect("validated in the window");
+    let params = schema
+        .index(&idxname)
+        .and_then(|d| d.vector.clone())
+        .expect("just-created vector index");
+    // Serialize the backfill against concurrent DML transitions on the
+    // same index (the postings are full-partition rewrites here).
+    let _vec_guards = crate::sql::index::vector::lock_schema_indexes(&shared.latch, &schema).await;
+    let read_ts = shared.sql_ts.now();
+    let ops = crate::sql::index::vector_build::build_ops(
+        &shared.store,
+        &schema,
+        col_pos,
+        &params,
+        read_ts,
+    )
+    .map_err(SqlError::from)?;
+    let mut batch = WriteBatch::default();
+    index::maintain::apply_ops(&mut batch, ops);
+    ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
         .map_err(SqlError::from)?;
     Ok(ExecOutcome::Ok)

@@ -170,6 +170,8 @@ fn lit_display(v: &Value) -> String {
         Value::DateTime(us) => format!("'{}'", crate::sql::temporal::format_datetime(*us)),
         Value::Str(s) => format!("'{s}'"),
         Value::Bytes(b) => format!("x'{}'", hex::encode(b)),
+        // Canonical '[e,e,...]' spelling, quoted like string literals.
+        Value::Vector(v) => format!("'{}'", crate::sql::storage::vector::format_vector(v)),
     }
 }
 

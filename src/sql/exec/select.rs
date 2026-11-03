@@ -14,6 +14,8 @@ use crate::sql::exec::relation::CteScope;
 use crate::sql::exec::render;
 use crate::sql::exec::scan::{self, FromScope, Source};
 use crate::sql::exec::subquery::SubqCtx;
+use crate::sql::exec::vector_ann;
+use crate::sql::exec::vector_knn;
 use crate::sql::exec::{ColMeta, ExecOutcome, SqlSession};
 use crate::sql::parse::ast::{
     AggFunc, BinOp, CorrelatedKind, CorrelatedOut, Expr, OrderKey, Query, SelectItem, Statement,
@@ -79,17 +81,24 @@ pub async fn run_at(
         outer: None,
     };
     let rewritten = crate::sql::exec::subquery::rewrite_query(q, &subq).await?;
-    // Multi-node clusters read scatter-gather (falls back to the local
-    // scan path for joins / single-node topologies).
-    let src = gather::materialize(
-        shared,
-        &rewritten.from,
-        read_ts,
-        txn,
-        rewritten.filter.as_ref(),
-        ctes,
-    )
-    .await?;
+    // ANN hook: a vector-index-backed KNN shape builds its source
+    // from index candidates instead of scanning the table (approximate
+    // recall, 02 doc §4.3); everything the probe declines falls
+    // through to the exact paths below unchanged.
+    let src = match vector_ann::ann_source(shared, &rewritten, read_ts) {
+        Some(src) => src,
+        None => {
+            gather::materialize(
+                shared,
+                &rewritten.from,
+                read_ts,
+                txn,
+                rewritten.filter.as_ref(),
+                ctes,
+            )
+            .await?
+        }
+    };
     // Correlated subqueries deferred by the rewrite above bind here,
     // per distinct outer-row binding (no cost when none deferred).
     let bound = crate::sql::exec::correlated::bind_query(&rewritten, &src, &subq).await?;
@@ -135,6 +144,16 @@ pub fn explain(shared: &Shared, stmt: &Statement) -> SqlResult<ExecOutcome> {
 /// scatter-gather: the banner rides ABOVE the plain SeqScan line
 /// (bands are scanned, per node, exactly as a local SeqScan would).
 fn headline_lines(shared: &Shared, q: &Query) -> Vec<String> {
+    // The exact-KNN collector replaces the scan verdict line: same
+    // rows read, but the sort is a bounded top-k heap. The
+    // scatter-gather banner (if any) still rides on top.
+    if let Some(line) = vector_knn::explain_line(q) {
+        let mut out = gather::headline(shared, &q.from)
+            .into_iter()
+            .collect::<Vec<_>>();
+        out.push(line);
+        return out;
+    }
     if let Some(banner) = gather::headline(shared, &q.from) {
         return vec![banner, format!("SeqScan {}", render::from_display(&q.from))];
     }
@@ -156,6 +175,7 @@ fn access_line(shared: &Shared, q: &Query) -> Option<String> {
         plan::Path::IndexLookup { index, pks, .. } => {
             Some(format!("IndexScan {} -> {} pks", index.name, pks.len()))
         }
+        plan::Path::PkLookup { pks } => Some(format!("PkLookup {name} -> {} pks", pks.len())),
         plan::Path::SeqScan => None,
     }
 }
@@ -170,6 +190,15 @@ pub fn execute_query(q: &Query, src: &Source) -> SqlResult<(Vec<ColMeta>, Vec<Ve
     validate_refs(q, scope, &group_keys)?;
 
     let items = expand_items(&q.items, scope)?;
+
+    // Exact-KNN fast path (D11): a recognized ORDER BY
+    // DISTANCE(col, const, metric) LIMIT k runs one bounded top-k
+    // pass over the rows instead of the full project+sort pipeline;
+    // every other shape falls through to the generic path below.
+    if let Some(out) = vector_knn::try_execute(q, src, &items)? {
+        return Ok(out);
+    }
+
     let rows = filter_rows(&src.rows, scope, q.filter.as_ref())?;
 
     let grouped = !group_keys.is_empty()
@@ -229,7 +258,6 @@ pub fn execute_query(q: &Query, src: &Source) -> SqlResult<(Vec<ColMeta>, Vec<Ve
     if q.distinct {
         dedupe_pairs(&mut pairs);
     }
-    sort_pairs(&mut pairs, &q.order_by);
 
     // LIMIT / OFFSET coerce once here: a bound `?` must be a
     // non-negative integer, exactly like a numeric literal.
@@ -238,6 +266,18 @@ pub fn execute_query(q: &Query, src: &Source) -> SqlResult<(Vec<ColMeta>, Vec<Ve
         None => usize::MAX,
     };
     let offset = limit_u64(&q.offset)? as usize;
+
+    // Top-N shortcut: with an ORDER BY and a window of offset+limit
+    // smaller than the row count, partition once so only that window
+    // reaches the full sort (O(n) select + O(k log k) sort instead of
+    // O(n log n)). Boundary ties between the window and the rest may
+    // resolve either way, matching MySQL's unspecified tie order.
+    let bound = offset.saturating_add(take).min(pairs.len());
+    if q.limit.is_some() && !q.order_by.is_empty() && bound < pairs.len() {
+        let cmp = order_cmp(&q.order_by);
+        pairs.select_nth_unstable_by(bound, |a, b| cmp(a, b));
+    }
+    sort_pairs(&mut pairs[..bound], &q.order_by);
     let rows = pairs
         .into_iter()
         .skip(offset)
@@ -601,7 +641,17 @@ fn cast_result_type(to: &crate::sql::parse::ast::CastSpec) -> SqlType {
 /// Stable sort by pre-evaluated order keys; NULLs sort smallest (first
 /// ascending, last descending).
 pub fn sort_pairs(pairs: &mut [(Vec<Value>, Vec<Value>)], keys: &[OrderKey]) {
-    pairs.sort_by(|a, b| {
+    let cmp = order_cmp(keys);
+    pairs.sort_by(|a, b| cmp(a, b));
+}
+
+/// Key-comparison closure shared by the full sort and the top-N
+/// partition step (they must agree exactly or Nth-select would cut the
+/// window on a different ordering than the sort produces).
+fn order_cmp<'k>(
+    keys: &'k [OrderKey],
+) -> impl Fn(&(Vec<Value>, Vec<Value>), &(Vec<Value>, Vec<Value>)) -> std::cmp::Ordering + 'k {
+    move |a, b| {
         for (i, k) in keys.iter().enumerate() {
             let ord = if k.asc {
                 cmp_null_first(&a.0[i], &b.0[i])
@@ -613,7 +663,7 @@ pub fn sort_pairs(pairs: &mut [(Vec<Value>, Vec<Value>)], keys: &[OrderKey]) {
             }
         }
         std::cmp::Ordering::Equal
-    });
+    }
 }
 
 /// SQL ordering with NULLs smallest; inhomogeneous pairs compare Equal.

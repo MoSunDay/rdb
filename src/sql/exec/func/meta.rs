@@ -121,8 +121,28 @@ pub fn result_type(name: &str, args: &[Expr], ty: &dyn Fn(&Expr) -> SqlType) -> 
         }
         // Binary-string answer (hex decode).
         "unhex" => SqlType::Blob,
+        // Vector family (01-vector-surface D5): the literal's width is
+        // static when spelled inline, else unknown (dim 0 = "runtime
+        // only" -- wire typing ignores the dimension).
+        "string_to_vector" | "to_vector" => SqlType::Vector {
+            dim: lit_vector_dim(args.first()),
+        },
+        "vector_to_string" | "vec_to_text" => SqlType::VarChar,
+        "vector_dim" => SqlType::Int,
+        "distance" => SqlType::Double,
         // Everything else in the string family answers text.
         _ => SqlType::VarChar,
+    }
+}
+
+/// Element count of an inline vector literal, when statically spelled
+/// (and well-formed); anything else types as "unknown width".
+fn lit_vector_dim(e: Option<&Expr>) -> u32 {
+    match e {
+        Some(Expr::Lit(Value::Str(s))) => crate::sql::storage::vector::parse_vector_literal(s)
+            .map(|vals| vals.len() as u32)
+            .unwrap_or(0),
+        _ => 0,
     }
 }
 

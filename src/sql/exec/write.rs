@@ -682,6 +682,11 @@ pub(crate) async fn apply_writes(
             ts
         })
         .collect();
+    // Vector postings are read-modify-write state: hold the per-index
+    // latch from the posting read (inside index_ops) until this batch
+    // lands, so two concurrent statements cannot drop each other's
+    // appended entries.
+    let _vec_guards = crate::sql::index::vector::lock_schema_indexes(&shared.latch, schema).await;
     let idx = index_ops(shared, schema, &trans)?;
     // M3 2PC hook: the write list widens pk moves into tombstone + row,
     // exactly the versions the local batch below stamps.

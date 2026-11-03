@@ -75,6 +75,25 @@ pub async fn run(shared: &Shared, stmt: Statement) -> SqlResult<ExecOutcome> {
             unique,
             if_not_exists,
         } => ddl_alter::create_index(shared, &table, &name, &column, unique, if_not_exists).await,
+        Statement::CreateVectorIndex {
+            table,
+            name,
+            column,
+            metric,
+            nprobe,
+            if_not_exists,
+        } => {
+            ddl_alter::create_vector_index(
+                shared,
+                &table,
+                &name,
+                &column,
+                metric,
+                nprobe,
+                if_not_exists,
+            )
+            .await
+        }
         Statement::DropIndex {
             table,
             name,
@@ -251,6 +270,24 @@ struct CreateTableBody<'a> {
 async fn create_table(shared: &Shared, body: &CreateTableBody<'_>) -> SqlResult<ExecOutcome> {
     let (name, if_not_exists, indexes) = (&body.name, body.if_not_exists, body.indexes);
     let schema = build_schema(0, name, body.columns, body.pk, body.engine, body.starrocks)?;
+    // Inline KEY/UNIQUE KEY constraints become real indexes only after
+    // the table lands (below); a VECTOR key column would fail there
+    // too late, so gate it before any catalog write. Foreign keys never
+    // reach here -- `parse::translate` rejects other table constraints.
+    for idx in indexes {
+        if let Some(c) = body
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&idx.column))
+        {
+            if matches!(c.sql_type, SqlType::Vector { .. }) {
+                return Err(SqlError::unsupported(format!(
+                    "index '{}' on VECTOR column '{}'",
+                    idx.name, idx.column
+                )));
+            }
+        }
+    }
     let table = name.to_string();
     let plan = catalog_txn(shared, move |raft| {
         if catalog::lookup_state(raft, &table)?.is_some() {
@@ -432,6 +469,17 @@ pub fn build_schema(
             "DECIMAL primary key is not supported (use an integer pk)",
         ));
     }
+    // Vectors are an equality-only domain with no key encoding (see
+    // `codec::encode_key`), so pk membership is a loud 1235 rejection
+    // (single or composite).
+    for &i in &pk_indices {
+        if matches!(columns[i].sql_type, SqlType::Vector { .. }) {
+            return Err(SqlError::unsupported(format!(
+                "PRIMARY KEY column '{}' has type vector; vector primary keys are not supported",
+                columns[i].name
+            )));
+        }
+    }
     // Composite pk column types are narrowed to the fixed-width and
     // varlen key components that concatenate unambiguously: Bool and
     // Double have no composite key support, Decimal is rejected above
@@ -463,6 +511,16 @@ pub fn build_schema(
             "DECIMAL columns are not supported on columnar tables",
         ));
     }
+    // ... and no vector encoding either.
+    if engine.is_columnar()
+        && columns
+            .iter()
+            .any(|c| matches!(c.sql_type, SqlType::Vector { .. }))
+    {
+        return Err(SqlError::unsupported(
+            "VECTOR columns are not supported on columnar tables",
+        ));
+    }
     // AUTO_INCREMENT validation (MySQL 1075/1063): at most one auto
     // column, integer type (TINYINT/SMALLINT/INT/BIGINT all translate
     // to SqlType::Int; BOOL is a distinct engine type and rejected),
@@ -474,6 +532,14 @@ pub fn build_schema(
     let auto_increment = match auto_cols.as_slice() {
         [] => None,
         [one] => {
+            // Vectors have no sequence semantics; reject with the type
+            // named before the generic integer-key rule below.
+            if matches!(one.sql_type, SqlType::Vector { .. }) {
+                return Err(SqlError::unsupported(format!(
+                    "AUTO_INCREMENT on VECTOR column '{}'",
+                    one.name
+                )));
+            }
             if one.sql_type != SqlType::Int {
                 return Err(SqlError::new(
                     ErrorCode::WrongAutoKey,
@@ -552,3 +618,9 @@ mod tests;
 #[cfg(test)]
 #[path = "ddl_starrocks_tests.rs"]
 mod starrocks_tests;
+
+/// VECTOR(N) DDL accept/reject matrix (kept here so `ddl.rs` stays
+/// under the file-size budget).
+#[cfg(test)]
+#[path = "ddl_vector_tests.rs"]
+mod vector_tests;
