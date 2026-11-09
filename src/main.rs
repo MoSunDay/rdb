@@ -2,6 +2,9 @@
 //! monitor endpoint, rcache raft node, topology sync, RESP listener(s).
 
 mod beacon;
+mod standalone;
+#[cfg(test)]
+mod standalone_tests;
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -43,6 +46,43 @@ fn config_missing_error(path: &str) -> Option<String> {
     } else {
         Some(format!("read config file {path}: no such file"))
     }
+}
+
+/// Startup config resolution: the `standalone` subcommand builds the
+/// whole config from CLI flags (multi-protocol quick-start, see
+/// `standalone.rs`); every other invocation takes the yaml path.
+/// `Some(opts)` in the return marks a standalone boot for the forced
+/// bootstrap + topology seed below. `Err` is fatal (printed, exit 1).
+fn startup_conf(args: &[String]) -> Result<(conf::Config, Option<standalone::StandaloneOpts>), String> {
+    if args.first().map(String::as_str) == Some("standalone") {
+        if !conf::raft_join_addr().is_empty() {
+            return Err(
+                "standalone mode cannot join an existing cluster: unset RAFT_JOIN_ADDR"
+                    .to_string(),
+            );
+        }
+        let opts = standalone::parse_args(&args[1..])?;
+        let token = standalone::token_for(&opts.dir, opts.token.as_deref())?;
+        eprintln!(
+            "[standalone] host={} port={} dir={}",
+            opts.host, opts.port, opts.dir.display()
+        );
+        let conf = standalone::build_conf(&opts, &token);
+        eprintln!("[standalone] {}", standalone::endpoints(&conf));
+        return Ok((conf, Some(opts)));
+    }
+    let config_path = config_path_arg(args);
+    // Fail fast on a dangling -config path (Go's conf.init Fatalf).
+    if let Some(e) = config_missing_error(&config_path) {
+        return Err(e);
+    }
+    let conf = conf::load(&config_path)?;
+    // D6b: refuse to run without control-plane auth, before ANY listener
+    // (monitor included) is bound.
+    if let Some(e) = empty_raft_token_error(&conf, &config_path) {
+        return Err(e);
+    }
+    Ok((conf, None))
 }
 
 /// Open the store for one listener (Go `newDB`: `filepath.Join(path, bind)`).
@@ -261,25 +301,13 @@ async fn do_main() {
             .init();
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let config_path = config_path_arg(&args);
-    // Fail fast on a dangling -config path (Go's conf.init Fatalf).
-    if let Some(e) = config_missing_error(&config_path) {
-        eprintln!("{e}");
-        std::process::exit(1);
-    }
-    let conf = match conf::load(&config_path) {
-        Ok(c) => c,
+    let (conf, standalone_opts) = match startup_conf(&args) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    // D6b: refuse to run without control-plane auth, before ANY listener
-    // (monitor included) is bound.
-    if let Some(e) = empty_raft_token_error(&conf, &config_path) {
-        eprintln!("{e}");
-        std::process::exit(1);
-    }
 
     println!("Start..");
     println!("Bind: {}", conf.bind);
@@ -298,7 +326,10 @@ async fn do_main() {
     // --- rcache assembly (Go server.newRCache) ---
     let data_dir = raft_data_dir(&conf);
 
-    let node = match rcache::new_raft_node(&data_dir, &conf.raft_tcp_address).await {
+    // Standalone boots force a single-member initialize (no env var).
+    let force_bootstrap = standalone_opts.is_some();
+    let node = match rcache::new_raft_node(&data_dir, &conf.raft_tcp_address, force_bootstrap).await
+    {
         Ok(n) => n,
         Err(e) => {
             eprintln!("new raft node failed:{e}");
@@ -376,6 +407,13 @@ async fn do_main() {
     {
         let val = state::raft_get(&raft_state.read().unwrap(), TOPOLOGY_KEY);
         *topo.write().unwrap() = topology::refresh(&val);
+    }
+
+    // Standalone quick-start: once the (force-bootstrapped) node leads,
+    // seed the one-node topology + sql_nodes registry -- idempotent
+    // across restarts, fatal on a store carrying a multi-node topology.
+    if standalone_opts.is_some() {
+        standalone::spawn_ensure_topology(raft_state.clone(), conf.clone());
     }
 
     // M3: cluster-global SQL timestamp core (narrow deps, no Shared

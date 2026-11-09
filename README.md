@@ -39,6 +39,37 @@ cargo build --release
 
 ## 运行
 
+### 单实例（快捷模式）
+
+一条命令得到完整可用的单实例：无 yaml、无环境变量、无手工 `CLUSTER INIT`，重启幂等：
+
+```bash
+./target/release/rdb standalone [--host H] [--port P] [--dir PATH] [--token X]
+# 默认 host=127.0.0.1 port=6379 dir=./rdb-standalone
+```
+
+- 首次启动生成随机 token（32 hex），写入 `{dir}/standalone_token`（0600）并打印到 stderr；
+  重启复用同一 token；`--token` 显式指定并覆写文件。同一个 token 用于所有协议面：
+  RESP `AUTH`、MySQL 密码（用户 `root`）、Kafka SASL PLAIN、ES/S3/RocksMQ HTTP 的 Bearer。
+- 多协议前端随基端口一起拉起（偏移沿用 e2e 约定）：
+
+  | 端口 | 协议 |
+  | --- | --- |
+  | `P` | RESP（Redis 协议） |
+  | `P+2` | monitor `/metrics` |
+  | `P+3` / `P+4` | raft HTTP / raft TCP |
+  | `P+5` / `P+6` | MySQL wire / SQL 2PC RPC |
+  | `P+7` / `P+8` | Kafka wire / RocksMQ HTTP |
+  | `P+9` / `P+10` | ES HTTP / S3 HTTP |
+
+  （`P+1` 预留给 backup 面，standalone 下不启用。）
+- 自动完成：单成员 raft 引导（无需 `RAFT_BOOTSTRAP`）→ 等本节点成为 leader → 幂等写入
+  单节点拓扑与 `sql_nodes` 注册表 → `CLUSTER INFO/NODES/SLOTS` 直接可用。
+- 护栏：`standalone` 与 `RAFT_JOIN_ADDR` 互斥（exit 1）；store 里已有多节点拓扑时拒绝
+  降级（exit 1）；已初始化的 raft 不会二次 initialize。
+
+### 多实例（集群模式）
+
 配置复用 [`config/`](./config/) 下的多实例 yaml（`bind`、`store_path`、`raft_bind_address`、
 `raft_http_bind_address`、`raft_token`、`backup_target_map` 等）：
 

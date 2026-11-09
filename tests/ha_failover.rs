@@ -37,7 +37,7 @@ async fn bootstrap_leader(tcp_addr: &str) -> (tempfile::TempDir, Arc<rdb::rcache
     std::env::set_var("RAFT_BOOTSTRAP", "true");
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("raft");
-    let RaftNode { raft, kv } = new_raft_node(data_dir.to_str().unwrap(), tcp_addr)
+    let RaftNode { raft, kv } = new_raft_node(data_dir.to_str().unwrap(), tcp_addr, false)
         .await
         .unwrap();
     std::env::remove_var("RAFT_BOOTSTRAP");

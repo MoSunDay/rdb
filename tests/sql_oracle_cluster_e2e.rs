@@ -79,7 +79,7 @@ async fn start_node(bootstrap: bool) -> TestNode {
     let tcp_addr = free_addr().await;
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("raft");
-    let RaftNode { raft, kv } = new_raft_node(data_dir.to_str().unwrap(), &tcp_addr)
+    let RaftNode { raft, kv } = new_raft_node(data_dir.to_str().unwrap(), &tcp_addr, false)
         .await
         .unwrap();
 

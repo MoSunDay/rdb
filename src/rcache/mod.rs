@@ -106,9 +106,15 @@ pub struct RaftNode {
 
 /// Go `rcache.NewRaftNode`: create the data dir, open the log store,
 /// build FSM + transport + raft instance, then optionally bootstrap.
-/// Bootstrap errors are logged and ignored, exactly like the Go original
-/// ignores the `BootstrapCluster` future's error.
-pub async fn new_raft_node(data_dir: &str, raft_tcp_addr: &str) -> Result<RaftNode, String> {
+/// Bootstrap runs when `RAFT_BOOTSTRAP=true` OR `force_bootstrap` (the
+/// `standalone` quick-start's single-member initialize). Bootstrap
+/// errors are logged and ignored, exactly like the Go original ignores
+/// the `BootstrapCluster` future's error.
+pub async fn new_raft_node(
+    data_dir: &str,
+    raft_tcp_addr: &str,
+    force_bootstrap: bool,
+) -> Result<RaftNode, String> {
     std::fs::create_dir_all(data_dir).map_err(|e| format!("mkdir {data_dir}: {e}"))?;
     let log_store = store::open(data_dir).map_err(|e| format!("open raft log store: {e}"))?;
     let state_machine =
@@ -127,7 +133,7 @@ pub async fn new_raft_node(data_dir: &str, raft_tcp_addr: &str) -> Result<RaftNo
     .map_err(|e| format!("new raft: {e}"))?;
     let raft = Arc::new(raft);
 
-    if crate::conf::raft_bootstrap() {
+    if crate::conf::raft_bootstrap() || force_bootstrap {
         match raft.is_initialized().await {
             Ok(true) => {}
             Ok(false) => {
