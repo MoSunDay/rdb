@@ -63,6 +63,18 @@ cargo build --release
   | `P+9` / `P+10` | ES HTTP / S3 HTTP |
 
   （`P+1` 预留给 backup 面，standalone 下不启用。）
+- 同一 token 直连各协议（默认端口下）：
+
+  ```bash
+  TOKEN=$(cat ./rdb-standalone/standalone_token)
+  redis-cli -h 127.0.0.1 -p 6379 -a "$TOKEN" SET k v          # RESP
+  mysql -h 127.0.0.1 -P 6384 -uroot -p"$TOKEN"                # MySQL wire
+  kcat -b 127.0.0.1:6386 -X security.protocol=SASL_PLAIN \
+        -X sasl.mechanisms=PLAIN -X sasl.username=root -X sasl.password="$TOKEN" -L   # Kafka
+  curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:6388/_cat   # ES
+  curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:6389/       # S3
+  ```
+
 - 自动完成：单成员 raft 引导（无需 `RAFT_BOOTSTRAP`）→ 等本节点成为 leader → 幂等写入
   单节点拓扑与 `sql_nodes` 注册表 → `CLUSTER INFO/NODES/SLOTS` 直接可用。
 - 护栏：`standalone` 与 `RAFT_JOIN_ADDR` 互斥（exit 1）；store 里已有多节点拓扑时拒绝
