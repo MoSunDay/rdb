@@ -245,6 +245,23 @@ fn sql_nodes_seed(c: &conf::Config, current_registry: &str) -> Option<rtypes::Ra
     })
 }
 
+/// Pre-listener downgrade guard: the FSM map is readable the moment the
+/// raft store opens, so a store that ever belonged to a multi-node
+/// cluster is refused before ANY data-plane listener binds (only the
+/// earlier-started monitor endpoint is ever up briefly). The seed task
+/// re-checks, so this is an optimization of the failure point, not the
+/// only guard.
+pub(crate) fn refuse_multi_node_store(kv: &rdb::rcache::fsm::KvMap, own_bind: &str) {
+    let current = kv.read().unwrap().get(TOPOLOGY_KEY).cloned().unwrap_or_default();
+    if let TopologyPlan::Refuse(v) = topology_plan(&current, own_bind) {
+        eprintln!(
+            "[standalone] refusing to start: this store holds a multi-node \
+             topology ({v}) that does not match single instance {own_bind}"
+        );
+        std::process::exit(1);
+    }
+}
+
 /// Background task: refuse a multi-node store immediately (its own raft
 /// log carries the full topology, visible pre-leadership), then poll
 /// until this force-bootstrapped node leads and seed the one-node

@@ -23,8 +23,10 @@ ready 门禁。仓库中无任何 standalone/一键形态。
   `cluster init` 同构）；等于自身 bind → 跳过；非空且不同 → **exit 1 拒绝降级**
   （store 属于多节点集群时绝不静默覆盖）。既有 3s `spawn_topology_sync` 随后翻
   `cluster_ready`。
-- **护栏**：`standalone` + `RAFT_JOIN_ADDR` 互斥（exit 1）；raft 已初始化则跳过
-  initialize（D7b 语义保持）。多实例模式（yaml + env bootstrap/join）完全不动。
+- **护栏**：`standalone` + `RAFT_JOIN_ADDR` 互斥（exit 1）；拒绝降级判定在
+  `new_raft_node` 返回后、任何数据面监听器绑定前预检（`refuse_multi_node_store` 直读
+  FSM map，种子任务内保留同判定作兜底）；raft 已初始化则跳过 initialize（D7b 语义保持）。
+  多实例模式（yaml + env bootstrap/join）完全不动。
 
 ## 文件
 

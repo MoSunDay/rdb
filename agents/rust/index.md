@@ -91,7 +91,7 @@ Commit: b7378c0
 3. `rcache::new_raft_node`：建目录、打开 RocksDB 日志存储与 FSM；`RAFT_BOOTSTRAP=true` 或 standalone 强制引导且未初始化时单节点 initialize。
 4. 可选 beacon → raft RPC 监听（`service::serve`）→ HTTP 控制 API 绑定并服务。
 5. join 地址非空时 `join::join_cluster`（应答必须为 `ok`，否则退出）。
-6. apply loop 与共享状态：`RaftState`（leader 状态/统计/FSM 实时读）→ 启动时立即读一次拓扑 → （standalone）`spawn_ensure_topology`：本地 FSM 拓扑为空则等 leader 后幂等写入单节点拓扑 + `sql_nodes` 种子，等于自身 bind 则跳过，多地址则 exit 1 拒绝降级 → 3s 拓扑同步任务 → metrics 同步任务 → 5s `raft_stats` gauge 刷新。
+6. apply loop 与共享状态：`RaftState`（leader 状态/统计/FSM 实时读）→ 启动时立即读一次拓扑 → （standalone，建节点后已先经 `refuse_multi_node_store` 预检多节点 store）`spawn_ensure_topology`：本地 FSM 拓扑为空则等 leader 后幂等写入单节点拓扑 + `sql_nodes` 种子，等于自身 bind 则跳过，多地址则 exit 1 拒绝降级 → 3s 拓扑同步任务 → metrics 同步任务 → 5s `raft_stats` gauge 刷新。
 7. HA 任务：`spawn_backup_map_init`（leader 将 yaml `backup_target_map` 灌入 raft 并置 init 标记）、`spawn_leader_probe`（每 5s TCP 探测 peers，驱动 `handler_observer` 做 src/target 互换）。
 8. 可选备份监听（`backup_bind` 非空，mode=backup，独立 store 路径）→ 正常监听：`store::open` + `resp::serve`（不返回）。
 

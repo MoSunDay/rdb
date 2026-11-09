@@ -336,6 +336,11 @@ async fn do_main() {
             std::process::exit(1);
         }
     };
+    // Standalone: refuse a multi-node store before any data-plane
+    // listener binds (earliest point the raft store / FSM is open).
+    if standalone_opts.is_some() {
+        standalone::refuse_multi_node_store(&node.kv, &conf.bind);
+    }
     let raft = node.raft.clone();
 
     // D7b: join only when the node has NO persisted raft state. Go (and
