@@ -546,6 +546,18 @@ never used one; (z1)/(z2) keep the suffix inside the turso block's letter space)
 - (z2) `INTERSECT ALL` / `EXCEPT ALL`: rocks answers the multiset semantics
   (min / subtraction); turso 0.9.0-pre.2's grammar takes ALL on UNION only, so
   those two spellings keep the uniform 1235 on turso.
+- (z3) file-level interop with stock SQLite is real and e2e'd against the host
+  `sqlite3` CLI (version floor tested: 3.37.2; turso's private hrana/sqld wire
+  protocol is not part of the contract). Access posture: while the rdb process
+  is alive an external stock reader is REFUSED (`SQLITE_BUSY` "database is
+  locked", persistent across a 3s busy-timeout — turso runs the WAL with no
+  `-shm` file), so the library is writer-exclusive and rdb is the sole writer
+  by construction; after rdb exits (graceful SIGTERM or hard kill) stock
+  sqlite3 recovers the WAL on open and reads everything MySQL wrote, even
+  checkpointing it away. Externally created files adopt via `CREATE DATABASE
+  IF NOT EXISTS` (column-type and read-only consequences per (p)/(x)); vector
+  blobs cross as raw LE f32 (`hex()` / `X'...'` literals round-trip both
+  ways).
 - Non-lettered posture notes: UNSIGNED column types reject 1235 on BOTH engines
   (shared parse surface, numbered ledger (9) — unchanged by the second engine);
   the dependency is `default-features = false` (turso's default `mimalloc`
