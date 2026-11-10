@@ -68,6 +68,7 @@ pub fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         409 => "Conflict",
         413 => "Request Entity Too Large",
         500 => "Internal Server Error",
@@ -237,6 +238,8 @@ mod tests {
     fn reason_phrases() {
         assert_eq!(reason(200), "OK");
         assert_eq!(reason(201), "Created");
+        assert_eq!(reason(401), "Unauthorized");
+        assert_eq!(reason(408), "Request Timeout"); // query-timeout status
         assert_eq!(reason(409), "Conflict");
         assert_eq!(reason(413), "Request Entity Too Large");
         assert_eq!(reason(501), "Not Implemented");

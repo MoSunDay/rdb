@@ -4,7 +4,12 @@
 //! `Expect: 100-continue` is answered before the body read (curl
 //! sends it for >1 KiB bodies). Chunked bodies are refused (501) --
 //! clients that size their payloads (every ES client) always send
-//! Content-Length. Auth: a non-empty configured token requires
+//! Content-Length. Transport hardening (P1/P2): live connections are
+//! capped by `es_max_connections` (`guard.rs`, the kafka/rocksmq
+//! `ConnGuard` posture) and handler execution is bounded by
+//! [`QUERY_TIMEOUT`], so a huge query can no longer pin a task
+//! forever (the head/body read timeouts only bound the socket).
+//! Auth: a non-empty configured token requires
 //! `Authorization: Bearer <token>` (simple compare; not
 //! timing-hardened, same as the RESP AUTH path). Handler failures are
 //! `Reply`s already; the transport never panics a connection task.
@@ -17,6 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::state::Shared;
 
+use super::guard;
 use super::reply::{self, Reply};
 use super::router;
 
@@ -63,8 +69,16 @@ const MAX_HEAD_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bounds handler execution (full-materialization queries); the
+/// head/body read timeouts above only bound the socket.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn handle_conn(mut sock: TcpStream, shared: Arc<Shared>, token: String) {
+    let cap = guard::cap_of(shared.conf.es_max_connections);
+    let Some(_guard) = guard::ConnGuard::enter(cap) else {
+        eprintln!("[es] connection refused: at cap {cap}");
+        return;
+    };
     let rep = match read_request(&mut sock).await {
         Ok(Some(req)) => {
             if !authorized(&req, &token) {
@@ -74,7 +88,14 @@ async fn handle_conn(mut sock: TcpStream, shared: Arc<Shared>, token: String) {
                     "missing or invalid bearer credentials",
                 )
             } else {
-                router::route(&shared, &req).await
+                match tokio::time::timeout(QUERY_TIMEOUT, router::route(&shared, &req)).await {
+                    Ok(rep) => rep,
+                    Err(_) => reply::error(
+                        408,
+                        "timeout_exception",
+                        "request processing exceeded the query timeout",
+                    ),
+                }
             }
         }
         Ok(None) => return, // peer closed before a full head
@@ -114,6 +135,16 @@ async fn read_request(sock: &mut TcpStream) -> Result<Option<Request>, Reply> {
             501,
             "not_implemented",
             "chunked transfer encoding is not supported",
+        ));
+    }
+    // body-less methods (GET/DELETE/HEAD/...) must not carry a body:
+    // v1 used to silently drop it (the handler saw an empty body and
+    // produced a confusing downstream error) -- reject visibly instead.
+    if !head.body_semantics() && head.content_length.unwrap_or(0) > 0 {
+        return Err(reply::error(
+            400,
+            "illegal_argument_exception",
+            "request body is not allowed for this method; resend as POST or PUT",
         ));
     }
     // curl waits for the interim response before sending >1 KiB bodies

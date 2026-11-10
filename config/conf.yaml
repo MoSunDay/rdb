@@ -27,6 +27,8 @@ tx:
 # Elasticsearch-compatible HTTP frontend on the search kernel (empty = disabled; e.g. es_bind: "127.0.0.1:9200")
 es_bind: ""
 es_token: ""
+# ES HTTP front live-connection cap (0 = built-in 4096)
+es_max_connections: 0
 
 # S3-compatible object-storage frontend on the local filesystem
 # (empty = disabled; e.g. s3_bind: "127.0.0.1:9000")

@@ -91,6 +91,10 @@ pub struct Config {
     /// Bearer token for the ES frontend (empty = no auth).
     #[serde(default, rename = "es_token")]
     pub es_token: String,
+    /// ES HTTP front live-connection cap (0 = the built-in default;
+    /// mirrors `kafka_max_connections` / `rocksmq_max_connections`).
+    #[serde(default, rename = "es_max_connections")]
+    pub es_max_connections: i64,
     /// S3-compatible object storage HTTP front (empty = disabled).
     #[serde(default, rename = "s3_bind")]
     pub s3_bind: String,
@@ -290,6 +294,7 @@ backup_target_map:
         assert!(!cfg.kafka_auto_create_topics);
         assert_eq!(cfg.rocksmq_max_connections, 0);
         assert_eq!(cfg.lite.consumer_gc_ms, 0);
+        assert_eq!(cfg.es_max_connections, 0);
 
         let cfg: Config = serde_yaml::from_str(
             "bind: 1.2.3.4:1\nkafka_auto_create_topics: true\nrocksmq_max_connections: 128\nlite:\n  consumer_gc_ms: 60000\n",
@@ -298,6 +303,10 @@ backup_target_map:
         assert!(cfg.kafka_auto_create_topics);
         assert_eq!(cfg.rocksmq_max_connections, 128);
         assert_eq!(cfg.lite.consumer_gc_ms, 60000);
+        // the ES front's cap knob parses the same way
+        let cfg: Config =
+            serde_yaml::from_str("bind: 1.2.3.4:1\nes_max_connections: 64\n").unwrap();
+        assert_eq!(cfg.es_max_connections, 64);
 
         // Explicit off survives a round-trip too (upgrade path).
         let cfg: Config = serde_yaml::from_str(

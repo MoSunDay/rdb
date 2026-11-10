@@ -16,6 +16,7 @@ pub mod bulk;
 pub mod dsl;
 pub mod eval;
 pub mod exec;
+pub mod guard;
 pub mod http;
 pub mod mapping;
 pub mod misc;

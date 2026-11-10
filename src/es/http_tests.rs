@@ -242,3 +242,42 @@ async fn protocol_errors() {
     .await;
     assert_eq!(status, "501");
 }
+
+/// GET/DELETE must not carry a body (P2): v1 silently dropped it (the
+/// handler saw an empty body and produced a confusing downstream
+/// error) -- the transport now answers 400 before the handler runs.
+#[tokio::test]
+async fn bodyless_method_with_body_is_rejected() {
+    let shared = shared();
+    let listener = bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    tokio::spawn(serve(listener, shared, String::new()));
+
+    // GET with a declared 2-byte body -> the 400 illegal_argument
+    // envelope naming the reason (no interim 100-continue either).
+    let (status, body) = roundtrip(
+        &addr,
+        b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nok",
+    )
+    .await;
+    assert_eq!(status, "400");
+    assert!(has(&body, "illegal_argument_exception"), "{body:?}");
+    assert!(
+        has(&body, "request body is not allowed for this method"),
+        "{body:?}"
+    );
+
+    // DELETE is body-less too
+    let (status, body) = roundtrip(
+        &addr,
+        b"DELETE /books/_doc/1 HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nok",
+    )
+    .await;
+    assert_eq!(status, "400");
+    assert!(has(&body, "illegal_argument_exception"), "{body:?}");
+
+    // plain GET still works (no Content-Length -> no rejection)
+    let (status, body) = roundtrip(&addr, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    assert_eq!(status, "200");
+    assert!(has(&body, "You Know, for Search"), "{body:?}");
+}
