@@ -159,9 +159,12 @@ Commit: b0d81c9
   `translate/`：MySQL AST→SQLite 渲染器即 allowlist 门——`mod.rs` 引用定界、
   `expr.rs` 表达式、`funcs.rs` 标量函数白名单、`select.rs` 单表 SELECT 干线、
   `dml.rs` INSERT/UPDATE/DELETE/TRUNCATE、`ddl.rs` 建表类型映射与内联索引、
-  `vector.rs` 向量函数映射与写路径校验。库为节点本地：无 MVCC/2PC/slot/MOVED/
-  raft schema 复制；契约与两引擎对照矩阵、偏差台账 (k)–(z) 见 `COMPAT.sql.md`
-  "turso engine" 节。
+  `vector.rs` 向量函数映射与写路径校验。文件级 SQLite 互操作（2026-11-10 验收
+  收口：rdb 存活期外部 stock sqlite3 CLI 被拒 SQLITE_BUSY——写者独占 WAL 无
+  -shm；退出后 CLI 恢复 WAL 全量可读；外部 `.db` 经 `CREATE DATABASE IF NOT
+  EXISTS` 收养；台账 (z3)，e2e `turso_sqlite_interop_e2e`）。库为节点本地：无
+  MVCC/2PC/slot/MOVED/raft schema 复制；契约与两引擎对照矩阵、偏差台账 (k)–(z)
+  见 `COMPAT.sql.md` "turso engine" 节。
 
 ## 关键不变量
 - 版本键 ts 后缀取反（`!ts`）：同 pk 新版本在前；`visible_value` 取 `ts ≤ read_ts`
@@ -227,7 +230,8 @@ Commit: b0d81c9
   `sql_outer_join_e2e`（LEFT/RIGHT OUTER JOIN 首次 e2e 覆盖）与 `sql_failover_e2e`
   （三进程 SIGKILL SQL leader：新 leader 接管 DDL/写/ts，尸体 respawn 追平，M5）、
   `sql_decimal_e2e`（自 `sql_types_e2e` 拆出的 DECIMAL 精确语义自包含用例，M5）、
-  turso 引擎六套件（2026-11-09 turso-engine，`turso_db_dir` 临时目录 + yaml 注入
+  turso 引擎套件（2026-11-09 turso-engine 主体六套 + 后续批次，`turso_db_dir`
+  临时目录 + yaml 注入
   `turso_engine`，偏差断言引擎侧钉死）：`turso_smoke_e2e`（T1 路由骨架：常量算术/
   1235 拒绝形状/默认库零变化/未开引擎节点 USE turso_x 仍 1049）、
   `turso_catalog_e2e`（T2：CREATE/DROP DATABASE 文件+raft 条目、SHOW DATABASES
@@ -237,4 +241,7 @@ Commit: b0d81c9
   `turso_parity_e2e`（T3：同语句双引擎对照，五条台账偏差逐条断言）、
   `turso_vector_e2e`（T4：VECTOR DDL/函数族/精确 KNN/错误矩阵/rocks id 序
   parity，数值断言 epsilon=1e-6）、`turso_txn_e2e`（T5：直通事务+隐式提交语义/
-  prepared `?` 绑定/事务内 USE 1235/双连接脏读检查/隔离级别回显）。
+  prepared `?` 绑定/事务内 USE 1235/双连接脏读检查/隔离级别回显）、
+  `turso_sqlite_interop_e2e`（2026-11-10 验收收口：stock sqlite3 CLI 双向文件级
+  互操作——存活期外部读 SQLITE_BUSY（写者独占 WAL）、优雅退出后恢复 WAL 全量
+  可读含 `hex()` 裸 LE f32、预建 `.db` 收养 MySQL 侧读回，偏差 (z3)）。

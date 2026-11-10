@@ -435,6 +435,10 @@ MySQL 9.0's own semantics are unverified. Full decision ledger: `plans/2026-11-0
   key latches (`vector::lock_schema_indexes`) — no lost entries under concurrent
   writers, but also no cross-node coordination; **NPROBE is DDL-fixed** (no runtime hint); EXPLAIN has
   no dedicated ANN line (the access annotation lives in the access line only).
+  Turso posture: "usable" there = exact KNN + the full function family (parity
+  e2e'd, `turso_vector_e2e`); ANN DDL stays 1235 on turso as an explicit
+  non-goal (rocks carries SQ8/SPANN; a turso-side ANN is its own plan); vector
+  blobs also cross the file-level SQLite channel per ledger (z3).
 
 ## turso engine (turso-engine feature, 2026-11-09)
 

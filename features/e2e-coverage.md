@@ -187,9 +187,10 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
     sql_upsert_cluster）**有意未迁移**（自带编排/取证样板，后续分批）。
 - **turso 引擎（2026-11-09 turso-engine，首次入台账；计划
   `plans/2026-11-09-turso-engine/`，摘要 `changelog/2026-11-09/turso-engine.md`，
-  契约/偏差台账 `COMPAT.sql.md` "turso engine" 节）**——七套件均为真进程 +
+  契约/偏差台账 `COMPAT.sql.md` "turso engine" 节）**——八套件均为真进程 +
   yaml 注入 `turso_engine`/`turso_db_dir`（临时目录），双引擎偏差在引擎侧断言：
-  （2026-11-10 allowlist batch 1 增 `turso_setops_e2e`，见下。）
+  （2026-11-10 allowlist batch 1 增 `turso_setops_e2e`、同日验收收口增
+  `turso_sqlite_interop_e2e`，见下。）
   - `turso_smoke_e2e`（2）：T1 路由骨架——`turso_` 库上常量算术由嵌入式引擎应答、
     引擎绑定未实现语句统一 1235、默认（rocks）库零行为变化；独立节点用例：
     未开引擎节点 `USE turso_x` 仍 1049。
@@ -220,6 +221,12 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
     括号操作数定形、无优先级混合链、首分支列名）、CTE（含列别名/链式/join 体）；
     引擎侧断言两条台账：(z1) USING 下 `SELECT *` 列数合并、(z2) INTERSECT/
     EXCEPT ALL turso 1235（rocks 多重集语义照答），另断言派生表维持 1235。
+  - `turso_sqlite_interop_e2e`（2）：验收收口（2026-11-10）——双向文件级互操作：
+    MySQL 写 → stock sqlite3 CLI 读（存活期外部读被拒 SQLITE_BUSY——turso WAL
+    写者独占、无 -shm；优雅退出后 CLI 恢复 WAL 全量可读，`hex()` 钉死裸 LE
+    f32 向量布局）；反向 stock CLI 预建 `.db` 经 `CREATE DATABASE IF NOT
+    EXISTS` 收养、MySQL 侧 `VECTOR_TO_STRING`/`VECTOR_DIM` 读回（偏差 (z3)；
+    宿主 sqlite3 3.37.2 为 e2e 依赖，缺失则跳过）。
 - **Shell 场景**：新增 `scenario_ha_failover.sh`（首次启用 `e2e_kill_node`，kill→MOVED-backup ~4-5s、
   回切 ~5s）、`scenario_lite_mq.sh`（XADD/XREADGROUP/XPENDING/XACK/XAUTOCLAIM + ORDERED/INFLIGHT，
   2026-10-06 增 (g) DLQ/MAXDELIVERY 死信+DLQ 独立消费、(h) XTRIM MINID/LIMIT/时间窗
