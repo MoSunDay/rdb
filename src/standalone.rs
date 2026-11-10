@@ -38,6 +38,14 @@ pub(crate) struct StandaloneOpts {
     pub token: Option<String>,
 }
 
+/// What the standalone boot still owes after the config is built:
+/// carried from `conf_from_args` to the post-refusal `persist_token`.
+#[derive(Debug, Clone)]
+pub(crate) struct Boot {
+    pub opts: StandaloneOpts,
+    pub token: TokenChoice,
+}
+
 /// `--flag v` and `--flag=v` forms; last one wins, unknown flags fail.
 pub(crate) fn parse_args(args: &[String]) -> Result<StandaloneOpts, String> {
     let mut opts = StandaloneOpts {
@@ -114,30 +122,59 @@ pub(crate) fn derived_binds(host: &str, port: u16) -> DerivedBinds {
     }
 }
 
-/// Resolve the AUTH token: an explicit `--token` wins (and rewrites the
-/// file); otherwise the persisted file is read back, and only a fresh
-/// dir generates a random one (printed to stderr). No secret ever lives
-/// in source. Pure w.r.t. its inputs except the one token-file write.
-pub(crate) fn token_for(dir: &Path, explicit: Option<&str>) -> Result<String, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    let path = dir.join(TOKEN_FILE);
+/// Ports below 1024 need root/CAP_NET_BIND_SERVICE; surfaced as a
+/// warning, not an error (root may legitimately want 80/443).
+pub(crate) fn port_warning(port: u16) -> Option<&'static str> {
+    (port < 1024).then_some(
+        "--port below 1024: privileged ports usually require root or CAP_NET_BIND_SERVICE",
+    )
+}
+
+/// Resolved auth credential plus what must still be written to disk.
+/// `resolve_token` is a pure read (no dir create, no file write); the
+/// one side effect -- persisting `{dir}/standalone_token` -- waits in
+/// `persist_token` until the multi-node refusal check has passed.
+/// No secret ever lives in source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TokenChoice {
+    pub token: String,
+    /// `Some(t)`: the token file must be (re)written with `t` (fresh
+    /// dir or explicit `--token`); `None`: existing file is current.
+    pub persist: Option<String>,
+    /// Randomly generated this boot (log wording only).
+    pub generated: bool,
+}
+
+pub(crate) fn resolve_token(dir: &Path, explicit: Option<&str>) -> Result<TokenChoice, String> {
     if let Some(t) = explicit {
-        if t.trim().is_empty() {
+        let t = t.trim();
+        if t.is_empty() {
             return Err("--token must not be empty".to_string());
         }
-        write_token(&path, t.trim())?;
-        return Ok(t.trim().to_string());
+        return Ok(TokenChoice { token: t.to_string(), persist: Some(t.to_string()), generated: false });
     }
-    if let Ok(existing) = std::fs::read_to_string(&path) {
+    if let Ok(existing) = std::fs::read_to_string(dir.join(TOKEN_FILE)) {
         let t = existing.trim().to_string();
         if !t.is_empty() {
-            return Ok(t);
+            return Ok(TokenChoice { token: t, persist: None, generated: false });
         }
     }
     let t = random_token()?;
-    write_token(&path, &t)?;
-    eprintln!("[standalone] generated auth token (saved to {}): {t}", path.display());
-    Ok(t)
+    Ok(TokenChoice { token: t.clone(), persist: Some(t), generated: true })
+}
+
+/// The one write side effect, deliberately deferred past the refusal
+/// check so a refused boot mutates nothing under `dir`.
+pub(crate) fn persist_token(dir: &Path, choice: &TokenChoice) -> Result<(), String> {
+    if let Some(t) = &choice.persist {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let path = dir.join(TOKEN_FILE);
+        write_token(&path, t)?;
+        if choice.generated {
+            eprintln!("[standalone] generated auth token (saved to {}): {t}", path.display());
+        }
+    }
+    Ok(())
 }
 
 fn write_token(path: &Path, token: &str) -> Result<(), String> {
@@ -199,6 +236,30 @@ pub(crate) fn endpoints(c: &conf::Config) -> String {
         c.bind, c.monitor_addr, c.http_address, c.raft_tcp_address, c.mysql_bind,
         c.sql_rpc_bind, c.kafka_bind, c.rocksmq_bind, c.es_bind, c.s3_bind
     )
+}
+
+/// `standalone` subcommand entry (called from main's `startup_conf`):
+/// `Ok(None)` = not a standalone invocation, caller falls through to
+/// the yaml path. Resolves (but does not persist) the token; the file
+/// write happens in `persist_token` only after the refusal check.
+pub(crate) fn conf_from_args(args: &[String]) -> Result<Option<(conf::Config, Boot)>, String> {
+    if args.first().map(String::as_str) != Some("standalone") {
+        return Ok(None);
+    }
+    if !conf::raft_join_addr().is_empty() {
+        return Err(
+            "standalone mode cannot join an existing cluster: unset RAFT_JOIN_ADDR".to_string(),
+        );
+    }
+    let opts = parse_args(&args[1..])?;
+    if let Some(w) = port_warning(opts.port) {
+        eprintln!("[standalone] warning: {w}");
+    }
+    let token = resolve_token(&opts.dir, opts.token.as_deref())?;
+    eprintln!("[standalone] host={} port={} dir={}", opts.host, opts.port, opts.dir.display());
+    let conf = build_conf(&opts, &token.token);
+    eprintln!("[standalone] {}", endpoints(&conf));
+    Ok(Some((conf, Boot { opts, token })))
 }
 
 /// What the topology seed must do with the persisted value.

@@ -28,9 +28,18 @@ ready 门禁。仓库中无任何 standalone/一键形态。
   FSM map，种子任务内保留同判定作兜底）；raft 已初始化则跳过 initialize（D7b 语义保持）。
   多实例模式（yaml + env bootstrap/join）完全不动。
 
+## 打磨（同日 P3）
+
+- token 拆 `resolve_token`（纯读，不建目录不写文件）/`persist_token`（唯一写），持久化推迟到
+  多节点拒绝预检（`refuse_multi_node_store`）之后 —— 拒绝路径零残留；`startup_conf` 的
+  standalone 分支下沉为 `standalone::conf_from_args`（main.rs 行数预算）。
+- `--port < 1024` 启动时仅打 warning（特权端口需 root/CAP_NET_BIND_SERVICE，README 已
+  注明可用范围 1–65525），不硬拒，不阻止 root 使用 80/443。
+
 ## 文件
 
-- `src/standalone.rs`（新增，316 行）：旗标解析/端口派生/token 持久化/`build_conf`/
+- `src/standalone.rs`（新增，394 行）：旗标解析/端口派生/token 解析与持久化
+  （`resolve_token`/`persist_token`）/`conf_from_args`/`build_conf`/
   `topology_plan` 纯函数 + `spawn_ensure_topology`。
 - `src/standalone_tests.rs`（新增）：上述纯函数单测（拆分守 400 行上限）。
 - `src/main.rs`：`startup_conf` 分派（standalone 免 yaml）、强制引导与种子任务挂接。

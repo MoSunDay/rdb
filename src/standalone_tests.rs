@@ -52,20 +52,49 @@ fn derived_binds_follow_e2e_offsets() {
 }
 
 #[test]
-fn token_generated_once_and_read_back() {
+fn token_resolved_then_persisted_with_restart_reuse() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let t1 = token_for(dir.path(), None).expect("gen");
-    assert_eq!(t1.len(), 32);
-    assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
-    // Restart reads the same token back; explicit token wins + rewrites.
-    assert_eq!(token_for(dir.path(), None).unwrap(), t1);
-    assert_eq!(token_for(dir.path(), Some("my-token")).unwrap(), "my-token");
-    assert_eq!(token_for(dir.path(), None).unwrap(), "my-token");
-    // 0600 on the persisted file; empty explicit token is refused.
+    // Fresh resolve is pure: nothing written, token generated.
+    let c1 = resolve_token(dir.path(), None).expect("resolve");
+    assert_eq!(c1.token.len(), 32);
+    assert!(c1.token.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(c1.persist.as_deref(), Some(c1.token.as_str()));
+    assert!(c1.generated);
+    assert!(!dir.path().join(TOKEN_FILE).exists());
+    // persist writes the file (and creates dir if missing).
+    persist_token(dir.path(), &c1).expect("persist");
+    assert_eq!(std::fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(), c1.token);
+    // Restart: same token read back, nothing to persist.
+    let c2 = resolve_token(dir.path(), None).unwrap();
+    assert_eq!(c2.token, c1.token);
+    assert_eq!(c2.persist, None);
+    assert!(!c2.generated);
+    // Explicit --token wins and re-persists; file content follows.
+    let c3 = resolve_token(dir.path(), Some("my-token")).unwrap();
+    assert_eq!((c3.token.as_str(), c3.persist.as_deref(), c3.generated), ("my-token", Some("my-token"), false));
+    persist_token(dir.path(), &c3).unwrap();
+    assert_eq!(std::fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(), "my-token");
+    // Empty / whitespace explicit token is refused; restart still reads
+    // the last persisted value with nothing to rewrite.
+    assert!(resolve_token(dir.path(), Some("  ")).is_err());
+    assert!(resolve_token(dir.path(), Some("")).is_err());
+    let c4 = resolve_token(dir.path(), None).unwrap();
+    assert_eq!((c4.token.as_str(), c4.persist.as_deref()), ("my-token", None));
+    // 0600 on the persisted file.
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(dir.path().join(TOKEN_FILE)).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
-    assert!(token_for(dir.path(), Some("  ")).is_err());
+    // persist with persist=None is a no-op (restart path leaves no write).
+    persist_token(dir.path(), &c4).unwrap();
+}
+
+#[test]
+fn port_warning_flags_privileged_range_only() {
+    assert!(port_warning(80).is_some());
+    assert!(port_warning(1023).is_some());
+    assert!(port_warning(1024).is_none());
+    assert!(port_warning(6379).is_none());
+    assert!(port_warning(65525).is_none());
 }
 
 #[test]

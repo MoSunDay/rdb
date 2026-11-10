@@ -48,28 +48,15 @@ fn config_missing_error(path: &str) -> Option<String> {
     }
 }
 
-/// Startup config resolution: the `standalone` subcommand builds the
-/// whole config from CLI flags (multi-protocol quick-start, see
-/// `standalone.rs`); every other invocation takes the yaml path.
-/// `Some(opts)` in the return marks a standalone boot for the forced
-/// bootstrap + topology seed below. `Err` is fatal (printed, exit 1).
-fn startup_conf(args: &[String]) -> Result<(conf::Config, Option<standalone::StandaloneOpts>), String> {
-    if args.first().map(String::as_str) == Some("standalone") {
-        if !conf::raft_join_addr().is_empty() {
-            return Err(
-                "standalone mode cannot join an existing cluster: unset RAFT_JOIN_ADDR"
-                    .to_string(),
-            );
-        }
-        let opts = standalone::parse_args(&args[1..])?;
-        let token = standalone::token_for(&opts.dir, opts.token.as_deref())?;
-        eprintln!(
-            "[standalone] host={} port={} dir={}",
-            opts.host, opts.port, opts.dir.display()
-        );
-        let conf = standalone::build_conf(&opts, &token);
-        eprintln!("[standalone] {}", standalone::endpoints(&conf));
-        return Ok((conf, Some(opts)));
+/// Startup config resolution: the `standalone` subcommand derives
+/// everything in `standalone.rs` (`conf_from_args`: CLI flags, derived
+/// ports, resolved-but-not-yet-persisted token); every other invocation
+/// takes the yaml path. `Some(boot)` in the return marks a standalone
+/// boot for the forced bootstrap + token persist + topology seed below.
+/// `Err` is fatal (printed, exit 1).
+fn startup_conf(args: &[String]) -> Result<(conf::Config, Option<standalone::Boot>), String> {
+    if let Some((conf, boot)) = standalone::conf_from_args(args)? {
+        return Ok((conf, Some(boot)));
     }
     let config_path = config_path_arg(args);
     // Fail fast on a dangling -config path (Go's conf.init Fatalf).
@@ -340,6 +327,14 @@ async fn do_main() {
     // listener binds (earliest point the raft store / FSM is open).
     if standalone_opts.is_some() {
         standalone::refuse_multi_node_store(&node.kv, &conf.bind);
+    }
+    // Standalone: the token file is written only once the store passed
+    // the refusal check -- a refused boot must leave nothing behind.
+    if let Some(boot) = &standalone_opts {
+        if let Err(e) = standalone::persist_token(&boot.opts.dir, &boot.token) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     }
     let raft = node.raft.clone();
 

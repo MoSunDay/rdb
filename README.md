@@ -49,7 +49,8 @@ cargo build --release
 ```
 
 - 首次启动生成随机 token（32 hex），写入 `{dir}/standalone_token`（0600）并打印到 stderr；
-  重启复用同一 token；`--token` 显式指定并覆写文件。同一个 token 用于所有协议面：
+  重启复用同一 token；`--token` 显式指定并覆写文件（token 文件仅在 store 通过多节点
+  预检后落盘，拒绝启动时不写任何文件）。同一个 token 用于所有协议面：
   RESP `AUTH`、MySQL 密码（用户 `root`）、Kafka SASL PLAIN、ES/S3/RocksMQ HTTP 的 Bearer。
 - 多协议前端随基端口一起拉起（偏移沿用 e2e 约定）：
 
@@ -63,6 +64,7 @@ cargo build --release
   | `P+9` / `P+10` | ES HTTP / S3 HTTP |
 
   （`P+1` 预留给 backup 面，standalone 下不启用。）
+- `--port` 可用范围 1–65525；低于 1024 的特权端口通常需要 root/CAP_NET_BIND_SERVICE（启动时仅打 warning，不阻止 root 使用）。
 - 同一 token 直连各协议（默认端口下）：
 
   ```bash

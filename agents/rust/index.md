@@ -86,7 +86,7 @@ Commit: b7378c0
 
 ## 关键流程
 进程装配（`do_main`，对照 Go `server.NewRDB`）：
-1. 启动配置解析（`startup_conf`）：`standalone` 子命令走 `standalone.rs`（CLI 旗标派生全部协议端口 + token 文件，见下）；否则加载 yaml 配置。→ 启动 monitor `/metrics` 端点。
+1. 启动配置解析（`startup_conf`）：`standalone` 子命令下沉为 `standalone::conf_from_args`（CLI 旗标派生全部协议端口 + 解析 token；token 文件推迟到多节点拒绝预检之后才落盘，见下）；否则加载 yaml 配置。→ 启动 monitor `/metrics` 端点。
 2. join 决策先于建节点：数据目录（`store_path/bind/raft`）已存在则不 join，否则取 `RAFT_JOIN_ADDR`。
 3. `rcache::new_raft_node`：建目录、打开 RocksDB 日志存储与 FSM；`RAFT_BOOTSTRAP=true` 或 standalone 强制引导且未初始化时单节点 initialize。
 4. 可选 beacon → raft RPC 监听（`service::serve`）→ HTTP 控制 API 绑定并服务。
