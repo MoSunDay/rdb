@@ -26,6 +26,12 @@ pub struct BulkOp {
 const MAX_ID_LEN: usize = 512;
 const MAX_INDEX_LEN: usize = 255;
 
+/// Upper bound on parsed (action, source) pairs per `_bulk` request:
+/// every op latches and fsyncs independently, so item count -- not
+/// just the 64 MiB body cap -- must be bounded (each item also
+/// materializes a source copy plus a reply item).
+const MAX_BULK_OPS: usize = 100_000;
+
 type BulkParseResult = Result<Vec<(BulkOp, Option<Vec<u8>>)>, String>;
 
 /// Split an NDJSON body into (action, source) pairs. Blank lines are
@@ -104,6 +110,9 @@ pub async fn run_bulk(shared: &Shared, default_index: &str, body: &[u8]) -> Repl
         Ok(ops) => ops,
         Err(e) => return reply::error(400, "illegal_argument_exception", &e),
     };
+    if let Err(e) = check_cap(ops.len()) {
+        return reply::error(400, "illegal_argument_exception", &e);
+    }
     let mut items = Vec::with_capacity(ops.len());
     let mut errors = false;
     for (op, source) in ops {
@@ -161,7 +170,12 @@ pub async fn run_bulk(shared: &Shared, default_index: &str, body: &[u8]) -> Repl
                 let Some(src) = source else {
                     continue; // parser guarantees a source for index/create
                 };
-                if !valid_name(&op.id, MAX_ID_LEN) || op.id.contains('/') {
+                // `_id` may be omitted for index/create (server-generated); a
+                // PRESENT id must be valid. The old `!valid_name(&op.id, ..)` was
+                // true for every empty id, so bare `{"index":{}}` items always
+                // failed with "invalid document id" and the auto_id branch below
+                // was dead code.
+                if !op.id.is_empty() && !valid_name(&op.id, MAX_ID_LEN) {
                     errors = true;
                     items.push(item_err(
                         &op.action,
@@ -208,6 +222,18 @@ pub async fn run_bulk(shared: &Shared, default_index: &str, body: &[u8]) -> Repl
 /// Names are non-empty (when required), slash-free and length-capped.
 fn valid_name(s: &str, max: usize) -> bool {
     !s.is_empty() && !s.contains('/') && s.len() <= max
+}
+
+/// Cap admission: `Err(reason)` when the parsed op count exceeds
+/// [`MAX_BULK_OPS`]. Pure.
+fn check_cap(n: usize) -> Result<(), String> {
+    if n > MAX_BULK_OPS {
+        Err(format!(
+            "bulk request exceeds the maximum allowed number of items ({MAX_BULK_OPS})"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn item_err(action: &str, index: &str, id: &str, es_type: &str, reason: &str) -> Value {
@@ -261,5 +287,12 @@ mod tests {
         assert_eq!(err, "line 3: unknown bulk action 'frobnicate'");
         let err = parse_ndjson(b"{\"delete\":{\"_index\":\"i\"}}\n").unwrap_err();
         assert!(err.contains("requires an _id"), "{err}");
+    }
+
+    #[test]
+    fn bulk_ops_cap_boundary() {
+        assert!(check_cap(MAX_BULK_OPS).is_ok());
+        let err = check_cap(MAX_BULK_OPS + 1).unwrap_err();
+        assert!(err.contains(&format!("{MAX_BULK_OPS}")), "{err}");
     }
 }

@@ -205,3 +205,51 @@ async fn es_bulk_and_ttl_interop() {
     assert_eq!(status, 404, "doc purged with family: {body}");
     assert_eq!(json_body(&body)["found"], false, "{body}");
 }
+
+/// 自动生成 `_id`（P0 修复）：`index`/`create` 动作行可省略 `_id`——
+/// `{"index":{}}` 与 `{"index":{"_index":..}}`（带显式索引、无 `_id`）
+/// 均走服务端 auto_id；`create` 仍可带固定 `_id`。三条全部 created，
+/// 返回的 `_id` 非空且 GET 可按它取回文档。
+#[tokio::test]
+async fn es_bulk_auto_id_items() {
+    let (_node, es) = spawn_es_ready("interop3").await;
+    let resp_addr = _node.resp.clone();
+    const SCHEMA_AID: &[&[u8]] = &[b"SCHEMA", b"body", b"TEXT"];
+
+    ft_create_ok(&resp_addr, "aidx", SCHEMA_AID).await;
+    let nd = r#"{"index":{}}
+{"body":"auto id doc one"}
+{"index":{"_index":"aidx"}}
+{"body":"auto id doc two"}
+{"create":{"_id":"fixed1"}}
+{"body":"fixed id doc"}
+"#;
+    let (status, body) = http(&es, "POST", "/aidx/_bulk", Some(nd)).await;
+    assert_eq!(status, 200, "{body}");
+    let v = json_body(&body);
+    assert_eq!(v["errors"], false, "{body}");
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3, "{body}");
+    // items[0]/[1]：省略 `_id` -> 服务端生成非空 id，status 201 created。
+    let auto1 = items[0]["index"]["_id"].as_str().unwrap_or_default();
+    assert!(!auto1.is_empty(), "items[0] auto id: {body}");
+    assert_eq!(items[0]["index"]["status"], 201, "{body}");
+    assert_eq!(items[0]["index"]["result"], "created", "{body}");
+    let auto2 = items[1]["index"]["_id"].as_str().unwrap_or_default();
+    assert!(!auto2.is_empty(), "items[1] auto id: {body}");
+    assert_eq!(items[1]["index"]["status"], 201, "{body}");
+    assert_eq!(items[1]["index"]["result"], "created", "{body}");
+    assert_ne!(auto1, auto2, "auto ids must differ: {body}");
+    // items[2]：显式 `_id` 原样返回。
+    assert_eq!(items[2]["create"]["_id"], "fixed1", "{body}");
+    assert_eq!(items[2]["create"]["result"], "created", "{body}");
+
+    // 返回的 id 是真实落盘 id：GET 能按它取回文档。
+    let (status, body) = http(&es, "GET", &format!("/aidx/_doc/{auto1}"), None).await;
+    assert_eq!(status, 200, "get by auto id: {body}");
+    assert_eq!(json_body(&body)["found"], true, "{body}");
+
+    // match 查询只命中两篇 auto 文档。
+    let v = es_query(&es, "aidx", r#"{"query":{"match":{"body":"auto"}}}"#).await;
+    assert_eq!(v["hits"]["total"]["value"], 2, "match auto total: {v}");
+}
