@@ -242,6 +242,8 @@ Commit: b0d81c9
   `turso_vector_e2e`（T4：VECTOR DDL/函数族/精确 KNN/错误矩阵/rocks id 序
   parity，数值断言 epsilon=1e-6）、`turso_txn_e2e`（T5：直通事务+隐式提交语义/
   prepared `?` 绑定/事务内 USE 1235/双连接脏读检查/隔离级别回显）、
+  `turso_setops_e2e`（allowlist batch 1：JOIN 全矩阵/USING×各 kind/子查询七型/
+  UNION[ALL]/INTERSECT/EXCEPT/CTE 双引擎对照，偏差 (z1)/(z2) 断言）、
   `turso_sqlite_interop_e2e`（2026-11-10 验收收口：stock sqlite3 CLI 双向文件级
   互操作——存活期外部读 SQLITE_BUSY（写者独占 WAL）、优雅退出后恢复 WAL 全量
   可读含 `hex()` 裸 LE f32、预建 `.db` 收养 MySQL 侧读回，偏差 (z3)）。
