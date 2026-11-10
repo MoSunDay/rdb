@@ -7,7 +7,6 @@
 //!     offsets stay in the durable ledger and a rejoin rebuilds the
 //!     group at a fresh generation that still fences older ones.
 
-use crate::common;
 use crate::kafka_front_common;
 
 use kafka_front_common::groups::{

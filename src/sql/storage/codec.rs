@@ -169,8 +169,10 @@ pub fn decode_typed(bytes: &[u8]) -> Result<(Value, &[u8]), String> {
                 return Err("vector payload must be a non-empty f32 array".into());
             }
             let vals = rest
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             Ok((Value::Vector(vals), &[]))
         }

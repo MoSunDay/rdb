@@ -3,7 +3,6 @@
 //! (explicit + null topics), generation fencing, and durability
 //! across a kill + respawn of the process.
 
-use crate::common;
 use crate::kafka_front_common;
 
 use kafka_front_common::{kafka_req, kafka_round, resp_one_shot, spawn_kafka_node, wait_accepting};

@@ -3,7 +3,6 @@
 //! TCP ApiVersions v0/v3 and Metadata v0/v8 handshakes hand-decoded with
 //! the production `kafka::frame::Reader` (dogfooding the parser).
 
-use crate::common;
 use crate::kafka_front_common;
 
 use tokio::io::AsyncReadExt;

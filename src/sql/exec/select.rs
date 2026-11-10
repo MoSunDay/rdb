@@ -648,9 +648,10 @@ pub fn sort_pairs(pairs: &mut [(Vec<Value>, Vec<Value>)], keys: &[OrderKey]) {
 /// Key-comparison closure shared by the full sort and the top-N
 /// partition step (they must agree exactly or Nth-select would cut the
 /// window on a different ordering than the sort produces).
-fn order_cmp<'k>(
-    keys: &'k [OrderKey],
-) -> impl Fn(&(Vec<Value>, Vec<Value>), &(Vec<Value>, Vec<Value>)) -> std::cmp::Ordering + 'k {
+/// Sort payload pair: (ordering keys, projected values).
+type SortPair = (Vec<Value>, Vec<Value>);
+
+fn order_cmp<'k>(keys: &'k [OrderKey]) -> impl Fn(&SortPair, &SortPair) -> std::cmp::Ordering + 'k {
     move |a, b| {
         for (i, k) in keys.iter().enumerate() {
             let ord = if k.asc {

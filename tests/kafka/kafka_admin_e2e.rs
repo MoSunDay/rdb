@@ -8,7 +8,6 @@
 //! ApiVersions, unauthenticated traffic dropped, wrong password ->
 //! 58 + close, correct PLAIN token -> full produce/fetch surface.
 
-use crate::common;
 use crate::kafka_front_common;
 
 use kafka_front_common::groups::{

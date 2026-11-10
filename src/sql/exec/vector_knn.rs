@@ -121,11 +121,14 @@ fn is_row_constant(e: &Expr) -> bool {
 /// Run the recognized shape over the materialized source. `None` (the
 /// caller's fallback signal) only ever comes from the matcher; every
 /// evaluation error is the same error the generic path would raise.
+/// Exact-KNN projection outcome: result column shape + rows.
+type KnnOutcome = (Vec<ColMeta>, Vec<Vec<Value>>);
+
 pub(crate) fn try_execute(
     q: &Query,
     src: &Source,
     items: &[(Expr, ColMeta)],
-) -> SqlResult<Option<(Vec<ColMeta>, Vec<Vec<Value>>)>> {
+) -> SqlResult<Option<KnnOutcome>> {
     let Some(shape) = match_knn(q) else {
         return Ok(None);
     };

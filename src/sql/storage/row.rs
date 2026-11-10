@@ -376,14 +376,16 @@ fn decode_payload(mut rest: &[u8], ty: SqlType) -> Result<(Value, &[u8]), String
         // request is a corrupt catalog, not an empty vector.
         SqlType::Vector { dim } => {
             let need = 4 * dim as usize;
-            if need == 0 || need % 4 != 0 || rest.len() < need {
+            if need == 0 || !need.is_multiple_of(4) || rest.len() < need {
                 return Err("vector payload truncated".into());
             }
             let (raw, r) = rest.split_at(need);
             rest = r;
             Value::Vector(
-                raw.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect(),
             )
         }

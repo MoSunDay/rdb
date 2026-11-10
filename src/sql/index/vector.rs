@@ -165,8 +165,18 @@ pub fn decode_meta(v: &[u8]) -> Option<(VectorIndexParams, usize, Calibration)> 
         return None;
     }
     let halves = dim as usize * 4;
-    let min = body[..halves].chunks_exact(4).map(f32_from_le).collect();
-    let scale = body[halves..].chunks_exact(4).map(f32_from_le).collect();
+    let min = body[..halves]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(f32_from_le)
+        .collect();
+    let scale = body[halves..]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(f32_from_le)
+        .collect();
     Some((
         VectorIndexParams {
             metric,
@@ -178,8 +188,8 @@ pub fn decode_meta(v: &[u8]) -> Option<(VectorIndexParams, usize, Calibration)> 
     ))
 }
 
-fn f32_from_le(c: &[u8]) -> f32 {
-    f32::from_le_bytes(c.try_into().expect("chunk_exact(4)"))
+fn f32_from_le(c: &[u8; 4]) -> f32 {
+    f32::from_le_bytes(*c)
 }
 
 /// centroids value: `k * dim` f32LE.
@@ -194,12 +204,12 @@ pub fn encode_centroids(cs: &[Vec<f32>]) -> Vec<u8> {
 }
 
 pub fn decode_centroids(v: &[u8], dim: usize) -> Option<Vec<Vec<f32>>> {
-    if v.len() % (dim * 4) != 0 {
+    if !v.len().is_multiple_of(dim * 4) {
         return None;
     }
     Some(
         v.chunks_exact(dim * 4)
-            .map(|c| c.chunks_exact(4).map(f32_from_le).collect())
+            .map(|c| c.as_chunks::<4>().0.iter().map(f32_from_le).collect())
             .collect(),
     )
 }

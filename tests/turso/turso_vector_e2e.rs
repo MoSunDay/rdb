@@ -40,7 +40,7 @@ fn near(a: f64, b: f64) -> bool {
 }
 
 /// The ids of one-column KNN results, in arrival order.
-fn ids(rs: &Vec<Vec<mysql_async::Value>>) -> Vec<String> {
+fn ids(rs: &[Vec<mysql_async::Value>]) -> Vec<String> {
     rs.iter()
         .map(|r| match &r[0] {
             mysql_async::Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),

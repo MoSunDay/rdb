@@ -314,14 +314,11 @@ async fn standalone_refuses_to_downgrade_a_multi_node_store() {
     let mut s = spawn_standalone(&node0_dir, host, port, None);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match s.child.try_wait().expect("try_wait") {
-            Some(st) => {
-                assert_eq!(st.code(), Some(1), "refuse exit code\n{}", s.stderr_tail());
-                let tail = s.stderr_tail();
-                assert!(tail.contains("refusing to start"), "{tail}");
-                return;
-            }
-            None => {}
+        if let Some(st) = s.child.try_wait().expect("try_wait") {
+            assert_eq!(st.code(), Some(1), "refuse exit code\n{}", s.stderr_tail());
+            let tail = s.stderr_tail();
+            assert!(tail.contains("refusing to start"), "{tail}");
+            return;
         }
         assert!(
             Instant::now() < deadline,

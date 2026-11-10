@@ -245,14 +245,13 @@ pub(crate) async fn drop_index(
     let vec_guard = catalog::lookup(shared, &table)
         .ok()
         .flatten()
-        .map(|schema| {
+        .and_then(|schema| {
             schema
                 .indexes
                 .iter()
                 .find(|d| d.name == *name && d.vector.is_some())
                 .map(|d| (schema.id, d.id))
-        })
-        .flatten();
+        });
     let _vec_lock = match vec_guard {
         Some((tid, iid)) => Some(
             crate::ds::latch::lock(

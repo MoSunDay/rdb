@@ -168,10 +168,11 @@ impl TableColumns {
 /// the embedded engine is single-process, so no cross-node coherence
 /// is needed. One PRAGMA (+ at most one sqlite_master read) per table
 /// per DDL generation instead of per write statement.
-fn table_columns_cache() -> &'static std::sync::Mutex<HashMap<(String, String), Arc<TableColumns>>>
-{
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<(String, String), Arc<TableColumns>>>> =
-        OnceLock::new();
+/// Per-(db, table) column cache shared across statements.
+type ColumnsCache = std::sync::Mutex<HashMap<(String, String), Arc<TableColumns>>>;
+
+fn table_columns_cache() -> &'static ColumnsCache {
+    static CACHE: OnceLock<ColumnsCache> = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 

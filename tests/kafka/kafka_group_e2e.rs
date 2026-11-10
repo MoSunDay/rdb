@@ -6,7 +6,6 @@
 //! and the commit-fencing lattice (22 stale generation / 25 unknown
 //! member / authorized commits landing in the durable ledger).
 
-use crate::common;
 use crate::kafka_front_common;
 
 use kafka_front_common::groups::{

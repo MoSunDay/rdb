@@ -35,8 +35,10 @@ pub fn value_from_typed(v: turso::Value, decl: Option<&str>) -> Value {
     if let (Some(d), turso::Value::Blob(b)) = (decl, &v) {
         if is_vector_decl(d) && !b.is_empty() && b.len() % 4 == 0 {
             return Value::Vector(
-                b.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect(),
             );
         }
