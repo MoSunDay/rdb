@@ -20,11 +20,13 @@ pub fn idf(df: u64, n: u64) -> f64 {
 /// One term's contribution for a document.
 ///
 /// `tf` = term occurrences in the doc, `doclen` = the doc's total term
-/// count (all fields), `avgdl` = corpus mean doclen.
-pub fn term_score(tf: u64, df: u64, doclen: u64, avgdl: f64, n: u64) -> f64 {
+/// count (all fields), `avgdl` = corpus mean doclen; `k1`/`b` are the
+/// index-tunable saturation / length-normalization knobs (K1/B above
+/// are the defaults a meta record falls back to).
+pub fn term_score(tf: u64, df: u64, doclen: u64, avgdl: f64, n: u64, k1: f64, b: f64) -> f64 {
     let tf = tf as f64;
-    let norm = 1.0 - B + B * (doclen.max(1) as f64) / avgdl.max(1e-9);
-    idf(df, n) * (tf * (K1 + 1.0)) / (tf + K1 * norm)
+    let norm = 1.0 - b + b * (doclen.max(1) as f64) / avgdl.max(1e-9);
+    idf(df, n) * (tf * (k1 + 1.0)) / (tf + k1 * norm)
 }
 
 /// A scored hit; ties break by ascending docid bytes (deterministic
@@ -126,15 +128,15 @@ mod tests {
     #[test]
     fn term_score_matches_hand_computation() {
         let expected = idf(2, 4) * (3.0 * (K1 + 1.0)) / (3.0 + K1 * 1.0);
-        assert!((term_score(3, 2, 10, 10.0, 4) - expected).abs() < 1e-12);
+        assert!((term_score(3, 2, 10, 10.0, 4, K1, B) - expected).abs() < 1e-12);
     }
 
     #[test]
     fn longer_docs_are_penalized() {
-        assert!(term_score(3, 2, 10, 10.0, 4) > term_score(3, 2, 500, 10.0, 4));
+        assert!(term_score(3, 2, 10, 10.0, 4, K1, B) > term_score(3, 2, 500, 10.0, 4, K1, B));
         // tf saturation: doubling tf less than doubles the score.
-        let s1 = term_score(2, 2, 10, 10.0, 4);
-        let s2 = term_score(4, 2, 10, 10.0, 4);
+        let s1 = term_score(2, 2, 10, 10.0, 4, K1, B);
+        let s2 = term_score(4, 2, 10, 10.0, 4, K1, B);
         assert!(s2 < 2.0 * s1);
     }
 

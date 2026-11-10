@@ -18,7 +18,8 @@ use std::sync::OnceLock;
 
 use jieba_rs::Jieba;
 
-fn jieba() -> &'static Jieba {
+/// The process-global jieba (shared with `highlight`'s span mirror).
+pub(crate) fn jieba() -> &'static Jieba {
     static JIEBA: OnceLock<Jieba> = OnceLock::new();
     JIEBA.get_or_init(Jieba::new)
 }
@@ -26,20 +27,23 @@ fn jieba() -> &'static Jieba {
 /// Han code points jieba knows how to segment (Unified Ideographs,
 /// Extension A, compatibility ideographs). Kana/Hangul are rare in the
 /// dict and fall through to the alphanumeric-run path.
-fn is_han(c: char) -> bool {
+pub(crate) fn is_han(c: char) -> bool {
     matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
 }
 
-/// One contiguous script run of the input.
+/// One contiguous script run of the input (shared with the span
+/// mirror in `highlight.rs`).
 #[derive(Debug, PartialEq)]
-enum Run<'a> {
+pub(crate) enum Run<'a> {
     Han(&'a str),
     Other(&'a str),
 }
 
 /// Split `text` into maximal Han / non-Han runs. Non-Han runs keep
-/// their raw bytes; alphanumeric filtering happens per token.
-fn runs(text: &str) -> Vec<Run<'_>> {
+/// their raw bytes; alphanumeric filtering happens per token. The
+/// runs tile `text` contiguously, so byte offsets rebuild by
+/// accumulating run lengths (see `highlight::token_spans`).
+pub(crate) fn runs(text: &str) -> Vec<Run<'_>> {
     let mut out = Vec::new();
     let mut other_start = 0usize;
     let mut in_han = false;

@@ -1,9 +1,22 @@
-//! FT.SEARCH execution + the FT.INFO reply. Query dialect (v1, all
-//! node-local): `*` matches every doc; otherwise whitespace-separated
-//! AND terms, each optionally field-scoped `@field:term`. Terms run
-//! through the SAME tokenizer as indexing (a CJK query tokenizes into
-//! its bigrams, so substring recall lines up with the postings).
-//! Options: `LIMIT o n`, `WITHSCORES`, `NOCONTENT`, and vector search
+//! FT.SEARCH execution + the FT.INFO reply. Query dialect (v2, all
+//! node-local, parsed by `query_tree`): `*` matches every doc;
+//! otherwise whitespace-separated clauses -- implicit AND, optional
+//! `@field:term` scopes, `"quoted phrases"` (adjacent positions),
+//! trailing-`*` prefix scans, `|`/OR union, `-`/NOT complement. Terms
+//! run through the SAME tokenizer as indexing (a CJK query tokenizes
+//! into its bigrams, so substring recall lines up with the postings).
+//! NOTE: whitespace clauses are now a STRICT AND (the v1 code unioned
+//! multi-term queries despite its docs; aligned with the documented
+//! contract and the KNN prefilter).
+//! Options: `LIMIT o n`, `WITHSCORES`, `NOCONTENT`, `SORTBY <field>
+//! [ASC|DESC]` (NUMERIC doc-value sort: full match set ordered by
+//! (value, docid), MISSING values last in BOTH directions, total =
+//! the FULL match count), `RETURN <n> <f...>` (project the reply's
+//! doc JSON to those keys, in list order; missing keys skip, `0`
+//! gives `{}`), `HIGHLIGHT [FIELDS <n> <f...>] [TAGS <open>
+//! <close>]` (wrap the reply docs' matched query terms in tags;
+//! default fields = every TEXT field, default tags `<b>`/`</b>`,
+//! incompatible with NOCONTENT), and vector search
 //! `KNN <k> @<field>` followed by `FP16 <blob>` or a `VALUES <f64...>`
 //! tail (VSIM's convention: VALUES swallows the remaining args). A
 //! text query combined with KNN pre-filters the candidate set, then
@@ -15,6 +28,7 @@
 //! layout is a documented COMPAT deviation). KNN scores are
 //! `1/(1+L2)` so every mode sorts descending.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::command::hash_cmd::{arity, WRONGTYPE};
@@ -23,11 +37,14 @@ use crate::resp::codec::{append_array, append_bulk, append_bulk_string, append_e
 use crate::store::{ops, Store};
 
 use super::ann;
-use super::bm25::{term_score, Hit, TopK};
+use super::bm25::{Hit, TopK};
+use super::eval_tree::{eval_node, new_tree_ctx, scan_numvals, TreeHits};
 use super::ft_cmd::{index_state, IndexState};
-use super::ft_index::{read_doc, read_posting, read_termstat, FieldType, IndexMeta};
-use super::ft_query::{knn_vector, parse_opts, KnnOpts, QueryTerm, SearchOpts};
+use super::ft_index::{read_doc, text_fields, FieldType, IndexMeta};
+use super::ft_query::{knn_vector, parse_opts, KnnOpts, SearchOpts};
+use super::highlight::{highlight_doc, highlight_terms};
 use super::index_codec::doc_range;
+use super::query_tree::QueryNode;
 use super::vecmath;
 
 pub async fn ft_search(ctx: &mut Ctx<'_>) {
@@ -56,16 +73,38 @@ pub async fn ft_search(ctx: &mut Ctx<'_>) {
     };
     let store = &ctx.shared.store;
     let prefix = &ctx.prefix_key;
+    // SORTBY 只支持 NUMERIC 字段（列存 doc-value 排序），schema 校验
+    if let Some((f, _)) = &opts.sortby {
+        let numeric = meta
+            .fields
+            .iter()
+            .any(|fl| &fl.name == f && matches!(fl.ftype, FieldType::Numeric));
+        if !numeric {
+            append_error(ctx.out, "ERR SORTBY field is not NUMERIC");
+            return;
+        }
+    }
+    // HIGHLIGHT：FIELDS 未给定 -> 全部 TEXT 字段；词 = 正向查询词
+    // （match-all 的 `*` 无查询树 -> 空词表 -> 内容原样）
+    let hl_terms = terms
+        .as_ref()
+        .map(|n| highlight_terms(n, &meta))
+        .unwrap_or_default();
+    let hl_fields = opts
+        .highlight
+        .as_ref()
+        .map(|h| h.fields.clone().unwrap_or_else(|| text_fields(&meta)));
+    // (total, page): total = 全匹配数（SORTBY 路径），否则为页大小
     let result = match (&opts.knn, &terms) {
-        (Some(knn), None) => run_knn(store, prefix, &index, &meta, knn, None),
+        (Some(knn), None) => run_knn(store, prefix, &index, &meta, knn, None).map(|h| (h.len(), h)),
         (Some(knn), Some(terms)) => {
             let filter = matched_docids(store, prefix, &index, &meta, terms);
-            run_knn(store, prefix, &index, &meta, knn, Some(filter))
+            run_knn(store, prefix, &index, &meta, knn, Some(filter)).map(|h| (h.len(), h))
         }
         (None, None) => Ok(scan_all(store, prefix, &index, &opts)),
         (None, Some(terms)) => text_search(store, prefix, &index, &meta, terms, &opts),
     };
-    let hits = match result {
+    let (total, hits) = match result {
         Ok(h) => h,
         Err(e) => {
             append_error(ctx.out, &e);
@@ -79,7 +118,7 @@ pub async fn ft_search(ctx: &mut Ctx<'_>) {
     // tests/search_e2e.rs (ft_search_reply_is_a_flat_array).
     let per_hit = 1 + opts.with_scores as usize + (!opts.no_content) as usize;
     append_array(ctx.out, 1 + hits.len() * per_hit);
-    append_int(ctx.out, hits.len() as i64);
+    append_int(ctx.out, total as i64);
     for h in &hits {
         append_bulk(ctx.out, &h.docid);
         if opts.with_scores {
@@ -91,102 +130,75 @@ pub async fn ft_search(ctx: &mut Ctx<'_>) {
                 .flatten()
                 .map(|r| r.doc)
                 .unwrap_or_default();
+            // RETURN 投影：按列表顺序保留存在的键
+            let content = match &opts.ret {
+                Some(list) => project_return(&content, list),
+                None => content,
+            };
+            // HIGHLIGHT：投影之后的命中词包裹（KNN/过滤路径共用本
+            // 循环，同样生效；无命中词则原样）
+            let content = match (&hl_fields, opts.highlight.as_ref()) {
+                (Some(fields), Some(h)) if !hl_terms.is_empty() => {
+                    highlight_doc(&content, fields, &hl_terms, &h.open, &h.close)
+                }
+                _ => content,
+            };
             append_bulk(ctx.out, &content);
         }
     }
 }
 
-/// Text fields a bare term searches (all TEXT fields of the schema).
-fn scope_fields<'a>(meta: &'a IndexMeta, scope: &'a Option<Vec<u8>>) -> Vec<&'a [u8]> {
-    match scope {
-        Some(f) => vec![f.as_slice()],
-        None => meta
-            .fields
-            .iter()
-            .filter(|f| matches!(f.ftype, FieldType::Text))
-            .map(|f| f.name.as_slice())
-            .collect(),
-    }
-}
-
-/// BM25 text search over AND-ed terms; TopK bounded by offset+count
-/// (the node-local page contract), sliced to the requested page.
+/// Tree search (strict AND of clauses; phrase/prefix/bool leaves per
+/// `eval_tree`); TopK bounded by offset+count (the node-local page
+/// contract), sliced to the requested page. SORTBY replaces TopK
+/// with the full-match doc-value sort (needs the whole set before
+/// the window). Returns (total, page).
 fn text_search(
     store: &Store,
     prefix: &[u8],
     index: &[u8],
     meta: &IndexMeta,
-    terms: &[QueryTerm],
+    node: &QueryNode,
     opts: &SearchOpts,
-) -> Result<Vec<Hit>, String> {
-    let n = meta.num_docs.max(1);
-    let avgdl = meta.sum_doclen as f64 / n as f64;
-    let mut doclens: HashMap<Vec<u8>, u64> = HashMap::new();
-    let mut scores: HashMap<Vec<u8>, f64> = HashMap::new();
-    let mut doclen_of = |docid: &[u8]| -> u64 {
-        *doclens.entry(docid.to_vec()).or_insert_with(|| {
-            read_doc(store, prefix, index, docid)
-                .ok()
-                .flatten()
-                .map_or(1, |r| r.doclen.max(1))
-        })
-    };
-    for qt in terms {
-        for field in scope_fields(meta, &qt.field) {
-            for term in &qt.terms {
-                let stat = read_termstat(store, prefix, index, field, term)?;
-                if stat.df == 0 {
-                    continue;
-                }
-                for e in read_posting(store, prefix, index, field, term)? {
-                    let doclen = doclen_of(&e.docid);
-                    let s = term_score(e.tf, stat.df, doclen, avgdl, n);
-                    *scores.entry(e.docid).or_insert(0.0) += s;
-                }
-            }
-        }
+) -> Result<(usize, Vec<Hit>), String> {
+    let mut ctx = new_tree_ctx(store, prefix, index, meta);
+    let hits = eval_node(&mut ctx, node)?;
+    if let Some((field, desc)) = &opts.sortby {
+        let col = scan_numvals(store, prefix, index, field, &|_| true);
+        return Ok(sort_by_numval(hits, &col, *desc, opts));
     }
     let mut top = TopK::new(opts.offset + opts.count);
-    for (docid, score) in &scores {
+    for (docid, score) in &hits {
         top.push(docid, *score);
     }
-    Ok(top
+    let page: Vec<Hit> = top
         .finish()
         .into_iter()
         .skip(opts.offset)
         .take(opts.count)
-        .collect())
+        .collect();
+    Ok((page.len(), page))
 }
 
-/// Docids matching ALL terms (KNN prefilter; empty set = no matches).
+/// Docids matching the whole tree (KNN prefilter; empty set = no
+/// matches).
 fn matched_docids(
     store: &Store,
     prefix: &[u8],
     index: &[u8],
     meta: &IndexMeta,
-    terms: &[QueryTerm],
+    node: &QueryNode,
 ) -> HashSet<Vec<u8>> {
-    let mut acc: Option<HashSet<Vec<u8>>> = None;
-    for qt in terms {
-        for field in scope_fields(meta, &qt.field) {
-            for term in &qt.terms {
-                let docs: HashSet<Vec<u8>> = read_posting(store, prefix, index, field, term)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|e| e.docid)
-                    .collect();
-                acc = Some(match acc {
-                    Some(a) => a.intersection(&docs).cloned().collect(),
-                    None => docs,
-                });
-            }
-        }
-    }
-    acc.unwrap_or_default()
+    let mut ctx = new_tree_ctx(store, prefix, index, meta);
+    eval_node(&mut ctx, node)
+        .map(|h| h.into_keys().collect())
+        .unwrap_or_default()
 }
 
 /// `*` without KNN: docids in physical order, page applied, score 1.
-fn scan_all(store: &Store, prefix: &[u8], index: &[u8], opts: &SearchOpts) -> Vec<Hit> {
+/// SORTBY switches to the full-match doc-value sort. Returns
+/// (total, page).
+fn scan_all(store: &Store, prefix: &[u8], index: &[u8], opts: &SearchOpts) -> (usize, Vec<Hit>) {
     let (lower, upper) = doc_range(prefix, index);
     let mut docids = Vec::new();
     let _ = ops::for_each_from(store, &lower, false, &mut |k, _| {
@@ -196,14 +208,72 @@ fn scan_all(store: &Store, prefix: &[u8], index: &[u8], opts: &SearchOpts) -> Ve
         docids.push(k.to_vec());
         true
     });
+    let docid_of = |k: &[u8]| ann::docid_of_key(k, prefix.len()).unwrap_or_default();
+    if let Some((field, desc)) = &opts.sortby {
+        let hits: TreeHits = docids.iter().map(|k| (docid_of(k), 1.0)).collect();
+        let col = scan_numvals(store, prefix, index, field, &|_| true);
+        return sort_by_numval(hits, &col, *desc, opts);
+    }
     let mut out = Vec::new();
     for key in docids.into_iter().skip(opts.offset).take(opts.count) {
         out.push(Hit {
-            docid: ann::docid_of_key(&key, prefix.len()).unwrap_or_default(),
+            docid: docid_of(&key),
             score: 1.0,
         });
     }
-    out
+    (out.len(), out)
+}
+
+/// SORTBY 排序共用路径：全量 (docid, score) 命中按数值列排序后
+/// 分页。缺失值两个方向都排最后（先按 missing 分桶再桶内比较，
+/// 与 es/source.rs cmp_sortval 语义一致），同值 docid 升序，DESC
+/// 只反转数值序。返回 (全匹配数, 分页结果)。
+fn sort_by_numval(
+    hits: TreeHits,
+    col: &HashMap<Vec<u8>, f64>,
+    desc: bool,
+    opts: &SearchOpts,
+) -> (usize, Vec<Hit>) {
+    let total = hits.len();
+    let mut keyed: Vec<(Option<f64>, Vec<u8>, f64)> = hits
+        .into_iter()
+        .map(|(docid, score)| (col.get(&docid).copied(), docid, score))
+        .collect();
+    keyed.sort_by(|a, b| match (&a.0, &b.0) {
+        (None, None) => a.1.cmp(&b.1),
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            let ord = x.total_cmp(y);
+            (if desc { ord.reverse() } else { ord }).then_with(|| a.1.cmp(&b.1))
+        }
+    });
+    let page = keyed
+        .into_iter()
+        .skip(opts.offset)
+        .take(opts.count)
+        .map(|(_, docid, score)| Hit { docid, score })
+        .collect();
+    (total, page)
+}
+
+/// RETURN 投影：文档 JSON 只保留列表中存在键（顺序跟随列表），
+/// 缺键跳过；列表为空或文档非 object（含解析失败）退化为 `{}`。
+fn project_return(doc: &[u8], list: &[Vec<u8>]) -> Vec<u8> {
+    let kept = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(doc)
+        .ok()
+        .map(|obj| {
+            let mut kept = serde_json::Map::new();
+            for f in list {
+                let key = String::from_utf8_lossy(f);
+                if let Some(v) = obj.get(key.as_ref()) {
+                    kept.insert(key.into_owned(), v.clone());
+                }
+            }
+            kept
+        })
+        .unwrap_or_default();
+    serde_json::to_vec(&serde_json::Value::Object(kept)).unwrap_or_else(|_| b"{}".to_vec())
 }
 
 /// KNN path: SPANN probe+rerank via `ann::knn`, or an exact scan over
@@ -252,7 +322,8 @@ fn run_knn(
 }
 
 /// FT.INFO reply: flat key/value array (index_name, num_docs,
-/// sum_doclen, avg_doclen, fields [...], ann_built, ann_centroids).
+/// sum_doclen, avg_doclen, fields [...], ann_built, ann_centroids,
+/// stopwords [...], k1, b).
 pub(super) fn reply_info(
     out: &mut Vec<u8>,
     store: &Store,
@@ -265,7 +336,7 @@ pub(super) fn reply_info(
     } else {
         "0".to_string()
     };
-    append_array(out, 14);
+    append_array(out, 20);
     append_bulk_string(out, "index_name");
     append_bulk(out, index);
     append_bulk_string(out, "num_docs");
@@ -303,6 +374,15 @@ pub(super) fn reply_info(
     append_int(out, built);
     append_bulk_string(out, "ann_centroids");
     append_int(out, centroids);
+    append_bulk_string(out, "stopwords");
+    append_array(out, meta.stopwords.len());
+    for s in &meta.stopwords {
+        append_bulk(out, s);
+    }
+    append_bulk_string(out, "k1");
+    append_bulk(out, format!("{}", meta.k1).as_bytes());
+    append_bulk_string(out, "b");
+    append_bulk(out, format!("{}", meta.b).as_bytes());
 }
 
 /// (built?, centroid count) -- reads the centroid record when the

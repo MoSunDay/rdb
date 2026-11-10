@@ -89,7 +89,9 @@ fn bool_nesting_and_arrays() {
             filter,
             should,
             must_not,
+            msm,
         } => {
+            assert_eq!(msm, None);
             assert_eq!(must.len(), 1);
             assert!(filter.is_empty());
             assert_eq!(should.len(), 2);
@@ -165,4 +167,134 @@ fn window_limit_and_unknown_query() {
     let e = parse_search(br#"{"query":{"foo":{}}}"#).unwrap_err();
     assert_eq!(e.es_type, "parsing_exception");
     assert!(e.reason.contains("unknown query type 'foo'"));
+}
+
+#[test]
+fn match_phrase_forms() {
+    let p = parse_search(br#"{"query":{"match_phrase":{"body":"Hello Redis"}}}"#).unwrap();
+    match p.query {
+        Plan::MatchPhrase { field, terms } => {
+            assert_eq!(field, "body");
+            assert_eq!(terms, vec![b"hello".to_vec(), b"redis".to_vec()]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // object form; non-string query is a 400
+    let p = parse_search(br#"{"query":{"match_phrase":{"t":{"query":"a b c"}}}}"#).unwrap();
+    match p.query {
+        Plan::MatchPhrase { terms, .. } => assert_eq!(terms.len(), 3),
+        other => panic!("{other:?}"),
+    }
+    assert!(parse_search(br#"{"query":{"match_phrase":{"t":{"query":1}}}}"#).is_err());
+    // empty analysis matches nothing
+    let p = parse_search(br#"{"query":{"match_phrase":{"t":"!!!"}}}"#).unwrap();
+    match p.query {
+        Plan::MatchPhrase { terms, .. } => assert!(terms.is_empty()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn prefix_forms() {
+    let p = parse_search(br#"{"query":{"prefix":{"title":"red"}}}"#).unwrap();
+    match p.query {
+        Plan::Prefix { field, prefix } => {
+            assert_eq!(field, "title");
+            assert_eq!(prefix, b"red".to_vec());
+        }
+        other => panic!("{other:?}"),
+    }
+    let p = parse_search(r#"{"query":{"prefix":{"t":{"value":"向量"}}}}"#.as_bytes()).unwrap();
+    match p.query {
+        Plan::Prefix { prefix, .. } => assert_eq!(prefix, "向量".as_bytes().to_vec()),
+        other => panic!("{other:?}"),
+    }
+    assert!(parse_search(br#"{"query":{"prefix":{"t":7}}}"#).is_err());
+    assert!(parse_search(br#"{"query":{"prefix":{"t":{"boost":2}}}}"#).is_err());
+}
+
+#[test]
+fn query_string_reuses_shared_tree() {
+    let p =
+        parse_search(r#"{"query":{"query_string":{"query":"title:redis AND 向量"}}}"#.as_bytes())
+            .unwrap();
+    match p.query {
+        Plan::QueryString { node } => {
+            let n = node.expect("non-empty");
+            match n {
+                crate::search::query_tree::QueryNode::And(v) => assert_eq!(v.len(), 2),
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+    // bare star = match-all
+    let p = parse_search(br#"{"query":{"query_string":{"query":"*"}}}"#).unwrap();
+    match p.query {
+        Plan::QueryString { node } => assert!(node.is_none()),
+        other => panic!("{other:?}"),
+    }
+    // missing/empty query string is a 400; other keys tolerated
+    assert!(parse_search(br#"{"query":{"query_string":{}}}"#).is_err());
+    assert!(parse_search(br#"{"query":{"query_string":{"query":""}}}"#).is_err());
+    let p = parse_search(
+        br#"{"query":{"query_string":{"query":"a","default_field":"t","fields":["x"]}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(p.query, Plan::QueryString { .. }));
+}
+
+#[test]
+fn term_value_object_form() {
+    let p = parse_search(br#"{"query":{"term":{"tag":{"value":"red","boost":2}}}}"#).unwrap();
+    match p.query {
+        Plan::Term { field, value } => {
+            assert_eq!(field, "tag");
+            assert_eq!(value, TermValue::Bytes(b"red".to_vec()));
+        }
+        other => panic!("{other:?}"),
+    }
+    let p = parse_search(br#"{"query":{"term":{"price":{"value":9}}}}"#).unwrap();
+    match p.query {
+        Plan::Term { value, .. } => assert_eq!(value, TermValue::Number(9.0)),
+        other => panic!("{other:?}"),
+    }
+    let e = parse_search(br#"{"query":{"term":{"tag":{"boost":2}}}}"#).unwrap_err();
+    assert_eq!(e.es_type, "parsing_exception");
+}
+
+#[test]
+fn minimum_should_match_shapes() {
+    let body = |msm: &str| {
+        // no format! -- raw JSON pieces keep the escapes readable
+        let mut s =
+            String::from(r#"{"query":{"bool":{"should":[{"term":{"a":"x"}},{"term":{"b":"y"}}],"#);
+        s.push_str(msm);
+        s.push_str(r#"}}}"#);
+        s
+    };
+    let p = parse_search(body(r#""minimum_should_match":2"#).as_bytes()).unwrap();
+    match p.query {
+        Plan::Bool { msm, .. } => assert_eq!(msm, Some(MinShouldMatch::Count(2))),
+        other => panic!("{other:?}"),
+    }
+    let p = parse_search(body(r#""minimum_should_match":"75%""#).as_bytes()).unwrap();
+    match p.query {
+        Plan::Bool { msm, .. } => assert_eq!(msm, Some(MinShouldMatch::Percent(75))),
+        other => panic!("{other:?}"),
+    }
+    let p = parse_search(br#"{"query":{"bool":{"should":[{"term":{"a":"x"}}]}}}"#).unwrap();
+    match p.query {
+        Plan::Bool { msm, .. } => assert_eq!(msm, None),
+        other => panic!("{other:?}"),
+    }
+    for bad in [
+        r#""minimum_should_match":-1"#,
+        r#""minimum_should_match":"2<-25%""#,
+        r#""minimum_should_match":"101%""#,
+        r#""minimum_should_match":true"#,
+        r#""minimum_should_match":1.5"#,
+    ] {
+        assert!(parse_search(body(bad).as_bytes()).is_err(), "{bad}");
+    }
 }

@@ -42,17 +42,77 @@ pub(crate) fn index_state(store: &crate::store::Store, prefix: &[u8], index: &[u
     }
 }
 
-/// `FT.CREATE <index> SCHEMA <field> TEXT | KEYWORD | NUMERIC |
-/// <field> VECTOR DIM <n> ...` (SCHEMA keyword required, options
-/// case-insensitive, at least one field, one VECTOR field max at v1).
+/// `FT.CREATE <index> [STOPWORDS <n> <w...>] [K1 <f>] [B <f>]
+/// SCHEMA <field> TEXT | KEYWORD | NUMERIC | <field> VECTOR DIM <n>
+/// ...` (SCHEMA keyword required, options before it, case-insensitive,
+/// repeatable with last-wins, at least one field, one VECTOR field
+/// max at v1). STOPWORDS filters TEXT tokens at index AND query time
+/// (positions compact after the drop, a documented deviation); K1/B
+/// retune the BM25 scorer for this index.
 pub async fn ft_create(ctx: &mut Ctx<'_>) {
-    if ctx.args.len() < 3 || !eq_ignore_case(&ctx.args[1], b"SCHEMA") {
+    if ctx.args.len() < 3 {
         arity(ctx.out, "ft.create");
         return;
     }
+    let Some(schema_at) = (1..ctx.args.len()).find(|&i| eq_ignore_case(&ctx.args[i], b"SCHEMA"))
+    else {
+        arity(ctx.out, "ft.create");
+        return;
+    };
     let index = ctx.args[0].clone();
+    let mut stopwords: Vec<Vec<u8>> = Vec::new();
+    let mut k1 = super::bm25::K1;
+    let mut b = super::bm25::B;
+    let mut i = 1;
+    while i < schema_at {
+        let opt = &ctx.args[i];
+        if eq_ignore_case(opt, b"STOPWORDS") {
+            let Some(n) = ctx
+                .args
+                .get(i + 1)
+                .and_then(|a| std::str::from_utf8(a).ok())
+                .and_then(|t| t.parse::<u64>().ok())
+            else {
+                append_error(ctx.out, "ERR invalid STOPWORDS count");
+                return;
+            };
+            if !(0..=10000).contains(&n) || i + 2 + n as usize > schema_at {
+                append_error(ctx.out, "ERR invalid STOPWORDS count");
+                return;
+            }
+            stopwords = ctx.args[i + 2..i + 2 + n as usize].to_vec();
+            i += 2 + n as usize;
+        } else if eq_ignore_case(opt, b"K1") || eq_ignore_case(opt, b"B") {
+            let is_k1 = eq_ignore_case(opt, b"K1");
+            let val = ctx
+                .args
+                .get(i + 1)
+                .and_then(|a| std::str::from_utf8(a).ok())
+                .and_then(|t| t.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0);
+            match val {
+                Some(v) if is_k1 => k1 = v,
+                Some(v) => b = v,
+                None => {
+                    append_error(
+                        ctx.out,
+                        if is_k1 {
+                            "ERR invalid K1"
+                        } else {
+                            "ERR invalid B"
+                        },
+                    );
+                    return;
+                }
+            }
+            i += 2;
+        } else {
+            append_error(ctx.out, "ERR unknown option");
+            return;
+        }
+    }
     let mut fields: Vec<IndexField> = Vec::new();
-    let mut i = 2;
+    let mut i = schema_at + 1;
     while i < ctx.args.len() {
         let name = ctx.args[i].clone();
         i += 1;
@@ -144,6 +204,9 @@ pub async fn ft_create(ctx: &mut Ctx<'_>) {
         num_docs: 0,
         sum_doclen: 0,
         fields,
+        stopwords,
+        k1,
+        b,
     };
     let mut batch = WriteBatch::default();
     ft_index::put_meta(&mut batch, &ctx.prefix_key, &index, &meta);
@@ -164,11 +227,21 @@ pub(crate) fn text_of(v: &Value) -> Option<String> {
     }
 }
 
-type DocRecordWithNumFields = Result<(DocRecord, Vec<(Vec<u8>, f64)>), &'static str>;
+type DocRecordWithNumFields = Result<
+    (
+        DocRecord,
+        Vec<(Vec<u8>, f64)>,
+        Vec<(Vec<u8>, Vec<u8>, Vec<u64>)>,
+    ),
+    &'static str,
+>;
 
 /// Build the DocRecord (terms + doclen + vector) from the JSON body,
-/// plus the (field, value) pairs of NUMERIC fields for the kind 0x19
-/// doc-value records (written by `build_add_batch`).
+/// the (field, value) pairs of NUMERIC fields for the kind 0x19
+/// doc-value records, and the (field, term, positions) side-table for
+/// TEXT fields (token ordinals, 0-based per field; tf == positions
+/// count by construction). All three are written by
+/// `build_add_batch`.
 pub(crate) fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> DocRecordWithNumFields {
     let json: Value = serde_json::from_slice(body).map_err(|_| "ERR invalid JSON document")?;
     let Value::Object(map) = json else {
@@ -182,6 +255,7 @@ pub(crate) fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> DocRecordWithNumFi
         doc: body.to_vec(),
     };
     let mut numvals = Vec::new();
+    let mut positions: Vec<(Vec<u8>, Vec<u8>, Vec<u64>)> = Vec::new();
     for f in &meta.fields {
         let name = String::from_utf8_lossy(&f.name);
         let Some(v) = map.get(name.as_ref()) else {
@@ -190,8 +264,13 @@ pub(crate) fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> DocRecordWithNumFi
         match &f.ftype {
             FieldType::Text => {
                 let text = text_of(v).ok_or("ERR text field must be a JSON scalar")?;
-                let toks = tokenize(&text);
+                let mut toks = tokenize(&text);
+                // index-side stopword drop: positions and doclen stay
+                // compact over the surviving tokens (RediSearch keeps
+                // holes -- documented deviation, see COMPAT.md)
+                toks.retain(|t| !meta.stopwords.iter().any(|s| s.as_slice() == t.as_bytes()));
                 rec.doclen += toks.len() as u64;
+                bump_positions(&mut positions, &f.name, &toks);
                 bump_terms(&mut rec.terms, &f.name, toks);
             }
             FieldType::Keyword => {
@@ -203,15 +282,16 @@ pub(crate) fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> DocRecordWithNumFi
                     Value::Array(items) => {
                         let mut vals = Vec::with_capacity(items.len());
                         for it in items {
-                            let s =
-                                match it {
-                                    Value::String(s) => s.clone(),
-                                    Value::Number(n) => n.to_string(),
-                                    Value::Bool(b) => b.to_string(),
-                                    _ => return Err(
+                            let s = match it {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                _ => {
+                                    return Err(
                                         "ERR keyword field must be a string or array of strings",
-                                    ),
-                                };
+                                    );
+                                }
+                            };
                             vals.push(s);
                         }
                         vals
@@ -245,7 +325,27 @@ pub(crate) fn doc_record_of(meta: &IndexMeta, body: &[u8]) -> DocRecordWithNumFi
             }
         }
     }
-    Ok((rec, numvals))
+    Ok((rec, numvals, positions))
+}
+
+/// Fold token ordinals into the (field, term, positions) side-table;
+/// positions are strictly increasing by construction (enumerate
+/// order), which is the v2 posting encode invariant.
+fn bump_positions(
+    positions: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u64>)>,
+    field: &[u8],
+    toks: &[String],
+) {
+    for (i, t) in toks.iter().enumerate() {
+        let bytes = t.as_bytes();
+        match positions
+            .iter_mut()
+            .find(|(f, term, _)| f == field && term == bytes)
+        {
+            Some((_, _, pos)) => pos.push(i as u64),
+            None => positions.push((field.to_vec(), bytes.to_vec(), vec![i as u64])),
+        }
+    }
 }
 
 /// Fold tokens into the (field, term, tf) list (order-preserving merge
@@ -294,7 +394,7 @@ pub async fn ft_add(ctx: &mut Ctx<'_>) {
         }
         IndexState::Present(m) => m,
     };
-    let (rec, numvals) = match doc_record_of(&meta, &body) {
+    let (rec, numvals, positions) = match doc_record_of(&meta, &body) {
         Ok(r) => r,
         Err(e) => {
             append_error(ctx.out, e);
@@ -309,6 +409,7 @@ pub async fn ft_add(ctx: &mut Ctx<'_>) {
         &docid,
         rec,
         &numvals,
+        &positions,
     ) {
         Ok(batch) => match ctx.commit(batch).await {
             Ok(()) => append_int(ctx.out, 1),

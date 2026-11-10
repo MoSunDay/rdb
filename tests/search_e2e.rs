@@ -467,3 +467,282 @@ fn ft_dropindex_alias_drops_docs_like_ft_drop() {
         );
     }
 }
+
+/// Dialect v2 operators over the same corpus as the lifecycle test:
+/// phrases (positions), prefix scans, `-`/NOT exclusion, `|` union and
+/// the strict implicit AND (multi-term queries now INTERSECT, the
+/// documented v1 contract; v1 code unioned them).
+#[test]
+fn ft_dialect_v2_operators() {
+    let (shared, _dir) = shared_at("45021");
+    ok(
+        &call(
+            &shared,
+            "ft.create",
+            &[b"idx", b"SCHEMA", b"title", b"TEXT", b"body", b"TEXT"],
+        ),
+        "create",
+    );
+    let add = |docid: &[u8], json: &[u8]| {
+        assert_eq!(
+            call(&shared, "ft.add", &[b"idx", docid, json]),
+            b":1\r\n".to_vec(),
+            "add {docid:?}"
+        );
+    };
+    add(
+        b"d1",
+        br#"{"title":"redis quickstart","body":"hello redis world"}"#,
+    );
+    add(
+        b"d2",
+        br#"{"title":"full text","body":"hello hello hello redis"}"#,
+    );
+    let zh = r#"{"title":"中文检索","body":"全文检索引擎"}"#;
+    add(b"d3", zh.as_bytes());
+
+    let q = |query: &str| call(&shared, "ft.search", &[b"idx", query.as_bytes()]);
+
+    // phrase: adjacency against the v2 positions.
+    let r = q(r#""full text""#); // title phrase only d2 has
+    assert!(contains_bytes(&r, b":1\r\n"), "phrase full text: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d2");
+    let r = q(r#"@body:"redis world""#); // adjacent only in d1
+    assert!(contains_bytes(&r, b":1\r\n"), "phrase redis world: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d1");
+    let r = q(r#"@body:"hello redis""#); // adjacent in BOTH bodies
+    assert!(contains_bytes(&r, b":2\r\n"), "phrase hello redis: {r:?}");
+    // reversed order breaks the adjacency chain
+    let r = q(r#"@body:"redis hello""#);
+    assert!(contains_bytes(&r, b":0\r\n"), "reversed phrase: {r:?}");
+
+    // CJK phrase: bigram ordinals chain (中文检索 -> 中文|文检|检索).
+    let r = q(r#"@title:"中文检索""#);
+    assert!(contains_bytes(&r, b":1\r\n"), "cjk phrase: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d3");
+
+    // prefix: whole-query star AND scoped.
+    let r = q("red*");
+    assert!(contains_bytes(&r, b":2\r\n"), "prefix red*: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d1");
+    assert_eq!(bulk_at(&r, 2), "d2");
+    let r = q("@title:red*");
+    assert!(contains_bytes(&r, b":1\r\n"), "scoped prefix: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d1");
+
+    // exclusion: '-' and uppercase NOT (lowercase is a plain term).
+    let r = q("@body:hello -@body:world");
+    assert!(contains_bytes(&r, b":1\r\n"), "minus exclusion: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d2");
+    let r = q("@body:hello NOT @body:world");
+    assert!(contains_bytes(&r, b":1\r\n"), "NOT exclusion: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d2");
+
+    // union: '|' between clauses.
+    let r = q("@title:full | @title:quickstart");
+    assert!(contains_bytes(&r, b":2\r\n"), "pipe union: {r:?}");
+
+    // strict implicit AND: both terms must match (v1 unioned these).
+    let r = q("hello quickstart");
+    assert!(contains_bytes(&r, b":1\r\n"), "strict AND: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d1");
+    // mixed CJK + latin AND across fields
+    let r = q("@title:检索 @body:引擎");
+    assert!(contains_bytes(&r, b":1\r\n"), "cjk AND: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d3");
+
+    // star alone still matches everything.
+    let r = q("*");
+    assert!(contains_bytes(&r, b":3\r\n"), "star: {r:?}");
+}
+
+/// WP3 索引级停用词 + BM25 k1/b：索引侧过滤（位置紧凑）、查询侧过滤、
+/// FT.INFO 回显与 FT.CREATE 选项校错。
+#[test]
+fn ft_stopwords_and_bm25_knobs() {
+    let (shared, _dir) = shared_at("45031");
+    ok(
+        &call(
+            &shared,
+            "ft.create",
+            &[
+                b"si",
+                b"STOPWORDS",
+                b"2",
+                b"the",
+                b"of",
+                b"K1",
+                b"1.5",
+                b"B",
+                b"0.5",
+                b"SCHEMA",
+                b"body",
+                b"TEXT",
+            ],
+        ),
+        "create",
+    );
+    let add = |docid: &[u8], json: &[u8]| {
+        assert_eq!(
+            call(&shared, "ft.add", &[b"si", docid, json]),
+            b":1\r\n".to_vec(),
+            "add {docid:?}"
+        );
+    };
+    add(b"d1", br#"{"body":"the quick fox of the bay"}"#);
+
+    // 停用词：索引侧没建 posting，查询侧也短路，总数 0。
+    let r = call(&shared, "ft.search", &[b"si", b"the"]);
+    assert!(contains_bytes(&r, b":0\r\n"), "stopword term: {r:?}");
+    // 普通词不受影响。
+    let r = call(&shared, "ft.search", &[b"si", b"quick"]);
+    assert!(contains_bytes(&r, b":1\r\n"), "plain term: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d1");
+
+    // 位置紧凑：过滤 the 后 quick/fox 相邻（RediSearch 保留空洞时 d2 不会命中）。
+    add(b"d2", br#"{"body":"the quick the fox"}"#);
+    let r = call(&shared, "ft.search", &[b"si", br#""quick fox""#]);
+    assert!(contains_bytes(&r, b":2\r\n"), "compact phrase: {r:?}");
+    assert!(contains_bytes(&r, b"d2"), "d2 compact adjacency: {r:?}");
+    // 短语里只剩 1 个实词时按单 term 短语退化：两篇都含 fox。
+    let r = call(&shared, "ft.search", &[b"si", br#""the fox""#]);
+    assert!(contains_bytes(&r, b":2\r\n"), "stopword-head phrase: {r:?}");
+
+    // FT.INFO 回显 stopwords/k1/b。
+    let info = call(&shared, "ft.info", &[b"si"]);
+    for want in [
+        &b"stopwords"[..],
+        &b"k1"[..],
+        &b"b"[..],
+        &b"1.5"[..],
+        &b"0.5"[..],
+    ] {
+        assert!(contains_bytes(&info, want), "info {want:?}: {info:?}");
+    }
+
+    // 选项校错：未知选项 / 词数不匹配 / 坏 K1。
+    err_has(
+        &call(
+            &shared,
+            "ft.create",
+            &[b"x1", b"NOPE", b"SCHEMA", b"f", b"TEXT"],
+        ),
+        "unknown option",
+        "unknown option",
+    );
+    err_has(
+        &call(
+            &shared,
+            "ft.create",
+            &[b"x2", b"STOPWORDS", b"2", b"only", b"SCHEMA", b"f", b"TEXT"],
+        ),
+        "STOPWORDS",
+        "count mismatch",
+    );
+    err_has(
+        &call(
+            &shared,
+            "ft.create",
+            &[b"x3", b"K1", b"abc", b"SCHEMA", b"f", b"TEXT"],
+        ),
+        "invalid K1",
+        "bad k1",
+    );
+}
+
+/// WP4：`@f:[min max]` 数值范围 + SORTBY/RETURN。范围查询走共享
+/// query_tree 的 NumRange（doc-values 列扫描，常量分 1.0）；SORTBY
+/// 按 NUMERIC 列排全量命中（缺失值两个方向都最后），total = 全匹
+/// 配数；RETURN 投影文档 JSON。
+#[test]
+fn ft_numeric_range_sortby_return() {
+    let (shared, _dir) = shared_at("45025");
+    ok(
+        &call(
+            &shared,
+            "ft.create",
+            &[b"nidx", b"SCHEMA", b"t", b"TEXT", b"price", b"NUMERIC"],
+        ),
+        "create",
+    );
+    let add = |docid: &[u8], json: &[u8]| {
+        assert_eq!(
+            call(&shared, "ft.add", &[b"nidx", docid, json]),
+            b":1\r\n".to_vec(),
+            "add {docid:?}"
+        );
+    };
+    add(b"d1", br#"{"t":"cheap","price":5}"#);
+    add(b"d2", br#"{"t":"mid","price":10}"#);
+    add(b"d3", br#"{"t":"high","price":20}"#);
+    add(b"d4", br#"{"t":"no price"}"#);
+
+    let q = |args: &[&[u8]]| call(&shared, "ft.search", args);
+
+    // 范围命中 10/20 两篇，同分按 docid 升序
+    let r = q(&[b"nidx", b"@price:[10 20]"]);
+    assert!(contains_bytes(&r, b":2\r\n"), "range: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d2");
+    assert_eq!(bulk_at(&r, 2), "d3");
+    // 开界：`*` 上界 + -inf 下界
+    let r = q(&[b"nidx", b"@price:[-inf 10]"]);
+    assert!(contains_bytes(&r, b":2\r\n"), "open bounds: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d1");
+    // DESC 反转；缺失值两个方向都排最后
+    let r = q(&[b"nidx", b"@price:[10 20]", b"SORTBY", b"price", b"DESC"]);
+    assert_eq!(bulk_at(&r, 0), "d3", "desc: {r:?}");
+    assert_eq!(bulk_at(&r, 2), "d2", "desc: {r:?}");
+    let r = q(&[b"nidx", b"*", b"SORTBY", b"price"]);
+    assert!(contains_bytes(&r, b":4\r\n"), "asc total: {r:?}");
+    for (i, want) in ["d1", "d2", "d3", "d4"].iter().enumerate() {
+        assert_eq!(&bulk_at(&r, i * 2), want, "asc order: {r:?}");
+    }
+    let r = q(&[b"nidx", b"*", b"SORTBY", b"price", b"DESC"]);
+    for (i, want) in ["d3", "d2", "d1", "d4"].iter().enumerate() {
+        assert_eq!(&bulk_at(&r, i * 2), want, "desc missing-last: {r:?}");
+    }
+    // WITHSCORES 与 SORTBY 共存：scan_all 常量分照报
+    let r = q(&[b"nidx", b"*", b"WITHSCORES", b"SORTBY", b"price"]);
+    assert_eq!(bulk_at(&r, 1), "1.0000", "withscores+sortby: {r:?}");
+    // 分页：LIMIT 1 2 -> d2,d3；total 仍为全匹配数 4
+    let r = q(&[b"nidx", b"*", b"SORTBY", b"price", b"LIMIT", b"1", b"2"]);
+    assert!(contains_bytes(&r, b":4\r\n"), "limit total: {r:?}");
+    assert_eq!(bulk_at(&r, 0), "d2");
+    assert_eq!(bulk_at(&r, 2), "d3");
+
+    // RETURN 投影：只留存在的键（顺序跟随列表）；RETURN 0 -> {}
+    let r = q(&[b"nidx", b"@price:[10 20]", b"RETURN", b"1", b"t"]);
+    assert_eq!(bulk_at(&r, 1), r#"{"t":"mid"}"#, "return 1: {r:?}");
+    assert_eq!(bulk_at(&r, 3), r#"{"t":"high"}"#, "return 1: {r:?}");
+    let r = q(&[b"nidx", b"@t:cheap", b"RETURN", b"2", b"price", b"nope"]);
+    assert_eq!(bulk_at(&r, 1), r#"{"price":5}"#, "missing key skips: {r:?}");
+    let r = q(&[b"nidx", b"@t:cheap", b"RETURN", b"0"]);
+    assert_eq!(bulk_at(&r, 1), "{}", "return 0: {r:?}");
+
+    // 校错：非 NUMERIC 排序键 / 与 KNN 互斥（两种出现顺序）/ 坏区间
+    err_has(
+        &q(&[b"nidx", b"*", b"SORTBY", b"t"]),
+        "not NUMERIC",
+        "sortby text field",
+    );
+    err_has(
+        &q(&[
+            b"nidx", b"*", b"SORTBY", b"price", b"KNN", b"1", b"@price", b"VALUES", b"1",
+        ]),
+        "cannot be used with KNN",
+        "sortby+knn",
+    );
+    err_has(
+        // VALUES 吞尾参，反向互斥用 FP16 形式才能让 SORTBY 被解析到
+        &q(&[
+            b"nidx", b"*", b"KNN", b"1", b"@price", b"FP16", b"x", b"SORTBY", b"price",
+        ]),
+        "cannot be used with KNN",
+        "knn+sortby",
+    );
+    err_has(
+        &q(&[b"nidx", b"@price:[10]"]),
+        "bad numeric range",
+        "one bound",
+    );
+}

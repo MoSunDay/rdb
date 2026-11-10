@@ -126,7 +126,8 @@ fn family_delete_ranges_upper_is_never_empty_for_typed_roots() {
 fn classify_raw_vs_typed() {
     assert_eq!(classify(b"abc"), Classification::Raw);
     assert_eq!(classify(b""), Classification::Raw);
-    assert_eq!(classify(&[0x1A]), Classification::Raw); // unassigned, > KIND_SEARCH_NUMVAL
+    assert_eq!(classify(&[0x1A]), Classification::Typed(0x1A)); // KIND_SEARCH_POSTING2 (v2 postings)
+    assert_eq!(classify(&[0x1B]), Classification::Raw); // unassigned, > KIND_SEARCH_POSTING2
     assert_eq!(classify(&[0x20]), Classification::Typed(0x20)); // KIND_STREAM_OFFSET (space byte; documented misread)
     assert_eq!(
         classify(&[KIND_HASH_META, 0, 0, 0, 1]),
@@ -173,6 +174,10 @@ fn family_of_spans() {
     assert_eq!(family_of(KIND_HASH_FLD), Some(HASH_FAMILY));
     assert_eq!(family_of(KIND_STREAM_PEND), Some(STREAM_FAMILY));
     assert_eq!(family_of(KIND_STREAM_OFFSET), Some(OFFSET_FAMILY));
+    // v2 postings (0x1A) joined the search family and closed its span:
+    // family_delete_ranges/DROP/purge cover it via the tuple's upper end.
+    assert_eq!(family_of(KIND_SEARCH_POSTING2), Some(SEARCH_FAMILY));
+    assert_eq!(SEARCH_FAMILY, (KIND_SEARCH_META, KIND_SEARCH_POSTING2));
     for kind in meta_kinds() {
         let (first, last) = family_of(*kind).unwrap();
         assert!(first <= *kind && *kind <= last);

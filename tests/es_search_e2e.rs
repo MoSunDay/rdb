@@ -375,4 +375,322 @@ async fn resp_es_interop_one_kernel() {
     assert!(r.contains("d2"), "hit id missing: {r:?}");
     let r = resp_call(&resp_addr, &[b"ft.search", b"ridx", b"*"]).await;
     assert!(r.contains(":2\r\n"), "ft.search all: {r:?}");
+
+    // v2 operators cross the wire BOTH ways over the SAME kernel:
+    // RESP writes a phrase, ES match_phrase finds it adjacently.
+    let r = resp_text(
+        &resp_addr,
+        &[
+            b"ft.add",
+            b"ridx",
+            b"d3",
+            br#"{"body":"quick brown fox jumps","tag":"z","price":9}"#,
+        ],
+    )
+    .await;
+    assert!(r.starts_with(":1"), "ft.add d3: {r}");
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/ridx/_search",
+        Some(r#"{"query":{"match_phrase":{"body":"brown fox"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ids(&json_body(&body)), vec!["d3"], "{body}");
+    // ES writes, RESP phrase + prefix find it (v2 positions present
+    // on both write paths, so phrase works cross-frontend).
+    let (status, body) = http(
+        &es,
+        "PUT",
+        "/ridx/_doc/d4",
+        Some(r#"{"body":"deep dark depth","tag":"w","price":11}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let r = resp_call(
+        &resp_addr,
+        &[b"ft.search", b"ridx", br#"@body:"dark depth""#],
+    )
+    .await;
+    assert!(r.contains("d4"), "ft.search phrase d4: {r:?}");
+    let r = resp_call(&resp_addr, &[b"ft.search", b"ridx", b"@body:sec*"]).await;
+    assert!(r.contains("d2"), "ft.search prefix d2: {r:?}");
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/ridx/_search",
+        Some(r#"{"query":{"prefix":{"body":"deep"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ids(&json_body(&body)), vec!["d4"], "{body}");
+}
+
+/// v2 DSL clauses: match_phrase / prefix / query_string /
+/// minimum_should_match / term object form / numeric doc-value sort.
+/// All of them run over the SAME kernel records as FT.SEARCH.
+#[tokio::test]
+async fn dsl_v2_phrase_prefix_qs_msm() {
+    let (_node, es) = spawn_es_ready("dslv2").await;
+    let (status, _) = http(&es, "PUT", "/books", Some(MAPPINGS)).await;
+    assert_eq!(status, 200);
+    for (id, doc) in DOCS {
+        let path = format!("/books/_doc/{id}");
+        let (status, body) = http(&es, "PUT", &path, Some(doc)).await;
+        assert_eq!(status, 201, "{id}: {body}");
+    }
+
+    // match_phrase: ordered adjacency (positions), both object and
+    // shorthand forms; reversed order matches nothing.
+    let v = search(
+        &es,
+        r#"{"query":{"match_phrase":{"title":"cluster protocol"}}}"#,
+    )
+    .await;
+    assert_eq!(ids(&v), vec!["d4"], "{v}");
+    let v = search(
+        &es,
+        r#"{"query":{"match_phrase":{"title":{"query":"protocol cluster"}}}}"#,
+    )
+    .await;
+    assert_eq!(v["hits"]["total"]["value"], 0, "{v}");
+    // CJK phrase rides the bigram ordinals.
+    let v = search(&es, r#"{"query":{"match_phrase":{"title":"中文分词"}}}"#).await;
+    assert_eq!(ids(&v), vec!["d5"], "{v}");
+    // empty analysis matches nothing (no error).
+    assert_eq!(
+        search(&es, r#"{"query":{"match_phrase":{"title":"!!!"}}}"#).await["hits"]["total"]
+            ["value"],
+        0
+    );
+
+    // prefix = term disjunction over the posting keys.
+    let v = search(&es, r#"{"query":{"prefix":{"title":"red"}}}"#).await;
+    let mut got = ids(&v);
+    got.sort();
+    assert_eq!(got, vec!["d1", "d2", "d4"], "{v}");
+    let v = search(&es, r#"{"query":{"prefix":{"title":"向量"}}}"#).await;
+    assert_eq!(ids(&v), vec!["d3"], "{v}");
+    let v = search(&es, r#"{"query":{"prefix":{"title":"zzz"}}}"#).await;
+    assert_eq!(v["hits"]["total"]["value"], 0, "{v}");
+
+    // query_string shares the FT.SEARCH grammar (strict implicit AND,
+    // bare field scopes, quoted phrases, | union, `*`).
+    let v = search(
+        &es,
+        r#"{"query":{"query_string":{"query":"redis AND cluster"}}}"#,
+    )
+    .await;
+    assert_eq!(ids(&v), vec!["d4"], "{v}");
+    let v = search(
+        &es,
+        r#"{"query":{"query_string":{"query":"title:redis | title:向量"}}}"#,
+    )
+    .await;
+    let mut got = ids(&v);
+    got.sort();
+    assert_eq!(got, vec!["d1", "d2", "d3", "d4"], "{v}");
+    let v = search(
+        &es,
+        r#"{"query":{"query_string":{"query":"title:\"cluster protocol\""}}}"#,
+    )
+    .await;
+    assert_eq!(ids(&v), vec!["d4"], "{v}");
+    let v = search(&es, r#"{"query":{"query_string":{"query":"*"}}}"#).await;
+    assert_eq!(v["hits"]["total"]["value"], 5, "{v}");
+    // query_string 桥接 `price:[10 20]`：共享 parser 的 NumRange
+    // （doc-values 列扫描，常量分）；非法区间是 400
+    let v = search(
+        &es,
+        r#"{"query":{"query_string":{"query":"price:[10 20] OR tag:vector"}}}"#,
+    )
+    .await;
+    let mut got = ids(&v);
+    got.sort();
+    assert_eq!(got, vec!["d1", "d2", "d3"], "{v}");
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/books/_search",
+        Some(r#"{"query":{"query_string":{"query":"price:[10]"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    // unknown extra keys are tolerated; missing query is a 400.
+    let v = search(
+        &es,
+        r#"{"query":{"query_string":{"query":"redis","default_field":"title"}}}"#,
+    )
+    .await;
+    assert_eq!(v["hits"]["total"]["value"], 3, "{v}");
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/books/_search",
+        Some(r#"{"query":{"query_string":{}}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    // minimum_should_match, should-only: count and percent forms.
+    let shoulds = r#"{"query":{"bool":{"should":[{"term":{"tag":"Redis"}},{"term":{"tag":"vector"}}],"minimum_should_match":"#;
+    let v = search(&es, &format!(r#"{shoulds}1}}}}}}"#)).await;
+    assert_eq!(v["hits"]["total"]["value"], 3, "{v}"); // default union
+    let v = search(&es, &format!(r#"{shoulds}2}}}}}}"#)).await;
+    assert_eq!(v["hits"]["total"]["value"], 0, "{v}"); // needs BOTH tags
+    let v = search(&es, &format!(r#"{shoulds}"50%"}}}}}}"#)).await;
+    assert_eq!(v["hits"]["total"]["value"], 3, "{v}"); // round(2*50%)=1
+    let v = search(&es, &format!(r#"{shoulds}"100%"}}}}}}"#)).await;
+    assert_eq!(v["hits"]["total"]["value"], 0, "{v}"); // round(2*100%)=2
+                                                       // negative/combination forms are a 400.
+    for bad in ["\"-1\"", "\"2<-25%\""] {
+        let (status, body) = http(
+            &es,
+            "POST",
+            "/books/_search",
+            Some(&format!(r#"{shoulds}{bad}}}}}}}"#)),
+        )
+        .await;
+        assert_eq!(status, 400, "{bad}: {body}");
+    }
+
+    // msm beside must: explicit gate instead of additive should.
+    let v = search(
+        &es,
+        r#"{"query":{"bool":{"must":[{"match":{"title":"redis"}}],"should":[{"term":{"tag":"vector"}}]}}}"#,
+    )
+    .await;
+    assert_eq!(v["hits"]["total"]["value"], 3, "{v}"); // additive default
+    let v = search(
+        &es,
+        r#"{"query":{"bool":{"must":[{"match":{"title":"redis"}}],"should":[{"term":{"tag":"vector"}}],"minimum_should_match":1}}}"#,
+    )
+    .await;
+    assert_eq!(v["hits"]["total"]["value"], 0, "{v}"); // no redis doc has tag vector
+
+    // term object form: {"value": ..} (+ tolerated boost).
+    let v = search(
+        &es,
+        r#"{"query":{"term":{"tag":{"value":"Redis","boost":2}}}}"#,
+    )
+    .await;
+    assert_eq!(v["hits"]["total"]["value"], 2, "{v}");
+    let v = search(&es, r#"{"query":{"term":{"price":{"value":30}}}}"#).await;
+    assert_eq!(ids(&v), vec!["d3"], "{v}");
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/books/_search",
+        Some(r#"{"query":{"term":{"tag":{"boost":1}}}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    // numeric doc-value sort composes with the new clauses.
+    let v = search(
+        &es,
+        r#"{"sort":[{"price":"desc"}],"query":{"prefix":{"title":"red"}}}"#,
+    )
+    .await;
+    assert_eq!(ids(&v), vec!["d4", "d2", "d1"], "{v}");
+    let v = search(
+        &es,
+        r#"{"sort":["price"],"query":{"query_string":{"query":"redis -tag:vector"}}}"#,
+    )
+    .await;
+    assert_eq!(ids(&v), vec!["d1", "d2", "d4"], "{v}");
+}
+
+/// WP3 停用词互操作：mapping 建的索引（默认无停用词）match 不受影响；
+/// FT.CREATE 建带停用词的索引 + ES 写文档后，match / query_string 的
+/// 停用词在查询侧被过滤（同一内核，ES 写路径同样过滤建索引）。
+#[tokio::test]
+async fn es_stopwords_across_fronts() {
+    let (_node, es) = spawn_es_ready("stopw").await;
+    let resp_addr = _node.resp.clone();
+
+    // mapping 创建（默认无停用词）：普通词照常命中。
+    let (status, body) = http(
+        &es,
+        "PUT",
+        "/plain",
+        Some(r#"{"mappings":{"properties":{"t":{"type":"text"}}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http(
+        &es,
+        "PUT",
+        "/plain/_doc/1",
+        Some(r#"{"t":"the quick fox"}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/plain/_search",
+        Some(r#"{"query":{"match":{"t":"quick"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(json_body(&body)["hits"]["total"]["value"], 1, "{body}");
+
+    // RESP 建带停用词的索引；ES 写文档（索引侧过滤，位置紧凑）。
+    let r = resp_text(
+        &resp_addr,
+        &[
+            b"ft.create",
+            b"sw",
+            b"STOPWORDS",
+            b"1",
+            b"the",
+            b"SCHEMA",
+            b"body",
+            b"TEXT",
+        ],
+    )
+    .await;
+    assert!(r.starts_with("+OK"), "ft.create: {r}");
+    let (status, body) = http(
+        &es,
+        "PUT",
+        "/sw/_doc/1",
+        Some(r#"{"body":"the quick the fox"}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    // match 停用词 -> 空；普通词不受影响。
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/sw/_search",
+        Some(r#"{"query":{"match":{"body":"the"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(json_body(&body)["hits"]["total"]["value"], 0, "{body}");
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/sw/_search",
+        Some(r#"{"query":{"match":{"body":"quick"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(json_body(&body)["hits"]["total"]["value"], 1, "{body}");
+
+    // query_string 桥（共享 eval_tree）：短语里的停用词被滤掉，剩下的
+    // quick/fox 因索引侧位置紧凑而相邻命中。
+    let (status, body) = http(
+        &es,
+        "POST",
+        "/sw/_search",
+        Some(r#"{"query":{"query_string":{"query":"body:\"quick the fox\""}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ids(&json_body(&body)), vec!["1"], "{body}");
 }

@@ -54,6 +54,13 @@ pub const KIND_SEARCH_TERMSTAT: u8 = 0x16;
 pub const KIND_ANN_CENTROID: u8 = 0x17;
 pub const KIND_ANN_POSTING: u8 = 0x18;
 pub const KIND_SEARCH_NUMVAL: u8 = 0x19;
+/// v2 inverted-posting record (docid, tf, positions) -- written by
+/// EVERY FT.ADD/FT.DEL path since positions existed. v1
+/// [`KIND_SEARCH_POSTING`] keeps (docid, tf) for records written before
+/// positions were tracked: readers dual-read (0x1A first, fall back to
+/// 0x15 with empty positions), writers migrate a term to 0x1A on first
+/// touch (write 0x1A + delete 0x15 in the same batch).
+pub const KIND_SEARCH_POSTING2: u8 = 0x1A;
 /// Staged delayed-message row (`lite::delay`, WP2): one row per
 /// XADD ... DELAY, physically NOT a stream entry so every read path
 /// (XREAD/XREADGROUP/XRANGE/XLEN) is blind to it until the due sweep
@@ -109,7 +116,7 @@ pub const DELAY_FAMILY: CodecFamily = (KIND_STREAM_DELAY, KIND_STREAM_DELAY);
 pub const OFFSET_FAMILY: CodecFamily = (KIND_STREAM_OFFSET, KIND_STREAM_OFFSET);
 pub const JSON_FAMILY: CodecFamily = (KIND_JSON, KIND_JSON);
 pub const VECTORSET_FAMILY: CodecFamily = (KIND_VECTORSET_META, KIND_VECTORSET_ELEM);
-pub const SEARCH_FAMILY: CodecFamily = (KIND_SEARCH_META, KIND_SEARCH_NUMVAL);
+pub const SEARCH_FAMILY: CodecFamily = (KIND_SEARCH_META, KIND_SEARCH_POSTING2);
 
 /// Meta/root kinds a user key can exist under (one record = key "exists").
 pub const META_KINDS: [u8; 9] = [
@@ -150,7 +157,9 @@ pub fn family_of(kind: u8) -> Option<CodecFamily> {
         KIND_JSON => JSON_FAMILY,
         KIND_VECTORSET_META | KIND_VECTORSET_ELEM => VECTORSET_FAMILY,
         KIND_SEARCH_META | KIND_SEARCH_DOC | KIND_SEARCH_POSTING | KIND_SEARCH_TERMSTAT
-        | KIND_ANN_CENTROID | KIND_ANN_POSTING | KIND_SEARCH_NUMVAL => SEARCH_FAMILY,
+        | KIND_ANN_CENTROID | KIND_ANN_POSTING | KIND_SEARCH_NUMVAL | KIND_SEARCH_POSTING2 => {
+            SEARCH_FAMILY
+        }
         _ => return None,
     };
     Some(family)
@@ -309,7 +318,7 @@ pub fn decode_count(payload: &[u8]) -> u64 {
 
 /// How a physical key (after the slot prefix) reads during iteration.
 ///
-/// Rule: bytes `<= 0x19`, `== 0x1D` (staged delay row), `== 0x20`
+/// Rule: bytes `<= 0x1A`, `== 0x1D` (staged delay row), `== 0x20`
 /// (stream-offset ledger) or `== 0xFD` are typed records (kind
 /// header); anything else is a raw string whose user key is the whole
 /// remainder.
@@ -331,7 +340,7 @@ pub enum Classification {
 pub fn classify(after_prefix: &[u8]) -> Classification {
     match after_prefix.first() {
         Some(&b)
-            if b <= KIND_SEARCH_NUMVAL
+            if b <= KIND_SEARCH_POSTING2
                 || b == KIND_STREAM_DELAY
                 || b == KIND_EXPIRE_INDEX
                 || b == KIND_STREAM_OFFSET =>

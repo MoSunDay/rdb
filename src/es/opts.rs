@@ -115,6 +115,9 @@ pub(super) fn parse_sort(v: &Value) -> Result<Vec<SortKey>, DslError> {
                             ))
                         }
                     },
+                    // ES shorthand {"price":"desc"}
+                    Value::String(s) if s == "asc" => SortDir::Asc,
+                    Value::String(s) if s == "desc" => SortDir::Desc,
                     _ => default_order(name),
                 };
                 out.push(sort_key_named(name, dir)?);

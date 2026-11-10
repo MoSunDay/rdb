@@ -28,11 +28,24 @@
 
 ## DSL 子集
 - 查询：`match_all`、`match`（默认 `or` = 并集 + BM25 求和；`operator:and`）、
-  `term`/`terms`、`range`（数值边界）、`bool`（must/filter/should/must_not）。
+  `match_phrase`（v2 位置化 posting 的相邻链，短语分 = 成员词 BM25 之和；
+  v1 无位置记录退化为 AND —— 已记偏差）、`term`/`terms`（`{"value":..}` 对象式
+  亦收，boost 容忍忽略）、`range`（数值边界）、`prefix`（posting-key 前缀扫描 =
+  词项析取，BM25 求和；CJK 前缀按切分后的 bigram 词项匹配）、`query_string`
+  （仅认 `query`，default_field/fields 等容忍忽略 —— 偏差；文法与 FT.SEARCH
+  共用同一棵解析树，两端同语法同记录；含 `field:[min max]` 数值区间，
+  常量分 1.0）、`bool`
+  （must/filter/should/must_not + `minimum_should_match`：非负整数或 0-100 百分比，
+  负数/组合式 400；百分比四舍五入、下限 1；默认不变 —— 纯 should = 并集(msm 1)，
+  有 must/filter 时 should 只加分，显式 msm>0 才升级为门槛）。
+  停用词：`match` 分析后词项按索引停用词表过滤（FT.CREATE 建的索引才有非空
+  表，ES 建索引恒为空；纯停用词 match 零命中）；phrase/prefix/query_string
+  经共享求值器自动同样过滤；`term`/`terms`/`range` 精确值不过滤。
 - knn：`field/query_vector/k/num_candidates/filter`（精扫候选集或 SPANN probe，
   得分 `1/(1+L2)`）。
-- 修饰：`sort`（字段 / `_doc` / `_score`，缺值排最后）、`from`/`size`（窗口 ≤10000）、
-  `_source`（false / includes / excludes）。
+- 修饰：`sort`（字段 / `_doc` / `_score`，缺值排最后；数值字段走列式 f64
+  doc-values，未映射字段回退 `_source` JSON；`{"field":"desc"}` 简写亦收）、
+  `from`/`size`（窗口 ≤10000）、`_source`（false / includes / excludes）。
 - 未实现即 4xx/5xx 错误信封（`error.type/reason`），不静默降级。
 
 ## 偏差

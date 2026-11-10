@@ -12,6 +12,8 @@
 //! - `ft_index`: inverted-index read-modify-write paths (one fsync per
 //!   FT.ADD/FT.DEL via the index-key latch)
 //! - `ft_cmd` / `ft_search`: RESP command handlers
+//! - `query_tree` / `eval_tree`: shared query AST (FT.SEARCH + ES
+//!   query_string) and its kernel evaluator (phrase/prefix/bool)
 //! - `vecmath` / `quant` / `ann`: shared vector math, SQ8 scalar
 //!   quantization, SPANN-style disk ANN (centroids in one record,
 //!   SQ8 partition postings on disk, probe + exact rerank)
@@ -21,12 +23,15 @@
 
 pub mod ann;
 pub mod bm25;
+pub mod eval_tree;
 pub mod ft_build;
 pub mod ft_cmd;
 pub mod ft_index;
 pub mod ft_query;
 pub mod ft_search;
+pub mod highlight;
 pub mod index_codec;
 pub mod quant;
+pub mod query_tree;
 pub mod tokenize;
 pub mod vecmath;

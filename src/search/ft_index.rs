@@ -15,9 +15,10 @@ use crate::store::{ops, Store};
 
 use super::ann;
 use super::index_codec::{
-    decode_doc, decode_meta, decode_posting, decode_termstat, encode_doc, encode_meta,
-    encode_numval, encode_posting, encode_termstat, meta_key, numval_key, posting_key,
-    remove_posting, termstat_key, upsert_posting, DocRecord, PostEntry, TermStat,
+    decode_doc, decode_meta, decode_posting, decode_posting2, decode_termstat, encode_doc,
+    encode_meta, encode_numval, encode_posting2, encode_termstat, meta_key, numval_key,
+    posting2_key, posting_key, remove_posting, termstat_key, upsert_posting, DocRecord, PostEntry,
+    TermStat,
 };
 
 pub use super::index_codec::{FieldType, IndexField, IndexMeta};
@@ -58,7 +59,10 @@ pub fn read_doc(
     }
 }
 
-/// One term's posting list (empty when the term is unseen).
+/// One term's posting list (empty when the term is unseen). Dual
+/// read: the v2 record (kind 0x1A, positions) first, falling back to
+/// v1 (kind 0x15, empty positions) for terms untouched since the
+/// positions landed.
 pub fn read_posting(
     store: &Store,
     prefix: &[u8],
@@ -66,10 +70,12 @@ pub fn read_posting(
     field: &[u8],
     term: &[u8],
 ) -> Result<Vec<PostEntry>, String> {
-    let key = posting_key(prefix, index, field, term);
-    match ops::get_physical(store, &key)? {
-        None => Ok(Vec::new()),
-        Some(v) => decode_posting(&v).ok_or_else(|| "corrupt posting".to_string()),
+    match ops::get_physical(store, &posting2_key(prefix, index, field, term))? {
+        Some(v) => decode_posting2(&v).ok_or_else(|| "corrupt posting".to_string()),
+        None => match ops::get_physical(store, &posting_key(prefix, index, field, term))? {
+            Some(v) => decode_posting(&v).ok_or_else(|| "corrupt posting".to_string()),
+            None => Ok(Vec::new()),
+        },
     }
 }
 
@@ -93,9 +99,13 @@ pub fn read_termstat(
 /// meta (counters/statistics are mutated into the returned batch).
 /// `numvals` carries the (field, value) pairs for NUMERIC fields --
 /// a field absent from the list clears its stored value, so the
-/// replace path rewrites stale numbers too.
+/// replace path rewrites stale numbers too. `positions` carries this
+/// doc's (field, term, token ordinals) side-table for TEXT fields
+/// (KEYWORD fields post no positions); it REPLACES the doc's previous
+/// positions wherever the doc survives in a posting.
 /// Vector partitioning consults the ANN centroid table when the schema
 /// has a VECTOR field and a table exists (see `ann`).
+#[allow(clippy::too_many_arguments)] // explicit slices beat a param struct here
 pub fn build_add_batch(
     store: &Store,
     prefix: &[u8],
@@ -104,6 +114,7 @@ pub fn build_add_batch(
     docid: &[u8],
     mut rec: DocRecord,
     numvals: &[(Vec<u8>, f64)],
+    positions: &[(Vec<u8>, Vec<u8>, Vec<u64>)],
 ) -> Result<WriteBatch, String> {
     let old = read_doc(store, prefix, index, docid)?;
     let mut batch = WriteBatch::default();
@@ -143,17 +154,28 @@ pub fn build_add_batch(
             })
             .unwrap_or(0);
         let mut entries = read_posting(store, prefix, index, &field, &term)?;
-        upsert_by_delta(&mut entries, docid, tf_delta, old_tf);
+        // this doc's fresh positions (empty = keyword field / unknown)
+        let pos: &[u64] = positions
+            .iter()
+            .find(|(f, t, _)| f == &field && t == &term)
+            .map_or(&[], |(_, _, p)| p);
+        upsert_by_delta(&mut entries, docid, tf_delta, old_tf, pos);
         let mut stat = read_termstat(store, prefix, index, &field, &term)?;
         stat.df = (stat.df as i64 + df_delta).max(0) as u64;
         stat.total_tf = (stat.total_tf as i64 + tf_delta).max(0) as u64;
         let pkey = posting_key(prefix, index, &field, &term);
+        let pkey2 = posting2_key(prefix, index, &field, &term);
         let tkey = termstat_key(prefix, index, &field, &term);
         if entries.is_empty() {
             batch.delete(pkey);
+            batch.delete(pkey2);
             batch.delete(tkey);
         } else {
-            batch.put(pkey, encode_posting(&entries));
+            // v2 is the write target; deleting the v1 key alongside is a
+            // no-op for fresh terms and MIGRATES pre-positions records on
+            // their first touch (same batch, atomic).
+            batch.delete(pkey);
+            batch.put(pkey2, encode_posting2(&entries));
             batch.put(tkey, encode_termstat(&stat));
         }
     }
@@ -228,13 +250,21 @@ pub fn build_add_batch(
     Ok(batch)
 }
 
-/// Set/remove docid in a posting list given the tf delta vs the OLD tf.
-fn upsert_by_delta(entries: &mut Vec<PostEntry>, docid: &[u8], tf_delta: i64, old_tf: u64) -> bool {
+/// Set/remove docid in a posting list given the tf delta vs the OLD
+/// tf; `positions` REPLACES the entry's positions (a re-added doc
+/// carries its own ordinals, never a merge).
+fn upsert_by_delta(
+    entries: &mut Vec<PostEntry>,
+    docid: &[u8],
+    tf_delta: i64,
+    old_tf: u64,
+    positions: &[u64],
+) -> bool {
     let new_tf = (old_tf as i64 + tf_delta).max(0) as u64;
     if new_tf == 0 {
         return remove_posting(entries, docid);
     }
-    upsert_posting(entries, docid, new_tf)
+    upsert_posting(entries, docid, new_tf, positions)
 }
 
 /// Build the batch deleting `docid`; `Ok(None)` when the doc is absent.
@@ -256,12 +286,16 @@ pub fn build_del_batch(
         stat.df = stat.df.saturating_sub(1);
         stat.total_tf = stat.total_tf.saturating_sub(t.tf);
         let pkey = posting_key(prefix, index, &t.field, &t.term);
+        let pkey2 = posting2_key(prefix, index, &t.field, &t.term);
         let tkey = termstat_key(prefix, index, &t.field, &t.term);
         if entries.is_empty() {
             batch.delete(pkey);
+            batch.delete(pkey2);
             batch.delete(tkey);
         } else {
-            batch.put(pkey, encode_posting(&entries));
+            // same migration-on-touch as the add path: v2 write + v1 tomb
+            batch.delete(pkey);
+            batch.put(pkey2, encode_posting2(&entries));
             batch.put(tkey, encode_termstat(&stat));
         }
     }

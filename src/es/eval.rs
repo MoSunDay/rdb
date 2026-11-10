@@ -3,12 +3,16 @@
 //! uses -- postings + BM25 for TEXT, exact postings for KEYWORD,
 //! columnar f64 doc-values for NUMERIC, SPANN/exact-L2 for knn.
 //!
-//! v1 scoring deviations from real ES (kept local until COMPAT
+//! scoring deviations from real ES (kept local until COMPAT
 //! catches up): KEYWORD `term` and NUMERIC `term`/`range` score a
 //! CONSTANT 1.0 (no BM25, constant_score); unknown field names match
-//! NOTHING instead of erroring "no field mapping"; `should` beside
-//! must/filter only ADDS score (minimum_should_match unsupported);
-//! `bool` with only must_not matches everything else, like ES.
+//! NOTHING instead of erroring "no field mapping"; `bool` honors
+//! `minimum_should_match` (count / 0-100 percent, default 1 when
+//! only shoulds are present; beside must/filter should stays additive
+//! until an explicit msm>0 turns it into a gate); `match_phrase`/
+//! `prefix`/`query_string` delegate to the SHARED `eval_tree`
+//! kernel; `bool` with only must_not matches everything else, like
+//! ES.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,12 +23,14 @@ use crate::search::bm25::{term_score, TopK};
 use crate::search::ft_index::{
     read_doc, read_posting, read_termstat, vector_field, FieldType, IndexMeta,
 };
-use crate::search::index_codec::{decode_numval, doc_range, numval_range};
+use crate::search::index_codec::doc_range;
 use crate::search::tokenize::tokenize;
 use crate::search::vecmath;
 use crate::store::{ops, Store};
 
-use super::dsl::{BoolOp, KnnPlan, Plan, TermValue};
+use super::dsl::{BoolOp, KnnPlan, MinShouldMatch, Plan, TermValue};
+use crate::search::eval_tree::{eval_node, new_tree_ctx, scan_numvals};
+use crate::search::query_tree::QueryNode;
 
 /// (docid -> score) candidate set every clause evaluates to; bool
 /// clauses combine these with set ops.
@@ -98,13 +104,43 @@ pub(super) fn eval(ctx: &mut EvalCtx, plan: &Plan) -> Result<Scored, String> {
             lte,
             lt,
         } => eval_range(ctx, field, *gte, *gt, *lte, *lt),
+        Plan::MatchPhrase { field, terms } => eval_tree_node(
+            ctx,
+            &QueryNode::Phrase {
+                field: Some(field.as_bytes().to_vec()),
+                terms: terms.clone(),
+            },
+        ),
+        Plan::Prefix { field, prefix } => eval_tree_node(
+            ctx,
+            &QueryNode::Prefix {
+                field: Some(field.as_bytes().to_vec()),
+                prefix: prefix.clone(),
+            },
+        ),
+        Plan::QueryString { node } => match node {
+            // bare `*` parses to None: match-all (ES alignment)
+            None => eval_match_all(ctx),
+            Some(n) => eval_tree_node(ctx, n),
+        },
         Plan::Bool {
             must,
             filter,
             should,
             must_not,
-        } => eval_bool(ctx, must, filter, should, must_not),
+            msm,
+        } => eval_bool(ctx, must, filter, should, must_not, msm.as_ref()),
     }
+}
+
+/// Shared-kernel bridge: the tree clauses (phrase/prefix/query_string)
+/// evaluate over the SAME records via `search::eval_tree`, in their
+/// own stats/doclen context (identical inputs).
+fn eval_tree_node(ctx: &mut EvalCtx, node: &QueryNode) -> Result<Scored, String> {
+    let mut tctx = new_tree_ctx(ctx.store, ctx.prefix, ctx.index, ctx.meta);
+    Ok(Scored {
+        docs: eval_node(&mut tctx, node)?,
+    })
 }
 
 /// Every doc record in the index, score 1.0 (ES match_all constant).
@@ -148,6 +184,16 @@ fn eval_match(
     if terms.is_empty() {
         return Ok(Scored::default()); // empty token list matches nothing
     }
+    // full-text clause: query-side stopword drop (the plan-level
+    // term/terms/range queries stay unfiltered by design -- a
+    // stopword term simply has no posting)
+    let terms: Vec<&Vec<u8>> = terms
+        .iter()
+        .filter(|t| !ctx.meta.stopwords.contains(t))
+        .collect();
+    if terms.is_empty() {
+        return Ok(Scored::default());
+    }
     let fb = field.as_bytes();
     let mut per_term: Vec<(u64, HashMap<Vec<u8>, u64>)> = Vec::with_capacity(terms.len());
     for t in terms {
@@ -175,7 +221,9 @@ fn eval_match(
             let dl = doclen_of(ctx, &d);
             let sc = per_term
                 .iter()
-                .map(|(df, tfm)| term_score(tfm[&d], *df, dl, ctx.avgdl, ctx.n))
+                .map(|(df, tfm)| {
+                    term_score(tfm[&d], *df, dl, ctx.avgdl, ctx.n, ctx.meta.k1, ctx.meta.b)
+                })
                 .sum();
             docs.insert(d, sc);
         }
@@ -183,7 +231,8 @@ fn eval_match(
         for (df, tfm) in &per_term {
             for (d, tf) in tfm {
                 let dl = doclen_of(ctx, d);
-                *docs.entry(d.clone()).or_insert(0.0) += term_score(*tf, *df, dl, ctx.avgdl, ctx.n);
+                *docs.entry(d.clone()).or_insert(0.0) +=
+                    term_score(*tf, *df, dl, ctx.avgdl, ctx.n, ctx.meta.k1, ctx.meta.b);
             }
         }
     }
@@ -233,31 +282,19 @@ fn eval_term(ctx: &mut EvalCtx, field: &str, value: &TermValue) -> Result<Scored
             Ok(Scored { docs })
         }
         // NUMERIC: f64 doc-value equality (exact LE roundtrip).
-        (Some(FieldType::Numeric), TermValue::Number(x)) => scan_numvals(ctx, field, &|v| v == *x),
+        (Some(FieldType::Numeric), TermValue::Number(x)) => {
+            let docs = scan_numvals(ctx.store, ctx.prefix, ctx.index, field.as_bytes(), &|v| {
+                v == *x
+            })
+            .into_keys()
+            .map(|d| (d, 1.0))
+            .collect();
+            Ok(Scored { docs })
+        }
         // Unknown field / type mismatch: empty set (ES would 404 the
         // field mapping; v1 documents this as match-nothing).
         _ => Ok(Scored::default()),
     }
-}
-
-/// Walk one NUMERIC field's doc-value records keeping `keep` values
-/// (constant score 1.0). Docids ride the key suffix after the range's
-/// lower bound (the `numval_range` field prefix).
-fn scan_numvals(ctx: &EvalCtx, field: &str, keep: &dyn Fn(f64) -> bool) -> Result<Scored, String> {
-    let (lower, upper) = numval_range(ctx.prefix, ctx.index, field.as_bytes());
-    let mut docs = HashMap::new();
-    let _ = ops::for_each_from(ctx.store, &lower, false, &mut |k, v| {
-        if !upper.is_empty() && k >= upper.as_slice() {
-            return false;
-        }
-        if let (Some(docid), Some(x)) = (k.get(lower.len()..), decode_numval(v)) {
-            if keep(x) {
-                docs.insert(docid.to_vec(), 1.0);
-            }
-        }
-        true
-    });
-    Ok(Scored { docs })
 }
 
 /// Range over a NUMERIC field's doc-values; non-numeric fields (or
@@ -278,12 +315,43 @@ fn eval_range(
     if !numeric {
         return Ok(Scored::default());
     }
-    scan_numvals(ctx, field, &|v| {
+    // canonical scan_numvals: keep 谓词组合四个界，值 -> 1.0 进 Scored
+    let docs = scan_numvals(ctx.store, ctx.prefix, ctx.index, field.as_bytes(), &|v| {
         gte.is_none_or(|b| v >= b)
             && gt.is_none_or(|b| v > b)
             && lte.is_none_or(|b| v <= b)
             && lt.is_none_or(|b| v < b)
     })
+    .into_keys()
+    .map(|d| (d, 1.0))
+    .collect();
+    Ok(Scored { docs })
+}
+
+/// How many should clauses a doc must match. Default: 1 when only
+/// shoulds are present (union semantics), 0 beside must/filter
+/// (additive). A percent rounds to nearest, floored at 1 (ES).
+fn required_shoulds(msm: Option<&MinShouldMatch>, n_should: usize, only_should: bool) -> usize {
+    let n = n_should as u64;
+    match msm {
+        None => usize::from(only_should),
+        Some(MinShouldMatch::Count(k)) => (*k).min(n) as usize,
+        Some(MinShouldMatch::Percent(p)) => ((n * *p as u64 + 50) / 100).max(1).min(n) as usize,
+    }
+}
+
+/// Per-doc matched-should count and summed score over the should
+/// clause results.
+fn should_stats(should_s: &[Scored]) -> HashMap<Vec<u8>, (u32, f64)> {
+    let mut stats: HashMap<Vec<u8>, (u32, f64)> = HashMap::new();
+    for s in should_s {
+        for (d, x) in &s.docs {
+            let e = stats.entry(d.clone()).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += *x;
+        }
+    }
+    stats
 }
 
 fn eval_bool(
@@ -292,6 +360,7 @@ fn eval_bool(
     filter: &[Plan],
     should: &[Plan],
     must_not: &[Plan],
+    msm: Option<&MinShouldMatch>,
 ) -> Result<Scored, String> {
     let must_s = eval_all(ctx, must)?;
     let filter_s = eval_all(ctx, filter)?;
@@ -303,10 +372,14 @@ fn eval_bool(
             // bool{must_not} / bool{}: everything minus must_not
             docs = eval(ctx, &Plan::MatchAll)?.docs;
         } else {
-            // should is REQUIRED only when must+filter are empty: Or
-            for s in &should_s {
-                union_sum(&s.docs, &mut docs);
-            }
+            // should-only: match >= required shoulds (default 1: the
+            // ES union); score = sum of the MATCHED shoulds
+            let required = required_shoulds(msm, should.len(), true);
+            docs = should_stats(&should_s)
+                .into_iter()
+                .filter(|(_, (c, _))| *c as usize >= required)
+                .map(|(d, (_, sc))| (d, sc))
+                .collect();
         }
     } else {
         // membership = must INTERSECT filter (docs-only from filter)
@@ -317,7 +390,20 @@ fn eval_bool(
                 Some(m) => retain_common(m, &s.docs),
             }
         }
+        // explicit msm>0 beside must/filter turns should into a gate
+        let gate = required_shoulds(msm, should.len(), false);
+        let stats = if gate > 0 {
+            Some(should_stats(&should_s))
+        } else {
+            None
+        };
         for d in member.unwrap_or_default().into_keys() {
+            match stats.as_ref().and_then(|m| m.get(&d)) {
+                Some(req) if (req.0 as usize) >= gate => {}
+                // zero matched shoulds also fails an explicit gate
+                _ if gate == 0 => {}
+                _ => continue,
+            }
             // must scores sum; filter-only matches keep constant 1.0
             let parts: Vec<f64> = must_s
                 .iter()
@@ -331,7 +417,7 @@ fn eval_bool(
             };
             docs.insert(d, sc);
         }
-        // should beside must/filter only adds score (msm 0 default)
+        // should beside must/filter only adds score (default msm 0)
         for s in &should_s {
             for (d, x) in &s.docs {
                 if let Some(e) = docs.get_mut(d) {

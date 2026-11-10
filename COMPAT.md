@@ -500,31 +500,14 @@ Rust (Go clients must treat them as new):
 
 ## Full-text + vector search (FT.*, Rust-only)
 
-The Go archive has no search engine; the Rust tree ships one on the typed-record
-data plane (kinds `0x13`-`0x18`, one physical family, so index-key TTL purges
-docs, postings, term stats, centroids and ANN partitions together).
-
-- Commands: `FT.CREATE <idx> SCHEMA <f> TEXT | <f> VECTOR DIM <n>` (at most one
-  VECTOR field), `FT.ADD <idx> <docid> <json>` (add/replace, one fsync),
-  `FT.DEL <idx> <docid>`, `FT.DROP`/`FT.dropindex`, `FT.INFO`, `FT.BUILD [K n]
-  [ITERS n] [SEED n]`, `FT.SEARCH <idx> <query> [LIMIT o c] [WITHSCORES]
-  [NOCONTENT] [NPROBE n] [KNN k <field> FP16 <blob>|VALUES v...]`.
-- Tokenizer (index and query sides are identical by construction): Latin
-  alphanumeric runs lowercased; Han runs cut by jieba (embedded dict + HMM),
-  dictionary misses fall back to overlapping bigrams (the CJKAnalyzer trick);
-  an isolated single character emits itself.
-- Text ranking: BM25 (Lucene idf `ln(1+(n-df+0.5)/(df+0.5))`, K1=1.2, B=0.75),
-  terms AND-ed within a query, ties broken by docid ascending.
-- Vectors: SQ8 quantization (per-dimension min/scale, field-global calibration)
-  plus k-means centroids in a SPANN-style partition layout. `FT.BUILD` retrains
-  and repartitions; KNN probes `nprobe` nearest partitions and reranks on
-  dequantized vectors, score = `1/(1+L2)`. Without a trained table KNN
-  degrades to exact brute force. A `@field:term` query before `KNN`
-  prefilters candidates by text match (exact vectors, no SQ8 error).
-- Cross-node: an index lives on the slot of its key; non-local requests get
-  `MOVED` like any other command. Cross-index queries are client fan-out —
-  there is no distributed query planner. `FT.SEARCH` replies are node-local:
-  `:N` then per hit docid [, score] [, original JSON].
+The Rust tree adds a RediSearch-compatible FT.* surface on the typed-record
+data plane (kinds 0x13-0x1A, one physical family: meta/docs/postings/postings
+v2/termstats/numvals/centroids/ANN partitions — index-key TTL purges them
+together). The contract (commands, tokenizer, postings v2 positions, query
+dialect v2 shared with the ES `query_string`, stopwords + BM25 K1/B knobs,
+numeric ranges, SORTBY/RETURN/HIGHLIGHT, vectors/SPANN, node-locality) outgrew
+this file's size budget at the 2026-11-10 wukong-ft sync and lives in
+[COMPAT.ft.md](./COMPAT.ft.md). Frontend summary: `features/es-front.md`.
 
 ## SQL data plane (MySQL wire, Rust-only)
 
@@ -645,6 +628,31 @@ adapter, not an ES clone; the deviations below are the contract.
 - **`match` operator default is `or`**: multi-term `match` unions the per-term postings and
   sums BM25, whereas FT.SEARCH query strings AND their terms. `match` with an empty or
   whitespace-only query matches nothing.
+- **`match_phrase`** (2026-11-09): ordered adjacent tokens over the v2 postings, score =
+  sum of the constituent BM25 term scores. A position-less v1 posting entry degrades that
+  doc to AND membership; an empty analyzed query matches nothing.
+- **`prefix`** (2026-11-09): posting-key range scan = term disjunction, BM25-summed. The
+  value must be a string (object `{"value":..}` form accepted); an empty prefix matches
+  nothing. CJK stems prefix-match the SEGMENTED tokens (bigrams), not raw substrings.
+- **`query_string`** (2026-11-09): only `query` is honored (`default_field`/`fields`/... are
+  tolerated and ignored — deviation); the text reuses the SHARED FT.SEARCH grammar (see
+  [COMPAT.ft.md](./COMPAT.ft.md) "Query dialect v2"), so both frontends accept the same
+  syntax over the same records.
+  `*` matches all; a missing or whitespace-empty `query` is a 400 (real ES also rejects).
+- **Stopwords + shared numeric ranges** (2026-11-10): `match` drops analyzed
+  stopword terms of the index's FT.CREATED list (stopword-only match matches
+  nothing); phrase/prefix/query_string inherit the filtering via the shared
+  evaluator. `query_string` accepts `field:[min max]` numeric ranges with the
+  same grammar and constant-1.0 scoring as FT.SEARCH.
+- **`minimum_should_match`** (2026-11-09): a non-negative integer or a `0-100%` string;
+  the Lucene combination forms (`"2<-25%"`, negative counts) are a 400. Percent rounds to
+  nearest, floored at 1 (so `"0%"`/`"1%"` on two shoulds behaves as msm 1, not
+  "optional" — edge deviation). Default unchanged: should-only bool = union (msm 1);
+  beside must/filter should stays additive until an explicit msm>0 makes it a gate
+  (docs matching too few shoulds — including zero — are dropped, matched shoulds
+  still add score).
+- **`term` object form**: `{"field":{"value":..}}` is accepted (boost tolerated, ignored)
+  alongside the bare scalar form.
 - **Term semantics**: keyword `term`/`terms` compare exact bytes (case-sensitive, no
   analyzer — `Redis` != `redis`). Numeric fields accept exactly one scalar number (arrays are
   rejected with 400). `term`/`range` on an unknown or non-numeric field match nothing (0 hits)
@@ -652,8 +660,11 @@ adapter, not an ES clone; the deviations below are the contract.
 - **knn**: exact L2 distance over the filtered candidate set, SPANN probe otherwise; score is
   `1/(1+L2)`. `num_candidates` maps to the SPANN `nprobe = clamp(n/16, 1, 64)`. At most one
   VECTOR field per index.
-- **Not implemented**: aggs, highlight, scroll, script_score, `minimum_should_match`, custom
-  analyzers, index templates, aliases. An unsupported `_bulk` `update` action yields a
+- **Sort extras** (2026-11-09): numeric-field sorts read the columnar f64 doc-values (exact,
+  mapping-driven) with `_source` JSON fallback for unmapped fields; the `{"field":"desc"}`
+  shorthand is accepted.
+- **Not implemented**: aggs, highlight, scroll, script_score, custom analyzers, index
+  templates, aliases. An unsupported `_bulk` `update` action yields a
   per-item error inside the 200 `_bulk` envelope.
 - **sort by field** reads `_source` per hit (no doc-values); documents missing the sort field
   sort last; `from + size` is capped at 10000 (400 beyond).

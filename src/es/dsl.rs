@@ -1,15 +1,23 @@
 //! Elasticsearch Query-DSL subset parser: `_search` body bytes to a
 //! pure `SearchPlan` (no Store access, so every default and error
-//! shape is unit-testable). v1 subset: match_all/match/term/terms/
-//! range/bool + knn + sort + from/size + _source. Deviations from
-//! real ES: unknown TOP-LEVEL keys are ignored (ES tolerance), but an
-//! unknown query type is a 400 `parsing_exception`; `term` takes a
-//! bare scalar (the `{"value": ..}` object form is not parsed); an
-//! empty `match` token list matches NOTHING (ES also matches nothing
-//! on empty analyzed strings); `sort` ignores unmapped extra keys.
+//! shape is unit-testable). v2 subset: match_all/match/match_phrase/
+//! term (incl. the `{"value": ..}` object form)/terms/range/prefix/
+//! query_string/bool(+minimum_should_match) + knn + sort + from/size
+//! + _source. Deviations from real ES:
+//! - unknown TOP-LEVEL keys are ignored (ES tolerance), but an
+//!   unknown query type is a 400 `parsing_exception`;
+//! - an empty `match`/`match_phrase` token list matches NOTHING (ES
+//!   also matches nothing on empty analyzed strings);
+//! - `query_string` accepts ONLY `query` (default_field and friends
+//!   are tolerated and ignored) and reuses the shared FT.SEARCH
+//!   query-tree grammar (`search::query_tree`, QueryString dialect);
+//! - `minimum_should_match` takes a non-negative integer or a 0-100
+//!   percent (negative/combination forms are a 400);
+//! - `sort` ignores unmapped extra keys.
 
 use serde_json::{Map, Value};
 
+use crate::search::query_tree::{parse_query_tree, QueryDialect, QueryNode};
 use crate::search::tokenize::tokenize;
 
 use super::opts::{parse_knn, parse_sort, parse_source, uint_of};
@@ -62,12 +70,39 @@ pub enum Plan {
         lte: Option<f64>,
         lt: Option<f64>,
     },
+    /// Ordered adjacent tokens; positions come from the v2 postings
+    /// (a position-less v1 record degrades to AND, see `eval_tree`).
+    MatchPhrase {
+        field: String,
+        terms: Vec<Vec<u8>>,
+    },
+    /// Posting-key prefix iteration (ES `prefix` = term disjunction).
+    Prefix {
+        field: String,
+        prefix: Vec<u8>,
+    },
+    /// Shared FT.SEARCH/ES query-tree grammar; `None` (match-all `*`)
+    /// lowers to `Plan::MatchAll` at eval time.
+    QueryString {
+        node: Option<QueryNode>,
+    },
     Bool {
         must: Vec<Plan>,
         filter: Vec<Plan>,
         should: Vec<Plan>,
         must_not: Vec<Plan>,
+        /// None = default (should required only when must+filter are
+        /// empty, i.e. Count(1); otherwise should is additive).
+        msm: Option<MinShouldMatch>,
     },
+}
+
+/// `bool.minimum_should_match`: a non-negative count, or a percent
+/// of the should-clause count (rounded to nearest, min 1).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MinShouldMatch {
+    Count(u64),
+    Percent(u32),
 }
 
 /// Term value keeps both the raw JSON scalar and its f64 view
@@ -196,6 +231,9 @@ pub(super) fn parse_query(v: &Value) -> Result<Plan, DslError> {
         "term" => parse_term(spec),
         "terms" => parse_terms(spec),
         "range" => parse_range(spec),
+        "match_phrase" => parse_match_phrase(spec),
+        "prefix" => parse_prefix(spec),
+        "query_string" => parse_query_string(spec),
         "bool" => parse_bool(spec),
         other => Err(err(
             400,
@@ -293,9 +331,23 @@ fn parse_term(spec: &Value) -> Result<Plan, DslError> {
             "[term] requires a field name",
         ));
     };
+    let value = match raw {
+        // ES full form: {"value": ..} (+ tolerated boost/case_insensitive)
+        Value::Object(body) => match body.get("value") {
+            Some(v) => v,
+            None => {
+                return Err(err(
+                    400,
+                    "parsing_exception",
+                    "[term] query object requires a 'value' key",
+                ))
+            }
+        },
+        other => other,
+    };
     Ok(Plan::Term {
         field: field.clone(),
-        value: term_value(raw)?,
+        value: term_value(value)?,
     })
 }
 
@@ -382,13 +434,15 @@ fn parse_bool(spec: &Value) -> Result<Plan, DslError> {
     let mut filter = Vec::new();
     let mut should = Vec::new();
     let mut must_not = Vec::new();
+    let mut msm = None;
     for (key, v) in obj {
         match key.as_str() {
             "must" => must = clause_list(v, "must")?,
             "filter" => filter = clause_list(v, "filter")?,
             "should" => should = clause_list(v, "should")?,
             "must_not" => must_not = clause_list(v, "must_not")?,
-            _ => {} // minimum_should_match/boost tolerated and ignored
+            "minimum_should_match" => msm = Some(parse_msm(v)?),
+            _ => {} // boost tolerated and ignored
         }
     }
     Ok(Plan::Bool {
@@ -396,7 +450,166 @@ fn parse_bool(spec: &Value) -> Result<Plan, DslError> {
         filter,
         should,
         must_not,
+        msm,
     })
+}
+
+/// `minimum_should_match`: non-negative integer or `0-100%`. The
+/// Lucene combination forms (`"2<-25%"`, negative counts) are a 400.
+fn parse_msm(v: &Value) -> Result<MinShouldMatch, DslError> {
+    let bad = || {
+        err(
+            400,
+            "parsing_exception",
+            "[minimum_should_match] must be a non-negative integer or a 0-100 percent",
+        )
+    };
+    let text = match v {
+        Value::Number(n) => {
+            let f = n.as_f64().ok_or_else(bad)?;
+            if f.fract() != 0.0 || f < 0.0 {
+                return Err(bad());
+            }
+            return Ok(MinShouldMatch::Count(f as u64));
+        }
+        Value::String(s) => s.clone(),
+        _ => return Err(bad()),
+    };
+    match text.strip_suffix('%') {
+        Some(p) => p
+            .parse::<u32>()
+            .ok()
+            .filter(|x| *x <= 100)
+            .map(MinShouldMatch::Percent)
+            .ok_or_else(bad),
+        None => text
+            .parse::<u64>()
+            .map(MinShouldMatch::Count)
+            .map_err(|_| bad()),
+    }
+}
+
+/// `{"field": "text"}` or `{"field": {"query": ".."}}`; tokens come
+/// from the SAME tokenizer as indexing, so they line up with posting
+/// keys. An empty token list matches nothing (ES alignment).
+fn parse_match_phrase(spec: &Value) -> Result<Plan, DslError> {
+    let Some(obj) = spec.as_object() else {
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[match_phrase] must be an object",
+        ));
+    };
+    let Some((field, cfg)) = obj.iter().next() else {
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[match_phrase] requires a field name",
+        ));
+    };
+    let text = match cfg {
+        Value::String(s) => s.clone(),
+        Value::Object(body) => match body.get("query") {
+            Some(Value::String(s)) => s.clone(),
+            _ => {
+                return Err(err(
+                    400,
+                    "parsing_exception",
+                    "[match_phrase] query must be a string",
+                ))
+            }
+        },
+        _ => {
+            return Err(err(
+                400,
+                "parsing_exception",
+                "[match_phrase] query must be a string",
+            ))
+        }
+    };
+    let terms = tokenize(&text)
+        .into_iter()
+        .map(|t| t.into_bytes())
+        .collect();
+    Ok(Plan::MatchPhrase {
+        field: field.clone(),
+        terms,
+    })
+}
+
+/// `{"field": "val"}` or `{"field": {"value": "val"}}`; only strings
+/// (a numeric prefix has no posting-key meaning here). An empty
+/// prefix matches nothing (no posting key starts empty).
+fn parse_prefix(spec: &Value) -> Result<Plan, DslError> {
+    let Some(obj) = spec.as_object() else {
+        return Err(err(400, "parsing_exception", "[prefix] must be an object"));
+    };
+    let Some((field, cfg)) = obj.iter().next() else {
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[prefix] requires a field name",
+        ));
+    };
+    let value = match cfg {
+        Value::String(s) => s.clone().into_bytes(),
+        Value::Object(body) => match body.get("value") {
+            Some(Value::String(s)) => s.clone().into_bytes(),
+            _ => {
+                return Err(err(
+                    400,
+                    "parsing_exception",
+                    "[prefix] value must be a string",
+                ))
+            }
+        },
+        _ => {
+            return Err(err(
+                400,
+                "parsing_exception",
+                "[prefix] value must be a string",
+            ))
+        }
+    };
+    Ok(Plan::Prefix {
+        field: field.clone(),
+        prefix: value,
+    })
+}
+
+/// `{"query_string": {"query": ".."}}`; other keys (default_field,
+/// fields, analyzer, ...) are tolerated and ignored (v1 deviation).
+/// The query text reuses the SHARED query-tree grammar (QueryString
+/// dialect), so ES `query_string` and RESP `FT.SEARCH` accept the
+/// same syntax over the same postings.
+fn parse_query_string(spec: &Value) -> Result<Plan, DslError> {
+    let Some(obj) = spec.as_object() else {
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[query_string] must be an object",
+        ));
+    };
+    let text = match obj.get("query") {
+        Some(Value::String(s)) => s.clone(),
+        _ => {
+            return Err(err(
+                400,
+                "parsing_exception",
+                "[query_string] requires a 'query' string",
+            ))
+        }
+    };
+    if text.trim().is_empty() {
+        return Err(err(
+            400,
+            "parsing_exception",
+            "[query_string] query string must not be null or empty",
+        ));
+    }
+    let node = parse_query_tree(text.as_bytes(), QueryDialect::QueryString)
+        .map_err(|e| err(400, "parsing_exception", &format!("[query_string] {e}")))?;
+    Ok(Plan::QueryString { node })
 }
 
 /// A bool sub-clause is one object or an array of objects.

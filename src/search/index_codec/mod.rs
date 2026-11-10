@@ -1,5 +1,5 @@
 //! Physical codecs for the search-engine record family (kinds
-//! 0x13..=0x19, `codec::SEARCH_FAMILY`). One family on purpose: the
+//! 0x13..=0x1A, `codec::SEARCH_FAMILY`). One family on purpose: the
 //! index meta's TTL envelope drives a lazy purge that must wipe text
 //! AND vector side-records together.
 //!
@@ -9,6 +9,10 @@
 //!                  ++ per field [ name_len++name ++ type:u8 ++ dim? ]
 //!                  (type bytes: 1 TEXT, 2 VECTOR(+dim), 3 KEYWORD,
 //!                   4 NUMERIC -- keyword/numeric carry no payload)
+//!                  ++ n_stopwords ++ per stopword [ len++bytes ]
+//!                  ++ k1:f64LE ++ b:f64LE        (v2 append-only tail;
+//!                  payload ending at the fields = pre-v2 meta decoded
+//!                  with default empty stopwords and k1/b = 1.2/0.75)
 //! doc suffix     = docid_len ++ docid
 //! doc value      = doclen ++ nentries
 //!                  ++ per entry [ field++term++tf ]      (postings undo log)
@@ -16,7 +20,12 @@
 //!                  ++ vec_len ++ raw LE f64s             (exact rerank)
 //!                  ++ raw JSON bytes                     (content reply)
 //! posting sfx    = field_len++field ++ term_len++term
-//! posting value  = count ++ entries sorted by docid [ docid ++ tf ]
+//! posting value  = count ++ entries sorted by docid [ docid ++ tf ]      (v1, kind 0x15)
+//! posting2 value = count ++ entries sorted by docid
+//!                  [ docid ++ tf ++ npos ++ Δpositions ]  (v2, kind 0x1A;
+//!                  positions = strictly increasing token ordinals,
+//!                  delta-encoded as LEB128(pos[i]-pos[i-1]-1), first
+//!                  delta is pos[0]; npos=0 = unknown, the v1 fallback)
 //! termstat value = df ++ total_tf
 //! centroid sfx   = field_len ++ field
 //! centroid value = k ++ dim ++ k*dim*f32LE ++ dim*min ++ dim*scale
@@ -32,7 +41,8 @@
 
 use crate::ds::codec::{
     data_key, elem_key, encode_count, family_delete_ranges, KIND_ANN_CENTROID, KIND_ANN_POSTING,
-    KIND_SEARCH_DOC, KIND_SEARCH_META, KIND_SEARCH_POSTING, KIND_SEARCH_TERMSTAT, SEARCH_FAMILY,
+    KIND_SEARCH_DOC, KIND_SEARCH_META, KIND_SEARCH_POSTING, KIND_SEARCH_POSTING2,
+    KIND_SEARCH_TERMSTAT, SEARCH_FAMILY,
 };
 use crate::store::key_upper_bound;
 
@@ -41,8 +51,9 @@ pub mod posting;
 
 pub use numval::{decode_numval, encode_numval, numval_key, numval_range};
 pub use posting::{
-    decode_centroids, decode_posting, decode_termstat, encode_centroids, encode_posting,
-    encode_termstat, remove_posting, upsert_posting, CentroidTable, PostEntry, TermStat,
+    decode_centroids, decode_posting, decode_posting2, decode_termstat, encode_centroids,
+    encode_posting, encode_posting2, encode_termstat, remove_posting, upsert_posting,
+    CentroidTable, PostEntry, TermStat,
 };
 
 /// `u64::MAX` sentinel: a vector doc not yet assigned to any ANN
@@ -74,12 +85,33 @@ pub struct IndexField {
     pub ftype: FieldType,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+/// Index-level tuning: BM25 `k1`/`b` and the stopword list (both the
+/// index and the query side read them). Manual `Default`: f64's zero
+/// default is meaningless for k1/b, so they fall back to the `bm25`
+/// constants (the pre-tail payload decodes to exactly this).
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexMeta {
     pub expire_ms: u64,
     pub num_docs: u64,
     pub sum_doclen: u64,
     pub fields: Vec<IndexField>,
+    pub stopwords: Vec<Vec<u8>>,
+    pub k1: f64,
+    pub b: f64,
+}
+
+impl Default for IndexMeta {
+    fn default() -> Self {
+        IndexMeta {
+            expire_ms: 0,
+            num_docs: 0,
+            sum_doclen: 0,
+            fields: Vec::new(),
+            stopwords: Vec::new(),
+            k1: super::bm25::K1,
+            b: super::bm25::B,
+        }
+    }
 }
 
 /// One (field, term, tf) triple of a doc -- exactly what must be
@@ -122,6 +154,14 @@ pub fn encode_meta(meta: &IndexMeta) -> Vec<u8> {
             FieldType::Numeric => out.push(FIELD_NUMERIC),
         }
     }
+    // append-only v2 tail: stopwords + BM25 knobs (f64 LE)
+    out.extend_from_slice(&encode_count(meta.stopwords.len() as u64));
+    for s in &meta.stopwords {
+        out.extend_from_slice(&encode_count(s.len() as u64));
+        out.extend_from_slice(s);
+    }
+    out.extend_from_slice(&meta.k1.to_le_bytes());
+    out.extend_from_slice(&meta.b.to_le_bytes());
     out
 }
 
@@ -150,11 +190,35 @@ pub fn decode_meta(payload: &[u8]) -> Option<IndexMeta> {
         };
         fields.push(IndexField { name, ftype });
     }
+    // tail absent = pre-v2 payload: defaults (empty stopwords, the
+    // bm25 constants); any truncation inside the tail is malformed.
+    if rest.is_empty() {
+        return Some(IndexMeta {
+            expire_ms: 0,
+            num_docs,
+            sum_doclen,
+            fields,
+            ..Default::default()
+        });
+    }
+    let (nstop, mut rest) = take_count(rest)?;
+    let mut stopwords = Vec::with_capacity(nstop.min(10000) as usize);
+    for _ in 0..nstop {
+        let (slen, r) = take_count(rest)?;
+        let s = r.get(..slen as usize)?.to_vec();
+        rest = r.get(slen as usize..)?;
+        stopwords.push(s);
+    }
+    let k1 = f64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+    let b = f64::from_le_bytes(rest.get(8..16)?.try_into().ok()?);
     Some(IndexMeta {
         expire_ms: 0,
         num_docs,
         sum_doclen,
         fields,
+        stopwords,
+        k1,
+        b,
     })
 }
 
@@ -233,6 +297,48 @@ pub fn posting_key(prefix: &[u8], index: &[u8], field: &[u8], term: &[u8]) -> Ve
         index,
         &term_suffix(field, term),
     )
+}
+
+/// v2 posting key (kind 0x1A): same `term_suffix` as v1 so the two
+/// records of one term differ only by kind byte.
+pub fn posting2_key(prefix: &[u8], index: &[u8], field: &[u8], term: &[u8]) -> Vec<u8> {
+    elem_key(
+        prefix,
+        KIND_SEARCH_POSTING2,
+        index,
+        &term_suffix(field, term),
+    )
+}
+
+/// Inverse of [`term_suffix`] -> `(field, term)`; `None` on truncated
+/// lengths. Used by prefix scans that decode the suffix of every
+/// posting key a range walk hands over.
+pub fn decode_term_suffix(suffix: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (flen, rest) = take_count(suffix)?;
+    let field = rest.get(..flen as usize)?.to_vec();
+    let rest = rest.get(flen as usize..)?;
+    let (tlen, rest) = take_count(rest)?;
+    let term = rest.get(..tlen as usize)?.to_vec();
+    Some((field, term))
+}
+
+/// `[lower, upper)` span of one field's postings of `kind` (0x15 v1
+/// or 0x1A v2): lower anchors on `field_len ++ field` and upper is
+/// its last-byte increment -- the `ann_posting_range` pattern (the
+/// +1-length trick cannot cross into another field because the LEB128
+/// length grows before the bytes). The range covers the WHOLE field;
+/// callers filter terms (e.g. a term prefix) in the callback.
+pub fn posting_field_range(
+    prefix: &[u8],
+    index: &[u8],
+    field: &[u8],
+    kind: u8,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = encode_count(field.len() as u64);
+    suffix.extend_from_slice(field);
+    let lower = elem_key(prefix, kind, index, &suffix);
+    let upper = key_upper_bound(&lower).unwrap_or_default();
+    (lower, upper)
 }
 
 pub fn termstat_key(prefix: &[u8], index: &[u8], field: &[u8], term: &[u8]) -> Vec<u8> {
@@ -339,9 +445,43 @@ mod tests {
                     ftype: FieldType::Vector { dim: 4096 },
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(decode_meta(&encode_meta(&meta)).unwrap(), meta);
         assert!(decode_meta(b"\xff").is_none());
+    }
+
+    #[test]
+    fn meta_tail_roundtrip_and_pre_v2_default() {
+        let meta = IndexMeta {
+            num_docs: 3,
+            sum_doclen: 9,
+            stopwords: vec![b"the".to_vec(), "的".as_bytes().to_vec()],
+            k1: 1.5,
+            b: 0.5,
+            ..Default::default()
+        };
+        let full = encode_meta(&meta);
+        assert_eq!(decode_meta(&full).unwrap(), meta);
+
+        // pre-v2 payload (truncated right after the fields): the
+        // defaults -- empty stopwords, k1=1.2, b=0.75.
+        let count_len = |v: u64| crate::ds::codec::encode_count(v).len();
+        let mut tail = count_len(meta.stopwords.len() as u64);
+        for s in &meta.stopwords {
+            tail += count_len(s.len() as u64) + s.len();
+        }
+        tail += 16; // k1 + b
+        let old = &full[..full.len() - tail];
+        let decoded = decode_meta(old).unwrap();
+        assert_eq!(decoded.num_docs, 3);
+        assert!(decoded.stopwords.is_empty());
+        assert!((decoded.k1 - 1.2).abs() < 1e-12);
+        assert!((decoded.b - 0.75).abs() < 1e-12);
+
+        // truncated inside the tail -> malformed, not defaults
+        assert!(decode_meta(&full[..full.len() - 8]).is_none());
+        assert!(decode_meta(&full[..old.len() + 1]).is_none());
     }
 
     #[test]

@@ -132,6 +132,10 @@ pub async fn create_index(shared: &Shared, index: &str, body: &[u8]) -> Result<b
         num_docs: 0,
         sum_doclen: 0,
         fields,
+        // ES-side index creation carries no knobs: plain defaults
+        stopwords: Vec::new(),
+        k1: crate::search::bm25::K1,
+        b: crate::search::bm25::B,
     };
     let mut batch = WriteBatch::default();
     ft_index::put_meta(&mut batch, &prefix, key, &meta);
@@ -213,7 +217,7 @@ pub async fn put_doc(
             format!("[{docid}]: version conflict, document already exists (1)"),
         ));
     }
-    let (rec, numvals) = doc_record_of(&meta, body).map_err(|e| {
+    let (rec, numvals, positions) = doc_record_of(&meta, body).map_err(|e| {
         EsErr::new(
             400,
             "document_parsing_exception",
@@ -228,6 +232,7 @@ pub async fn put_doc(
         docid.as_bytes(),
         rec,
         &numvals,
+        &positions,
     )
     .map_err(EsErr::from)?;
     ops::batch_write_async(Arc::clone(&shared.store), batch)

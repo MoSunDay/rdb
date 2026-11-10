@@ -6,14 +6,19 @@
 //! Reply-shaping deviations from real ES: `_score` is null when the
 //! FIRST sort key is not `_score` (field sorts); `max_score` covers
 //! all matches pre-windowing and is None for scoreless sorts; `_doc`
-//! sort ignores its direction (natural docid order); sources that
-//! fail to parse JSON become Null instead of failing the query.
+//! sort ignores its direction (natural docid order); NUMERIC field
+//! sorts read the columnar f64 doc-values (exact, mapping-driven)
+//! with the `_source` JSON as fallback for unmapped fields; sources
+//! that fail to parse JSON become Null instead of failing the query.
 
 use std::cmp::Ordering;
 
 use serde_json::Value;
 
-use crate::search::ft_index::IndexMeta;
+use std::collections::HashMap;
+
+use crate::search::eval_tree::scan_numvals;
+use crate::search::ft_index::{FieldType, IndexMeta};
 use crate::store::Store;
 
 use super::dsl::{Plan, SearchPlan, SortDir, SortKey};
@@ -99,6 +104,24 @@ pub fn execute(
         &plan.sort
     };
     let by_field = sort.iter().any(|s| matches!(s, SortKey::Field { .. }));
+    // NUMERIC sort keys use the columnar doc-values (one range scan
+    // per field); other/unmapped fields fall back to `_source` JSON.
+    let numcols: Vec<(String, HashMap<Vec<u8>, f64>)> = sort
+        .iter()
+        .filter_map(|s| match s {
+            SortKey::Field { field, .. }
+                if meta.fields.iter().any(|f| {
+                    f.name == field.as_bytes() && matches!(f.ftype, FieldType::Numeric)
+                }) =>
+            {
+                Some((
+                    field.clone(),
+                    scan_numvals(store, prefix, index, field.as_bytes(), &|_| true),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
     let mut rows: Vec<Row> = Vec::with_capacity(scored.len());
     for (docid, score) in scored {
         let source = if by_field {
@@ -109,11 +132,21 @@ pub fn execute(
         let keys = sort
             .iter()
             .map(|s| match s {
-                SortKey::Field { field, .. } => source
-                    .as_ref()
-                    .and_then(|v| path_get(v, field))
-                    .map(sortval_of)
-                    .unwrap_or(SortVal::Missing),
+                SortKey::Field { field, .. } => {
+                    if let Some(x) = numcols
+                        .iter()
+                        .find(|(f, _)| f == field)
+                        .and_then(|(_, m)| m.get(&docid))
+                    {
+                        SortVal::Num(*x)
+                    } else {
+                        source
+                            .as_ref()
+                            .and_then(|v| path_get(v, field))
+                            .map(sortval_of)
+                            .unwrap_or(SortVal::Missing)
+                    }
+                }
                 _ => SortVal::Missing, // Doc/Score compare from the row
             })
             .collect();
