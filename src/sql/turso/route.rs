@@ -5,7 +5,7 @@
 
 use crate::sql::exec::sequence;
 use crate::sql::exec::{ExecOutcome, SqlSession};
-use crate::sql::parse::ast::{Query, Statement};
+use crate::sql::parse::ast::Statement;
 use crate::sql::parse::error::SqlResult;
 use crate::sql::storage::schema::Value;
 use crate::state::Shared;
@@ -27,14 +27,18 @@ pub async fn route(
         return Ok(None);
     }
     let out = match stmt {
-        Statement::Select(q) => select(shared, sess, q).await?,
-        // Set operations and CTEs stay whole-engine rejections: the
-        // host executor would answer from ITS tables (the library's
-        // rows are invisible there), which is silent wrong data.
-        Statement::SelectCompound(_) => {
-            return Err(engine::turso_unsupported(
-                "UNION/INTERSECT/EXCEPT set operations",
-            ))
+        Statement::Select(q) => {
+            let sql = translate::render_select(q)?;
+            run_select(shared, sess, &sql).await?
+        }
+        // Set operations + CTEs render through the same translator
+        // since the allowlist batch; the host executor would answer
+        // from ITS tables (the library's rows are invisible there),
+        // so this arm stays engine-bound -- it just no longer
+        // rejects wholesale.
+        Statement::SelectCompound(cq) => {
+            let sql = translate::render_compound(cq)?;
+            run_select(shared, sess, &sql).await?
         }
         // CREATE TABLE: the statement list is [table, inline
         // indexes...] in order (the indexes ride CREATE INDEX after
@@ -246,11 +250,13 @@ async fn ddl(shared: &Shared, sess: &mut SqlSession, sql: &str) -> SqlResult<Exe
     Ok(ExecOutcome::Ok)
 }
 
-async fn select(shared: &Shared, sess: &mut SqlSession, q: &Query) -> SqlResult<ExecOutcome> {
-    let sql = translate::render_select(q)?;
+/// One read-shaped statement already rendered to SQLite SQL: run it,
+/// decode cells (vector columns re-inflate their blobs) and shape the
+/// result metadata. Shared by the plain SELECT and compound arms.
+async fn run_select(shared: &Shared, sess: &mut SqlSession, sql: &str) -> SqlResult<ExecOutcome> {
     let conn = pin(shared, sess).await?;
     let guard = conn.lock().await;
-    let (cols, raw) = engine::run_query(&guard, &sql).await?;
+    let (cols, raw) = engine::run_query(&guard, sql).await?;
     drop(guard);
     // Vector-typed table columns decode their blob payloads back into
     // Value::Vector (the MySQL layer ships '[e,e,...]' text); every

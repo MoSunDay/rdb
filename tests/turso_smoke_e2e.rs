@@ -66,9 +66,12 @@ async fn turso_engine_smoke_end_to_end() {
 
     // Engine-bound but still unimplemented (T3 allowlist): loud 1235,
     // never a silent fallthrough to the host engine's tables.
-    let e = mysql_server_error(&mut c, "SELECT 1 UNION SELECT 2").await;
+    // (Plain set operations moved to the allowlist batch 1 and left
+    // this probe -- INTERSECT ALL keeps 1235: the engine's grammar
+    // takes ALL on UNION only; see turso_setops_e2e for what flipped.)
+    let e = mysql_server_error(&mut c, "SELECT 1 INTERSECT ALL SELECT 2").await;
     assert_eq!(e.code, ER_NOT_SUPPORTED_YET, "{e:?}");
-    assert!(e.message.contains("UNION/INTERSECT/EXCEPT"), "{e:?}");
+    assert!(e.message.contains("INTERSECT ALL"), "{e:?}");
     // The T3 CRUD trunk now executes where T2 rejected: the dedicated
     // turso_crud_e2e suite carries the full matrix; here one probe per
     // shape keeps the routing skeleton honest.

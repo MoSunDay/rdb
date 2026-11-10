@@ -78,6 +78,27 @@ pub fn render_expr(e: &Expr) -> SqlResult<String> {
             render_expr(pattern)?
         )),
         Expr::BinaryOp { left, op, right } => render_binop(left, *op, right),
+        // Subqueries (allowlist batch 1): the inner query expression
+        // renders through the compound renderer -- plain SELECT,
+        // set operation or CTE body alike; SQLite resolves
+        // correlated outer references natively (verified), so no
+        // correlation machinery is needed on this side.
+        Expr::Subquery(q) => Ok(format!("({})", super::set::render_compound(q)?)),
+        Expr::Exists { query, negated } => Ok(format!(
+            "({}EXISTS ({}))",
+            if *negated { "NOT " } else { "" },
+            super::set::render_compound(query)?
+        )),
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => Ok(format!(
+            "({} {}IN ({}))",
+            render_expr(expr)?,
+            if *negated { "NOT " } else { "" },
+            super::set::render_compound(query)?
+        )),
         Expr::Agg { .. } | Expr::Func { .. } => funcs::render_call(e),
         other => Err(engine::turso_unsupported(format!(
             "expression '{}'",

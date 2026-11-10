@@ -1,17 +1,16 @@
-//! SELECT rendering for the turso engine: the single-table trunk
-//! (projection / FROM / WHERE / GROUP BY + HAVING / ORDER BY / LIMIT).
-//! JOINs, set operations, subqueries, DISTINCT and locking clauses
-//! reject with the uniform 1235 -- the renderer IS the allowlist
-//! gate, nothing falls through silently.
+//! SELECT rendering for the turso engine: the projection / WHERE /
+//! GROUP BY + HAVING / ORDER BY / LIMIT trunk plus (since the
+//! allowlist batch) FROM join trees via `join.rs`. DISTINCT and
+//! locking clauses still reject with the uniform 1235 -- the
+//! renderer IS the allowlist gate, nothing falls through silently.
 
 use crate::sql::exec::render;
-use crate::sql::parse::ast::{Query, SelectItem, TableRef};
+use crate::sql::parse::ast::{LimitValue, OrderKey, Query, SelectItem, TableRef};
 use crate::sql::parse::error::SqlResult;
 use crate::sql::parse::order_limit::limit_u64;
 
 use super::super::engine;
 use super::expr::render_expr;
-use super::quote_ident;
 
 /// Render one SELECT as a SQLite statement. Every output column gets
 /// an explicit `AS "name"` alias (MySQL display name via the host
@@ -48,21 +47,10 @@ pub fn render_select(q: &Query) -> SqlResult<String> {
     }
     let from = match &q.from {
         TableRef::NoTable => String::new(),
-        TableRef::Table { name, alias } => {
-            // A table alias is accepted and honored (SQLite resolves
-            // `a.col` projections against it); JOIN/derived shapes
-            // reject below.
-            match alias {
-                Some(a) => format!(" FROM {} AS {}", quote_ident(name), quote_ident(a)),
-                None => format!(" FROM {}", quote_ident(name)),
-            }
-        }
-        TableRef::Join { .. } => return Err(engine::turso_unsupported("JOIN")),
-        TableRef::Derived { .. } => {
-            return Err(engine::turso_unsupported(
-                "derived tables (FROM (SELECT ...))",
-            ))
-        }
+        // Base tables, aliases and the whole join tree (this batch)
+        // render through the join renderer; it keeps its own
+        // allowlist (derived tables stay 1235).
+        other => format!(" FROM {}", super::join::render_table_ref(other)?),
     };
     let mut sql = format!("SELECT {}{}", items.join(", "), from);
     if let Some(f) = &q.filter {
@@ -80,11 +68,23 @@ pub fn render_select(q: &Query) -> SqlResult<String> {
     if let Some(h) = &q.having {
         sql.push_str(&format!(" HAVING {}", render_expr(h)?));
     }
+    sql.push_str(&render_tail(&q.order_by, q.limit.as_ref(), &q.offset)?);
+    Ok(sql)
+}
+
+/// Trailing ORDER BY / LIMIT / OFFSET, shared by the plain SELECT
+/// trunk and the compound renderer (`set.rs`): the outermost query
+/// owns these in both IRs, inner compound operands carry none.
+pub(super) fn render_tail(
+    order_by: &[OrderKey],
+    limit: Option<&LimitValue>,
+    offset: &LimitValue,
+) -> SqlResult<String> {
+    let mut sql = String::new();
     // The parser already resolved ordinals and select aliases into
     // plain expressions, so keys render as-is.
-    if !q.order_by.is_empty() {
-        let keys = q
-            .order_by
+    if !order_by.is_empty() {
+        let keys = order_by
             .iter()
             .map(|k| {
                 Ok(format!(
@@ -99,8 +99,8 @@ pub fn render_select(q: &Query) -> SqlResult<String> {
     }
     // MySQL's `LIMIT o, n` was normalized into (limit=n, offset=o) at
     // parse time; SQLite spells the same shape LIMIT n OFFSET o.
-    let offset = limit_u64(&q.offset)?;
-    match &q.limit {
+    let offset = limit_u64(offset)?;
+    match limit {
         Some(l) => {
             let n = limit_u64(l)?;
             sql.push_str(&format!(" LIMIT {n} OFFSET {offset}"));

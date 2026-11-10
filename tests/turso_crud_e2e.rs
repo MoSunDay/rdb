@@ -226,12 +226,11 @@ async fn turso_crud_end_to_end() {
         .await
         .expect("insert after index drop");
 
-    // (h) 1235 rejection matrix: JOIN / set operations / subqueries /
+    // (h) 1235 rejection matrix: still-unsupported shapes /
     // engine-specific DDL / unsupported operators and functions.
+    // (JOIN / UNION / IN-subquery left this matrix in the allowlist
+    // batch -- see turso_setops_e2e for their parity suites.)
     for sql in [
-        "SELECT t2.id, x.id FROM t2 JOIN t2 x",
-        "SELECT id FROM t2 UNION SELECT id FROM t2",
-        "SELECT id FROM t2 WHERE id IN (SELECT id FROM t2)",
         "SELECT id FROM t2 WHERE id <=> 1",
         "SELECT LEFT('abc', 2)",
         "SELECT id, GROUP_CONCAT(v) FROM t2 GROUP BY id",

@@ -458,10 +458,10 @@ engine-bound but unimplemented rejects with the uniform 1235 ("... on turso engi
 entry (`sql_db/<name>` = `"turso"`, the `sql_sequence/` queue_put_kv precedent,
 leader-only) rides raft next to the file; physical rows are as node-local as the
 library file itself. One statement can never span engines or libraries: `db.table`
-qualified names reject at parse (object names are single-segment, 1235), and the
-turso renderers are a single-table allowlist (JOIN/UNION/subquery → 1235) —
-cross-engine or cross-library JOIN/DML is therefore a loud 1235, never silent
-wrong data answered from the other engine's tables.
+qualified names reject at parse (object names are single-segment, 1235), so a JOIN,
+subquery or set operation on a turso session renders wholly against that session's
+library — cross-engine or cross-library combinations are therefore a loud 1235,
+never silent wrong data answered from the other engine's tables.
 
 ### Statement matrix (rocks vs turso)
 
@@ -474,14 +474,17 @@ wrong data answered from the other engine's tables.
 | CREATE / DROP INDEX | single-column, per-table scoping | single-column passthrough; per-library name scoping (row above) | — |
 | CREATE VECTOR INDEX (ANN) | yes (SQ8/SPANN, P4) | 1235 "exact KNN only; ANN is rocks-engine only" | — |
 | SELECT trunk (WHERE / ORDER BY / LIMIT incl. `LIMIT o,n` / aggregates / GROUP BY+HAVING) | yes | yes (IR renderer → SQLite; `LIMIT o,n` normalized to `LIMIT n OFFSET o`); SELECT DISTINCT and locking clauses (FOR UPDATE/FOR SHARE) → 1235; DECIMAL/AVG renderings drift | (k) |
-| JOIN / UNION / subquery | yes | 1235 (single-table allowlist: JOIN, derived tables, set operations, CTEs; grows by explicit renderer additions) | — |
+| JOIN / UNION / subquery / CTE | yes | yes (allowlist batch 1, 2026-11-10): JOIN trees INNER/LEFT/RIGHT/FULL OUTER/CROSS with ON or USING (every kind verified executing in turso 0.9.0-pre.2 — RIGHT/FULL are native), expression subqueries `[NOT] IN (SELECT…)`/`[NOT] EXISTS`/scalar `(SELECT…)` (correlation resolved natively), UNION [ALL]/INTERSECT/EXCEPT with the parsed tree shape (parenthesized operands render as a derived-table wrap — SQLite's compound grammar rejects parens), WITH prefixes incl. column aliases and chained CTEs, set-op + trailing ORDER BY/LIMIT; leftover 1235: `INTERSECT ALL`/`EXCEPT ALL` (engine grammar takes ALL on UNION only), derived tables (`FROM (SELECT …)`) | (z1),(z2) |
 | INSERT / UPDATE / DELETE / TRUNCATE | full surface (ODKU/REPLACE, INSERT…SELECT, ORDER BY/LIMIT forms) | multi-row literal VALUES + optional column list; ODKU/REPLACE/INSERT…SELECT/UPDATE|DELETE with ORDER BY|LIMIT → 1235; TRUNCATE = DELETE FROM (0 affected) | (l),(m),(n) |
 | Transactions (BEGIN/COMMIT/ROLLBACK) | host MVCC txn (`sess.txn`); DDL in txn rejected 1235 | string passthrough on the session's pinned engine connection (the connection IS the txn state); MySQL's BEGIN-implies-commit emulated app-side; COMMIT/ROLLBACK outside a txn = no-op OK; DDL in txn native (SQLite semantics) | (t),(v),(w) |
 | Prepared statements | IR-stored, params bound then re-executed | same path (params bind into rdb's IR, then the router renders); prepared USE → 1235 on both | — |
 | SET TRANSACTION ISOLATION LEVEL | accepted+echoed; engine always snapshot RR | accepted+echoed; engine ignores (SQLite connection-level locking) | (u) |
 | Vector functions (STRING_TO_VECTOR / VECTOR_TO_STRING / VECTOR_DIM / DISTANCE cos·euclidean·dot; KNN) | rdb vecmath (f64), exact KNN + ANN | mapped onto turso built-ins (`vector32`/`vector_extract`/`length(vector32())/4`/`vector_distance_{cos,l2}` + sign-flipped dot); exact KNN only; wire text `'[..]'` on both engines; dim/format validated app-side (D6) | (q),(r),(s) |
 
-### turso deviation ledger (k)–(z)
+### turso deviation ledger (k)–(z), (z1)–(z2)
+
+Multi-letter entries continue the single-letter series spreadsheet-style (the file
+never used one; (z1)/(z2) keep the suffix inside the turso block's letter space).
 
 - (k) DECIMAL/NUMERIC rides REAL (SQLite has no exact decimals): value formatting
   drifts (`10.50` → `10.5`); AVG over exact ints renders `2.5` where rocks renders
@@ -535,6 +538,14 @@ wrong data answered from the other engine's tables.
 - (z) NOW() renders `datetime('now')`: UTC on both engines (no session timezone
   exists anywhere), but turso truncates to whole seconds (TEXT) where rocks keeps
   microseconds.
+- (z1) `SELECT *` over a `USING` join: turso coalesces the join column (it appears
+  once, the MySQL shape) where rocks expands every side column (the join column
+  appears twice); bare references to the USING column are likewise unambiguous on
+  turso and `1054 ambiguous` on rocks. Projections qualify the column to stay
+  engine-portable.
+- (z2) `INTERSECT ALL` / `EXCEPT ALL`: rocks answers the multiset semantics
+  (min / subtraction); turso 0.9.0-pre.2's grammar takes ALL on UNION only, so
+  those two spellings keep the uniform 1235 on turso.
 - Non-lettered posture notes: UNSIGNED column types reject 1235 on BOTH engines
   (shared parse surface, numbered ledger (9) — unchanged by the second engine);
   the dependency is `default-features = false` (turso's default `mimalloc`
