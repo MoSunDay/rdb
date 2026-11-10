@@ -26,7 +26,8 @@ const LEADER_WAIT: Duration = Duration::from_secs(60);
 /// Seed poll cadence while waiting for leadership.
 const POLL: Duration = Duration::from_millis(500);
 
-const USAGE: &str = "usage: rdb standalone [--host H] [--port P] [--dir PATH] [--token X]";
+const USAGE: &str =
+    "usage: rdb standalone [--host H] [--port P] [--dir PATH] [--token X] [--turso-db-dir PATH]";
 
 /// Parsed `standalone` CLI flags (plain data).
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +37,9 @@ pub(crate) struct StandaloneOpts {
     pub dir: PathBuf,
     /// Explicit `--token`; overrides and rewrites the persisted file.
     pub token: Option<String>,
+    /// Explicit `--turso-db-dir`; presence turns the embedded turso
+    /// engine on (opt-in, off by default).
+    pub turso_db_dir: Option<PathBuf>,
 }
 
 /// What the standalone boot still owes after the config is built:
@@ -53,6 +57,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<StandaloneOpts, String> {
         port: 6379,
         dir: PathBuf::from("./rdb-standalone"),
         token: None,
+        turso_db_dir: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -86,6 +91,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<StandaloneOpts, String> {
             }
             "dir" => opts.dir = PathBuf::from(value(&mut i)?),
             "token" => opts.token = Some(value(&mut i)?),
+            "turso-db-dir" => opts.turso_db_dir = Some(PathBuf::from(value(&mut i)?)),
             _ => return Err(format!("unknown standalone flag: {arg}\n{USAGE}")),
         }
         i += 1;
@@ -241,15 +247,28 @@ pub(crate) fn build_conf(opts: &StandaloneOpts, token: &str) -> conf::Config {
         es_token: token.to_string(),
         s3_bind: b.s3,
         s3_token: token.to_string(),
+        turso_engine: opts.turso_db_dir.is_some(),
+        turso_db_dir: opts
+            .turso_db_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         ..Default::default()
     }
 }
 
 /// One-line endpoint summary for the startup log.
 pub(crate) fn endpoints(c: &conf::Config) -> String {
+    // The empty dir is the "off" half of the engine's double gate;
+    // the summary must say so rather than print a dead directory.
+    let turso = if c.turso_db_dir.is_empty() {
+        "off".to_string()
+    } else {
+        c.turso_db_dir.clone()
+    };
     format!(
         "endpoints: resp={} monitor={} raft-http={} raft-tcp={} mysql={} sql-rpc={} \
-         kafka={} rocksmq={} es={} s3={}",
+         kafka={} rocksmq={} es={} s3={} turso={}",
         c.bind,
         c.monitor_addr,
         c.http_address,
@@ -259,7 +278,8 @@ pub(crate) fn endpoints(c: &conf::Config) -> String {
         c.kafka_bind,
         c.rocksmq_bind,
         c.es_bind,
-        c.s3_bind
+        c.s3_bind,
+        turso
     )
 }
 
@@ -277,6 +297,13 @@ pub(crate) fn conf_from_args(args: &[String]) -> Result<Option<(conf::Config, Bo
         );
     }
     let opts = parse_args(&args[1..])?;
+    // Boot-prep, not config: one command = no manual mkdir for the
+    // turso root. Unlike the token write this is harmless even before
+    // the multi-node refusal check.
+    if let Some(dir) = &opts.turso_db_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("--turso-db-dir {}: {e}", dir.display()))?;
+    }
     if let Some(w) = port_warning(opts.port) {
         eprintln!("[standalone] warning: {w}");
     }

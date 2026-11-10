@@ -11,6 +11,7 @@ fn opts() -> StandaloneOpts {
         port: 6379,
         dir: PathBuf::from("./rdb-standalone"),
         token: None,
+        turso_db_dir: None,
     }
 }
 
@@ -141,6 +142,12 @@ fn build_conf_wires_every_plane_and_one_credential() {
     }
     // The backup plane stays off in standalone mode.
     assert!(c.backup_bind.is_empty() && c.backup_store_path.is_empty());
+    // Turso stays off unless the flag is given (default = old bits).
+    assert!(!c.turso_engine && c.turso_db_dir.is_empty());
+    let mut t = opts();
+    t.turso_db_dir = Some(PathBuf::from("/tmp/tdb"));
+    let c = build_conf(&t, "tok123");
+    assert!(c.turso_engine && c.turso_db_dir == "/tmp/tdb");
 }
 
 #[test]

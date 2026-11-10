@@ -71,7 +71,7 @@ impl Drop for Standalone {
     }
 }
 
-fn spawn_standalone(dir: &Path, host: &str, port: u16) -> Standalone {
+fn spawn_standalone(dir: &Path, host: &str, port: u16, turso_dir: Option<&Path>) -> Standalone {
     std::fs::create_dir_all(dir).expect("mkdir");
     let stderr_path = dir.join("stderr.log");
     let stderr = std::fs::OpenOptions::new()
@@ -79,14 +79,18 @@ fn spawn_standalone(dir: &Path, host: &str, port: u16) -> Standalone {
         .append(true)
         .open(&stderr_path)
         .expect("stderr log");
-    let child = Command::new(env!("CARGO_BIN_EXE_rdb"))
-        .arg("standalone")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rdb"));
+    cmd.arg("standalone")
         .arg("--host")
         .arg(host)
         .arg("--port")
         .arg(port.to_string())
         .arg("--dir")
-        .arg(dir)
+        .arg(dir);
+    if let Some(t) = turso_dir {
+        cmd.arg("--turso-db-dir").arg(t);
+    }
+    let child = cmd
         .env_remove("RAFT_BOOTSTRAP")
         .env_remove("RAFT_JOIN_ADDR")
         .env_remove("RDB_BEACON")
@@ -209,7 +213,7 @@ async fn standalone_boots_every_protocol_and_restarts_idempotently() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data = dir.path().join("data");
     let port = free_port_block();
-    let mut s = spawn_standalone(&data, "127.0.0.1", port);
+    let mut s = spawn_standalone(&data, "127.0.0.1", port, None);
     let token = wait_ready(&mut s, 90).await;
     let resp = s.resp();
 
@@ -268,7 +272,7 @@ async fn standalone_boots_every_protocol_and_restarts_idempotently() {
     // Restart idempotence: same dir + port -> same token, data intact,
     // topology still ready, no re-init side effects.
     s.kill_now();
-    let mut s2 = spawn_standalone(&data, "127.0.0.1", port);
+    let mut s2 = spawn_standalone(&data, "127.0.0.1", port, None);
     let token2 = wait_ready(&mut s2, 90).await;
     assert_eq!(token2, token, "token must survive restart");
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -307,7 +311,7 @@ async fn standalone_refuses_to_downgrade_a_multi_node_store() {
 
     // Same store dir + same bind => the very same raft log/store; the
     // standalone boot must refuse (exit 1), not silently overwrite.
-    let mut s = spawn_standalone(&node0_dir, host, port);
+    let mut s = spawn_standalone(&node0_dir, host, port, None);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match s.child.try_wait().expect("try_wait") {
@@ -326,4 +330,54 @@ async fn standalone_refuses_to_downgrade_a_multi_node_store() {
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+}
+
+#[tokio::test]
+async fn standalone_boots_turso_engine_with_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path().join("data");
+    let turso_dir = dir.path().join("tursodb");
+    let port = free_port_block();
+    // The turso dir is deliberately NOT pre-created: the flag alone
+    // must make the boot prepare it.
+    let mut s = spawn_standalone(&data, "127.0.0.1", port, Some(&turso_dir));
+    let token = wait_ready(&mut s, 30).await;
+
+    // MySQL front, user root, password = the one standalone token.
+    let mysql_port = s.port + 5;
+    let opts = || {
+        mysql_async::OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(mysql_port)
+            .user(Some("root"))
+            .pass(Some(token.as_str()))
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut c = loop {
+        match mysql_async::Conn::new(opts()).await {
+            Ok(c) => break c,
+            Err(mysql_async::Error::Io(_)) if Instant::now() < deadline => {
+                s.alive("mysql connect");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("mysql connect: {e}\n{}", s.stderr_tail()),
+        }
+    };
+    // A `turso_*` database rides the embedded engine: create, route,
+    // write, read back.
+    common::mysql::ddl(&mut c, "CREATE DATABASE turso_flag").await;
+    common::mysql::run(&mut c, "USE turso_flag").await;
+    common::mysql::ddl(&mut c, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+    common::mysql::run(&mut c, "INSERT INTO t VALUES (1, 'hello-turso')").await;
+    assert_eq!(
+        common::mysql::rows(&mut c, "SELECT v FROM t WHERE id = 1").await,
+        vec![vec![common::mysql::s("hello-turso")]]
+    );
+    // The library file lands under the flag's directory.
+    assert!(
+        turso_dir.join("turso_flag.db").exists(),
+        "turso library file missing\n{}",
+        s.stderr_tail()
+    );
+    s.alive("end");
 }

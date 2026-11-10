@@ -65,6 +65,7 @@ cargo build --release
 
   （`P+1` 预留给 backup 面，standalone 下不启用。）
 - `--port` 可用范围 1–65525；低于 1024 的特权端口通常需要 root/CAP_NET_BIND_SERVICE（启动时仅打 warning，不阻止 root 使用）。
+- `--turso-db-dir PATH`（opt-in）：出现即启用内嵌 turso 引擎并将库文件落在该目录（缺省关闭，行为与之前逐字节一致）。
 - 同一 token 直连各协议（默认端口下）：
 
   ```bash
