@@ -22,7 +22,7 @@ pub fn run(shared: &Shared, sess: &SqlSession, stmt: &Statement) -> SqlResult<Ex
         Statement::ShowColumns(table) => show_columns(shared, table),
         Statement::ShowIndexes(table) => show_indexes(shared, table),
         Statement::ShowCreateTable(table) => show_create_table(shared, table),
-        Statement::ShowDatabases => show_databases(sess),
+        Statement::ShowDatabases => show_databases(shared, sess),
         Statement::ShowVariables { like } => Ok(show_kv(
             "Variable_name",
             vars::show_variables_rows(
@@ -67,13 +67,27 @@ fn render_kv_value(v: Value) -> Value {
     })
 }
 
-fn show_databases(sess: &SqlSession) -> SqlResult<ExecOutcome> {
+fn show_databases(shared: &Shared, sess: &SqlSession) -> SqlResult<ExecOutcome> {
     // Single-database model: the implicit default plus the session's
     // USE target when one was picked (deduped, name-order stable).
+    // With the turso engine enabled, every `turso_*` library file in
+    // the configured root joins the list -- unconditionally (SHOW
+    // DATABASES may run before any USE), matching the model where the
+    // default database is always listed.
     let mut names = vec![DEFAULT_DB.to_string()];
     if !sess.db.is_empty() && !sess.db.eq_ignore_ascii_case(DEFAULT_DB) {
         names.push(sess.db.clone());
     }
+    #[cfg(feature = "turso-engine")]
+    if crate::sql::turso::enabled(&shared.conf) {
+        for name in crate::sql::turso::list_dbs(&shared.conf) {
+            if !names.iter().any(|n| n == &name) {
+                names.push(name);
+            }
+        }
+        names.sort();
+    }
+    let _ = shared;
     Ok(ExecOutcome::Rows {
         columns: vec![ColMeta::computed("", "Database", SqlType::VarChar)],
         rows: names.into_iter().map(|n| vec![Value::Str(n)]).collect(),

@@ -145,6 +145,23 @@ Commit: b0d81c9
   PLAIN+DICT 页、`decode.rs`）、元数据 kind `0x23`（`meta.rs`，无 slot 前缀）、
   段注册表（`mod.rs`，按 `(store_path, bind)` 缓存）、冲刷/放置（`writer.rs`、
   `commit.rs`）、读（`reader.rs`）、DROP 清理与孤儿清扫（`commit.rs`、`gc.rs`）。
+- `turso/`（2026-11-09 turso-engine，feature `turso-engine` 随 `full`，conf
+  `turso_engine`+`turso_db_dir` 双闸运行时启用）：第二嵌入式引擎（tursodatabase/
+  turso `=0.9.0-pre.2`，SQLite 文件格式兼容），按会话 db 名 `turso_` 前缀路由
+  （每库一文件 `<turso_db_dir>/<name>.db`；`rdb` 与非前缀名仍走 rocks，关闭时
+  零行为变化）——接入点在 `exec/mod.rs::dispatch` 的 cfg 门闩 `turso::route`
+  （`Ok(None)` 落回宿主执行器，COM_QUERY/prepared 双路径生效）；`engine.rs`
+  生命周期（进程级 Database 缓存 + 会话钉住 Connection、事务内 USE 守卫、
+  turso→MySQL 错误映射）、`route.rs` 逐语句分发（allowlist 外统一 1235）、
+  `conv.rs` 值/列元数据转换（向量 BLOB→`'[..]'` 文本）、`catalog.rs` 库对象面
+  （CREATE/DROP DATABASE = raft 存在性条目 `sql_db/<name>` + 节点本地文件、
+  SHOW DATABASES 合并、USE 文件校验）、`meta.rs` sqlite_master 三件 SHOW；
+  `translate/`：MySQL AST→SQLite 渲染器即 allowlist 门——`mod.rs` 引用定界、
+  `expr.rs` 表达式、`funcs.rs` 标量函数白名单、`select.rs` 单表 SELECT 干线、
+  `dml.rs` INSERT/UPDATE/DELETE/TRUNCATE、`ddl.rs` 建表类型映射与内联索引、
+  `vector.rs` 向量函数映射与写路径校验。库为节点本地：无 MVCC/2PC/slot/MOVED/
+  raft schema 复制；契约与两引擎对照矩阵、偏差台账 (k)–(z) 见 `COMPAT.sql.md`
+  "turso engine" 节。
 
 ## 关键不变量
 - 版本键 ts 后缀取反（`!ts`）：同 pk 新版本在前；`visible_value` 取 `ts ≤ read_ts`
@@ -209,4 +226,15 @@ Commit: b0d81c9
   周期，~7 轮清扫后改名表数据完好回归，M4）、
   `sql_outer_join_e2e`（LEFT/RIGHT OUTER JOIN 首次 e2e 覆盖）与 `sql_failover_e2e`
   （三进程 SIGKILL SQL leader：新 leader 接管 DDL/写/ts，尸体 respawn 追平，M5）、
-  `sql_decimal_e2e`（自 `sql_types_e2e` 拆出的 DECIMAL 精确语义自包含用例，M5）。
+  `sql_decimal_e2e`（自 `sql_types_e2e` 拆出的 DECIMAL 精确语义自包含用例，M5）、
+  turso 引擎六套件（2026-11-09 turso-engine，`turso_db_dir` 临时目录 + yaml 注入
+  `turso_engine`，偏差断言引擎侧钉死）：`turso_smoke_e2e`（T1 路由骨架：常量算术/
+  1235 拒绝形状/默认库零变化/未开引擎节点 USE turso_x 仍 1049）、
+  `turso_catalog_e2e`（T2：CREATE/DROP DATABASE 文件+raft 条目、SHOW DATABASES
+  合并、sqlite_master 三件 SHOW、数据往返、权限位只读重开 1290）、
+  `turso_crud_e2e`（T3：类型化建表/多行 INSERT+last-insert id/SELECT 干线含
+  `LIMIT o,n` 交换与聚合/UPDATE/DELETE affected/TRUNCATE/1235 矩阵）、
+  `turso_parity_e2e`（T3：同语句双引擎对照，五条台账偏差逐条断言）、
+  `turso_vector_e2e`（T4：VECTOR DDL/函数族/精确 KNN/错误矩阵/rocks id 序
+  parity，数值断言 epsilon=1e-6）、`turso_txn_e2e`（T5：直通事务+隐式提交语义/
+  prepared `?` 绑定/事务内 USE 1235/双连接脏读检查/隔离级别回显）。

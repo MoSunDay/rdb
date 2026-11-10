@@ -38,6 +38,11 @@ pub(crate) fn translate_drop(
         sqlparser::ast::ObjectType::Table if table.is_none() => {
             Ok(Statement::DropTable { name, if_exists })
         }
+        // `DROP DATABASE [IF EXISTS] db`: the turso-engine database
+        // object (library file + catalog entry).
+        sqlparser::ast::ObjectType::Database if table.is_none() => {
+            Ok(Statement::DropDatabase { name, if_exists })
+        }
         sqlparser::ast::ObjectType::Index => {
             // MySQL: DROP INDEX idx ON tbl
             let table = table

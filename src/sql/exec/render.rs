@@ -175,7 +175,9 @@ fn lit_display(v: &Value) -> String {
     }
 }
 
-fn binop_display(op: BinOp) -> &'static str {
+/// Operator spelling (also reused by the turso translator's rejection
+/// messages).
+pub fn binop_display(op: BinOp) -> &'static str {
     match op {
         BinOp::Eq => "=",
         BinOp::NullSafeEq => "<=>",

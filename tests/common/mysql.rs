@@ -31,6 +31,18 @@ pub const ER_NOT_SUPPORTED_YET: u16 = 1235;
 pub const ER_TRUNCATED_WRONG_VALUE: u16 = 1292;
 /// MySQL 1582 (ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT).
 pub const ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT: u16 = 1582;
+/// MySQL 1049 (ER_BAD_DB_ERROR): USE of an unknown database.
+pub const ER_BAD_DB_ERROR: u16 = 1049;
+
+/// MySQL 1007 (ER_DB_CREATE_EXISTS): CREATE DATABASE of an existing name.
+pub const ER_DB_CREATE_EXISTS: u16 = 1007;
+
+/// MySQL 1008 (ER_DB_DROP_EXISTS): DROP DATABASE of a missing name.
+pub const ER_DB_DROP_EXISTS: u16 = 1008;
+
+/// MySQL 1290 (ER_OPTION_PREVENTS_STATEMENT): writes against storage
+/// opened read-only (turso permission-decided read-only libraries).
+pub const ER_OPTION_PREVENTS_STATEMENT: u16 = 1290;
 
 /// Open a mysql_async connection to the node's MySQL frontend, retrying
 /// while the port settles. Retries only IO errors: handshake/auth
@@ -298,4 +310,60 @@ pub async fn funcs_node(tag: &str) -> (ProcNode, mysql_async::Conn) {
     .await
     .expect("seed f");
     (node, c)
+}
+
+/// `spawn_node_mysql` plus extra top-level yaml lines appended verbatim
+/// to the node's conf.yaml (the `spawn_node_yaml` pattern for nodes
+/// that also need the MySQL plane, e.g. the turso-engine smoke suite's
+/// `turso_engine`/`turso_db_dir` keys). Lives here (not common/mod.rs,
+/// which is at the file-size cap) beside the rest of the MySQL
+/// scaffolding; the private spawn helpers of the parent module are
+/// visible to this child module.
+pub fn spawn_node_mysql_yaml(
+    dir: &std::path::Path,
+    id: usize,
+    bootstrap: bool,
+    join_http: Option<&str>,
+    extra_yaml: &str,
+) -> ProcNode {
+    let node_dir = dir.join(format!("node{id}"));
+    std::fs::create_dir_all(&node_dir).expect("create node dir");
+    for _ in 0..super::SPAWN_ATTEMPTS {
+        let (resp, raft, http, monitor, mysql) = (
+            super::free_addr(),
+            super::free_addr(),
+            super::free_addr(),
+            super::free_addr(),
+            super::free_addr(),
+        );
+        let config_path = node_dir.join("conf.yaml");
+        super::write_config(
+            &config_path,
+            &node_dir,
+            &resp,
+            &raft,
+            &http,
+            &monitor,
+            &mysql,
+            extra_yaml,
+        );
+        let stderr_path = node_dir.join("stderr.log");
+        let mut child = super::spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
+        if !matches!(super::early_exit_kind(&mut child, &stderr_path), Some(true)) {
+            return ProcNode {
+                dir: node_dir,
+                config_path,
+                stderr_path,
+                child,
+                resp,
+                raft,
+                http,
+                monitor,
+                mysql,
+                sql_rpc: String::new(),
+                es: String::new(),
+            };
+        }
+    }
+    panic!("rdb kept dying at startup; see stderr.log in {dir:?}");
 }

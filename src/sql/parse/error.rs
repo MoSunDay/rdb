@@ -46,6 +46,19 @@ pub enum ErrorCode {
     /// MySQL 1582 (ER_WRONG_PARAMCOUNT_TO_NATIVE_FNC): a scalar
     /// function called with an argument count outside its signature.
     WrongParamCount,
+    /// MySQL 1007 (ER_DB_CREATE_EXISTS): `CREATE DATABASE` of a name
+    /// that already exists (the turso-engine library file).
+    DbCreateExists,
+    /// MySQL 1008 (ER_DB_DROP_EXISTS): `DROP DATABASE` of a name that
+    /// does not exist.
+    DbDropExists,
+    /// MySQL 1049 (ER_BAD_DB_ERROR): USE of an unknown database (the
+    /// exec-layer twin of the frontend handshake check).
+    UnknownDb,
+    /// MySQL 1290 (ER_OPTION_PREVENTS_STATEMENT): a write attempted
+    /// against storage opened read-only (the turso engine's
+    /// permission-decided read-only library files).
+    ReadOnly,
     Unknown,
 }
 
@@ -73,6 +86,12 @@ impl SqlError {
             ErrorCode::NoSuchTable,
             format!("table '{name}' doesn't exist"),
         )
+    }
+
+    /// MySQL 1049 wording, shared by the frontend handshake check and
+    /// the exec layer (the turso-engine USE tightening).
+    pub fn unknown_db(name: &str) -> SqlError {
+        Self::new(ErrorCode::UnknownDb, format!("Unknown database '{name}'"))
     }
 
     pub fn kind(&self) -> ErrorKind {
@@ -105,6 +124,13 @@ impl SqlError {
             // 1582: "Incorrect parameter count in the call to native
             // function '%s'" -- arity errors surface at prepare time.
             ErrorCode::WrongParamCount => ErrorKind::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+            ErrorCode::DbCreateExists => ErrorKind::ER_DB_CREATE_EXISTS,
+            ErrorCode::DbDropExists => ErrorKind::ER_DB_DROP_EXISTS,
+            ErrorCode::UnknownDb => ErrorKind::ER_BAD_DB_ERROR,
+            // 1290: "The MySQL server is running with the --read-only
+            // option so it cannot execute this statement" -- the errno
+            // MySQL clients recognize for write-in-read-only rejections.
+            ErrorCode::ReadOnly => ErrorKind::ER_OPTION_PREVENTS_STATEMENT,
             // 1213: the MySQL serialization-failure error clients retry on.
             ErrorCode::WriteConflict => ErrorKind::ER_LOCK_DEADLOCK,
             ErrorCode::TxnDdl => ErrorKind::ER_NOT_SUPPORTED_YET,

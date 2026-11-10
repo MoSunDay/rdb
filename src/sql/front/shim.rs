@@ -145,11 +145,22 @@ impl<W> SqlShim<W> {
     }
 }
 
-/// The single database this engine hosts is the executor's
-/// [`exec::DEFAULT_DB`]; a `USE` target exists iff it names that one
-/// database (case-blind, the way `SHOW DATABASES` dedupes it).
-fn is_known_db(db: &str) -> bool {
-    db.eq_ignore_ascii_case(exec::DEFAULT_DB)
+/// The databases this engine hosts: the executor's [`exec::DEFAULT_DB`]
+/// always, plus any `turso_*` library FILE while the embedded turso
+/// engine is enabled (the name prefix IS the engine marker; see
+/// `sql::turso`). Turso libraries must EXIST: auto-creation happens
+/// only via CREATE DATABASE, so USE of a never-created name keeps the
+/// unknown-database error.
+fn is_known_db(conf: &crate::conf::Config, db: &str) -> bool {
+    if db.eq_ignore_ascii_case(exec::DEFAULT_DB) {
+        return true;
+    }
+    #[cfg(feature = "turso-engine")]
+    return crate::sql::turso::is_turso_db(db)
+        && crate::sql::turso::enabled(conf)
+        && crate::sql::turso::catalog::db_file_exists(conf, db);
+    #[cfg(not(feature = "turso-engine"))]
+    false
 }
 
 /// Intermediary options: `USE` is routed to `on_init` (not parsed as a
@@ -301,13 +312,25 @@ where
         db: &'a str,
         w: InitWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        // Single-database engine: only the canonical name exists, so
-        // any other USE target answers MySQL's 1049 instead of
-        // silently registering a phantom database.
-        if !is_known_db(db) {
+        // Host database plus (configured) turso libraries: any other
+        // USE target answers MySQL's 1049 instead of silently
+        // registering a phantom database.
+        if !is_known_db(&self.shared.conf, db) {
             let msg = format!("Unknown database '{db}'");
             w.error(ErrorKind::ER_BAD_DB_ERROR, msg.as_bytes()).await?;
             return Ok(());
+        }
+        // Turso session inside an open engine transaction: switching
+        // to a different library would strand the old connection's
+        // transaction; 1235 with the escape hatch (same-db USE passes,
+        // host-engine sessions never engage the check).
+        #[cfg(feature = "turso-engine")]
+        {
+            let sess = self.sess.lock().await;
+            if let Err(e) = crate::sql::turso::check_use(&sess, db).await {
+                w.error(e.kind(), e.msg.as_bytes()).await?;
+                return Ok(());
+            }
         }
         self.sess.lock().await.db = db.to_string();
         w.ok().await
@@ -478,11 +501,12 @@ mod tests {
 
     #[test]
     fn use_accepts_only_the_canonical_database() {
-        assert!(is_known_db("rdb"));
+        let conf = crate::conf::Config::default();
+        assert!(is_known_db(&conf, "rdb"));
         // Case-blind, the way SHOW DATABASES dedupes the session db.
-        assert!(is_known_db("RDB"));
-        assert!(!is_known_db(""));
-        assert!(!is_known_db("nodb"));
-        assert!(!is_known_db("mydb"));
+        assert!(is_known_db(&conf, "RDB"));
+        assert!(!is_known_db(&conf, ""));
+        assert!(!is_known_db(&conf, "nodb"));
+        assert!(!is_known_db(&conf, "mydb"));
     }
 }

@@ -435,3 +435,108 @@ MySQL 9.0's own semantics are unverified. Full decision ledger: `plans/2026-11-0
   key latches (`vector::lock_schema_indexes`) — no lost entries under concurrent
   writers, but also no cross-node coordination; **NPROBE is DDL-fixed** (no runtime hint); EXPLAIN has
   no dedicated ANN line (the access annotation lives in the access line only).
+
+## turso engine (turso-engine feature, 2026-11-09)
+
+A second, embedded SQL engine behind the same MySQL wire frontend: the pure-Rust
+`tursodatabase/turso` crate pinned `=0.9.0-pre.2` (pre-1.0 API churn — upgrades are a
+dedicated mini-plan), SQLite file-format compatible (files + dialect + C API,
+tracking SQLite 3.50.4). Compiled in via cargo feature `turso-engine` (member of
+`full`), then runtime-gated by conf `turso_engine: true` AND a non-empty
+`turso_db_dir` (either key alone changes nothing; feature-less builds and disabled
+nodes keep the single-engine behavior bit for bit). Routing key is the session's
+logical database NAME: `turso_*` (case-sensitive prefix) rides the embedded engine,
+one library file per database (`<turso_db_dir>/<name>.db`, created only by CREATE
+DATABASE — USE never auto-creates, unknown names answer 1049); `rdb` and every
+non-prefixed name stay on the rocks engine. sqlparser's `CreateDatabase` carries no
+ENGINE clause, so the prefix IS the engine marker (deviation (y)). Anything
+engine-bound but unimplemented rejects with the uniform 1235 ("... on turso engine
+(see COMPAT.sql.md)"). Decisions/research: `plans/2026-11-09-turso-engine/`.
+
+**Cluster exemption** — turso libraries are NODE-LOCAL files: no MVCC chains, no
+2PC, no slot routing/MOVED, no raft schema replication. Only a catalog existence
+entry (`sql_db/<name>` = `"turso"`, the `sql_sequence/` queue_put_kv precedent,
+leader-only) rides raft next to the file; physical rows are as node-local as the
+library file itself. One statement can never span engines or libraries: `db.table`
+qualified names reject at parse (object names are single-segment, 1235), and the
+turso renderers are a single-table allowlist (JOIN/UNION/subquery → 1235) —
+cross-engine or cross-library JOIN/DML is therefore a loud 1235, never silent
+wrong data answered from the other engine's tables.
+
+### Statement matrix (rocks vs turso)
+
+| Statement surface | rocks | turso | dev |
+| --- | --- | --- | --- |
+| USE / SHOW DATABASES | `rdb` implicit default (case-insensitive); SHOW DATABASES lists it | USE `turso_x` validates the library file (else 1049, incl. nodes with the engine off); SHOW DATABASES merges `rdb` + every `*.db` stem in `turso_db_dir` | — |
+| CREATE / DROP DATABASE | not an object (1235) | `turso_*` only: raft existence entry + library file, 1007/1008 + IF [NOT] EXISTS shapes; non-prefixed name → 1235; DROP `rdb` → 1235 | (y) |
+| SHOW TABLES / DESCRIBE / SHOW CREATE TABLE | raft-catalog schema | the library's own sqlite_master / PRAGMA table_info (no shadow schema); SHOW INDEXES → 1235 | (o),(p) |
+| CREATE TABLE (types incl. VECTOR(n), AUTO_INCREMENT, inline KEY, UNSIGNED, ENGINE=) | full SqlType set; AUTO_INCREMENT = raft `sql_sequence/` counter | type map BOOL/INT→INTEGER, DOUBLE/**DECIMAL→REAL**, VARCHAR→TEXT, DATE/DATETIME/TIMESTAMP→TEXT, BLOB, `vector(n)` verbatim lowercase (stored BLOB); AUTO_INCREMENT = `INTEGER PRIMARY KEY AUTOINCREMENT` (single int pk only — a bad auto-column definition rejects 1235 where rocks answers MySQL 1075/1063; watermark = engine sequence table); inline KEY/UNIQUE → follow-up CREATE INDEX named `<table>_<name>` (SQLite index names per-library vs MySQL per-table; DROP INDEX drops by name only); UNSIGNED → 1235 on BOTH engines (parse surface); ENGINE=columnar / StarRocks models → 1235 (rocks-only table models), ENGINE=InnoDB etc. ignored | (k) |
+| CREATE / DROP INDEX | single-column, per-table scoping | single-column passthrough; per-library name scoping (row above) | — |
+| CREATE VECTOR INDEX (ANN) | yes (SQ8/SPANN, P4) | 1235 "exact KNN only; ANN is rocks-engine only" | — |
+| SELECT trunk (WHERE / ORDER BY / LIMIT incl. `LIMIT o,n` / aggregates / GROUP BY+HAVING) | yes | yes (IR renderer → SQLite; `LIMIT o,n` normalized to `LIMIT n OFFSET o`); SELECT DISTINCT and locking clauses (FOR UPDATE/FOR SHARE) → 1235; DECIMAL/AVG renderings drift | (k) |
+| JOIN / UNION / subquery | yes | 1235 (single-table allowlist: JOIN, derived tables, set operations, CTEs; grows by explicit renderer additions) | — |
+| INSERT / UPDATE / DELETE / TRUNCATE | full surface (ODKU/REPLACE, INSERT…SELECT, ORDER BY/LIMIT forms) | multi-row literal VALUES + optional column list; ODKU/REPLACE/INSERT…SELECT/UPDATE|DELETE with ORDER BY|LIMIT → 1235; TRUNCATE = DELETE FROM (0 affected) | (l),(m),(n) |
+| Transactions (BEGIN/COMMIT/ROLLBACK) | host MVCC txn (`sess.txn`); DDL in txn rejected 1235 | string passthrough on the session's pinned engine connection (the connection IS the txn state); MySQL's BEGIN-implies-commit emulated app-side; COMMIT/ROLLBACK outside a txn = no-op OK; DDL in txn native (SQLite semantics) | (t),(v),(w) |
+| Prepared statements | IR-stored, params bound then re-executed | same path (params bind into rdb's IR, then the router renders); prepared USE → 1235 on both | — |
+| SET TRANSACTION ISOLATION LEVEL | accepted+echoed; engine always snapshot RR | accepted+echoed; engine ignores (SQLite connection-level locking) | (u) |
+| Vector functions (STRING_TO_VECTOR / VECTOR_TO_STRING / VECTOR_DIM / DISTANCE cos·euclidean·dot; KNN) | rdb vecmath (f64), exact KNN + ANN | mapped onto turso built-ins (`vector32`/`vector_extract`/`length(vector32())/4`/`vector_distance_{cos,l2}` + sign-flipped dot); exact KNN only; wire text `'[..]'` on both engines; dim/format validated app-side (D6) | (q),(r),(s) |
+
+### turso deviation ledger (k)–(z)
+
+- (k) DECIMAL/NUMERIC rides REAL (SQLite has no exact decimals): value formatting
+  drifts (`10.50` → `10.5`); AVG over exact ints renders `2.5` where rocks renders
+  the decimal `2.5000`.
+- (l) no-op UPDATE (`SET x = x`): turso reports MATCHED rows (1); MySQL default and
+  rocks report CHANGED (0).
+- (m) multi-row INSERT last-insert id: turso reports the LAST rowid (OK packet and
+  `LAST_INSERT_ID()` alike — the pinned connection's `last_insert_rowid()`),
+  MySQL/rocks report the FIRST generated id (rocks' process-wide mirror: main
+  ledger AUTO_INCREMENT bullet). An explicit-id INSERT also echoes that rowid on
+  turso where MySQL keeps the previous value.
+- (n) TRUNCATE keeps the AUTOINCREMENT watermark (engine sequence table); rocks
+  resets the counter to 1 in the truncating raft window.
+- (o) SHOW CREATE TABLE returns the sqlite_master `sql` text verbatim (quoted
+  identifiers, SQLite spellings), not a MySQL-style rendering.
+- (p) DESCRIBE is best-effort: Type = lowercased SQLite declared type (`integer`,
+  not `int`); Null = NO for pk columns; Key = PRI or empty (no unique/secondary
+  key reporting); Default/Extra minimal. A declared `vector(N)` is re-dimensioned
+  from the CREATE TABLE text (turso's table_info normalizes `vector(3)` to bare
+  `vector`; the bare spelling survives only when the dim is unrecoverable, e.g.
+  odd external files); an externally BLOB-typed vector column shows `blob`.
+- (q) DISTANCE 'dot': turso = TRUE inner product (the wrapper flips turso's
+  negated simsimd convention); rocks = NEGATED (HeatWave convention, vector ledger
+  (g), pending real-MySQL verification) — the same ORDER BY yields mirrored
+  orderings and cross-engine value comparison diverges.
+- (r) cosine of identical vectors ≈ 1.79e-7 (simsimd f32 accumulation), rocks
+  exact 0 — comparisons need an epsilon (e2e uses 1e-6); distance columns are
+  f32 on turso vs f64 on rocks.
+- (s) unknown DISTANCE metric: turso 1235 ("DISTANCE metric '...' on turso
+  engine"), rocks 1292 from its own metric parser.
+- (t) DDL inside an open transaction: native on turso (SQLite semantics — the
+  host's `sess.txn` DDL guard never sees turso sessions); rejected 1235 on rocks.
+- (u) SET TRANSACTION ISOLATION LEVEL on a turso session: accepted and echoed via
+  `@@transaction_isolation` but ignored — actual behavior is SQLite
+  connection-level locking; the echoed value is a session-side record only.
+- (v) USE of a different database inside an open turso transaction → 1235
+  ("switching database inside a turso transaction (COMMIT or ROLLBACK first)");
+  MySQL allows USE mid-transaction.
+- (w) write/write contention between turso sessions: 5s busy-timeout on the
+  pinned connection, then 1205 (ER_LOCK_WAIT_TIMEOUT) with the engine's message;
+  the read path is WAL-style snapshot isolation — no dirty reads across
+  connections (two-connection e2e check).
+- (x) read-only libraries are decided by the FILE MODE BITS (`mode & 0o222 == 0`),
+  read directly instead of probing with open(2) — a privileged process (root)
+  bypasses permission checks and would otherwise keep writing a 0444 library;
+  writes against one answer 1290 ("turso database file is read-only: <name>.db").
+- (y) `CREATE DATABASE x ENGINE=turso` does not exist (sqlparser's
+  CreateDatabase has no ENGINE field): the `turso_` name prefix IS the marker;
+  non-prefixed CREATE/DROP DATABASE → 1235 (only `turso_*` exist as explicit
+  database objects; `rdb` is implicit).
+- (z) NOW() renders `datetime('now')`: UTC on both engines (no session timezone
+  exists anywhere), but turso truncates to whole seconds (TEXT) where rocks keeps
+  microseconds.
+- Non-lettered posture notes: UNSIGNED column types reject 1235 on BOTH engines
+  (shared parse surface, numbered ledger (9) — unchanged by the second engine);
+  the dependency is `default-features = false` (turso's default `mimalloc`
+  declares a process-wide `#[global_allocator]`, `fts` is unneeded) so the
+  embedded engine can never swap rdb's allocator; the feature rides `full` only.

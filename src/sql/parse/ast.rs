@@ -133,6 +133,22 @@ pub enum Statement {
     ShowStatus {
         like: Option<String>,
     },
+    /// `CREATE DATABASE [IF NOT EXISTS] name`: only `turso_*` names
+    /// exist as explicit database objects (one embedded-engine library
+    /// file each); the host database `rdb` is implicit and cannot be
+    /// created. The name prefix IS the engine marker (sqlparser's
+    /// CreateDatabase carries no ENGINE clause).
+    CreateDatabase {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP DATABASE [IF EXISTS] name`: deletes the turso library
+    /// file plus its raft-catalog existence entry. Dropping `rdb` is
+    /// refused (it is implicit, not an object).
+    DropDatabase {
+        name: String,
+        if_exists: bool,
+    },
     /// SET ...: accepted and ignored (no session variables in v1).
     SetIgnored,
     /// A compound query: optional CTEs, a set-operation body
@@ -553,7 +569,9 @@ impl Statement {
             | Statement::CreateIndex { .. }
             | Statement::DropIndex { .. }
             | Statement::TruncateTable { .. }
-            | Statement::RenameTable { .. } => "ddl",
+            | Statement::RenameTable { .. }
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. } => "ddl",
             Statement::Select(_) => "select",
             Statement::Insert { .. } => "insert",
             Statement::Update { .. } => "update",

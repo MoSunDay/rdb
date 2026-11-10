@@ -32,9 +32,17 @@ full = [
     "dep:sha1",
     "dep:socket2",
     "dep:sqlparser",
+    # The embedded engine's code is compiled into every full build and
+    # runtime-gated by conf (`turso_engine` + `turso_db_dir`); without
+    # the feature the e2e binary could not carry the engine at all.
+    "turso-engine",
     "dep:tracing-subscriber",
 ]
 store = []
+# Embedded turso engine (pure-Rust SQLite-compatible, tursodatabase/turso).
+# Runtime-gated by conf `turso_engine` + `turso_db_dir`; pinned pre-1.0
+# version on purpose (R1 in plans/2026-11-09-turso-engine).
+turso-engine = ["dep:turso"]
 # Produce-side decompression of compressed RecordBatches (gzip/snappy/
 # lz4). Pure-Rust backends only (flate2=miniz_oxide, snap, lz4_flex);
 # zstd stays out (C dependency). Deliberately NOT in `default`/`full`:
@@ -64,6 +72,14 @@ socket2 = { version = "0.6", features = ["all"], optional = true }
 # MySQL-protocol frontend (M1): shim + SQL parsing + native-password auth.
 opensrv-mysql = { version = "=0.7.0", default-features = false, optional = true }
 sqlparser = { version = "=0.62.0", optional = true }
+# Embedded turso engine (feature `turso-engine`): pure-Rust, SQLite-format
+# compatible (files + dialect + C API, tracking 3.50.4). Pinned exact:
+# pre-1.0 API churn (upgrade = dedicated mini-plan).
+# default-features off: turso's default `mimalloc` feature declares
+# #[global_allocator] inside the crate, which would swap the whole rdb
+# process to mimalloc; `fts` is unneeded (verified by T0 smoke, see
+# plans/2026-11-09-turso-engine/00-research.md D1/⑨).
+turso = { version = "=0.9.0-pre.2", default-features = false, optional = true }
 sha1 = { version = "0.10", optional = true }
 async-trait = { version = "0.1", optional = true }
 # Chinese word segmentation for the FT.* search tokenizer (embedded dict).

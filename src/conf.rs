@@ -112,6 +112,15 @@ pub struct Config {
     /// Node-to-node SQL RPC (sub-plans, 2PC); empty = disabled.
     #[serde(default, rename = "sql_rpc_bind")]
     pub sql_rpc_bind: String,
+    /// Embedded turso engine switch (T1 of plans/2026-11-09-turso-engine):
+    /// false (default) keeps the SQL plane exactly on the rocks engine.
+    #[serde(default, rename = "turso_engine")]
+    pub turso_engine: bool,
+    /// Root directory of the per-database turso library files
+    /// (`<turso_db_dir>/<name>.db`); the engine stays disabled while
+    /// empty, so `turso_engine: true` alone changes nothing.
+    #[serde(default, rename = "turso_db_dir")]
+    pub turso_db_dir: String,
     /// Columnar engine: max rows one transaction/INSERT statement may
     /// append before the flush refuses it (0 = built-in default 65536).
     #[serde(default, rename = "columnar_flush_rows")]

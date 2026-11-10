@@ -440,6 +440,14 @@ fn translate(stmt: SqlStatement, sr: Option<&StarRocksModel>) -> SqlResult<State
         SqlStatement::Update(u) => super::translate_dml::translate_update(u),
         SqlStatement::Delete(d) => super::translate_dml::translate_delete(d),
         SqlStatement::CreateTable(c) => translate_create_table(c, sr),
+        SqlStatement::CreateDatabase {
+            db_name,
+            if_not_exists,
+            ..
+        } => Ok(Statement::CreateDatabase {
+            name: object_name(&db_name)?,
+            if_not_exists,
+        }),
         SqlStatement::Drop {
             object_type,
             if_exists,

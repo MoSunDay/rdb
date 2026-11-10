@@ -118,6 +118,13 @@ pub struct SqlSession {
     /// functions see it through per-exec substitution
     /// ([`session_funcs`]), never a global.
     pub info: SessionInfo,
+    /// Pinned turso-engine connection of the session's current turso
+    /// database (None while the session sits on a host-engine db; see
+    /// `sql::turso`). One connection per (session, database), held
+    /// across statements so explicit transactions ride a single engine
+    /// connection. Feature-gated: absent builds never see it.
+    #[cfg(feature = "turso-engine")]
+    pub turso: Option<std::sync::Arc<tokio::sync::Mutex<crate::sql::turso::ConnHandle>>>,
 }
 
 /// Connection identity for the session scalar functions. A snapshot of
@@ -185,6 +192,12 @@ async fn dispatch(
     // DDL mutates the raft-replicated catalog; refusing it inside an
     // open transaction keeps snapshot reads consistent with the schema
     // they were planned against.
+    // DIVERGENCE (ledger, T6 to lift): turso libraries support DDL
+    // inside a transaction (SQLite semantics) -- this guard only sees
+    // `sess.txn`, which turso sessions never set (their transactions
+    // live on the pinned engine connection), so turso DDL executes
+    // natively inside the open SQLite transaction while rocks DDL is
+    // rejected.
     if sess.txn.is_some()
         && matches!(
             stmt,
@@ -196,12 +209,23 @@ async fn dispatch(
                 // (decision point 5): reject in-txn, never stage.
                 | Statement::TruncateTable { .. }
                 | Statement::RenameTable { .. }
+                // CREATE/DROP DATABASE mutate the raft catalog (and
+                // the turso library files) exactly like table DDL:
+                // refused inside an open transaction.
+                | Statement::CreateDatabase { .. }
+                | Statement::DropDatabase { .. }
         )
     {
         return Err(SqlError::new(
             ErrorCode::TxnDdl,
             "DDL not allowed inside a transaction".to_string(),
         ));
+    }
+    // Per-session engine routing: turso_* databases ride the embedded
+    // engine (None = host engine, fall through unchanged).
+    #[cfg(feature = "turso-engine")]
+    if let Some(out) = crate::sql::turso::route(shared, sess, &stmt).await? {
+        return Ok(out);
     }
     match stmt {
         Statement::Begin => {
@@ -247,6 +271,22 @@ async fn dispatch(
             Ok(ExecOutcome::Rows { columns, rows })
         }
         Statement::Explain(inner) => select::explain(shared, &inner),
+        // Database objects (turso-engine libraries): CREATE/DROP
+        // DATABASE ride the turso catalog arm on engine builds; a
+        // featureless build answers the same 1235 the engine's other
+        // boundaries use.
+        Statement::CreateDatabase { .. } | Statement::DropDatabase { .. } => {
+            #[cfg(feature = "turso-engine")]
+            {
+                crate::sql::turso::catalog::run(shared, sess, &stmt).await
+            }
+            #[cfg(not(feature = "turso-engine"))]
+            {
+                Err(SqlError::unsupported(
+                    "CREATE/DROP DATABASE (built without the turso engine)",
+                ))
+            }
+        }
         Statement::ShowTables
         | Statement::ShowColumns(_)
         | Statement::ShowIndexes(_)
@@ -255,6 +295,12 @@ async fn dispatch(
         | Statement::ShowVariables { .. }
         | Statement::ShowStatus { .. } => show::run(shared, sess, &stmt),
         Statement::Use(db) => {
+            // Defensive in-process twin of the frontend's on_init
+            // check: a turso session inside an open engine
+            // transaction must not silently re-pin onto another
+            // library (1235; see turso::check_use).
+            #[cfg(feature = "turso-engine")]
+            crate::sql::turso::check_use(sess, &db).await?;
             sess.db = db;
             Ok(ExecOutcome::Ok)
         }
@@ -262,6 +308,10 @@ async fn dispatch(
         Statement::SetIsolation { level } => {
             // Stored for `@@transaction_isolation` reporting; the
             // engine runs one isolation (snapshot = REPEATABLE READ).
+            // DIVERGENCE (ledger, T6): turso libraries IGNORE the
+            // isolation setting -- actual behavior is SQLite
+            // connection-level locking semantics; the echoed value is
+            // a session-side record only.
             sess.isolation = Some(level.replace(' ', "-"));
             Ok(ExecOutcome::Ok)
         }

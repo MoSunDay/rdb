@@ -56,6 +56,7 @@ Commit: b0d81c9
 | `2026-10-06-mysql-hardening/` | 部分落地 | 6 | M0–M5 评审缺陷修复（H0 静默错误结果清零已落地，H1 协议会话/H2 唯一性索引/H3 P2 功能/H4 测试卫生 proposed） |
 | `2026-10-07-mq-p3-backfill/` | landed | 1 | P3 按需池全池补齐（总览即 README.md）：#1–#15 分诊（13 立项、#3 观望、#9 LIMIT 语义收缩），W0 conf → W1 三车道（kafka/lite/http）→ W2 消费者 idle GC → W4 台账收尾 |
 | `2026-11-02-turso-ref/` | landed | 5 | 以 tursodatabase/libsql（pin d8bc862d）为 1:1 参考：VECTOR(N) 类型/函数面 + 精确 KNN（V1）→ SQ8/SPANN ANN 索引（V2）+ SQL 引擎性能批次（前缀 seek/pk 点查/top-N/hash join）与 mysql bench 基线 |
+| `2026-11-09-turso-engine/` | landed | 2 | 第二嵌入式引擎 tursodatabase/turso（pin =0.9.0-pre.2）：T0 研究（00-research 嵌入 API 调查 + 00-rdb-context 落点地图）→ T1 `turso_` 前缀库级路由 → T2 目录/库文件 → T3 CRUD 翻译与双引擎 parity → T4 向量面（精确 KNN）→ T5 事务/预编译 → T6 对照矩阵与台账收尾 |
 
 `2026-10-06-mq-gap/` 背景：以常用 MQ 功能清单为尺，对 Lite（RESP 动词面）、
 Kafka（wire 面）、HTTP（rocksmq 面）三面做只读差距复核，产出分级处置矩阵；
@@ -81,6 +82,14 @@ C 级与"显式不做"进入按需池固化，避免无触发条件的功能蔓�
 > 已合入（fda8098 DLQ 水位提交后结算/sweep 批作废、80a3bc2 headers 存储形态、
 > d043311 组语义：DLQ 校验/有序接管/续读游标/DESTROY 折叠账本）；Batch 2
 > （延迟消息/HTTP parity/kafka admin+SASL）为下一批次，推进中。
+
+> 2026-11-09 注记（turso-engine）：T0–T6 全量落地（研究决策 `00-research.md`
+> （D1–D8 拍板）与 rdb 侧落点 `00-rdb-context.md`；T1–T5 代码 + 六个
+> `turso_*_e2e` 套件，T6 文档收尾）；摘要归档
+> `features/changelog/2026-11-09/turso-engine.md`，两引擎语句对照矩阵与偏差
+> 台账 (k)–(z) 见 `COMPAT.sql.md` "turso engine" 节，e2e 台账见
+> `features/e2e-coverage.md`；后续（ANN 跟随上游、pre-1.0 升级 mini-plan、
+> JOIN/子查询 allowlist 渐进扩容）见 changelog 同名节。
 
 内部文档：
 

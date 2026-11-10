@@ -185,6 +185,33 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
     集群/HA 编排套件（sql_2pc/sql_join_cluster/sql_setop_cluster/sql_dist_read/
     sql_restart/sql_composite_pk/sql_ddl_visibility/starrocks_model/
     sql_upsert_cluster）**有意未迁移**（自带编排/取证样板，后续分批）。
+- **turso 引擎（2026-11-09 turso-engine，首次入台账；计划
+  `plans/2026-11-09-turso-engine/`，摘要 `changelog/2026-11-09/turso-engine.md`，
+  契约/偏差台账 `COMPAT.sql.md` "turso engine" 节）**——六套件均为真进程 +
+  yaml 注入 `turso_engine`/`turso_db_dir`（临时目录），双引擎偏差在引擎侧断言：
+  - `turso_smoke_e2e`（2）：T1 路由骨架——`turso_` 库上常量算术由嵌入式引擎应答、
+    引擎绑定未实现语句统一 1235、默认（rocks）库零行为变化；独立节点用例：
+    未开引擎节点 `USE turso_x` 仍 1049。
+  - `turso_catalog_e2e`（1）：T2 库对象面——CREATE/DROP DATABASE（1007/1008/IF
+    形状 + raft 存在性条目 + 库文件）、SHOW DATABASES 合并（rdb ∪ `*.db`）、
+    sqlite_master 三件 SHOW（SHOW TABLES/DESCRIBE/SHOW CREATE TABLE）、最小
+    INSERT/SELECT 往返、文件权限位决定的只读重开（写 → 1290）。
+  - `turso_crud_e2e`（1）：T3 CRUD 干线——类型化建表（pk AUTO_INCREMENT/NOT
+    NULL/内联二级索引）、多行 INSERT（引擎侧 id 分配 + last-insert id）、SELECT
+    干线（WHERE/ORDER/LIMIT 含 `LIMIT o,n` 交换/GROUP BY 聚合）、UPDATE/DELETE
+    affected 检查、TRUNCATE/DROP、allowlist 外 1235 拒绝矩阵。
+  - `turso_parity_e2e`（1）：同 schema 同语句双引擎（`USE rdb` vs `USE turso_parity`）
+    对照——一致面全等 + 五条台账偏差引擎侧断言（DECIMAL→REAL 渲染、AVG 格式、
+    no-op UPDATE affected、多行 INSERT last-insert id、TRUNCATE 自增水位）。
+  - `turso_vector_e2e`（1）：T4 向量面——VECTOR(N) DDL/DESCRIBE、应用侧维度校验
+    写路径、STRING_TO_VECTOR/VECTOR_TO_STRING/VECTOR_DIM/DISTANCE 函数族、精确
+    KNN（ORDER BY DISTANCE … LIMIT）、1292/1582 错误矩阵、CREATE VECTOR INDEX
+    1235、与 rocks 同数据同查询的 id 序 parity（数值断言 epsilon=1e-6，f32 vs
+    f64 纪律）。
+  - `turso_txn_e2e`（1）：T5 事务/预编译/会话边角——字符串直通 BEGIN/COMMIT/
+    ROLLBACK（含 MySQL BEGIN 隐式提交语义）、txn 外 no-op COMMIT/ROLLBACK、
+    prepared INSERT/SELECT `?` 绑定、事务内 USE 换库 1235、双连接脏读检查
+    （WAL 式快照无脏读）、隔离级别回显（会话记录，引擎忽略）。
 - **Shell 场景**：新增 `scenario_ha_failover.sh`（首次启用 `e2e_kill_node`，kill→MOVED-backup ~4-5s、
   回切 ~5s）、`scenario_lite_mq.sh`（XADD/XREADGROUP/XPENDING/XACK/XAUTOCLAIM + ORDERED/INFLIGHT，
   2026-10-06 增 (g) DLQ/MAXDELIVERY 死信+DLQ 独立消费、(h) XTRIM MINID/LIMIT/时间窗

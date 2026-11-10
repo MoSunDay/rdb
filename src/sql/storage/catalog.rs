@@ -37,6 +37,22 @@ pub const SEQUENCE_PREFIX: &str = "sql_sequence/";
 /// and is what both id allocation and the MVCC GC read.
 pub const DROPPED_PREFIX: &str = "sql_dropped/";
 
+/// FSM key prefix under which explicit database objects live
+/// (`sql_db/<name>` -> engine marker, currently "turso"). Only the
+/// turso-engine `turso_*` libraries exist as explicit databases; the
+/// host database `rdb` is implicit and has no entry. An empty value is
+/// the standard tombstone (readers treat it as absent).
+pub const SQL_DB_PREFIX: &str = "sql_db/";
+
+/// The engine-marker value stored under [`SQL_DB_PREFIX`] for turso
+/// libraries (kept as data so a future second engine extends rather
+/// than rewrites the entries).
+pub const SQL_DB_TURSO: &str = "turso";
+
+pub fn db_key(name: &str) -> String {
+    format!("{SQL_DB_PREFIX}{name}")
+}
+
 pub fn catalog_key(table: &str) -> String {
     format!("{CATALOG_PREFIX}{table}")
 }

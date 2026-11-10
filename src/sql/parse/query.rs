@@ -128,8 +128,14 @@ pub(crate) fn translate_select(sel: &sqlparser::ast::Select) -> SqlResult<Query>
         None => TableRef::NoTable,
     };
     let group_by = match &sel.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
+        // WITH ROLLUP/CUBE/TOTALS modifiers previously fell through
+        // this arm silently (plain GROUP BY semantics) -- reject them
+        // loudly instead, on BOTH engines (turso T3: no silent drift).
+        sqlparser::ast::GroupByExpr::Expressions(exprs, mods) if mods.is_empty() => {
             translate_group_for_select(exprs, &items)?
+        }
+        sqlparser::ast::GroupByExpr::Expressions(_, _) => {
+            return Err(SqlError::unsupported("GROUP BY WITH ROLLUP/CUBE/TotalS"))
         }
         sqlparser::ast::GroupByExpr::All(_) => return Err(SqlError::unsupported("GROUP BY ALL")),
     };

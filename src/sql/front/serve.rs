@@ -90,6 +90,9 @@ async fn handle_conn(sock: TcpStream, shared: Arc<Shared>, user: String, passwor
     // BEGIN's snapshot registered; release it so the GC watermark never
     // pins on a dead session (staged writes die with it -- nothing was
     // written to the store).
+    // Turso sessions need no mirroring cleanup: the pinned engine
+    // connection (`sess.turso`) drops together with this session
+    // handle and the engine rolls back any open transaction on close.
     let mut sess = sess.lock().await;
     if let Some(txn) = sess.txn.take() {
         crate::sql::tx::rollback(&shared.sql_ts, txn);
