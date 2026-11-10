@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::io::{Seek, SeekFrom, Read as StdRead};
+use std::io::{Read as StdRead, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -52,7 +52,10 @@ impl Standalone {
     fn alive(&mut self, what: &str) {
         match self.child.try_wait() {
             Ok(None) => {}
-            Ok(Some(st)) => panic!("standalone exited during {what} (status {st})\n{}", self.stderr_tail()),
+            Ok(Some(st)) => panic!(
+                "standalone exited during {what} (status {st})\n{}",
+                self.stderr_tail()
+            ),
             Err(e) => panic!("try_wait failed: {e}"),
         }
     }
@@ -111,7 +114,10 @@ fn free_port_block() -> u16 {
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
         let held: Vec<_> = (0u16..=10)
-            .filter_map(|o| port.checked_add(o).and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok()))
+            .filter_map(|o| {
+                port.checked_add(o)
+                    .and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok())
+            })
             .collect();
         if held.len() == 11 {
             return port;
@@ -214,7 +220,10 @@ async fn standalone_boots_every_protocol_and_restarts_idempotently() {
         "{}",
         s.stderr_tail()
     );
-    assert_eq!(text(&cmd_one_shot(&resp, &token, &[b"GET", b"k"]).await), "$1\r\nv");
+    assert_eq!(
+        text(&cmd_one_shot(&resp, &token, &[b"GET", b"k"]).await),
+        "$1\r\nv"
+    );
 
     // Auto topology: CLUSTER INFO/NODES answer with NO manual CLUSTER
     // INIT once ensure_topology's seed replicates (3s sync flips ready).
@@ -269,7 +278,11 @@ async fn standalone_boots_every_protocol_and_restarts_idempotently() {
             break;
         }
         s2.alive("post-restart GET");
-        assert!(Instant::now() < deadline, "data lost after restart\n{got}\n{}", s2.stderr_tail());
+        assert!(
+            Instant::now() < deadline,
+            "data lost after restart\n{got}\n{}",
+            s2.stderr_tail()
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let info = text(&cmd_one_shot(&resp, &token, &[b"cluster", b"info"]).await);

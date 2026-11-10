@@ -70,7 +70,9 @@ async fn turso_txn_end_to_end() {
     c.query_drop("INSERT INTO t VALUES (3, 'kept')")
         .await
         .expect("insert in first txn");
-    c.query_drop("BEGIN").await.expect("begin 2 (implicit commit)");
+    c.query_drop("BEGIN")
+        .await
+        .expect("begin 2 (implicit commit)");
     c.query_drop("ROLLBACK").await.expect("rollback second txn");
     assert_eq!(
         common::mysql::col(&mut c, "SELECT id FROM t WHERE id = 3").await,
@@ -80,7 +82,9 @@ async fn turso_txn_end_to_end() {
 
     // (t4) COMMIT/ROLLBACK outside any transaction are no-op OKs
     // (MySQL shape), never errors.
-    c.query_drop("COMMIT").await.expect("bare commit is a no-op");
+    c.query_drop("COMMIT")
+        .await
+        .expect("bare commit is a no-op");
     c.query_drop("ROLLBACK")
         .await
         .expect("bare rollback is a no-op");
@@ -88,18 +92,12 @@ async fn turso_txn_end_to_end() {
     // (t5) prepared statements: INSERT with `?` placeholders executed
     // twice with different values (parse once, rebind), prepared
     // SELECT with `?` in WHERE.
-    c.exec_drop(
-        "INSERT INTO t (id, v) VALUES (?, ?)",
-        (4i64, "prepped-a"),
-    )
-    .await
-    .expect("prepared insert a");
-    c.exec_drop(
-        "INSERT INTO t (id, v) VALUES (?, ?)",
-        (5i64, "prepped-b"),
-    )
-    .await
-    .expect("prepared insert b (rebind)");
+    c.exec_drop("INSERT INTO t (id, v) VALUES (?, ?)", (4i64, "prepped-a"))
+        .await
+        .expect("prepared insert a");
+    c.exec_drop("INSERT INTO t (id, v) VALUES (?, ?)", (5i64, "prepped-b"))
+        .await
+        .expect("prepared insert b (rebind)");
     let got: Vec<(i64, String)> = c
         .exec("SELECT id, v FROM t WHERE id >= ? ORDER BY id", (3i64,))
         .await
@@ -122,7 +120,8 @@ async fn turso_txn_end_to_end() {
     let e = mysql_server_error(&mut c, "USE turso_other").await;
     assert_eq!(e.code, ER_NOT_SUPPORTED_YET, "{e:?}");
     assert!(
-        e.message.contains("switching database inside a turso transaction"),
+        e.message
+            .contains("switching database inside a turso transaction"),
         "t6 message: {e:?}"
     );
     // Still on turso_txn, still inside the transaction.

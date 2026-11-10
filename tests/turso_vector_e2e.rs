@@ -15,8 +15,8 @@
 mod common;
 
 use common::mysql::{
-    ddl, rows, run, s, spawn_node_mysql_yaml, ER_TRUNCATED_WRONG_VALUE, ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
-    PASS,
+    ddl, rows, run, s, spawn_node_mysql_yaml, ER_TRUNCATED_WRONG_VALUE,
+    ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT, PASS,
 };
 use common::{mysql_root_conn, mysql_server_error, wait_mysql_ready, wait_resp_ready};
 use mysql_async::prelude::Queryable;
@@ -65,7 +65,11 @@ const DATASET: &[(&str, &str)] = &[
 
 /// Create the shared table and load DATASET on one connection.
 async fn setup(c: &mut mysql_async::Conn) {
-    ddl(c, "CREATE TABLE vecs (id INT PRIMARY KEY, v VECTOR(3) NOT NULL)").await;
+    ddl(
+        c,
+        "CREATE TABLE vecs (id INT PRIMARY KEY, v VECTOR(3) NOT NULL)",
+    )
+    .await;
     let values = DATASET
         .iter()
         .map(|(id, v)| format!("({id}, '{v}')"))
@@ -105,10 +109,8 @@ async fn turso_vector_end_to_end() {
     // (b) Read-back: stored blobs decode to the canonical '[e,e,...]'
     // text, byte-identical to the rocks engine's spellings.
     let got = rows(&mut c, "SELECT id, v FROM vecs ORDER BY id").await;
-    let want: Vec<Vec<mysql_async::Value>> = DATASET
-        .iter()
-        .map(|(id, v)| vec![s(id), s(v)])
-        .collect();
+    let want: Vec<Vec<mysql_async::Value>> =
+        DATASET.iter().map(|(id, v)| vec![s(id), s(v)]).collect();
     assert_eq!(got, want);
     setup(&mut r).await;
     assert_eq!(
@@ -133,7 +135,11 @@ async fn turso_vector_end_to_end() {
         vec![vec![s("[1.5,2.5]")]]
     );
     assert_eq!(
-        rows(&mut c, "SELECT VECTOR_DIM('[1,2]'), VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))").await,
+        rows(
+            &mut c,
+            "SELECT VECTOR_DIM('[1,2]'), VECTOR_DIM(STRING_TO_VECTOR('[1,2,3]'))"
+        )
+        .await,
         vec![vec![s("2"), s("3")]]
     );
     // VECTOR_DIM(NULL) is NULL on both engines (turso needs the CASE
@@ -149,7 +155,11 @@ async fn turso_vector_end_to_end() {
     // plan's D5 -- rocks negates instead, see the ledger note below).
     assert!(
         near(
-            scalar_f64(&mut c, "SELECT DISTANCE(v, v, 'cosine') FROM vecs WHERE id = 1").await,
+            scalar_f64(
+                &mut c,
+                "SELECT DISTANCE(v, v, 'cosine') FROM vecs WHERE id = 1"
+            )
+            .await,
             0.0
         ),
         "cosine of identical vectors is ~0, not exactly 0"
@@ -187,9 +197,12 @@ async fn turso_vector_end_to_end() {
         d3
     ));
     assert_eq!(
-        mysql_server_error(&mut c, "SELECT DISTANCE(v, '[1,0,0]') FROM vecs WHERE id = 1")
-            .await
-            .code,
+        mysql_server_error(
+            &mut c,
+            "SELECT DISTANCE(v, '[1,0,0]') FROM vecs WHERE id = 1"
+        )
+        .await
+        .code,
         ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT
     );
 
@@ -200,9 +213,8 @@ async fn turso_vector_end_to_end() {
         ("cosine", vec!["1", "5", "2", "3", "6", "4", "7", "8"]),
         ("euclidean", vec!["2", "8", "3", "5", "1", "6", "4", "7"]),
     ] {
-        let sql = format!(
-            "SELECT id FROM vecs ORDER BY DISTANCE(v, '[1,0,0]', '{metric}') LIMIT 8"
-        );
+        let sql =
+            format!("SELECT id FROM vecs ORDER BY DISTANCE(v, '[1,0,0]', '{metric}') LIMIT 8");
         assert_eq!(ids(&rows(&mut c, &sql).await), want, "turso {metric}");
         assert_eq!(
             ids(&rows(&mut r, &sql).await),
@@ -214,7 +226,11 @@ async fn turso_vector_end_to_end() {
         let sql = format!(
             "SELECT id FROM vecs ORDER BY DISTANCE(v, STRING_TO_VECTOR('[1,0,0]'), '{metric}') LIMIT 3"
         );
-        assert_eq!(ids(&rows(&mut c, &sql).await), &want[..3], "turso {metric} k=3");
+        assert_eq!(
+            ids(&rows(&mut c, &sql).await),
+            &want[..3],
+            "turso {metric} k=3"
+        );
     }
     // A distance column itself rides the resultset (f32 vs f64
     // accumulation: epsilon, never equality).
@@ -258,19 +274,24 @@ async fn turso_vector_end_to_end() {
         assert_eq!(er.code, 1136, "{sql}: {er:?}");
         assert_eq!(e.message, er.message, "{sql}: message parity with rocks");
         assert!(
-            e.message.contains("cannot store Int(5) into Vector { dim: 3 } column"),
+            e.message
+                .contains("cannot store Int(5) into Vector { dim: 3 } column"),
             "{e:?}"
         );
     }
     // The dimension message, verbatim on both engines.
     let e = mysql_server_error(&mut c, "INSERT INTO vecs VALUES (9, '[1,2]')").await;
     assert!(
-        e.message.contains("vector has 2 dimensions, column expects 3"),
+        e.message
+            .contains("vector has 2 dimensions, column expects 3"),
         "{e:?}"
     );
     // Malformed literals: same shape (parse-level text differs by
     // engine -- code parity only).
-    for sql in ["INSERT INTO vecs VALUES (9, 'nope')", "SELECT TO_VECTOR('nope')"] {
+    for sql in [
+        "INSERT INTO vecs VALUES (9, 'nope')",
+        "SELECT TO_VECTOR('nope')",
+    ] {
         assert_eq!(
             mysql_server_error(&mut c, sql).await.code,
             ER_TRUNCATED_WRONG_VALUE,
@@ -289,7 +310,9 @@ async fn turso_vector_end_to_end() {
     );
     // Arity is parse-time (both engines): 1582.
     assert_eq!(
-        mysql_server_error(&mut c, "SELECT VECTOR_DIM(v, v) FROM vecs WHERE id = 1").await.code,
+        mysql_server_error(&mut c, "SELECT VECTOR_DIM(v, v) FROM vecs WHERE id = 1")
+            .await
+            .code,
         ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT
     );
     // UPDATE with a well-formed vector round-trips.

@@ -78,7 +78,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<StandaloneOpts, String> {
                     .map_err(|_| format!("invalid --port (expected 1-65535)\n{USAGE}"))?;
                 // +10 derivation must stay inside the u16 port range.
                 if p > 65525 {
-                    return Err(format!("--port {p} too high: +10 derivation would overflow\n{USAGE}"));
+                    return Err(format!(
+                        "--port {p} too high: +10 derivation would overflow\n{USAGE}"
+                    ));
                 }
                 opts.port = p;
             }
@@ -151,16 +153,28 @@ pub(crate) fn resolve_token(dir: &Path, explicit: Option<&str>) -> Result<TokenC
         if t.is_empty() {
             return Err("--token must not be empty".to_string());
         }
-        return Ok(TokenChoice { token: t.to_string(), persist: Some(t.to_string()), generated: false });
+        return Ok(TokenChoice {
+            token: t.to_string(),
+            persist: Some(t.to_string()),
+            generated: false,
+        });
     }
     if let Ok(existing) = std::fs::read_to_string(dir.join(TOKEN_FILE)) {
         let t = existing.trim().to_string();
         if !t.is_empty() {
-            return Ok(TokenChoice { token: t, persist: None, generated: false });
+            return Ok(TokenChoice {
+                token: t,
+                persist: None,
+                generated: false,
+            });
         }
     }
     let t = random_token()?;
-    Ok(TokenChoice { token: t.clone(), persist: Some(t), generated: true })
+    Ok(TokenChoice {
+        token: t.clone(),
+        persist: Some(t),
+        generated: true,
+    })
 }
 
 /// The one write side effect, deliberately deferred past the refusal
@@ -171,7 +185,10 @@ pub(crate) fn persist_token(dir: &Path, choice: &TokenChoice) -> Result<(), Stri
         let path = dir.join(TOKEN_FILE);
         write_token(&path, t)?;
         if choice.generated {
-            eprintln!("[standalone] generated auth token (saved to {}): {t}", path.display());
+            eprintln!(
+                "[standalone] generated auth token (saved to {}): {t}",
+                path.display()
+            );
         }
     }
     Ok(())
@@ -233,8 +250,16 @@ pub(crate) fn endpoints(c: &conf::Config) -> String {
     format!(
         "endpoints: resp={} monitor={} raft-http={} raft-tcp={} mysql={} sql-rpc={} \
          kafka={} rocksmq={} es={} s3={}",
-        c.bind, c.monitor_addr, c.http_address, c.raft_tcp_address, c.mysql_bind,
-        c.sql_rpc_bind, c.kafka_bind, c.rocksmq_bind, c.es_bind, c.s3_bind
+        c.bind,
+        c.monitor_addr,
+        c.http_address,
+        c.raft_tcp_address,
+        c.mysql_bind,
+        c.sql_rpc_bind,
+        c.kafka_bind,
+        c.rocksmq_bind,
+        c.es_bind,
+        c.s3_bind
     )
 }
 
@@ -256,7 +281,12 @@ pub(crate) fn conf_from_args(args: &[String]) -> Result<Option<(conf::Config, Bo
         eprintln!("[standalone] warning: {w}");
     }
     let token = resolve_token(&opts.dir, opts.token.as_deref())?;
-    eprintln!("[standalone] host={} port={} dir={}", opts.host, opts.port, opts.dir.display());
+    eprintln!(
+        "[standalone] host={} port={} dir={}",
+        opts.host,
+        opts.port,
+        opts.dir.display()
+    );
     let conf = build_conf(&opts, &token.token);
     eprintln!("[standalone] {}", endpoints(&conf));
     Ok(Some((conf, Boot { opts, token })))
@@ -300,9 +330,11 @@ fn sql_nodes_seed(c: &conf::Config, current_registry: &str) -> Option<rtypes::Ra
         mysql: c.mysql_bind.clone(),
         sql_rpc: c.sql_rpc_bind.clone(),
     };
-    sql::tx::nodes::merged_registry(current_registry, &binds).map(|value| rtypes::RaftLogEntryData {
-        key: sql::tx::nodes::SQL_NODES_KEY.to_string(),
-        value,
+    sql::tx::nodes::merged_registry(current_registry, &binds).map(|value| {
+        rtypes::RaftLogEntryData {
+            key: sql::tx::nodes::SQL_NODES_KEY.to_string(),
+            value,
+        }
     })
 }
 
@@ -313,7 +345,12 @@ fn sql_nodes_seed(c: &conf::Config, current_registry: &str) -> Option<rtypes::Ra
 /// re-checks, so this is an optimization of the failure point, not the
 /// only guard.
 pub(crate) fn refuse_multi_node_store(kv: &rdb::rcache::fsm::KvMap, own_bind: &str) {
-    let current = kv.read().unwrap().get(TOPOLOGY_KEY).cloned().unwrap_or_default();
+    let current = kv
+        .read()
+        .unwrap()
+        .get(TOPOLOGY_KEY)
+        .cloned()
+        .unwrap_or_default();
     if let TopologyPlan::Refuse(v) = topology_plan(&current, own_bind) {
         eprintln!(
             "[standalone] refusing to start: this store holds a multi-node \
@@ -362,7 +399,9 @@ pub(crate) fn spawn_ensure_topology(raft_state: Arc<RwLock<state::RaftState>>, c
                     Ok(()) => {
                         // Best-effort seed, exactly like `cluster init`:
                         // the 3s registration loop re-covers a failure.
-                        if let Some(seed) = sql_nodes_seed(&c, &read_key(sql::tx::nodes::SQL_NODES_KEY)) {
+                        if let Some(seed) =
+                            sql_nodes_seed(&c, &read_key(sql::tx::nodes::SQL_NODES_KEY))
+                        {
                             let started =
                                 state::raft_apply_start(&mut raft_state.write().unwrap(), &seed);
                             let seeded = match started {

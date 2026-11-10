@@ -24,16 +24,25 @@ fn parse_defaults_and_forms() {
     let p = parse(&["--host", "0.0.0.0", "--port", "7000"]).unwrap();
     assert_eq!((p.host.as_str(), p.port), ("0.0.0.0", 7000));
     let eq = parse(&["--host=::1", "--port=1", "--dir=/tmp/x", "--token=t"]).unwrap();
-    assert_eq!((eq.host.as_str(), eq.port, eq.dir.to_str().unwrap()), ("::1", 1, "/tmp/x"));
+    assert_eq!(
+        (eq.host.as_str(), eq.port, eq.dir.to_str().unwrap()),
+        ("::1", 1, "/tmp/x")
+    );
     assert_eq!(eq.token.as_deref(), Some("t"));
     // Last one wins.
     assert_eq!(parse(&["--port", "1", "--port", "2"]).unwrap().port, 2);
-    assert!(parse(&["--port", "abc"]).unwrap_err().contains("invalid --port"));
+    assert!(parse(&["--port", "abc"])
+        .unwrap_err()
+        .contains("invalid --port"));
     // +10 derivation must stay inside the u16 port range.
-    assert!(parse(&["--port", "65530"]).unwrap_err().contains("too high"));
+    assert!(parse(&["--port", "65530"])
+        .unwrap_err()
+        .contains("too high"));
     assert!(parse(&["--port", "65525"]).is_ok());
     assert!(parse(&["--port"]).unwrap_err().contains("needs a value"));
-    assert!(parse(&["--wat", "x"]).unwrap_err().contains("unknown standalone flag"));
+    assert!(parse(&["--wat", "x"])
+        .unwrap_err()
+        .contains("unknown standalone flag"));
 }
 
 #[test]
@@ -63,7 +72,10 @@ fn token_resolved_then_persisted_with_restart_reuse() {
     assert!(!dir.path().join(TOKEN_FILE).exists());
     // persist writes the file (and creates dir if missing).
     persist_token(dir.path(), &c1).expect("persist");
-    assert_eq!(std::fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(), c1.token);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(),
+        c1.token
+    );
     // Restart: same token read back, nothing to persist.
     let c2 = resolve_token(dir.path(), None).unwrap();
     assert_eq!(c2.token, c1.token);
@@ -71,18 +83,30 @@ fn token_resolved_then_persisted_with_restart_reuse() {
     assert!(!c2.generated);
     // Explicit --token wins and re-persists; file content follows.
     let c3 = resolve_token(dir.path(), Some("my-token")).unwrap();
-    assert_eq!((c3.token.as_str(), c3.persist.as_deref(), c3.generated), ("my-token", Some("my-token"), false));
+    assert_eq!(
+        (c3.token.as_str(), c3.persist.as_deref(), c3.generated),
+        ("my-token", Some("my-token"), false)
+    );
     persist_token(dir.path(), &c3).unwrap();
-    assert_eq!(std::fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(), "my-token");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(),
+        "my-token"
+    );
     // Empty / whitespace explicit token is refused; restart still reads
     // the last persisted value with nothing to rewrite.
     assert!(resolve_token(dir.path(), Some("  ")).is_err());
     assert!(resolve_token(dir.path(), Some("")).is_err());
     let c4 = resolve_token(dir.path(), None).unwrap();
-    assert_eq!((c4.token.as_str(), c4.persist.as_deref()), ("my-token", None));
+    assert_eq!(
+        (c4.token.as_str(), c4.persist.as_deref()),
+        ("my-token", None)
+    );
     // 0600 on the persisted file.
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(dir.path().join(TOKEN_FILE)).unwrap().permissions().mode();
+    let mode = std::fs::metadata(dir.path().join(TOKEN_FILE))
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o600);
     // persist with persist=None is a no-op (restart path leaves no write).
     persist_token(dir.path(), &c4).unwrap();
