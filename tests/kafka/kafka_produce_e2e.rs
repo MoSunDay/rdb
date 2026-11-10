@@ -11,6 +11,7 @@ use common::contains_bytes;
 use kafka_front_common::{kafka_req, kafka_round, resp_one_shot, spawn_kafka_node, wait_accepting};
 use rdb::kafka::frame::{put_array_len, put_i16, put_i32, put_i64, put_string, Reader};
 use rdb::kafka::record::{build_batch, crc32c, parse_batch, BatchRecord};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -384,11 +385,21 @@ async fn produce_appends_and_listoffsets_answer() {
         Some(300),
         "next response is ApiVersions, not a produce ack"
     );
-    let xlen = resp_one_shot(&resp, &[b"XLEN", b"t1/q0"]).await;
-    assert!(
-        contains_bytes(&xlen, b":5\r\n"),
-        "acks=0 still appends (eventually)"
-    );
+    // acks=0 append is asynchronous: poll XLEN until the batch lands instead
+    // of racing one immediate read.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let xlen = resp_one_shot(&resp, &[b"XLEN", b"t1/q0"]).await;
+        if contains_bytes(&xlen, b":5\r\n") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "acks=0 still appends (eventually): last XLEN={}",
+            String::from_utf8_lossy(&xlen)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
