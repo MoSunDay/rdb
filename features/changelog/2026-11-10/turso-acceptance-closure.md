@@ -33,7 +33,10 @@ SQ8/SPANN 已在案，turso 侧 ANN 另立计划）；向量 blob 另经文件�
 - CI 三段门全绿：`cargo fmt --check` / `cargo clippy --workspace
   --all-targets -- -D warnings` / `cargo test --workspace --no-fail-fast`
   （含新 `turso_sqlite_interop_e2e` 2 用例与
-  `standalone_boots_turso_engine_with_flag`）。
+  `standalone_boots_turso_engine_with_flag`，17 目标 2025 用例 0 失败）。
+  收口时 clippy 1.98 新 lint 已令基线转红（12 lib + 7 test 目标，全部
+  `src/sql/*` 既有代码与 reorg 残留），随批以行为保持改写清零
+  （`30121f4`）。
 - 宿主缺 sqlite3 CLI（或版本 <3.37.2）时互操作套件自跳过，不作硬依赖。
 - 验证在独立 worktree 内完成：主工作树有并行会话 WIP（es/search 面），未触碰。
 

@@ -46,7 +46,12 @@ docs, postings, term stats, centroids and ANN partitions together).
   range (a multi-token CJK stem degrades to AND of its tokens, star dropped —
   deviation); `|`/`OR` union, `AND` explicit, `NOT`/leading `-` complement
   (case-sensitive keywords; lowercase stays a term); `*` alone matches all;
-  no parentheses. `@num:[min max]` is an INCLUSIVE NUMERIC range over the
+  no parentheses. A clause scoped to a KEYWORD field matches EXACT bytes
+  as typed (keyword postings are un-tokenized -- ES `term`/`match` parity):
+  `@kw:Foo` matches only the value `Foo`, a quoted keyword body matches the
+  whole multi-word value, and the wrong case matches nothing (pre-2026-11-10
+  the shared grammar lowercased the clause, making mixed-case keyword values
+  silently unreachable). `@num:[min max]` is an INCLUSIVE NUMERIC range over the
   columnar doc-values in BOTH dialects (bounds are floats or `*`/`±inf` for
   open ends; scoped syntax only, a bare `[1 5]` stays a word; exclusive `(`
   bounds, fuzzy and geometric filters are NOT supported; a malformed range is

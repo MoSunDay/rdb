@@ -72,9 +72,12 @@ pub enum Plan {
     },
     /// Ordered adjacent tokens; positions come from the v2 postings
     /// (a position-less v1 record degrades to AND, see `eval_tree`).
+    /// `raw` = the query text as typed: a KEYWORD field is matched
+    /// exact-bytes on it (keyword-analyzer semantics).
     MatchPhrase {
         field: String,
         terms: Vec<Vec<u8>>,
+        raw: Vec<u8>,
     },
     /// Posting-key prefix iteration (ES `prefix` = term disjunction).
     Prefix {
@@ -534,6 +537,7 @@ fn parse_match_phrase(spec: &Value) -> Result<Plan, DslError> {
     Ok(Plan::MatchPhrase {
         field: field.clone(),
         terms,
+        raw: text.into_bytes(),
     })
 }
 

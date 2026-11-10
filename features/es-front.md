@@ -6,9 +6,16 @@
   （`src/search/`）——一个索引 = 一个用户 key = 一个 slot，RESP 侧 FT.CREATE 建的
   索引在 ES 面可直接查写（进程级 e2e `tests/es/es_search_e2e.rs` 有互操作证明）。
 - 接线：`es_bind`（空 = 关闭，backup 监听器天然不含）；`es_token` 非空时要求
-  `Authorization: Bearer <token>`。
+  `Authorization: Bearer <token>`；`es_max_connections` 活连接帽（0 = 内置 4096，
+  帽满静默断连 + 一行 stderr，镜像 kafka/rocksmq `ConnGuard`）。
 
 ## 端点面（HTTP/1.1，每连接一请求 `Connection: close`）
+- 传输护栏（2026-11-10 hardening）：活连接帽见上；handler 执行 30s 查询超时
+  （408 `timeout_exception`；head/body 读超时原本就有）；无 body 语义的方法
+  （GET/DELETE/HEAD…）携带 `Content-Length > 0` 直接 400，不再静默吞 body。
+  写请求也可能撞 30s 超时：latch 为 async RAII、写路径单批 fsync 且无后台线程，
+  超时不会留下半批写；但恰在边界完成的写客户端视角仍可能收到 408（写 >30s
+  属罕见）。
 - 元数据：`GET /`（tagline）、`GET /_cluster/health`（green/yellow）、
   `GET /_cat/indices`。
 - 索引：`PUT|GET|HEAD|DELETE /{index}`（mappings 往返；重复建 409；缺 404）。
@@ -16,7 +23,10 @@
   409）、`GET|HEAD|DELETE /{index}/_doc/{id}`。
 - 检索：`POST /{index}/_search`（见下）、`POST /{index}/_count`、
   `POST /{index}/_refresh`（no-op 成功回）。
-- 批量：`POST /_bulk`、`POST /{index}/_bulk`（NDJSON；`update` 动作按条报错不炸整批）。
+- 批量：`POST /_bulk`、`POST /{index}/_bulk`（NDJSON；`index`/`create` 可省
+  `_id` —— 服务端生成并在条目里回填（2026-11-10 修复：此前空 `_id` 恒报
+  "invalid document id"，auto-id 分支为死代码）；`update` 动作按条报错不炸整批；
+  单请求项数上限 100 000，超限整批 400）。
 
 ## 字段类型映射（权威）
 | ES mapping 类型 | FT.* 内核类型 |

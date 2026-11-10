@@ -14,6 +14,18 @@ fn term(t: &str) -> QueryNode {
     QueryNode::Term {
         field: None,
         term: t.as_bytes().to_vec(),
+        raw: t.as_bytes().to_vec(),
+    }
+}
+
+/// Unscoped term whose AS-TYPED stem differs from the token (e.g.
+/// `foo:bar` or `[1` -- punctuation splits into tokens, `raw` keeps
+/// the whole stem; unscoped TEXT lookups never use `raw`).
+fn term_raw(t: &str, r: &str) -> QueryNode {
+    QueryNode::Term {
+        field: None,
+        term: t.as_bytes().to_vec(),
+        raw: r.as_bytes().to_vec(),
     }
 }
 
@@ -35,13 +47,17 @@ fn v1_compat_terms_and_scopes() {
         Some(QueryNode::Term {
             field: Some(b"title".to_vec()),
             term: b"redis".to_vec(),
+            raw: b"redis".to_vec(),
         })
     );
     // v1 quirk kept: a bare `foo:bar` is NOT a scope in the Ft
     // dialect -- it tokenizes to two AND-ed terms.
     assert_eq!(
         ft("foo:bar"),
-        Some(QueryNode::And(vec![term("foo"), term("bar")]))
+        Some(QueryNode::And(vec![
+            term_raw("foo", "foo:bar"),
+            term_raw("bar", "foo:bar")
+        ]))
     );
     // noise-only clause vanishes
     assert_eq!(ft("hello ,.!"), Some(term("hello")));
@@ -93,6 +109,7 @@ fn phrases_and_prefix() {
         Some(QueryNode::Phrase {
             field: None,
             terms: vec![b"full".to_vec(), b"text".to_vec(), b"search".to_vec()],
+            raw: b"full text search".to_vec(),
         })
     );
     // single-token phrase folds to a Term; scope rides through
@@ -101,6 +118,7 @@ fn phrases_and_prefix() {
         Some(QueryNode::Term {
             field: Some(b"title".to_vec()),
             term: b"redis".to_vec(),
+            raw: b"redis".to_vec(),
         })
     );
     assert_eq!(
@@ -108,6 +126,7 @@ fn phrases_and_prefix() {
         Some(QueryNode::Prefix {
             field: None,
             prefix: b"redi".to_vec(),
+            raw: b"redi".to_vec(),
         })
     );
     assert_eq!(
@@ -115,6 +134,7 @@ fn phrases_and_prefix() {
         Some(QueryNode::Prefix {
             field: Some(b"title".to_vec()),
             prefix: b"red".to_vec(),
+            raw: b"red".to_vec(),
         })
     );
     // star alone tokenizes to nothing -> star dropped, not a prefix
@@ -129,24 +149,30 @@ fn query_string_dialect() {
             QueryNode::Term {
                 field: Some(b"title".to_vec()),
                 term: b"redis".to_vec(),
+                raw: b"redis".to_vec(),
             },
             QueryNode::Term {
                 field: None,
                 // CJK single term survives segmentation as one token
                 term: "向量".as_bytes().to_vec(),
+                raw: "向量".as_bytes().to_vec(),
             },
         ]))
     );
     // bare scope needs a letter: 12:30 stays plain terms
     assert_eq!(
         qs("12:30"),
-        Some(QueryNode::And(vec![term("12"), term("30")]))
+        Some(QueryNode::And(vec![
+            term_raw("12", "12:30"),
+            term_raw("30", "12:30")
+        ]))
     );
     assert_eq!(
         qs("NOT tag:redis"),
         Some(QueryNode::Not(Box::new(QueryNode::Term {
             field: Some(b"tag".to_vec()),
             term: b"redis".to_vec(),
+            raw: b"redis".to_vec(),
         })))
     );
     assert_eq!(
@@ -154,6 +180,7 @@ fn query_string_dialect() {
         Some(QueryNode::Phrase {
             field: Some(b"title".to_vec()),
             terms: vec!["向量".as_bytes().to_vec(), "检索".as_bytes().to_vec()],
+            raw: "向量检索".as_bytes().to_vec(),
         })
     );
 }
@@ -165,6 +192,7 @@ fn unterminated_phrase_takes_rest() {
         Some(QueryNode::Phrase {
             field: None,
             terms: vec![b"full".to_vec(), b"text".to_vec()],
+            raw: b"full text".to_vec(),
         })
     );
 }
@@ -224,8 +252,51 @@ fn numeric_ranges() {
     // 无 scope 的 `[..]` 不触发区间语法，走旧 word 路径（`[1` -> 词 "1"）
     assert_eq!(
         ft("[1 5]"),
-        Some(QueryNode::And(vec![term("1"), term("5")]))
+        Some(QueryNode::And(vec![
+            term_raw("1", "[1"),
+            term_raw("5", "5]")
+        ]))
     );
     // 未闭合的 `[` 吞到输入结尾（短语约定）
     assert_eq!(ft("@n:[10 20"), Some(numrange("n", Some(10.0), Some(20.0))));
+}
+
+/// KEYWORD 对齐：scoped 子句的叶子携带 AS-TYPED 原始字节（`raw`），
+/// 求值侧对 KEYWORD 字段用 `raw` 做精确查找（本测试只锁 parse 层：
+/// term 走 tokenize 小写化，raw 保持原样）。
+#[test]
+fn keyword_scoped_leaves_carry_raw_bytes() {
+    assert_eq!(
+        ft("@kw:MiXeD"),
+        Some(QueryNode::Term {
+            field: Some(b"kw".to_vec()),
+            term: b"mixed".to_vec(),
+            raw: b"MiXeD".to_vec(),
+        })
+    );
+    assert_eq!(
+        ft("@kw:\"New York\""),
+        Some(QueryNode::Phrase {
+            field: Some(b"kw".to_vec()),
+            terms: vec![b"new".to_vec(), b"york".to_vec()],
+            raw: b"New York".to_vec(),
+        })
+    );
+    assert_eq!(
+        ft("@kw:Ne*"),
+        Some(QueryNode::Prefix {
+            field: Some(b"kw".to_vec()),
+            prefix: b"ne".to_vec(),
+            raw: b"Ne".to_vec(),
+        })
+    );
+    // 单 token 短语折叠成 Term，raw = 引号内原文
+    assert_eq!(
+        ft("@kw:\"RedisLabs\""),
+        Some(QueryNode::Term {
+            field: Some(b"kw".to_vec()),
+            term: b"redislabs".to_vec(),
+            raw: b"RedisLabs".to_vec(),
+        })
+    );
 }

@@ -173,9 +173,10 @@ fn window_limit_and_unknown_query() {
 fn match_phrase_forms() {
     let p = parse_search(br#"{"query":{"match_phrase":{"body":"Hello Redis"}}}"#).unwrap();
     match p.query {
-        Plan::MatchPhrase { field, terms } => {
+        Plan::MatchPhrase { field, terms, raw } => {
             assert_eq!(field, "body");
             assert_eq!(terms, vec![b"hello".to_vec(), b"redis".to_vec()]);
+            assert_eq!(raw, b"Hello Redis".to_vec());
         }
         other => panic!("{other:?}"),
     }

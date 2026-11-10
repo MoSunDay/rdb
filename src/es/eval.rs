@@ -104,11 +104,12 @@ pub(super) fn eval(ctx: &mut EvalCtx, plan: &Plan) -> Result<Scored, String> {
             lte,
             lt,
         } => eval_range(ctx, field, *gte, *gt, *lte, *lt),
-        Plan::MatchPhrase { field, terms } => eval_tree_node(
+        Plan::MatchPhrase { field, terms, raw } => eval_tree_node(
             ctx,
             &QueryNode::Phrase {
                 field: Some(field.as_bytes().to_vec()),
                 terms: terms.clone(),
+                raw: raw.clone(),
             },
         ),
         Plan::Prefix { field, prefix } => eval_tree_node(
@@ -116,6 +117,7 @@ pub(super) fn eval(ctx: &mut EvalCtx, plan: &Plan) -> Result<Scored, String> {
             &QueryNode::Prefix {
                 field: Some(field.as_bytes().to_vec()),
                 prefix: prefix.clone(),
+                raw: prefix.clone(),
             },
         ),
         Plan::QueryString { node } => match node {

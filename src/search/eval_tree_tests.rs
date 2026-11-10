@@ -1,7 +1,8 @@
 //! Unit tests for the pure helpers of `eval_tree.rs` (position-chain
 //! verification; the store-backed eval paths are covered by the
-//! process-level e2e suites, except the stopword short-circuit which
-//! must hold before any read).
+//! process-level e2e suites, except the stopword short-circuit and
+//! the all-stopword KEYWORD phrase boundary, which get a small
+//! store-backed harness here: put_meta + build_add_batch).
 
 use super::verify_positions;
 use super::{eval_node, new_tree_ctx};
@@ -61,6 +62,7 @@ fn stopword_term_and_phrase_match_nothing() {
         &QueryNode::Term {
             field: None,
             term: b"the".to_vec(),
+            raw: b"the".to_vec(),
         },
     )
     .unwrap();
@@ -70,6 +72,65 @@ fn stopword_term_and_phrase_match_nothing() {
         &QueryNode::Phrase {
             field: None,
             terms: vec![b"the".to_vec(), b"of".to_vec()],
+            raw: b"the of".to_vec(),
+        },
+    )
+    .unwrap();
+    assert!(hits.is_empty());
+}
+
+/// 全停用词短语在 KEYWORD scope 上仍走 raw 精确字节分支：停用词
+/// 短路只属于 TEXT 路径（曾是函数级提前 return，keyword 分支根本
+/// 到不了 -- 修复回归）。store-backed 装置：meta 记录 + 一条 KEYWORD
+/// 文档，全程同步写（put_meta + build_add_batch + batch_write）。
+#[test]
+fn all_stopword_phrase_matches_keyword_raw_bytes() {
+    let shared = crate::state::testutil::shared_with(crate::state::testutil::test_config());
+    let meta = IndexMeta {
+        fields: vec![crate::search::ft_index::IndexField {
+            name: b"kw".to_vec(),
+            ftype: crate::search::ft_index::FieldType::Keyword,
+        }],
+        stopwords: vec![b"the".to_vec(), b"of".to_vec()],
+        ..Default::default()
+    };
+    let mut batch = rocksdb::WriteBatch::default();
+    crate::search::ft_index::put_meta(&mut batch, b"pfx", b"idx", &meta);
+    crate::store::ops::batch_write(&shared.store, batch).unwrap();
+    let (rec, numvals, positions) =
+        crate::search::ft_cmd::doc_record_of(&meta, br#"{"kw":"the of"}"#).unwrap();
+    let add = crate::search::ft_index::build_add_batch(
+        &shared.store,
+        b"pfx",
+        b"idx",
+        &meta,
+        b"k3",
+        rec,
+        &numvals,
+        &positions,
+    )
+    .unwrap();
+    crate::store::ops::batch_write(&shared.store, add).unwrap();
+
+    let mut ctx = new_tree_ctx(&shared.store, b"pfx", b"idx", &meta);
+    // tokenized terms are ALL stopwords, yet the KEYWORD raw path hits
+    let hits = eval_node(
+        &mut ctx,
+        &QueryNode::Phrase {
+            field: Some(b"kw".to_vec()),
+            terms: vec![b"the".to_vec(), b"of".to_vec()],
+            raw: b"the of".to_vec(),
+        },
+    )
+    .unwrap();
+    assert_eq!(hits.keys().collect::<Vec<_>>(), vec![&b"k3"[..].to_vec()]);
+    // wrong raw bytes -> no hit (exact, not prefix/token match)
+    let hits = eval_node(
+        &mut ctx,
+        &QueryNode::Phrase {
+            field: Some(b"kw".to_vec()),
+            terms: vec![b"the".to_vec(), b"of".to_vec()],
+            raw: b"the off".to_vec(),
         },
     )
     .unwrap();

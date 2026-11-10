@@ -53,7 +53,7 @@ turso-engine 主体（T0–T6）与 allowlist batch 1 落地后，上线前余�
 | WP1 | commit `81ca5a9`；`standalone_boots_turso_engine_with_flag`（e2e 3 用例） |
 | WP2 | commit `6a06c5b`；`turso_sqlite_interop_e2e`（2 用例）+ `COMPAT.sql.md` (z3) |
 | WP3 | `COMPAT.sql.md` ANN deviations 段 turso posture 句 |
-| WP4 | `features/e2e-coverage.md` / `agents/rust/sql.md` / `agents/rust/index.md` / changelog 摘要 |
+| WP4 | `features/e2e-coverage.md` / `agents/rust/sql.md` / `agents/rust/index.md` / changelog 摘要；CI 三段门收口（clippy 1.98 基线清零 `30121f4`，17 目标 2025 用例 0 失败） |
 
 CI 三段门（fmt / clippy -D warnings / `cargo test --workspace`）全绿；宿主缺
 sqlite3 CLI 时互操作套件自跳过。

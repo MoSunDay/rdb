@@ -36,20 +36,26 @@ use super::tokenize::tokenize;
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryNode {
     /// Exact posting lookup; `field: None` = every TEXT field.
+    /// `raw` = the clause body as typed (KEYWORD exact lookups).
     Term {
         field: Option<Vec<u8>>,
         term: Vec<u8>,
+        raw: Vec<u8>,
     },
     /// Ordered adjacent tokens (v2 postings supply positions; a term
     /// with unknown positions degrades to AND, see `eval_tree`).
+    /// `raw` = the quoted body as typed (KEYWORD exact lookups).
     Phrase {
         field: Option<Vec<u8>>,
         terms: Vec<Vec<u8>>,
+        raw: Vec<u8>,
     },
-    /// Posting-key prefix iteration (`term*`).
+    /// Posting-key prefix iteration (`term*`). `raw` = the stem as
+    /// typed, star excluded (KEYWORD exact lookups).
     Prefix {
         field: Option<Vec<u8>>,
         prefix: Vec<u8>,
+        raw: Vec<u8>,
     },
     /// Closed-interval walk of one NUMERIC field's columnar
     /// doc-values (`@price:[10 20]`; `None` bound = open). The
@@ -302,6 +308,8 @@ pub fn parse_num_range(text: &str) -> Option<(Option<f64>, Option<f64>)> {
 }
 
 /// One clause body -> a leaf/AND subtree under the parsed scope.
+/// Every leaf carries `raw` (the body bytes AS TYPED) so the
+/// evaluator can do exact-bytes lookups on KEYWORD fields.
 fn body_to_node(field: Option<Vec<u8>>, body: Body) -> Option<QueryNode> {
     match body {
         Body::Phrase(s) => {
@@ -311,10 +319,12 @@ fn body_to_node(field: Option<Vec<u8>>, body: Body) -> Option<QueryNode> {
                 1 => Some(QueryNode::Term {
                     field,
                     term: toks.into_iter().next().unwrap().into_bytes(),
+                    raw: s.into_bytes(),
                 }),
                 _ => Some(QueryNode::Phrase {
                     field,
                     terms: toks.into_iter().map(|t| t.into_bytes()).collect(),
+                    raw: s.into_bytes(),
                 }),
             }
         }
@@ -327,6 +337,7 @@ fn body_to_node(field: Option<Vec<u8>>, body: Body) -> Option<QueryNode> {
                 return Some(QueryNode::Prefix {
                     field,
                     prefix: toks.into_iter().next().unwrap().into_bytes(),
+                    raw: stem.into_bytes(),
                 });
             }
             // multi-token stem (CJK segmentation): AND of the terms;
@@ -334,6 +345,7 @@ fn body_to_node(field: Option<Vec<u8>>, body: Body) -> Option<QueryNode> {
             let mut terms = toks.into_iter().map(|t| QueryNode::Term {
                 field: field.clone(),
                 term: t.into_bytes(),
+                raw: stem.clone().into_bytes(),
             });
             let first = terms.next().unwrap();
             Some(match terms.next() {

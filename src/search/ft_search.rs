@@ -98,8 +98,9 @@ pub async fn ft_search(ctx: &mut Ctx<'_>) {
     let result = match (&opts.knn, &terms) {
         (Some(knn), None) => run_knn(store, prefix, &index, &meta, knn, None).map(|h| (h.len(), h)),
         (Some(knn), Some(terms)) => {
-            let filter = matched_docids(store, prefix, &index, &meta, terms);
-            run_knn(store, prefix, &index, &meta, knn, Some(filter)).map(|h| (h.len(), h))
+            matched_docids(store, prefix, &index, &meta, terms).and_then(|filter| {
+                run_knn(store, prefix, &index, &meta, knn, Some(filter)).map(|h| (h.len(), h))
+            })
         }
         (None, None) => Ok(scan_all(store, prefix, &index, &opts)),
         (None, Some(terms)) => text_search(store, prefix, &index, &meta, terms, &opts),
@@ -181,18 +182,18 @@ fn text_search(
 }
 
 /// Docids matching the whole tree (KNN prefilter; empty set = no
-/// matches).
+/// matches). Errors PROPAGATE -- a store/decode failure used to
+/// collapse to an empty set, turning a bad posting into a silent
+/// 0-hit KNN answer.
 fn matched_docids(
     store: &Store,
     prefix: &[u8],
     index: &[u8],
     meta: &IndexMeta,
     node: &QueryNode,
-) -> HashSet<Vec<u8>> {
+) -> Result<HashSet<Vec<u8>>, String> {
     let mut ctx = new_tree_ctx(store, prefix, index, meta);
-    eval_node(&mut ctx, node)
-        .map(|h| h.into_keys().collect())
-        .unwrap_or_default()
+    Ok(eval_node(&mut ctx, node)?.into_keys().collect())
 }
 
 /// `*` without KNN: docids in physical order, page applied, score 1.

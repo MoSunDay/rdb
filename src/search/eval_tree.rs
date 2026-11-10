@@ -73,6 +73,33 @@ fn scope_fields<'a>(meta: &'a IndexMeta, scope: &'a Option<Vec<u8>>) -> Vec<&'a 
     }
 }
 
+/// KEYWORD schema check for one scope field.
+fn is_keyword_field(meta: &IndexMeta, field: &[u8]) -> bool {
+    meta.fields
+        .iter()
+        .any(|f| f.name == field && matches!(f.ftype, FieldType::Keyword))
+}
+
+/// Exact-bytes posting lookup for a KEYWORD-scoped clause (BM25 over
+/// the posting, same shape as a TEXT term; keyword postings are never
+/// stopword-filtered at index time, so no stopword skip here).
+fn keyword_exact_hits(ctx: &mut TreeCtx, f: &[u8], raw: &[u8]) -> Result<TreeHits, String> {
+    let mut docs = TreeHits::new();
+    if raw.is_empty() {
+        return Ok(docs);
+    }
+    let stat = read_termstat(ctx.store, ctx.prefix, ctx.index, f, raw)?;
+    if stat.df == 0 {
+        return Ok(docs);
+    }
+    for e in read_posting(ctx.store, ctx.prefix, ctx.index, f, raw)? {
+        let dl = doclen_of(ctx, &e.docid);
+        *docs.entry(e.docid).or_insert(0.0) +=
+            term_score(e.tf, stat.df, dl, ctx.avgdl, ctx.n, ctx.meta.k1, ctx.meta.b);
+    }
+    Ok(docs)
+}
+
 /// Cached doclen (defaults 1 on a missing/short record).
 fn doclen_of(ctx: &mut TreeCtx, docid: &[u8]) -> u64 {
     if let Some(&l) = ctx.doclens.get(docid) {
@@ -90,9 +117,9 @@ fn doclen_of(ctx: &mut TreeCtx, docid: &[u8]) -> u64 {
 /// empty-query contract).
 pub fn eval_node(ctx: &mut TreeCtx, node: &QueryNode) -> Result<TreeHits, String> {
     match node {
-        QueryNode::Term { field, term } => eval_term(ctx, field, term),
-        QueryNode::Phrase { field, terms } => eval_phrase(ctx, field, terms),
-        QueryNode::Prefix { field, prefix } => eval_prefix(ctx, field, prefix),
+        QueryNode::Term { field, term, raw } => eval_term(ctx, field, term, raw),
+        QueryNode::Phrase { field, terms, raw } => eval_phrase(ctx, field, terms, raw),
+        QueryNode::Prefix { field, prefix, raw } => eval_prefix(ctx, field, prefix, raw),
         QueryNode::NumRange { field, gte, lte } => eval_numrange(ctx, field, *gte, *lte),
         QueryNode::And(children) => {
             let mut acc: Option<TreeHits> = None;
@@ -194,13 +221,27 @@ fn all_docids(ctx: &TreeCtx, f: &mut dyn FnMut(&[u8])) {
     });
 }
 
-/// BM25 posting lookup summed over the scoped fields.
-fn eval_term(ctx: &mut TreeCtx, field: &Option<Vec<u8>>, term: &[u8]) -> Result<TreeHits, String> {
+/// BM25 posting lookup summed over the scoped fields. A KEYWORD
+/// scope looks up the clause's RAW bytes (keyword postings are
+/// exact, un-tokenized); the stopword skip is TEXT-only (a keyword
+/// value like "the" is a legitimate exact value).
+fn eval_term(
+    ctx: &mut TreeCtx,
+    field: &Option<Vec<u8>>,
+    term: &[u8],
+    raw: &[u8],
+) -> Result<TreeHits, String> {
     let mut docs = TreeHits::new();
-    if is_stopword(ctx.meta, term) {
-        return Ok(docs); // stopword never entered the index either
-    }
     for f in scope_fields(ctx.meta, field) {
+        if is_keyword_field(ctx.meta, f) {
+            for (d, s) in keyword_exact_hits(ctx, f, raw)? {
+                *docs.entry(d).or_insert(0.0) += s;
+            }
+            continue;
+        }
+        if is_stopword(ctx.meta, term) {
+            continue; // stopword never entered the index either
+        }
         let stat = read_termstat(ctx.store, ctx.prefix, ctx.index, f, term)?;
         if stat.df == 0 {
             continue;
@@ -224,25 +265,43 @@ fn is_stopword(meta: &IndexMeta, term: &[u8]) -> bool {
 /// docs whose every entry carries positions are kept only when the
 /// positions chain adjacently (p, p+1, p+2, ...); a position-less
 /// entry (v1 record) degrades that doc to a plain AND member --
-/// documented deviation. Score = sum of the constituent term scores
-/// (a BM25-flavored phrase score).
+/// documented deviation. A KEYWORD-scoped phrase is instead an exact
+/// whole-value match on the raw clause bytes, BEFORE any stopword
+/// logic (the stopword short-circuit is TEXT-only: a keyword value
+/// like "the of" is a legitimate exact value). Score = sum of the
+/// constituent term scores (a BM25-flavored phrase score).
 fn eval_phrase(
     ctx: &mut TreeCtx,
     field: &Option<Vec<u8>>,
     terms: &[Vec<u8>],
+    raw: &[u8],
 ) -> Result<TreeHits, String> {
     let mut docs = TreeHits::new();
-    // stopwords drop out of the chain (positions were compacted at
-    // index time); every term a stopword -> nothing to match
+    // stopwords drop out of the TEXT chain (positions were compacted
+    // at index time). The short-circuit is TEXT-only and lives inside
+    // the field loop: a KEYWORD scope matches raw bytes regardless of
+    // stopword tokens, so the keyword branch must be reached even
+    // when every tokenized term is a stopword.
     let terms: Vec<&[u8]> = terms
         .iter()
         .filter(|t| !is_stopword(ctx.meta, t))
         .map(|t| t.as_slice())
         .collect();
-    if terms.is_empty() {
-        return Ok(docs);
-    }
     for f in scope_fields(ctx.meta, field) {
+        // a "phrase" on a KEYWORD field = exact whole-value match
+        // (keyword-analyzer semantics): raw bytes, no position chain
+        if is_keyword_field(ctx.meta, f) {
+            for (d, s) in keyword_exact_hits(ctx, f, raw)? {
+                *docs.entry(d).or_insert(0.0) += s;
+            }
+            continue;
+        }
+        // TEXT path: every term a stopword -> no posting exists in
+        // this field either (per-field skip == the old short-circuit
+        // return for TEXT scopes)
+        if terms.is_empty() {
+            continue;
+        }
         // stats first (df per term), then postings; an unseen term
         // leaves no candidates for this field
         let mut stats = Vec::with_capacity(terms.len());
@@ -320,18 +379,27 @@ pub fn verify_positions(positions: &[&[u64]]) -> bool {
 }
 
 /// Prefix scan: walk both posting kinds' field ranges, decode each
-/// key's (field, term), keep `term.starts_with(prefix)`, BM25-sum the
-/// matched terms' postings (ES prefix = term disjunction).
+/// key's (field, term), keep `term.starts_with(pfx)`, BM25-sum the
+/// matched terms' postings (ES prefix = term disjunction). A KEYWORD
+/// scope scans on the clause's RAW stem (keyword postings are exact,
+/// un-tokenized); the empty check is per-field because the two
+/// scopes use different bytes.
 fn eval_prefix(
     ctx: &mut TreeCtx,
     field: &Option<Vec<u8>>,
     prefix: &[u8],
+    raw: &[u8],
 ) -> Result<TreeHits, String> {
     let mut docs = TreeHits::new();
-    if prefix.is_empty() {
-        return Ok(docs);
-    }
     for f in scope_fields(ctx.meta, field) {
+        let pfx: &[u8] = if is_keyword_field(ctx.meta, f) {
+            raw
+        } else {
+            prefix
+        };
+        if pfx.is_empty() {
+            continue;
+        }
         // collect matching terms first: read_posting inside the
         // for_each closure would borrow the store cursor and the ctx
         let mut terms: Vec<Vec<u8>> = Vec::new();
@@ -343,7 +411,7 @@ fn eval_prefix(
                     return false;
                 }
                 if let Some((kf, term)) = k.get(suffix_at..).and_then(decode_term_suffix) {
-                    if kf == f && term.starts_with(prefix) && !terms.contains(&term) {
+                    if kf == f && term.starts_with(pfx) && !terms.contains(&term) {
                         terms.push(term);
                     }
                 }

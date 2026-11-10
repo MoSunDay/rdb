@@ -694,3 +694,105 @@ async fn es_stopwords_across_fronts() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(ids(&json_body(&body)), vec!["1"], "{body}");
 }
+
+/// KEYWORD 大小写对齐（P1 hardening）：共享语法（FT.SEARCH 与 ES
+/// `query_string`）对 KEYWORD 字段的 scoped 子句改按 AS-TYPED 原始
+/// 字节精确查 posting——与索引侧 "exact bytes, NO tokenize/lowercase"
+/// 及 ES `term`/`match` 的 keyword 路径一致。此前查询侧一律 tokenize
+/// 小写化，混大小写 keyword 值经两个前端都静默零命中。
+#[tokio::test]
+async fn keyword_exact_case_both_fronts() {
+    let (_node, es) = spawn_es_ready("kwcase").await;
+    let resp_addr = _node.resp.clone();
+
+    let r = resp_text(
+        &resp_addr,
+        &[
+            b"ft.create",
+            b"kidx",
+            b"SCHEMA",
+            b"kw",
+            b"KEYWORD",
+            b"body",
+            b"TEXT",
+        ],
+    )
+    .await;
+    assert!(r.starts_with("+OK"), "ft.create: {r}");
+    for (id, doc) in [
+        ("k1", r#"{"kw":"RedisLabs","body":"case sensitivity doc"}"#),
+        ("k2", r#"{"kw":"Redis Labs","body":"spaced keyword value"}"#),
+    ] {
+        let r = resp_text(
+            &resp_addr,
+            &[b"ft.add", b"kidx", id.as_bytes(), doc.as_bytes()],
+        )
+        .await;
+        assert!(r.starts_with(":1"), "ft.add {id}: {r}");
+    }
+
+    // RESP：混大小写 keyword 按原始字节命中；错误大小写零命中（精确语义）
+    let r = resp_call(&resp_addr, &[b"ft.search", b"kidx", b"@kw:RedisLabs"]).await;
+    assert!(r.contains("k1"), "exact case hits: {r:?}");
+    let r = resp_call(&resp_addr, &[b"ft.search", b"kidx", b"@kw:redislabs"]).await;
+    assert!(r.contains(":0\r\n"), "wrong case misses: {r:?}");
+    // 带空格的 keyword 值：引号短语体按整值精确命中
+    let r = resp_call(&resp_addr, &[b"ft.search", b"kidx", b"@kw:\"Redis Labs\""]).await;
+    assert!(r.contains("k2"), "quoted whole-value match: {r:?}");
+
+    // ES query_string 走同一语法；term 的 keyword 精确路径保持不变
+    let (status, out) = http(
+        &es,
+        "POST",
+        "/kidx/_search",
+        Some(r#"{"query":{"query_string":{"query":"kw:RedisLabs"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{out}");
+    let v = json_body(&out);
+    assert_eq!(v["hits"]["total"]["value"], 1, "{v}");
+    assert_eq!(v["hits"]["hits"][0]["_id"], "k1");
+
+    let (status, out) = http(
+        &es,
+        "POST",
+        "/kidx/_search",
+        Some(r#"{"query":{"query_string":{"query":"kw:redislabs"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(
+        json_body(&out)["hits"]["total"]["value"],
+        0,
+        "wrong case: {out}"
+    );
+
+    let (status, out) = http(
+        &es,
+        "POST",
+        "/kidx/_search",
+        Some(r#"{"query":{"term":{"kw":"RedisLabs"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(
+        json_body(&out)["hits"]["total"]["value"],
+        1,
+        "term exact: {out}"
+    );
+
+    // TEXT 路径不受影响（tokenize 小写化照旧）
+    let (status, out) = http(
+        &es,
+        "POST",
+        "/kidx/_search",
+        Some(r#"{"query":{"match":{"body":"case"}}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(
+        json_body(&out)["hits"]["total"]["value"],
+        1,
+        "text path: {out}"
+    );
+}

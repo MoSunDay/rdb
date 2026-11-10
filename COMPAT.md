@@ -670,7 +670,11 @@ adapter, not an ES clone; the deviations below are the contract.
   sort last; `from + size` is capped at 10000 (400 beyond).
 - **Transport**: HTTP/1.1 only, one request per connection (`Connection: close`, no
   keep-alive), Content-Length bodies only (`Transfer-Encoding: chunked` -> 501). Optional
-  `Authorization: Bearer <es_token>` when `es_token` is non-empty.
+  `Authorization: Bearer <es_token>` when `es_token` is non-empty. Handlers run under a
+  30s timeout (408 `timeout_exception`); a WRITE can hit it too — the latch is async
+  RAII and each write is one fsynced batch with no background thread, so a timeout
+  never leaves a partial batch, but a write completing right at the boundary can still
+  surface as 408 client-side (writes >30s are rare).
 
 ## RocksMQ-compatible HTTP frontend (Rust-only)
 
