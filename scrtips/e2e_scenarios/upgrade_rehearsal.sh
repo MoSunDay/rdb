@@ -267,7 +267,7 @@ phaseB_verify () {
     snap_eq ai_ids "AUTO_INCREMENT rows unchanged" 1 "SELECT id FROM up_ai ORDER BY id"
 
     # AUTO_INCREMENT is a leader-only catalog write (same rule as DDL,
-    # tests/auto_increment_e2e.rs "allocation must be leader-only");
+    # tests/sql/auto_increment_e2e.rs "allocation must be leader-only");
     # route via the leader and keep a follower-refusal check so the
     # rehearsal proves the rule SURVIVED the upgrade.
     sql_mysql "$LEADER" "INSERT INTO up_ai (note) VALUES ('post-up-1')"

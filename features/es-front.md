@@ -4,7 +4,7 @@
 - **协议前置适配层**，与 `src/kafka/` 之于 Lite MQ、`sql/front` 之于 MySQL 协议同构：
   `src/es/` 只做 HTTP/JSON 编解码与 DSL 映射，存储与检索完全复用 FT.* 内核
   （`src/search/`）——一个索引 = 一个用户 key = 一个 slot，RESP 侧 FT.CREATE 建的
-  索引在 ES 面可直接查写（进程级 e2e `tests/es_search_e2e.rs` 有互操作证明）。
+  索引在 ES 面可直接查写（进程级 e2e `tests/es/es_search_e2e.rs` 有互操作证明）。
 - 接线：`es_bind`（空 = 关闭，backup 监听器天然不含）；`es_token` 非空时要求
   `Authorization: Bearer <token>`。
 

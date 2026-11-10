@@ -20,7 +20,7 @@
 #       FP32 form. Half floats of common values contain NUL bytes,
 #       which argv cannot carry, so the blob is fed via `redis-cli -x`
 #       (last argument from STDIN; supported by redis-cli 6.0.16).
-#       src/ds/vectorset_ds.rs:238 fp16_to_f64, tests/vectorset_e2e.rs:147
+#       src/ds/vectorset_ds.rs:238 fp16_to_f64, tests/kv/vectorset_e2e.rs:147
 #   FT.CREATE <idx> SCHEMA <f> TEXT | <f> VECTOR DIM <n> -> +OK
 #                                     src/search/ft_cmd.rs:45-52
 #   FT.ADD <idx> <docid> <json> -> :1 (fields = schema fields; VECTOR
@@ -101,7 +101,7 @@ E_QIANTAN='\xe6\xb5\x85\xe8\xb0\x88'                                    # qianta
 # Titles: "<group word> <descriptor>". The ASCII space makes the group
 # word its own jieba Han run, so index-side and query-side segmentation
 # of that word CANNOT diverge (tokenize.rs runs; the same pattern is
-# what lets tests/search_e2e.rs match "zhongwen jiansuo" by "jiansuo").
+# what lets tests/search/search_e2e.rs match "zhongwen jiansuo" by "jiansuo").
 T_DB0="$W_DB $(u8 "$E_SUOYIN$E_YUANLI")"        # shujuku suoyin yuanli
 T_DB1="$W_DB $(u8 "$E_SHIWU$E_YU$E_SUO")"       # shujuku shiwu yu suo
 T_DB2="$W_DB $(u8 "$E_BEIFEN$E_YU$E_HUIFU")"    # shujuku beifen yu huifu
@@ -175,7 +175,7 @@ assert_eq "type is vectorset" "vectorset" "$(rc TYPE "$VSET")"
 
 # VSIM full scan WITHSCORES (spec last, no dim token after VALUES).
 # Self-match ranks FIRST: score=(cos+1)/2 = 1 for the queried element
-# itself (tests/vectorset_e2e.rs:97-116), rank-2 is the nearest kin.
+# itself (tests/kv/vectorset_e2e.rs:97-116), rank-2 is the nearest kin.
 sim_all=$(rc VSIM "$VSET" WITHSCORES VALUES 1 0.05 0)
 pairs=$(rc_items "$sim_all" | paste - -)
 assert_eq "vsim top-1 is the queried element itself (A1)" "A1" \

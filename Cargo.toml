@@ -100,9 +100,24 @@ lz4_flex = { version = "0.11", optional = true }
 # test-util while normal builds compile tokio without it.
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
-# tests/sql_e2e.rs hand-rolls the mysql_native_password scramble.
+# tests/sql/sql_e2e.rs hand-rolls the mysql_native_password scramble.
 sha1 = "0.10"
 mysql_async = "0.37.0"
+
+# Env-isolation carve-outs (tests-reorg 2026-11-10): these three set
+# RAFT_BOOTSTRAP process-wide, so they stay standalone targets instead
+# of modules inside the group crates (tests/{sql,cluster}/).
+[[test]]
+name = "sql_oracle_cluster_e2e"
+path = "tests/sql/sql_oracle_cluster_e2e.rs"
+
+[[test]]
+name = "ha_failover"
+path = "tests/cluster/ha_failover.rs"
+
+[[test]]
+name = "raft_cluster_e2e"
+path = "tests/cluster/raft_cluster_e2e.rs"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

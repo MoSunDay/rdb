@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scenario_migrate.sh - e2e: slot migration driven by REAL redis-cli
 # against the 3-node rdb cluster assembled by env.sh -- the CLI-suite
-# twin of tests/migrate_e2e.rs. Steps: (a) hash-tag family + band owner
+# twin of tests/cluster/migrate_e2e.rs. Steps: (a) hash-tag family + band owner
 # discovery, (b) seed 2 strings + a hash on the OWNER (retrying through
 # the post-init settle), (c) `migrate task` on the leader -> done/3 in
 # `migrate list`, (d) dst serves, src + bystander MOVED to dst,
@@ -13,7 +13,7 @@
 #   -40 + its test): argv[1] "TASK" falls through to the DATA command and
 #   answers "ERR wrong number of arguments for 'migrate' command". So the
 #   orchestration is `migrate task <slot> <src-resp> <dst-resp>` and the
-#   record is `migrate list` -- exactly the casing tests/migrate_e2e.rs
+#   record is `migrate list` -- exactly the casing tests/cluster/migrate_e2e.rs
 #   :141-149,185-193 uses.
 # - `migrate task` drives the whole reshard protocol SYNCHRONOUSLY (src
 #   /command/migrate/task.rs:52-80: src MIGRATING -> dst IMPORTING ->
@@ -28,7 +28,7 @@
 #   migrate_busy.swap) -- a successful run MUST clear it, which the
 #   reverse task below exercises (migrate_e2e.rs:226-243).
 # - Bands after CLUSTER INIT (3 equal splits, src/command/cluster.rs +
-#   tests/migrate_e2e.rs:53-59): slot<=5461 -> resp_0, <=10922 -> resp_1,
+#   tests/cluster/migrate_e2e.rs:53-59): slot<=5461 -> resp_0, <=10922 -> resp_1,
 #   else resp_2. MOVED text is "MOVED <slot> <addr>"
 #   (src/router.rs:74-77) and the addr is the owner's RESP bind.
 # - The slot's NEW owner reaches the SOURCE node immediately (it ran the

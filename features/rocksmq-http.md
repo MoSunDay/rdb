@@ -167,16 +167,16 @@
 - 组名 ≤256 字节（Lite 本身收 raw bytes，HTTP 面收紧）。
 
 ## 测试
-- `tests/rocksmq_http_e2e.rs`（进程级，真二进制 + rocksmq_bind + RESP 互证）：
+- `tests/rocksmq/rocksmq_http_e2e.rs`（进程级，真二进制 + rocksmq_bind + RESP 互证）：
   产/组消/确认全流程（含幂等 ack、PEL 清空、组 404）、RESP XADD ↔ HTTP consume、
   HTTP produce ↔ RESP XRANGE 同流互证、裸名/全名等价、无组尾部拉取无进度、
   400/404/405/413、keep-alive 两连发与 `Connection: close` 关闭。
-- `tests/rocksmq_wait_pending_e2e.rs`（进程级，同上真二进制，`lite.delay_sweep_ms`
+- `tests/rocksmq/rocksmq_wait_pending_e2e.rs`（进程级，同上真二进制，`lite.delay_sweep_ms`
   武装）：`wait_ms` 超时回空且默认/0 行为不变、有消息即回；plain produce 与
   **延迟到期交换**两种唤醒（延迟唤醒断言新 id）；`/pending` 摘要（计数/min/max/
   消费者分布、ack 后递减、空 PEL 形状、400/404/405）；`delay_ms` 到期前不可消/
   到期后可消、`0` 即时、非法 400；`rocksmq_token` 401/通过矩阵（FAKE token）。
-- `tests/rocksmq_batch_range_e2e.rs`（进程级，fixture 取自 `tests/common/mq.rs`）：
+- `tests/rocksmq/rocksmq_batch_range_e2e.rs`（进程级，fixture 取自 `tests/common/mq.rs`）：
   批量 produce 有序 id；混合批量（一项非法）其余成功且逐项错误可见；批量 ack
   子集后 pending 相应收缩；`/range` 界内回放 id 升序 + `limit` 截断；`/range`
   只读（随后组消费仍见全部未确认消息、pending 不增长）；三新路由 token 门禁

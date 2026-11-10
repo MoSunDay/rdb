@@ -117,7 +117,7 @@ mod tests {
     use super::*;
 
     /// Smoke: the accept loop survives bare connect-and-drop clients
-    /// (e2e protocol behavior lives in tests/sql_e2e.rs).
+    /// (e2e protocol behavior lives in tests/sql/sql_e2e.rs).
     #[tokio::test]
     async fn serve_accepts_bare_connections() {
         let shared = Arc::new(crate::state::testutil::shared_with(

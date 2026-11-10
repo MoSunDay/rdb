@@ -66,7 +66,7 @@ TYPE -> the step self-SKIPs (6/6, exit 0); on
 `cargo build --release --features kafka-codecs` it runs and passes
 (7/7: gzip@11..40 snappy@41..70 lz4@71..100). zstd is not probed via
 the SDK (this build ships zstd produce uncompressed, attributes=0);
-its 76 rejection is pinned by `tests/kafka_codec_e2e.rs`.
+its 76 rejection is pinned by `tests/kafka/kafka_codec_e2e.rs`.
 
 2026-09-18: kafka bench workloads added (P5c) --
 `scenario_kafka_bench.sh` drives the kafka front with the repo's own

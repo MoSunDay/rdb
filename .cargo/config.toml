@@ -8,3 +8,14 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
 rustdocflags = ["--cfg", "tokio_unstable"]
+
+# Integration e2e suites spawn real multi-listener rdb nodes (each node
+# derives ~10 bound ports from one free-:0 probe), so same-process test
+# parallelism directly drives free-port TOCTOU races (EADDRINUSE
+# respawns, RocksDB same-dir LOCK clashes when per-test dir names
+# collide on the probed port). Capping at 4 matches the CI runner core
+# count and keeps spawn pressure at the pre-reorg level regardless of
+# host size (tests/*/main.rs group crates run up to 161 tests per
+# process -- tests-reorg 2026-11-10).
+[env]
+RUST_TEST_THREADS = "4"

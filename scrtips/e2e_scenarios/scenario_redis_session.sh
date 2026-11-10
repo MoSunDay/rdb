@@ -20,14 +20,14 @@
 #   redis-cli call here AND the bare-PING readiness probes env.sh itself makes.
 # - SET key val EX px supported (src/command/string_opts.rs:83-99).
 # - TTL/PTTL: missing key -2, no expiry -1, expired key -2 (lazy purge on
-#   read) -- src/command/keys_core.rs:53-60, tests/expire_e2e.rs:115-123.
+#   read) -- src/command/keys_core.rs:53-60, tests/kv/expire_e2e.rs:115-123.
 # - Hash tag = FIRST {...} group, empty tag means no tag (src/hash.rs:59-81);
 #   slot = CRC16(tag) % 16384 (src/hash.rs:41-46). CLUSTER KEYSLOT exists and
 #   returns that slot (src/command/cluster.rs:48,61-69; cluster_slot tests:
 #   keyslot "key"=12539, "foo"=12182).
 # - MOVED text is "MOVED <slot> <addr>" (src/router.rs:74-77); addr is the
 #   owner's RESP bind from the instances list (src/command/mod.rs:300-312,
-#   tests/process_cluster_e2e.rs:129-146 "MOVED addr must be one of the
+#   tests/cluster/process_cluster_e2e.rs:129-146 "MOVED addr must be one of the
 #   cluster binds"). GET is routed like SET, so a plain GET on a non-owner
 #   MOVEDs too (process_cluster_e2e.rs:169); reads go through the owner or
 #   via redis-cli -c following the redirect.
@@ -38,7 +38,7 @@
 #   redirects dirty transactions when a queued key MOVEDs
 #   (src/resp/conn.rs:322-334) -- so the MULTI must be sent to the OWNER of
 #   the transaction slot. EXEC frames all buffered replies as one "*N" array
-#   (src/tx/exec.rs:24-30,94-101; tests/tx_e2e.rs:126 "*2 [+OK, $2 v1]").
+#   (src/tx/exec.rs:24-30,94-101; tests/kv/tx_e2e.rs:126 "*2 [+OK, $2 v1]").
 # - ZADD replies the count of NEW members (src/command/zset_cmd.rs:59-60);
 #   ZREVRANGE ... WITHSCORES interleaves member/score as bulk strings with
 #   scores rendered like Rust f64 Display ("98.5", "72" not "72.0")

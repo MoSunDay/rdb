@@ -7,7 +7,7 @@
 #   * src/sql/parse/starrocks.rs       -- clause lifting + loud rejections
 #   * src/sql/exec/ddl.rs:457-505      -- model/engine matrix, BUCKETS check
 #   * src/sql/exec/write.rs:143+       -- columnar INSERT limits, append-only
-#   * tests/starrocks_model_e2e.rs     -- the executable specification
+#   * tests/sql/starrocks_model_e2e.rs     -- the executable specification
 #
 # Models:
 #   PRIMARY KEY(col) [DISTRIBUTED BY HASH(col) [BUCKETS n]] -> row store,
@@ -139,7 +139,7 @@ PORT=$(node_mysql "$LEADER")
 echo "sql endpoint: leader node$LEADER mysql $PORT"
 
 # ---- a. PK model DDL ----------------------------------------------------
-# Exact accepted header shape (tests/starrocks_model_e2e.rs:145):
+# Exact accepted header shape (tests/sql/starrocks_model_e2e.rs:145):
 #   CREATE TABLE t (cols...) PRIMARY KEY(col) DISTRIBUTED BY HASH(col) BUCKETS n
 expect_ok "a: CREATE sr_user PK model" "$PORT" \
     "CREATE TABLE sr_user (id BIGINT NOT NULL, name VARCHAR(64) NULL, age INT NULL) PRIMARY KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 3"

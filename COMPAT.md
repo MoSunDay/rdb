@@ -240,8 +240,8 @@ expire idx = <slot_prefix> ++ 0xFD ++ <expire_ms:u64 BE> ++ <data key from kind 
     exactly the XTRIM parameter — a per-call budget on victims this round, budgeted
     BEFORE victims are chosen (LIMIT 0 = nothing trimmed); XADD-carried trims share the
     same parser and executor (`src/lite/append_opts.rs` trim_at/trim_victims), so no
-    private LIMIT syntax exists. Pinned by `tests/lite_trim_minid_e2e.rs` (XTRIM
-    LIMIT segmentation/LIMIT 0) and `tests/lite_xinfo_full_e2e.rs::
+    private LIMIT syntax exists. Pinned by `tests/lite/lite_trim_minid_e2e.rs` (XTRIM
+    LIMIT segmentation/LIMIT 0) and `tests/lite/lite_xinfo_full_e2e.rs::
     xadd_trim_pins_xtrim_limit_semantics` (XADD `MINID ... LIMIT`).
   - XADD options (P3 backfill, 2026-10-07; parsing centralized in
     `src/lite/append_opts.rs`, shared with XTRIM): `NOMKSTREAM` (a missing stream does

@@ -2,7 +2,7 @@
 # scenario_kafka_sdk.sh - e2e: the Kafka front exercised by a REAL Kafka
 # client SDK (confluent-kafka / librdkafka), not hand-rolled frames.
 #
-# Why: raw-frame e2e (tests/kafka_*_e2e.rs) cannot prove version
+# Why: raw-frame e2e (tests/kafka/kafka_*_e2e.rs) cannot prove version
 # negotiation actually satisfies librdkafka -- it negotiates feature
 # versions itself (Produce v3 unlocks MSGVER2 RecordBatch, Fetch v10,
 # JoinGroup v4, OffsetFetch v7 flexible framing, ...). This scenario
@@ -44,7 +44,7 @@
 #   batching (batch.num.messages=10 + linger.ms=200, 30 msgs => >=1 full
 #   compressed batch per codec). This SDK build ships zstd produce
 #   UNCOMPRESSED (attributes=0 on the wire), so zstd cannot be probed
-#   via the SDK; its 76 rejection is pinned by tests/kafka_codec_e2e.rs.
+#   via the SDK; its 76 rejection is pinned by tests/kafka/kafka_codec_e2e.rs.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

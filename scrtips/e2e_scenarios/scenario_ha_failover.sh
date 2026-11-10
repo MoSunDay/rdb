@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scenario_ha_failover.sh - e2e: `backup_target_map` backup takeover driven
 # by a REAL redis-cli against 3 live rdb processes (first CLI-suite coverage
-# of the path tests/backup_failover_e2e.rs drives through raw sockets):
+# of the path tests/cluster/backup_failover_e2e.rs drives through raw sockets):
 #   1. yaml comes from env.sh's generator, but the `backup_target_map` is
 #      CYCLED to the reference layout of config/conf.yaml: node i's entry
 #      (keyed by node i's RAFT addr) maps src=resp_i -> target=backup_(i+1)%3.

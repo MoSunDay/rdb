@@ -38,7 +38,7 @@
 #   (src/sql/exec/render.rs:148-159,213,223); in routed cluster mode the
 #   plan is ALWAYS Gather(bands=N) + SeqScan <table> + Filter: <expr> --
 #   IndexScan never appears (src/sql/exec/select.rs:98-134,
-#   tests/sql_dist_read_e2e.rs:265-292).
+#   tests/sql/sql_dist_read_e2e.rs:265-292).
 # - SHOW TABLES/COLUMNS/INDEX (src/sql/exec/show.rs:60-124): Key flag PRI
 #   for the pk column, UNI for the unique-index column; SHOW INDEX rows
 #   are "<table>,<non_unique>,<key_name>,1,<column>,BTREE".
@@ -53,7 +53,7 @@
 #   the header row (cli_helpers delimited_output_adapter), so sql_mycli
 #   strips it; errors go to stderr as "(<errno>, \"<msg>\")", rc=1.
 #   Arithmetic UPDATE "SET amount = amount - 40": precedent
-#   tests/sql_txn_e2e.rs:153 ("SET score = score + 1").
+#   tests/sql/sql_txn_e2e.rs:153 ("SET score = score + 1").
 
 # env.sh installs `set -uo pipefail` and the assertion helpers. Deliberately
 # NO `set -e`: assertion failures count into E2E_FAILS so the scenario
@@ -388,7 +388,7 @@ main () {
 
     # ---- (h) DECIMAL(p,s) amounts (W2.0): exact math, rounding, SUM/AVG,
     # secondary-index point lookup, DESCRIBE type, precision edge.
-    # Semantics from tests/sql_types_e2e.rs decimal_exact_semantics:
+    # Semantics from tests/sql/sql_types_e2e.rs decimal_exact_semantics:
     # 0.1+0.2 == 0.3 exactly; writes round half-away-from-zero at the
     # declared scale; SUM keeps the column scale, AVG divides at
     # scale+4; DECIMAL(5,2) rejects 1000 with MySQL 1292. EXPLAIN in

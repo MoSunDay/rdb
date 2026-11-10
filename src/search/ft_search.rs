@@ -115,7 +115,7 @@ pub async fn ft_search(ctx: &mut Ctx<'_>) {
     // docid, [score], [content]. Without the array header every
     // element becomes a standalone RESP value and clients (redis-cli,
     // iredis, python) stop after the total -- regression-tested in
-    // tests/search_e2e.rs (ft_search_reply_is_a_flat_array).
+    // tests/search/search_e2e.rs (ft_search_reply_is_a_flat_array).
     let per_hit = 1 + opts.with_scores as usize + (!opts.no_content) as usize;
     append_array(ctx.out, 1 + hits.len() * per_hit);
     append_int(ctx.out, total as i64);

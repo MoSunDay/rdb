@@ -13,7 +13,7 @@ Commit: b7378c0
 | in-proc wire | `resp::serve` 临时监听（`resp_e2e`/`gaps_e2e`/`bits_e2e`/`server_surface_e2e`/`routing_newcmds_e2e`） | 真实编解码 + 原始 TcpStream |
 | in-proc raft | `raft_cluster_e2e`/`raft_transport`/`ha_failover`/`sql_oracle_cluster_e2e` | 进程内 openraft 节点 |
 | 进程级 e2e | `tests/common/mod.rs`（`CARGO_BIN_EXE_rdb` + 临时 yaml + 临时端口） | 最接近真实部署 |
-| 前端专用 mini-harness | `kafka_front_common/`、`es_common/`、`s3_e2e/`、`rocksmq_http_e2e` | 真实二进制 + 手搓协议客户端 |
+| 前端专用 mini-harness | `kafka_front_common/`、`es_common/`、`s3/`、`rocksmq_http_e2e` | 真实二进制 + 手搓协议客户端 |
 | shell 场景 | `scrtips/e2e_scenarios/scenario_*.sh`（run_all.sh glob，当前 9 个） | redis-cli/iredis/redis-py/mysql/confluent-kafka 等真实客户端 |
 
 CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2e）；

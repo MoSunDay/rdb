@@ -420,7 +420,7 @@ mod tests {
     /// the durable ledger high-water mark: the reply generation is
     /// seed + 1, so a post-restart member outranks every pre-restart
     /// ledger row (restart death-zone regression, e2e companion in
-    /// tests/kafka_group_failover_e2e.rs).
+    /// tests/kafka/kafka_group_failover_e2e.rs).
     #[tokio::test]
     async fn first_join_seeds_generation_from_ledger() {
         let shared = crate::state::testutil::shared_with(crate::state::testutil::test_config());

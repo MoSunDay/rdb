@@ -2,7 +2,7 @@
 # scenario_lite_mq.sh - e2e: Lite MQ (RocketMQ-5.5-Lite semantics on the
 # Redis Streams verbs) driven by REAL redis-cli against the 3-node rdb
 # cluster assembled by env.sh: first CLI-suite coverage of what only the
-# Rust tests pin (tests/lite_*_e2e.rs). Steps: (a) produce (bare-parent
+# Rust tests pin (tests/lite/lite_*_e2e.rs). Steps: (a) produce (bare-parent
 # queue pick, explicit queue, XLEN, XRANGE COUNT), (b) XGROUP CREATE +
 # XREADGROUP `>` COUNT handoff, (c) XPENDING summary/range + XACK,
 # (d) second consumer + XAUTOCLAIM takeover, (e) ORDERED strict-serial
@@ -31,7 +31,7 @@
 #   id, so XGROUP CREATE s g 0 answers "ERR Invalid stream ID specified
 #   as stream command argument" (src/lite/group.rs:47,127-133) while
 #   `0-0` and `$` are the Rust tests' start points; duplicate CREATE =>
-#   BUSYGROUP (tests/lite_pel_e2e.rs:26-36).
+#   BUSYGROUP (tests/lite/lite_pel_e2e.rs:26-36).
 # - XREADGROUP GROUP g c [COUNT n] STREAMS <parent/child> `>` delivers
 #   NEW entries past the group watermark to the NAMED consumer and mints
 #   PEL rows (src/lite/read.rs:614-620). A total miss is the nil array
@@ -39,10 +39,10 @@
 # - XPENDING <s> <g> summary = [total, min-id, max-id, consumer, count];
 #   empty PEL = [0, nil, nil] (src/lite/pending.rs:58-83) => "0" plus two
 #   empty lines. Range `XPENDING s g - + n` = [id, consumer, idle,
-#   deliveries] rows in id order (tests/lite_pel_e2e.rs:96-116).
+#   deliveries] rows in id order (tests/lite/lite_pel_e2e.rs:96-116).
 # - XACK replies the committed-watermark ADVANCE, not rows removed
-#   (tests/lite_pel_e2e.rs "ack_below_watermark..."); a contiguous drain
-#   replies the acked count (tests/lite_proc_e2e.rs:185-190).
+#   (tests/lite/lite_pel_e2e.rs "ack_below_watermark..."); a contiguous drain
+#   replies the acked count (tests/lite/lite_proc_e2e.rs:185-190).
 # - XAUTOCLAIM <s> <g> <c> <min-idle> <start> [COUNT n] replies the
 #   Redis>=7 shape [next-cursor, entries[], deleted-ids[]]: entries carry
 #   FULL frames (id + field/value pairs), the cursor is the SUCCESSOR of
@@ -53,7 +53,7 @@
 #   error, n >= 1. Default ORDERED = inflight 1 = strict serial; the queue
 #   has ONE owner (30s lease, src/lite/mod.rs:83-90) so a second consumer
 #   gets the nil array, not a steal, and only the owner's XACK frees the
-#   window (tests/lite_ordered_e2e.rs:34-60,86-98).
+#   window (tests/lite/lite_ordered_e2e.rs:34-60,86-98).
 # - XINFO STREAM <s> = [length, last-generated-id, groups, idle-ms]
 #   (src/lite/info.rs:30-48). XINFO GROUPS <s> per-group arrays carry 13
 #   elements (name + 6 labeled fields). Fixed 2026-09-26: the header
@@ -69,7 +69,7 @@
 #   src/lite/delay.rs ID POLICY) and wakes parked BLOCK readers
 #   (XADD-parity notify on the stream + parent keys). The sweep exists
 #   only when `lite.delay_sweep_ms` > 0 (default 0 = OFF); family
-#   delete/RENAME fold/carry the staged rows (tests/lite_delay_e2e.rs).
+#   delete/RENAME fold/carry the staged rows (tests/lite/lite_delay_e2e.rs).
 # - P3 W2 (section j), verified against source before writing it:
 #   NOMKSTREAM is a LEADING XADD option; on a FRESH key the nil bulk is
 #   the whole reply -- no meta, no entry, no stats (src/lite/append.rs,
@@ -385,7 +385,7 @@ main () {
     # Time-window retention: ids are `<ms timestamp>-<seq>`, so
     # `XTRIM <s> MINID <cutoff_ms>-0` keeps exactly the entries whose
     # arrival time is >= cutoff -- one periodic command, no per-message
-    # index (the sliding-window idiom from tests/lite_trim_minid_e2e.rs).
+    # index (the sliding-window idiom from tests/lite/lite_trim_minid_e2e.rs).
     local t3=tm/q2
     rc "$mq" XADD "$t3" 1000-0 f old >/dev/null
     rc "$mq" XADD "$t3" 2000-0 f edge >/dev/null
@@ -434,7 +434,7 @@ main () {
     assert_contains "the woken reader got the FRESH exchange id" "$fresh" \
         "$(cat "$blk" 2>/dev/null)"
     # RENAME carries staged rows with the stream family (same-slot pair
-    # from tests/lite_delay_e2e.rs): the row exchanges at the NEW name.
+    # from tests/lite/lite_delay_e2e.rs): the row exchanges at the NEW name.
     local rsrc=t3107/q5 rdst=t43847/q5
     rc "$mq" XADD "$rsrc" '*' DELAY 2500 evt moved >/dev/null
     assert_eq "RENAME carries the staged 0x1D row with the family" "OK" \

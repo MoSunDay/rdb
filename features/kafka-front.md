@@ -227,7 +227,7 @@ SDK 实测暴露并已修复的兼容性 bug（每条均有 e2e/单测或场景�
   （裸 deflate 兜底可能把垃圾"解成"垃圾，随后在记录截断处报错，仍归 2）。
 - 测试：`src/kafka/codec_tests.rs`（6 例，内嵌真实 librdkafka 三格式
   wire fixture）、`produce_tests.rs` feature 门控 Lite 追加断言、
-  `tests/kafka_codec_e2e.rs`（真二进制：三格式 ×5 条 roundtrip、zstd→76、
+  `tests/kafka/kafka_codec_e2e.rs`（真二进制：三格式 ×5 条 roundtrip、zstd→76、
   坏 gzip→2、XRANGE 键值断言）；SDK 场景第 7 步（30 条/codec，
   `batch.num.messages=10, linger.ms=200` 逼 librdkafka 真正成批压缩；
   无 feature 构建 DR 全 76 → 步骤自 SKIP，不判失败）。
@@ -331,11 +331,11 @@ kafka 面消费到的三处引擎级缺口（详见 `features/changelog/2026-10-
 1. **headers 真回放**：Fetch 对 produce 形状的存储还原**真 record headers**
    （"h" 对 JSON 反解，`parse_headers_json` = produce 侧写入的逆函数）；exotic
    形状回退 JSON envelope 并加标记头 `("rdb-envelope", null)`，存量 envelope
-   数据照常兼容；存储格式零改动。e2e `tests/kafka_headers_roundtrip_e2e.rs`
+   数据照常兼容；存储格式零改动。e2e `tests/kafka/kafka_headers_roundtrip_e2e.rs`
    （4 用例：真往返/tombstone/无 headers/exotic 兜底）。
 2. **RENAME 随搬 0x20 账本**：`move_family` 折叠 OFFSET_FAMILY 窗口，组账本随流
    迁移；旧名 OffsetCommit 回 error 3 `UNKNOWN_TOPIC_OR_PARTITION`（映射解析先于
-   账本写入，无悬空行）。e2e `tests/kafka_rename_ledger_e2e.rs`（2 用例）。
+   账本写入，无悬空行）。e2e `tests/kafka/kafka_rename_ledger_e2e.rs`（2 用例）。
 3. **XTRIM/XDEL 账本守卫**：有 0x20 账本行的流拒绝 XTRIM/XDEL
    （`ERR stream <name> has committed consumer-group offsets; delete the groups
    first`），ordinal↔id 映射不再被删条目撕裂（守卫同样保护 RESP 面的 Lite 流）。
@@ -355,7 +355,7 @@ plans/2026-10-06-mq-gap/03 的"字节永不丢失"规则；e2e 此前只用 ASCI
    header 时原样回放、不附加标记头；标记头只由兜底合成（恒 null 值且为该记录
    唯一头）。客户端无法区分"用户单发 null 值 `rdb-envelope` 头"与兜底标记，
    标记头为提示性信号，依赖它的客户端应避免使用该保留名。
-   e2e：`tests/kafka_headers_fidelity_e2e.rs`（3 用例：native 名字节往返/
+   e2e：`tests/kafka/kafka_headers_fidelity_e2e.rs`（3 用例：native 名字节往返/
    envelope 名字节往返/碰撞用户头优先）。
 
 ## 组管理 API 与 SASL（MQ Batch 2，2026-10-06）
@@ -408,7 +408,7 @@ OffsetCommit、从未 JoinGroup，无 lite 0x0E 组记录）。两端语义：
 - api key 实证（confluent-kafka 2.15.1 / librdkafka 2.15.1 线上抓帧）：Handshake=17
   v1、Authenticate=36 v1、DeleteGroups=42 v1（与 plans/2026-10-06-mq-gap/03 一致；
   42 之外的编号会直接让 SDK 端 `UNSUPPORTED_FEATURE` 拒发）。
-- e2e：`tests/kafka_admin_e2e.rs`（4 用例：ListGroups 并集/守卫释放+69 重建/SASL
+- e2e：`tests/kafka/kafka_admin_e2e.rs`（4 用例：ListGroups 并集/守卫释放+69 重建/SASL
   全矩阵——预认证 ApiVersions、未认证断连、错机制 33、错密码 58+断连、正确 token
   后 produce+fetch+commit+ListGroups 全通）。
 
@@ -503,7 +503,7 @@ DeleteTopics 走 **DEL/闲置收割的同一条 family-delete 路径**
 0x20**（组 committed offset 行随流死，等于批量释放 XTRIM/XDEL 守卫）、**延迟暂存
 0x1D**（到期前删 topic 不留幽灵行）、以及分区流的嵌套子流（默认 DLQ
 `T/pN/dlq`——它本身是完整流）。RENAME 随搬 0x20/0x1D 的既有行为（Batch 1/2）不
-受影响。e2e 断言删后 DLQ/延迟/账本齐消（`tests/kafka_topics_e2e.rs::
+受影响。e2e 断言删后 DLQ/延迟/账本齐消（`tests/kafka/kafka_topics_e2e.rs::
 delete_topics_folds_family_collateral`）。
 
 
@@ -520,7 +520,7 @@ delete_topics_folds_family_collateral`）。
   决策）。
 - 实测环境无 kcat；真实客户端覆盖由 P5a 的 confluent-kafka/librdkafka 实测补齐
   （见上节），P0/P1 的 wire 正确性另由
-  `tests/kafka_wire_e2e.rs` + `tests/kafka_produce_e2e.rs`（真实二进制 + RESP 造流
+  `tests/kafka/kafka_wire_e2e.rs` + `tests/kafka/kafka_produce_e2e.rs`（真实二进制 + RESP 造流
   + 裸 TCP 手写帧，公共夹具在 `tests/kafka_front_common/`）与 lib 单测覆盖。
 
 ## 实现
@@ -550,21 +550,21 @@ delete_topics_folds_family_collateral`）。
   `rocksmq_bind`（`conf.rs`，空=关闭）。
 - 指标：`rdb_kafka_api_latency`（`monitor.rs`；conn 侧观测排除 Fetch park 时长、
   覆盖 acks=0 无响应路径）。
-- 测试：`tests/kafka_wire_e2e.rs`（P0 握手/元数据）、`tests/kafka_produce_e2e.rs`
-  （P1 Produce/ListOffsets + 错误路径）、`tests/kafka_fetch_e2e.rs`
-  （P2 Fetch 阶梯/截断/长轮询）、`tests/kafka_offsets_e2e.rs`
+- 测试：`tests/kafka/kafka_wire_e2e.rs`（P0 握手/元数据）、`tests/kafka/kafka_produce_e2e.rs`
+  （P1 Produce/ListOffsets + 错误路径）、`tests/kafka/kafka_fetch_e2e.rs`
+  （P2 Fetch 阶梯/截断/长轮询）、`tests/kafka/kafka_offsets_e2e.rs`
   （P2 提交偏移：世代规则 + kill/respawn 持久化）；公共进程夹具
   `tests/kafka_front_common/`（含 `kill_now`/`respawn` 重启支持，`groups.rs`
-  组协议 helpers）；`tests/kafka_group_e2e.rs`（P3 两段式 join→barrier→分发→
-  Describe Stable→commit→Leave→rejoin→两层 fencing）；`tests/kafka_group_
+  组协议 helpers）；`tests/kafka/kafka_group_e2e.rs`（P3 两段式 join→barrier→分发→
+  Describe Stable→commit→Leave→rejoin→两层 fencing）；`tests/kafka/kafka_group_
   failover_e2e.rs`（session 超时 sweep 拉回 rebalance、重启丢 membership 但
-  offsets 持久 + 跨重启 member id 不复用）；`tests/kafka_codec_e2e.rs`
-  （P5b 压缩 roundtrip，feature 门控）；`tests/kafka_headers_roundtrip_e2e.rs`
-  （headers 真回放 + envelope 兜底标记头）与 `tests/kafka_rename_ledger_e2e.rs`
+  offsets 持久 + 跨重启 member id 不复用）；`tests/kafka/kafka_codec_e2e.rs`
+  （P5b 压缩 roundtrip，feature 门控）；`tests/kafka/kafka_headers_roundtrip_e2e.rs`
+  （headers 真回放 + envelope 兜底标记头）与 `tests/kafka/kafka_rename_ledger_e2e.rs`
   （RENAME 随搬 0x20 账本 + 旧名 commit 回 3，MQ Batch 1）；
-  `tests/kafka_admin_e2e.rs`（Batch 2：ListGroups 并集/守卫释放/69+重建/
+  `tests/kafka/kafka_admin_e2e.rs`（Batch 2：ListGroups 并集/守卫释放/69+重建/
   SASL 矩阵，admin+SASL wire helpers 在 `kafka_front_common/groups.rs`）；
-  `tests/kafka_topics_e2e.rs`（2026-10-07 P3 回填：建/删/扩分区全 wire 往返、
+  `tests/kafka/kafka_topics_e2e.rs`（2026-10-07 P3 回填：建/删/扩分区全 wire 往返、
   键族折叠（DLQ/延迟/0x20 账本齐消）、auto-create 开关两态、ListOffsets v2–v5、
   DescribeConfigs/OffsetForLeaderEpoch；topic-admin wire helpers 在
   `kafka_front_common/topics.rs`）；场景脚本
