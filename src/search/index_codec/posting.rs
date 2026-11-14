@@ -185,11 +185,11 @@ pub fn encode_centroids(table: &CentroidTable) -> Vec<u8> {
             out.extend_from_slice(&x.to_le_bytes());
         }
     }
-    for axis in 0..table.dim as usize {
-        out.extend_from_slice(&table.min[axis].to_le_bytes());
+    for &x in table.min.iter().take(table.dim as usize) {
+        out.extend_from_slice(&x.to_le_bytes());
     }
-    for axis in 0..table.dim as usize {
-        out.extend_from_slice(&table.scale[axis].to_le_bytes());
+    for &x in table.scale.iter().take(table.dim as usize) {
+        out.extend_from_slice(&x.to_le_bytes());
     }
     for &m in &table.members {
         out.extend_from_slice(&encode_count(m));
