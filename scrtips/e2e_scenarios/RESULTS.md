@@ -255,3 +255,20 @@ pip line gained `confluent-kafka` so kafka_sdk exercises the real SDK
 nightly instead of self-skipping. This file's results table predates
 the kafka scenarios (counts for the other four are per their last
 logged runs). Full quantified gap register: `features/e2e-coverage.md`.
+
+2026-11-14 note: nightly soak had been red since 2026-11-04 on two
+scenarios, both fixed at `e37a51e` and re-validated locally (summary:
+9 pass, 0 fail). (1) `mysql_orders`: M4 (mysql-gap, 2026-10-06) turned
+the `UNIQUE KEY` table constraint into a legal inline one-column
+secondary index, so the v1 "other table constraints" rejection
+assertion went stale -- the negative matrix now uses FOREIGN KEY
+(still errno 1235) and a new (b2) block proves the M4 positive
+contract (SHOW INDEX row, dup 1062, nothing leaked). (2)
+`kafka_bench`: CI produce hit 220-270k ops/s (fsync-batched) while the
+single fetch client tails at a fixed reply cadence (~24k records per
+~400ms reply, 60-120k records/s by host), so the fixed 2x fetch
+duration missed the 90% catch-up deterministically; fetch now gets 6x
+produce duration (budget tolerates fetch/produce >= 0.15, observed
+worst ~0.37). Triage aid: `run_all.sh` ::error annotation tail
+widened 8 lines/300c -> 20 lines/1200c; soak.yml pins
+`confluent-kafka==2.15.1` alongside the other clients.
