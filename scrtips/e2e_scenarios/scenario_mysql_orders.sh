@@ -14,13 +14,15 @@
 #   None (src/sql/dist/mod.rs:97) and writes stay node-local, so this
 #   script runs CLUSTER INIT itself and polls EXPLAIN until plans carry a
 #   "Gather(bands=" headline (src/sql/dist/gather.rs:80-98).
-# - Table constraints other than PRIMARY KEY are rejected with
-#   "not supported in this version: other table constraints"
-#   (src/sql/parse/translate.rs:527, src/sql/parse/error.rs:62-65); an
-#   inline column UNIQUE is silently ignored (translate.rs:597). The
-#   supported uniqueness form is CREATE UNIQUE INDEX on ONE column
-#   (translate.rs:307-323), enforced incl. the distributed 2PC veto
-#   (src/sql/index/mod.rs:336-345, src/sql/dist/participant.rs:147-163).
+# - Since M4 (mysql-gap, features/changelog/2026-10-06/mysql-m4-*), a
+#   `KEY`/`UNIQUE KEY` table constraint is an inline ONE-column secondary
+#   index (src/sql/parse/translate.rs, TableConstraint::Index/Unique):
+#   accepted, listed by SHOW INDEX, and the unique form enforces errno
+#   1062 incl. the distributed 2PC veto (src/sql/index/mod.rs,
+#   src/sql/dist/participant.rs). Other table constraints (FOREIGN KEY,
+#   CHECK) still reject with "not supported in this version: other table
+#   constraints"; an inline column UNIQUE stays silently ignored.
+#   CREATE [UNIQUE] INDEX on one column keeps working as before.
 # - Duplicate table: "table 'x' already exists" errno 1050
 #   (src/sql/exec/ddl.rs:182-185); duplicate index: "index 'x' already
 #   exists" (ddl.rs:289-292). DDL is leader-gated: non-leaders answer
@@ -280,8 +282,10 @@ main () {
         "orders_t,0,PRIMARY,1,id,BTREE" "$index_csv"
 
     # ---- (b) DDL failure modes ------------------------------------------
-    ddl_exec 0 "CREATE TABLE orders_bad_t (id BIGINT PRIMARY KEY, user_id BIGINT, UNIQUE KEY uk_bad (user_id))"
-    assert_fails "table-constraint UNIQUE KEY rejected"
+    # (M4 made `UNIQUE KEY` table constraints legal inline indexes -- the
+    # still-rejected family is FOREIGN KEY / CHECK, see header notes.)
+    ddl_exec 0 "CREATE TABLE orders_bad_t (id BIGINT PRIMARY KEY, user_id BIGINT, FOREIGN KEY (user_id) REFERENCES orders_t (id))"
+    assert_fails "table-constraint FOREIGN KEY rejected"
     assert_err_contains "rejection is the v1 grammar error" "not supported in this version"
     sql_mysql 2 "SHOW TABLES"
     assert_not_contains "rejected DDL left no orders_bad_t behind" "orders_bad_t" "$SQL_OUT"
@@ -298,6 +302,20 @@ main () {
     # ---- routing: the topology ticker must have published the sql nodes --
     assert_eventually "node0 EXPLAIN shows a routed Gather plan" wait_routing 0 30
     wait_routing 1 30 && wait_routing 2 30
+
+    # ---- (b2) M4 inline `UNIQUE KEY` = a real unique secondary index ----
+    ddl_exec 0 "CREATE TABLE orders_uk_t (id BIGINT PRIMARY KEY, user_id BIGINT, UNIQUE KEY uk_bad (user_id))"
+    assert_ok "M4: inline UNIQUE KEY table constraint accepted"
+    poll_has 2 "SHOW INDEX FROM orders_uk_t" "uk_bad" 30
+    assert_contains "inline uk_bad is a unique index row on user_id" \
+        "orders_uk_t,0,uk_bad,1,user_id,BTREE" \
+        "$(printf '%s' "$POLL_OUT" | tr '\t' ',')"
+    sql_mysql 1 "INSERT INTO orders_uk_t (id, user_id) VALUES (501, 501)"
+    assert_ok "seed one row into orders_uk_t via node1"
+    sql_mysql 2 "INSERT INTO orders_uk_t (id, user_id) VALUES (502, 501)"
+    assert_dup_1062 "inline UNIQUE KEY vetoes a duplicate user_id on node2"
+    sql_mysql 0 "SELECT COUNT(*) FROM orders_uk_t"
+    assert_eq "no row leaked from the inline-unique veto" "1" "$SQL_OUT"
 
     # ---- (c) seed + cross-node transactional transfer --------------------
     sql_mysql 0 "INSERT INTO orders_t (id, user_id, amount, note) VALUES (1001, 101, 100, 'alice')"

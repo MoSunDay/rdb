@@ -49,12 +49,13 @@ jobs:
         # probe), confluent-kafka (kafka_sdk -- installed here so the
         # scenario runs instead of self-skipping its SDK steps). Versions
         # pinned to the locally-validated matrix (mysql 8.0 line, iredis
-        # 1.16.1, mycli 1.31.2, redis-py 7.4.1). PEP 668 runner python
+        # 1.16.1, mycli 1.31.2, redis-py 7.4.1, confluent-kafka 2.15.1).
+        # PEP 668 runner python
         # needs --break-system-packages.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev redis-tools curl default-mysql-client python3-pip
-          python3 -m pip install --break-system-packages "iredis==1.16.1" "redis==7.4.1" "mycli==1.31.2" "confluent-kafka"
+          python3 -m pip install --break-system-packages "iredis==1.16.1" "redis==7.4.1" "mycli==1.31.2" "confluent-kafka==2.15.1"
 
       - uses: dtolnay/rust-toolchain@stable
 

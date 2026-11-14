@@ -66,7 +66,7 @@ if [ "$fail" -ne 0 ]; then
     if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
         for name in "${failed_names[@]}"; do
             short="${name#scenario_}"; short="${short%.sh}"
-            tail_txt="$(tail -n 8 "/tmp/rdb_e2e_${name%.sh}.out" 2>/dev/null | tr '\n' '|' | tail -c 300)"
+            tail_txt="$(tail -n 20 "/tmp/rdb_e2e_${name%.sh}.out" 2>/dev/null | tr '\n' '|' | tail -c 1200)"
             printf '::error title=e2e-%s::%s\n' "$short" "${tail_txt:-no-log}"
         done
     fi

@@ -10,10 +10,14 @@
 #      topic bench1/q0 over RESP (XADD seed) before each run
 #   2. kafka-prod: 2 clients x 15s x 100 records/request (acks=1, one
 #      fsync per request server-side)
-#   3. kafka-fetch: 1 client x 30s tails partition 0 from offset 0
-#      (500ms long-poll at the tail) and must catch up with the log;
-#      fetch gets 2x produce duration because tailing measures ~84k
-#      records/s vs ~72k/s on the reference box
+#   3. kafka-fetch: 1 client x 90s tails partition 0 from offset 0
+#      (500ms long-poll at the tail) and must catch up with the log.
+#      Fetch gets 6x produce duration: produce is fsync-batched (2
+#      clients x 100 records/request) and reached 220-270k ops/s on CI's
+#      NVMe while the single sequential fetch client tails at a fixed
+#      reply cadence (~24k records per ~400ms reply => 60-120k records/s
+#      by host); 6x means the 90% catch-up only needs the fetch/produce
+#      rate ratio >= 0.15 (observed worst ~0.37 on 2026-11 CI runs)
 # Assertions: both bench runs exit 0 (exit 1 means kafka error replies /
 # base_offset regressions), produce ops > 0, and fetch reads >= 90% of
 # the produced records (ops counts RECORDS on both workloads).
@@ -110,10 +114,10 @@ else
   fail "kafka-prod produced nothing (ops=${PROD_OPS:-unparsed})"
 fi
 
-echo "== kafka-fetch: 1 client x 30s tailing bench1/0 from offset 0 =="
+echo "== kafka-fetch: 1 client x 90s tailing bench1/0 from offset 0 =="
 "$BENCH_BIN" --addr "127.0.0.1:$RESP_PORT" --token "$TOKEN" \
   --host "127.0.0.1:$KAFKA_PORT" --workload kafka-fetch \
-  --clients 1 --duration 30 >"$WORK/fetch.out" 2>"$WORK/fetch.err"
+  --clients 1 --duration 90 >"$WORK/fetch.out" 2>"$WORK/fetch.err"
 RC=$?
 if [ $RC -ne 0 ]; then
   fail "kafka-fetch exited $RC (error replies or client failure)"
