@@ -13,6 +13,7 @@ Commit: b7378c0
 | in-proc wire | `resp::serve` 临时监听（`resp_e2e`/`gaps_e2e`/`bits_e2e`/`server_surface_e2e`/`routing_newcmds_e2e`） | 真实编解码 + 原始 TcpStream |
 | in-proc raft | `raft_cluster_e2e`/`raft_transport`/`ha_failover`/`sql_oracle_cluster_e2e` | 进程内 openraft 节点 |
 | 进程级 e2e | `tests/common/mod.rs`（`CARGO_BIN_EXE_rdb` + 临时 yaml + 临时端口） | 最接近真实部署 |
+| 进程级多存储场景 | `tests/scenario_common/`（多前端单节点 `front_world` + 3 节点集群） | 真实业务场景横切多存储面 |
 | 前端专用 mini-harness | `kafka_front_common/`、`es_common/`、`s3/`、`rocksmq_http_e2e` | 真实二进制 + 手搓协议客户端 |
 | shell 场景 | `scrtips/e2e_scenarios/scenario_*.sh`（run_all.sh glob，当前 9 个） | redis-cli/iredis/redis-py/mysql/confluent-kafka 等真实客户端 |
 
@@ -40,6 +41,40 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2 十例，`tests/scenario_*_e2e.rs` 20 例 + `tests/scenario_common/` 公共夹具）**：
+  业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
+  断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
+  `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
+  `session_profile`（六类家族 + PX 过期判决 + kill -9 存活矩阵）、
+  `social_feed`（Set 关注图 + SINTER（hash-tag 键）+ List 收件箱 LTRIM + ZSET 热榜 + FT 中文分词双查询）、
+  `reco_vector`（VADD/VSIM 召回 + Hash 元数据 + SQL 目录对账）、
+  `log_pipeline`（RocksMQ /produce→/consume b64 载荷→ES 需显式建索引 + term 查询→SQL 台账对账→RESP 侧 XLEN 互查）、
+  `delay_jobs`（XADD DELAY 暂存换新 id + SET NX PX 租约 + MAXDELIVERY 2 的 DLQ 三跳 + SQL 台账）、
+  `risk_control`（INCR 窗口 + Set 黑名单 + SETBIT 指纹 + ZADD/ZREMRANGEBYSCORE 滑窗 + SQL 审计）、
+  `iot_telemetry`（Kafka Produce v3 上行→JSON.SET 影子→HGET 最新值→告警）、
+  `media_archive`（S3 PUT/GET/LIST + RESP 签名键 + 重启存活）、
+  `multistore_failover`（3 节点集群：SQL 2PC 死带显式拒绝 + KV 槽 MOVED 诚实停摆 + lite 流 raft 复制读 +
+  kill -9 后新 leader 续写 + respawn SQL 行追平）；
+  批次 2（2026-11-20，编号 #11–#20，互不重复的多平面横切）：
+  `payment_ledger`（INCRBY 钱包→SQL 双分录 UNIQUE(entry_no) 重放 COMMIT 拒绝→XGROUP 消费→ZSET 收款榜→DELAY 对账 job→SUM(D)=SUM(C)=榜=170 且转账守恒 950）、
+  `flash_sale`（INCRBY 库存 50→47 + SET NX PX 限购锁 nil 拒绝 + UNIQUE(order_no) 重放 + ZINCRBY 销量榜 + LPUSH 中奖名单）、
+  `chat_offline`（SET NX PX 会话锁 + HSET/HGETALL 画像 + XGROUP 在线直 ACK/离线 LPUSH 落箱 + GETDEL 回执烧毁 + ES term 大小写敏感）、
+  `config_center`（JSON.SET/GET/NUMINCRBY `.rev` + INCR epoch + FT 三服务检索 + S3 快照字节回读 + SET PX→EXPIRE→PERSIST(TTL -1)）、
+  `metrics_rollup`（INCR 分桶 + SETBIT 重复置位 :1 不虚增 BITCOUNT UV + ZINCRBY/ZREVRANGE 热点序 + XRANGE 重放计数 + SQL 对账三面同值）、
+  `inventory`（HINCRBY 出入库 + SADD/SMOVE 仓库集 + ZADD 缺口榜 ZREMRANGEBYSCORE 清队 + SQL movements SUM=HGET qty + RocksMQ 补货指令闭环）、
+  `ticket_seats`（SADD 占座 + SET NX PX 座位租约 + UNIQUE(seat) 对手单 COMMIT 拒 + RPUSH/LPOP 候补 FIFO + DELAY 超时释放 job 后 SREM :1）、
+  `push_news`（Kafka Produce v3 带 headers 上行→record_fields k/v/h 落流→XREADGROUP 逐条扇出 HSET/ZINCRBY/SQL/ES→ZREVRANGE 水位序）、
+  `game_season`（ZINCRBY 天梯 ZREVRANGE 冠军序 + JSON 档案 NUMINCRBY + VADD/VSIM 召回 + EXPIRE/PERSIST buff + SQL 结算 SUM=ZSCORE 和）、
+  `audit_archive`（RESP+MySQL+ES+S3 四前端单节点齐聚：SQL 审计 6 行 + XGROUP 消费 ACK + ES term + S3 字节回读 + ZREVRANGE 工作量榜）。
+  行为要点（写作时钉死的语义）：HSET/SADD/LPUSH/ZADD/SETBIT/EXPIRE 等回 `:N`，GET/HGET/JSON.GET/ZSCORE/
+  ZINCRBY/XADD 回 bulk（`scenario_common::rb` 兜 `$-1`）；XGROUP 起点 `0-0`；流名仅 `A-Za-z0-9_.-`（不能带 `{}`，
+  hash-tag 只能用于 KV 键）；单节点也强制 CROSSSLOT；ES 无自动建索引且 match 查询会 lowercase 而keyword 文档
+  不分词（大小写敏感场景用 term）；RocksMQ /consume 的 body 是 base64；集群上 lite 写/组操作任意节点可受理
+  （raft 复制），但 `XREADGROUP >` 投递只在 leader 生效；SQL 快照事务的 dup 冲突在 COMMIT 时才判决；
+  批次 2 追加钉死：SREM/SMOVE/TTL/SMEMBERS/GETDEL/JSON.NUMINCRBY 均已注册；多键 Set 运算（SMOVE）必须
+  hash-tag 同槽（`{inv}wh:*`）否则 CROSSSLOT；无 PRIMARY KEY 的建表直接 1235 拒绝；`IN (...) ORDER BY`
+  返回序以 IN 列表序为准；HSET 对已存在字段返回 0（只数新字段）；Kafka topic `t` 落流即 `t/q0`、
+  record 字段名为 `k`/`v`/`h`（header 名 hex 编码）。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
