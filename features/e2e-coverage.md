@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2 十例，`tests/scenario_*_e2e.rs` 20 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3 各十例，`tests/scenario_*_e2e.rs` 30 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -75,6 +75,24 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   hash-tag 同槽（`{inv}wh:*`）否则 CROSSSLOT；无 PRIMARY KEY 的建表直接 1235 拒绝；`IN (...) ORDER BY`
   返回序以 IN 列表序为准；HSET 对已存在字段返回 0（只数新字段）；Kafka topic `t` 落流即 `t/q0`、
   record 字段名为 `k`/`v`/`h`（header 名 hex 编码）。
+  批次 3（2026-11-20，编号 #21–#30，互不重复的多平面横切）：
+  `bank_2pc_cluster`（3 节点 sql_rpc 集群：开户批 24 行跨槽 2PC 提交 + 三节点 SUM 读一致 +
+  UNIQUE(txid) 重放远端 dup 否决全局消失 + /sql2pc/status unknown/committed 判决）、
+  `hotel_calendar`（SETBIT 入住日历 + BITCOUNT + ZRANGEBYSCORE 价窗 + SINTER（hash-tag `{amen}`）设施交集 +
+  UNIQUE(night) 重订 COMMIT 拒）、
+  `exchange_orderbook`（双 ZSET 买卖簿 ZREVRANGE/ZRANGE 最优价 + ZREM 撮合双撤 + SQL trades + INCRBY/HINCRBY ticker + XADD tape）、
+  `subscription_renewal`（DELAY 续费波 XLEN 不可见→交换→XREADGROUP 按 churn 名单分支 SMOVE + UNIQUE(user_cycle) 账单重放拒）、
+  `election_ballots`（UNIQUE(ballot_key) 防重投 + HINCRBY 汇总与 SQL GROUP BY 对账 + ES `_doc/{ballot_key}` 幂等镜像 term 区域计数）、
+  `courier_dispatch`（RocksMQ /produce→/consume 双派单员竞争 SET NX PX 认领 + UNIQUE(order_key) + ack 清零 + TTL 审计）、
+  `insurance_claims`（S3 证据字节级回读 + 前缀 list + 证据 GET 200 才准核的 gate + INCRBY 赔付台与 SQL SUM 对账）、
+  `clinic_slots`（UNIQUE(slot_key) 双订 COMMIT 拒 + DELAY 提醒波 + 投递按 SQL status 分支（cancelled 不发短信）+ XPENDING 清零）、
+  `flight_ground`（ZADD 时刻表 + ZRANGEBYSCORE 晨窗 + WHERE 守卫的 UPDATE 轮转（尾号未落地零行生效）+ IN(...) 重订 + ZREM/ZCARD 清板）、
+  `smartmeter_grid`（Kafka Produce v3 带 region headers→XRANGE hex 头互证 + INCRBY 分表 + SQL GROUP BY 区域汇总 +
+  last_batch 守卫离网翻转 + S3 原始批字节归档）。
+  批次 3 追加钉死：XREADGROUP 的 GROUP 参数是组名（写流名必得 NOGROUP）；XPENDING 汇总回复是
+  `*3\r\n:0\r\n$-1\r\n$-1\r\n` 形数组非单整数；ZADD/ZREM 多成员回 `:N` 非 +OK；HGET 回 bulk 需
+  `rb().parse()`；SQL 唯一性裁决只认 `UNIQUE KEY` 子句（PRIMARY KEY 列不裁重）；dup 冲突即便显式
+  BEGIN..COMMIT 也只在 COMMIT 边界回 1062；DELAY 交换后建组/读组均正常（组与流元数据独立存储）。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
