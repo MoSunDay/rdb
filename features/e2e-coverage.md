@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3 各十例，`tests/scenario_*_e2e.rs` 30 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 各十例，`tests/scenario_*_e2e.rs` 40 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -93,6 +93,32 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   `*3\r\n:0\r\n$-1\r\n$-1\r\n` 形数组非单整数；ZADD/ZREM 多成员回 `:N` 非 +OK；HGET 回 bulk 需
   `rb().parse()`；SQL 唯一性裁决只认 `UNIQUE KEY` 子句（PRIMARY KEY 列不裁重）；dup 冲突即便显式
   BEGIN..COMMIT 也只在 COMMIT 边界回 1062；DELAY 交换后建组/读组均正常（组与流元数据独立存储）。
+  批次 4（2026-11-21，编号 #31–#40，互不重复的多平面横切，changelog
+  `changelog/2026-11-20/multistore-scenarios-batch4.md`）：
+  `kafka_consumer`（RESP 侧 XADD 裸父 topic ×6→手搓 Fetch v0 整批读回 hwm=6/batch(0,6)→OffsetCommit v0 ship@4→
+  OffsetFetch 回 4→@4 续读尾两单 batch(4,2)→未提交新组 -1 哨兵）、
+  `saga_compensation`（SAVEPOINT sp_car 部分补偿只回滚租车腿、ROLLBACK TO 幂等/RELEASE 后报 does not exist、
+  1305 失败腿、三路 LEFT JOIN NULL 腿渲染 `<NULL>`）、
+  `dispatch_blocking`（BLPOP 唤醒 `*2`<4s/空队列 1s 超时 `*-1`/BRPOPLPUSH `{job}` 同槽唤醒+落 done 列/超时 `$-1`/
+  BZPOPMIN 唤醒 `*3` 含 9.5）、
+  `checkout_watch`（双连接 WATCH 竞争胜者 EXEC `*2 :2 :1` 败者原始 `*-1`、重试胜出、EXEC 消耗 watch、
+  CROSSSLOT/blpop 入队拒绝原文+EXECABORT）、
+  `checkpoint_dr`（S3 灾备演练：等 id≥写完成时刻且 meta.json 在位的 ckpt→kill_now→抹数据目录保 `raft/` 子目录→
+  拷回 ckpt 文件跳 meta.json/边车→respawn→预写数据全复活）、
+  `key_lifecycle`（EXPIRE/TTL/PERSIST、RENAME 迁 TTL、8 类 TYPE、SCAN 游标全走+MATCH+COUNT 分页+TYPE 过滤、
+  KEYS 对照、多键 DEL/EXISTS `{kc}` 同槽、惰性过期、流名 TYPE quirk：`TYPE <流名>` 回 none 但 SCAN TYPE stream 能见）、
+  `event_sourcing`（XADD 回执↔XRANGE id 对账、XREADGROUP 全量投递+XACK :4、空 PEL `*3`、XPENDING 非空扩展 `*5`、
+  XAUTOCLAIM `*3` 重领、XINFO GROUPS/CONSUMERS）、
+  `cart_json_vector`（JSON 购物车 ARRAPPEND/ARRLEN/STRAPPEND/OBJKEYS/DEL+SQL 结账+FT.CREATE TEXT+VECTOR DIM 4/
+  FT.BUILD/FT.INFO ann_centroids:2/KNN 召回/FT.DEL+VADD 方言 `VALUES <dim> <member> <f...>`×3/VSIM 最近邻）、
+  `es_bulk_reindex`（目录 ETL：显式 `PUT /<index>` 带 mappings 后 _bulk created×4 errors:false、update 翻 errors:true、
+  doc DELETE→deleted→not_found 非 404、_count/match 收缩）、
+  `gdpr_erase`（SQL 伪名化 UPDATE、ES doc 删除幂等、DEL/JSON.DEL :1→:0、u2 完好 KEYS 对照）。
+  批次 4 追加钉死：ES _bulk 不自动建索引（须先 PUT 索引，items[].index.status=201）；SCAN/KEYS 是白名单全局命令
+  （空前缀跨 slot 扫全库）；流名禁 hash tag、`TYPE <流名>` 回 none；BRPOPLPUSH src/dst 不同槽停车时立即回
+  CROSSSLOT（永不唤醒）；BLPOP 超时 `*-1`/BRPOPLPUSH 超时 `$-1`/BZPOPMIN 唤醒 `*3`；XPENDING 非空=扩展 `*5`；
+  VADD 方言 member 在浮点前；JSON.DEL 数组索引删除后重排（幂等断言须用对象路径）；checkpoint 恢复须保留数据目录下
+  `raft/` 子目录、s3data 根是 ProcNode.dir 的兄弟目录、首 ckpt 在 3s 启动宽限+interval 后。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
