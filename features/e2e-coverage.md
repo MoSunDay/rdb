@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5 各十例，`tests/scenario_*_e2e.rs` 60 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6 各十例，`tests/scenario_*_e2e.rs` 70 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -167,6 +167,35 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   invalid）；BITOP 回**结果字节长度**（Redis 语义），popcount 须 BITCOUNT 另读；FT.DROPINDEX 是 FT.DROP
   的别名（全族同删、无留文档变体）、FT.DROP 回 :1 二次 unknown index、FT.ADD 回 :1；HINCRBYFLOAT 整型
   现值+浮点增量回紧凑形式（"4" 非 "4.0"）；SDIFF/SMISMEMBER 等数组回复经 `bulk_at` 逐元素断言。
+  批次 6（2026-11-21，编号 #61–#70 再扩 10 例，changelog
+  `changelog/2026-11-21/multistore-scenarios-batch6.md`）：
+  `sports_playoff_seeding`（ZADD GT/LT/CH/NX 旗标语义、NX+GT 组合 rdb 特有文案、ZINCRBY、
+  ZPOPMIN/ZPOPMAX 平铺对、ZREVRANGEBYSCORE+LIMIT、ZUNIONSTORE、SQL 终榜）、
+  `url_shortener_slug`（SETNX 占位、INCR 铸 id、GETDEL 烧令牌、SETEX+TTL/PERSIST、
+  SETRANGE/GETRANGE、WRONGTYPE、SQL 注册表）、
+  `sensor_alarm_bitmap`（SETBIT/GETBIT 车道位图、BITPOS 字节偏移、BITCOUNT、SSCAN 分页、
+  SINTERSTORE/SDIFFSTORE 预计算、SMOVE 隔离）、
+  `deli_counter_queue`（LINSERT 失锚 -1/缺键 0、LSET、LINDEX 双端 nil、LTRIM 服务窗、
+  LPUSHX/RPUSHX 拒建、LREM、SQL 号同步）、
+  `org_chart_json`（OBJLEN/OBJKEYS、ARRINDEX 排他 stop、ARRTRIM/ARRPOP/ARRAPPEND、
+  STRAPPEND 数值路径报错、NUMINCRBY 紧凑、JSON.DEL、HGETALL 族+HSTRLEN、SQL rollup）、
+  `parcel_backlog_xinfo`（XADD 裸父回 [解析后流名,id]、XINFO STREAM 分型字段、XGROUP 0-0、
+  XINFO GROUPS、XREAD 重放、XTRIM/XDEL、裸父/缺全名两态）、
+  `slot_migration_drill`（双节点：cluster init 等分槽带、IMPORTING 门、MIGRATE ≥6 参 KEYS
+  形式、单帧 ASKING 读副本、STABLE 复位、COPY 保源、批量+缺席跳过、RESTORE BUSYKEY 先行）、
+  `vector_capacity_gauge`（VDIM/VCARD、VSETATTR/VGETATTR、VSIM VALUES 无 dim 参、VREM 只减计数、
+  ES range+size）、
+  `energy_settlement_ledger`（INCRBYFLOAT 紧凑、SETRANGE/GETRANGE、HINCRBYFLOAT+HSTRLEN、
+  GETDEL、SQL GROUP BY 复合主键）、
+  `audience_scan_retire`（SINTERSTORE/SDIFFSTORE、SRANDMEMBER 正负语义、SSCAN/SCAN MATCH+COUNT
+  分页、UNLINK 同 hash tag 过 CROSSSLOT、KEYS 清场）。
+  批次 6 追加钉死：MIGRATE ≥6 参（单键无 COPY 用 `"" 0 5000 KEYS <key>`）；裸父 topic XADD 回
+  **解析后队列流名**（parent/q0）且后续命令沿用；XGROUP CREATE id 须全形 `0-0`；XINFO STREAM
+  拒裸父名（要 parent/child 全名）；VSIM VALUES 尾**无 dim 参数**（VADD 才有）；多键命令
+  CROSSSLOT 门须同 hash tag；SQL 建表强制 PRIMARY KEY（无则 1235）；raft-http join 不写
+  `cluster_slots_stable_instances`——须 `cluster init` + 3s topology tick 才有 -MOVED；
+  IMPORTING 门非 ASKING 连接回 -MOVED、ASKING 连接级单帧放行、STABLE 复位；GETRANGE 越界
+  回 `$0` 空 bulk。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
