@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 各十例，`tests/scenario_*_e2e.rs` 40 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5 各十例，`tests/scenario_*_e2e.rs` 60 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -119,6 +119,54 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   CROSSSLOT（永不唤醒）；BLPOP 超时 `*-1`/BRPOPLPUSH 超时 `$-1`/BZPOPMIN 唤醒 `*3`；XPENDING 非空=扩展 `*5`；
   VADD 方言 member 在浮点前；JSON.DEL 数组索引删除后重排（幂等断言须用对象路径）；checkpoint 恢复须保留数据目录下
   `raft/` 子目录、s3data 根是 ProcNode.dir 的兄弟目录、首 ckpt 在 3s 启动宽限+interval 后。
+  批次 5（2026-11-21，编号 #41–#60 再扩 20 例复杂场景，changelog
+  `changelog/2026-11-21/multistore-scenarios-batch5.md`）：
+  `airline_seatmap_upgrade`（HSETNX 锁座、ZADD 里程榜、ZPOPMAX `*2 [member,score]` 授升舱、
+  LMOVE 候补→确认、LRANGE/LPOS 对账 + SQL 航班表）、
+  `fraud_ring_detection`（SINTERCARD 设备交集、SDIFF 独占设备、SUNIONSTORE 全足迹、SETBIT+BITOP
+  AND/OR 指纹合并 + HINCRBY 风险分 + SQL 案件表）、
+  `content_moderation_queue`（RocksMQ 种子→consume b64 解码→LPUSH 分诊→LMPOP RIGHT 首非空队列→
+  ZADD+ZREMRANGEBYRANK 留 top3→SPOP 抽查→SQL 台账 + ack 清零 pending）、
+  `ride_hailing_match`（ZRANGEBYSCORE 半径带、ZCOUNT 含/排除界、ZRANK/ZREVRANK/LPOS、ZINCRBY 热度、
+  HINCRBYFLOAT 计价、GETSET 换令牌、LREM+ZREM 收口）、
+  `warehouse_wave_pick`（ZINTERSTORE 求和+WEIGHTS、ZDIFFSTORE 独占拣、SMISMEMBER 批查 + SQL 拣货行）、
+  `dns_record_zone`（SETEX/TTL、APPEND/STRLEN/GETRANGE 双端含/SETRANGE、GETSET 换 SOA serial、
+  MSET/MGET nil 槽、INCRBYFLOAT、SQL zone 注册）、
+  `crypto_exchange_candles`（ZCOUNT/ZMSCORE nil 槽/ZPOPMAX `*2` 清算、XADD `mkt/tape` 成交带回 `$id`、
+  SQL OHLC、ES 显式建索引+_bulk+term 单命中）、
+  `loyalty_tier_sunset`（ZREVRANGEBYSCORE 铂金带、ZRANDMEMBER 非破坏、ZSCAN WITHSCORES 全走、
+  SUNIONSTORE 礼包、EXPIREAT 2s 落日+PTTL）、
+  `chat_edit_history`（RPUSH/RPUSHX 回新长度、LINSERT BEFORE/AFTER+失锚 -1、LSET `+OK`、LINDEX bulk、
+  LREM 0 全删、LPOS、RPOPLPUSH 同槽轮转入档）、
+  `image_thumbnail_pipeline`（JSON.ARRINSERT 插队回新长度/越界拒、ARRLEN/OBJLEN/STRLEN/TYPE、
+  S3 `/rdb/<key>` 字节级回程+LIST、SQL 资产台账）、
+  `feature_flag_rollout`（JSON.MGET 多键批+nil 槽、JSON.TYPE 状态行 `+integer/+object`、JSON.STRLEN
+  字符串字段、NUMINCRBY 10→25.5→40、HDEL kill、SQL 审计）、
+  `blackfriday_pipeline`（真 RESP pipelining：六命令单写回复严格按提交序、批中未知命令不毒化后续
+  （错误内联+后续写落地）、整段 MULTI..EXEC 单写 `+QUEUED`×3+嵌套 `*3`）、
+  `rate_limit_token_bucket`（INCR 计数+EXPIREAT 窗口、GETSET 原子清零、DECR/DECRBY 跨负数、
+  APPEND/STRLEN/GETRANGE 429 文案 + SQL 配额）、
+  `job_scheduler_cron`（ZRANGEBYLEX `[0 (1` 窗口+LIMIT 分页、ZLEXCOUNT 空键 0、ZREMRANGEBYLEX 执行
+  退役、XADD `jb/fire` `$id`+XREVRANGE 新→旧/XRANGE 旧→新 + SQL 运行台账）、
+  `product_search_autocomplete`（FT.SEARCH 精确词、FT.DROP :1→unknown index、FT.DROPINDEX 即 FT.DROP
+  别名（无留文档变体，偏差）、ZRANGE 建议排名+ZSCORE、SQL LIKE 前缀）、
+  `cdn_edge_logs`（RocksMQ 三 PoP 日志→consume/ack 清零 pending、SETBIT+BITOP OR 合并+BITCOUNT、
+  ES _bulk 5xx+term 单命中、SQL QoS 台账）、
+  `versioned_config_publish`（HMSET/HMGET nil 槽、HLEN/HKEYS/HVALS、HINCRBYFLOAT 3+1.0→"4" 去尾 .0、
+  HSETNX 一次性、HSCAN 全页游标 0、HRANDFIELD、TYPE `+hash`）、
+  `vector_dedup_cleanup`（VADD :1/:0 去重复写向量仍保属性、VSETATTR/VGETATTR bulk/nil、VSIM 复写后
+  重排、VREM :1/:0 末元素抹族、SQL 镜像清理）、
+  `stream_compaction`（XADD 显式 id `$` 批、XTRIM MINID :2、XDEL :1/:0、XREVRANGE 新→旧、
+  XREAD 非组 `0-0`（裸 `0` 报 invalid）、SQL 归档）、
+  `dr_drill_rpo_audit`（显式 `s3_checkpoint_retention: 1`：第二个 distinct ckpt id 出现后清扫只剩
+  最新完整集（本 FS 单次 publish 为 staging+fsync 秒级、节律由 publish 决定）、DBSIZE/RANDOMKEY 盘点）。
+  批次 5 追加钉死：JSON.TYPE 回简单串 `+integer/+object/...`、缺键/缺路径 `$-1`（非 bulk）；JSON.ARRINSERT
+  值参须为合法 JSON（裸字符串报 invalid JSON）、插队回新数组长度、越界拒；JSON.STRLEN 只吃字符串路径
+  （数值路径报 wrong type of path value）；XADD 回执形状随名而变：斜杠流名（父子段）回单 bulk `$id`、
+  裸父 topic 回 `*2 [stream,id]`、topic 名禁 hash tag 大括号；XREAD 非组 id 须全形 `0-0`（裸 `0` 报
+  invalid）；BITOP 回**结果字节长度**（Redis 语义），popcount 须 BITCOUNT 另读；FT.DROPINDEX 是 FT.DROP
+  的别名（全族同删、无留文档变体）、FT.DROP 回 :1 二次 unknown index、FT.ADD 回 :1；HINCRBYFLOAT 整型
+  现值+浮点增量回紧凑形式（"4" 非 "4.0"）；SDIFF/SMISMEMBER 等数组回复经 `bulk_at` 逐元素断言。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
