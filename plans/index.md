@@ -51,7 +51,7 @@ Commit: b0d81c9
 
 | 计划目录 | 状态 | 文档数 | 一句话简介 |
 | --- | --- | --- | --- |
-| `2026-10-06-mq-gap/` | 部分落地 | 8 | MQ 能力完备差距对比 + 新能力 e2e 计划（A/B 级入执行批次，C 级入按需池） |
+| `2026-10-06-mq-gap/` | landed | 8 | MQ 能力完备差距对比 + 新能力 e2e 计划（A/B 级入执行批次，C 级入按需池） |
 | `2026-10-06-mysql-gap/` | landed | 8 | MySQL 常用功能缺口矩阵（A–G 域）+ M0–M5 里程碑：查询语义修复/表达式函数族/DML 冲突/子查询与集合操作/DDL 与会话面/e2e 补盲 |
 | `2026-10-06-mysql-hardening/` | 部分落地 | 6 | M0–M5 评审缺陷修复（H0 静默错误结果清零已落地，H1 协议会话/H2 唯一性索引/H3 P2 功能/H4 测试卫生 proposed） |
 | `2026-10-07-mq-p3-backfill/` | landed | 1 | P3 按需池全池补齐（总览即 README.md）：#1–#15 分诊（13 立项、#3 观望、#9 LIMIT 语义收缩），W0 conf → W1 三车道（kafka/lite/http）→ W2 消费者 idle GC → W4 台账收尾 |
@@ -64,6 +64,12 @@ Commit: b0d81c9
 Kafka（wire 面）、HTTP（rocksmq 面）三面做只读差距复核，产出分级处置矩阵；
 A 级（引擎可靠性 + 已登记缺陷）与 B 级（常用语义补齐）进入执行批次，
 C 级与"显式不做"进入按需池固化，避免无触发条件的功能蔓延。
+
+> 2026-11-21 注记（mq-gap）：A/B 级批次（engine Batch 1 / Batch 1.5+2）与 C 级
+> 按需池（`2026-10-07-mq-p3-backfill` landed）均已落地，摘要归档
+> `features/changelog/2026-10-06/mq-{engine-batch1,batch2}.md`、
+> `features/changelog/2026-10-07/mq-p3-backfill.md`；台账外盲点补登见
+> `features/changelog/2026-10-08/mq-p3-intake.md`（#16–#24 + 显式不做 5 行）。
 
 > 2026-10-06 注记（mysql-gap）：M0–M5 六个里程碑全量落地（41 项 P0/P1 全部合入，
 > P2 暂缓项与理由见 `gap-matrix.md`）；逐里程碑摘要归档
