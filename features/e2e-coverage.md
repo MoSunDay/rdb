@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7，`tests/scenario_*_e2e.rs` 80 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8，`tests/scenario_*_e2e.rs` 90 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -223,6 +223,34 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   单 slot、队列期错 EXECABORT vs 运行期错内联；ES 窗口上限 `[10000] but was [10001]`、
   sort 字符串拼法默认 asc；XADD trim 选项先于 id 且重复后者胜；LPOP count=1 仍 `*1`
   数组形；JOIN USING/复合 ON/IS NULL 反连接可用。
+  批次 8（2026-11-22，编号 #81–#90 再扩 10 例，changelog
+  `changelog/2026-11-22/multistore-scenarios-batch8.md`）：
+  `shard_route_xpick`（XPICK 三策略：round_robin 发现序轮转、hash CRC16 稳定命中、
+  least_backlog 随积压摆动；回执全形 parent/child；三错误 verbatim）、
+  `replay_rewind_consumer`（XINFO CONSUMERS *6 扁平花名册、XGROUP SETID 0-0 回拨重放、
+  重放 PEL 行随条目换主、DELCONSUMER 回清除 pending 数、NOGROUP/Invalid stream ID）、
+  `session_flag_matrix`（SET GET 回旧值/nil、NX/XX 否决形与 GET 并存、NX+GET 新键不报错、
+  KEEPTTL 保 TTL vs 裸 SET 清 -1、NX+XX 与 KEEPTTL+EX 互斥门）、
+  `warranty_ttl_fences`（EXPIRE NX/XX/GT/LT 围栏只朝单侧动、:1/:0 诚实回、未知旗标
+  错误文案全列表）、
+  `score_guard_zadd_flags`（ZADD GT 挡降/LT 挡升、CH 计变更同分不计、INCR 回新分 bulk、
+  NX/XX 门、三互斥错误）、
+  `grade_curve_case_having`（CASE WHEN 表列分档、GROUP BY 别名+HAVING 滤瘦桶、AVG
+  scale-4 十进制、双列 ORDER BY、LIMIT n OFFSET m）、
+  `roster_groupconcat`（GROUP_CONCAT 默认/SEPARATOR/DISTINCT 首见序/多参、CONCAT_WS
+  跳 NULL、CONCAT NULL 传播、REGEXP 字节级大小写）、
+  `lexicon_prune_bylex`（ZREVRANGEBYLEX 倒序全窗/反转界拼写/LIMIT、ZREMRANGEBYLEX
+  前缀 `[a (b` 裁剪——与 #54 中窗形不重复）、
+  `festival_program_mustnot`（ES bool must_not 裸排/must 并置/filter+_count、空值全集；
+  槽位替换：裸 SUNION 已被 #73 盖、EXPIRETIME 未实现，取备选 2 未盖面 must_not）、
+  `sqlrpc_twopc`（**首启 `sql_rpc` 前端**：三节点 RESP+MySQL+sql_rpc、cluster init +
+  sql_nodes 收敛轮询、39 腿跨槽 INSERT 2PC 提交、三节点 gather 一致、dup 远端否决零落地、
+  /sql2pc/status 401/unknown）。
+  批次 8 追加钉死：XPICK 回执全形 parent/child、发现序=字节序、least_backlog 比 XLEN；
+  SETID 回拨重放且 PEL 行随条目换主（条目级 PEL，Redis 语义）、空史消费者注册行残留；
+  SET 否决+GET 仍回旧值；EXPIRE 围栏单侧性；ZADD 同分重加 CH 也计 0、INCR 否决回 null；
+  GROUP_CONCAT DISTINCT 首见序、AVG(int) scale-4；ZREVRANGEBYLEX 界拼写随向反转；
+  must_not 可与 must/filter 并置；sql_nodes 收敛前含空 "sql_rpc":"" 占位。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
