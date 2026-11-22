@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6 各十例，`tests/scenario_*_e2e.rs` 70 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7，`tests/scenario_*_e2e.rs` 80 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -196,6 +196,33 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   `cluster_slots_stable_instances`——须 `cluster init` + 3s topology tick 才有 -MOVED；
   IMPORTING 门非 ASKING 连接回 -MOVED、ASKING 连接级单帧放行、STABLE 复位；GETRANGE 越界
   回 `$0` 空 bulk。
+  批次 7（2026-11-21，编号 #71–#80 再扩 10 例，changelog
+  `changelog/2026-11-21/multistore-scenarios-batch7.md`）：
+  `lease_ttl_patrol`（SETEX/PSETEX/EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT 网格、TTL 半进位
+  (ms+500)/1000、PERSIST -1、无效期 verbatim）、
+  `namespace_rebrand`（RENAME 值+TTL 随迁覆盖、RENAMENX :1/:0、缺源 no such key、
+  CROSSSLOT、TYPE 保持）、
+  `social_union_feed`（SUNION/SINTER/SDIFF 非存储读 + CROSSSLOT 门、缺键空集、
+  SUNIONSTORE 对照、SMISMEMBER 旗标）、
+  `coupon_batch_multi_exec`（MULTI +QUEUED、EXEC 有序回放、空队列 *0、EXEC without
+  MULTI、嵌套 MULTI、EXECABORT 整批弃、运行期错内联不弃兄弟、全键同 slot）、
+  `ticket_redelivery`（裸父 XADD 回执、XGROUP 0-0、XREADGROUP COUNT、XPENDING 汇总/
+  range 两视图、XAUTOCLAIM 三段形换主、XACK 清 PEL）、
+  `telemetry_ring_buffer`（XADD 内联 trim 先于 id：MAXLEN/~//=/MINID、选项重复后者胜、
+  NOMKSTREAM、XLEN=XINFO length）、
+  `course_enrollment_join`（MySQL 复合主键、INNER JOIN USING、LEFT JOIN 复合 ON + NULL
+  腿、反连接、ORDER BY+LIMIT、GROUP BY COUNT/SUM）、
+  `review_analytics_es`（ES sort asc/desc、默认 _score desc、from/size、_count、
+  10k 窗口 verbatim 错）、
+  `print_spooler_lpop_count`（LPOP/RPOP count 数组形/短取/0/缺键两态、负数与非整数
+  verbatim、WRONGTYPE）、
+  `auction_standby_bzpop`（BZPOPMIN/MAX 平铺三元组、超时 *-1、BLOCK 0 spawn 唤醒、
+  多键同槽跳空落次、非浮点 timeout 错）。
+  批次 7 追加钉死：TTL 半进位 `(ms+500)/1000`；XAUTOCLAIM Redis≥7 三段
+  `[cursor,entries,deleted]`、XPENDING 汇总 2 消费者 3 行 PEL 为 `*7`；MULTI 事务体
+  单 slot、队列期错 EXECABORT vs 运行期错内联；ES 窗口上限 `[10000] but was [10001]`、
+  sort 字符串拼法默认 asc；XADD trim 选项先于 id 且重复后者胜；LPOP count=1 仍 `*1`
+  数组形；JOIN USING/复合 ON/IS NULL 反连接可用。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
