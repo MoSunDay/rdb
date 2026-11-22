@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8，`tests/scenario_*_e2e.rs` 90 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9，`tests/scenario_*_e2e.rs` 100 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -251,6 +251,39 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   SET 否决+GET 仍回旧值；EXPIRE 围栏单侧性；ZADD 同分重加 CH 也计 0、INCR 否决回 null；
   GROUP_CONCAT DISTINCT 首见序、AVG(int) scale-4；ZREVRANGEBYLEX 界拼写随向反转；
   must_not 可与 must/filter 并置；sql_nodes 收敛前含空 "sql_rpc":"" 占位。
+
+  批次 9（2026-11-22，编号 #91–#100 再扩 10 例，changelog
+  `changelog/2026-11-22/multistore-scenarios-batch9.md`）：
+  `idle_session_seal_xidle`（XIDLE 查询回配置秒/未配置 -1/缺流 -2、`XIDLE s N` 设定
+  与 0 清除、两错误 verbatim、1s 到期整个 family 封存——组记录同亡、重开后
+  XINFO GROUPS 空）、
+  `nightshift_handoff_blmove`（BLMOVE LEFT/RIGHT 对向唤醒回 moved 元素 bulk、双空道
+  超时 `$-1`、BRPOP 立即回尾元素/空道超时 `*-1`、RIGHT/LEFT 双向审计序）、
+  `cashier_abort_discard`（DISCARD 弃队不落地且同时清 WATCH、无 MULTI 专用文案、
+  嵌套 MULTI 弄脏队列 → EXECABORT、UNWATCH 恒 +OK、WATCH 竞态中止对照组）、
+  `ops_console_server`（PING/PONG/payload bulk、INFO 三节切片 + `db0:keys=N`、
+  COMMAND COUNT/GETKEYS/INFO、CONFIG 桩恒回 cluster-require-full-coverage=no 对、
+  SELECT 矩阵、QUIT +OK 后断连）、
+  `tags_terms_filter`（ES terms OR 并集/空集零命中、裸 bool.should=OR、match
+  operator or/and、terms+range filter 交集）、
+  `visual_search_knn`（ES knn 分数 ∈(0,1] 近邻序、filter 限池、_source:false→null
+  与字段剪枝、sort _doc=插入序且 _score:null）、
+  `tenant_token_sasl`（**首启 `kafka_token` scenario**：pre-auth ApiVersions 22 键含
+  17/36、未认证 Produce 静默丢弃断连、错机制 33/错 token 58（消息无 token 片段）均
+  +close、PLAIN 认证后单连接 Produce v3 + OffsetCommit/OffsetFetch v0 全通）、
+  `border_screening_subquery`（IN (SELECT) 命中、NOT IN 遇 NULL 列表全 UNKNOWN 零行
+  ——3 值逻辑钉死、NULL 守卫放行、EXISTS/NOT EXISTS 非相关+相关、标量子查询列表
+  空中 → NULL 与 WHERE id=(SELECT MAX(id))）、
+  `omnichannel_setops`（UNION 去重、UNION ALL 保重+字面量操作数、INTERSECT [ALL]
+  =min 乘数、EXCEPT [ALL]=多重集减法、INTERSECT 优先级紧于 UNION、复合尾
+  ORDER BY+LIMIT 翻页全复合体）、
+  `loyalty_upsert`（ODKU 插入 1/变更 2/同值 0 三态 affected、VALUES() 读入行算术、
+  REPLACE 现存=deleted+1/新键 1、INSERT..SELECT CONCAT 后缀自快照且源行原样）。
+  批次 9 追加钉死：XIDLE 家族级到期封存；BLMOVE/BRPOP 超时各 `$-1`/`*-1`；DISCARD
+  连带清 WATCH、嵌套 MULTI 后 EXEC 收 EXECABORT；CONFIG 桩任意参同答、SELECT 仅
+  0 号库；ES knn 分数上界 1、_doc 排序抑制 _score；SASL 失败消息无 token 片段、
+  未认证数据命令静默丢弃；NOT IN NULL 列表零行、INTERSECT ALL/EXCEPT ALL 乘数语义、
+  标量子查询空→NULL；ODKU affected 1/2/0 与 REPLACE=删除数+1。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
