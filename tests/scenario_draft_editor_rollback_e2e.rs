@@ -57,8 +57,8 @@ async fn draft_editor_stages_rolls_back_and_commits() {
     run(&mut b, "COMMIT").await;
     assert_eq!(ints(&mut b, "SELECT COUNT(*) FROM drafts").await, vec![2], "fresh snapshot after commit");
 
-    // e) DDL inside a txn rejects with 1235 (CREATE / DROP / RENAME /
-    //    CREATE INDEX / TRUNCATE), the txn stays usable for DML, and
+    // e) DDL inside a txn rejects with 1235 (CREATE TABLE / DROP TABLE /
+    //    CREATE INDEX / ALTER RENAME), the txn stays usable for DML, and
     //    the rollback afterwards leaves the world clean.
     run(&mut a, "BEGIN").await;
     for sql in [

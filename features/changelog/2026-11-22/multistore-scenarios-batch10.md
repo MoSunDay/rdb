@@ -78,7 +78,7 @@ clippy `-D warnings` 零告警（bits_e2e/blocking_concurrency_e2e 在 4 线程�
   需配尾通配符才有非空命中）；空窗 SUM 为 NULL。
 - ES `_bulk`：空节点 `_cat/indices` 仅表头；`index` 新建 201 created；`create` 撞
   现存 → item status 400 + `error.type` version_conflict_engine_exception、
-  errors:true；`delete` 未命中 404 not_found 不翻 errors；`_refresh` 后 docs.count
+  errors:true（真 ES 回 409，400 为实现现状，已知偏差）；`delete` 未命中 404 not_found 不翻 errors；`_refresh` 后 docs.count
   准确。
 - Kafka Metadata v1 未知 topic → None；ListOffsets v5 timestamp -1 latest = hwm、
   -2 earliest = 0，leader epoch -1 哨兵；JoinGroup 空成员 79 取 broker 分配 id、

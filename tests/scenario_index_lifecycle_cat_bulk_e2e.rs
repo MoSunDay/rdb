@@ -1,8 +1,9 @@
 //! Multi-store scenario #109 -- the fleet-ops index lifecycle on the
 //! ES face: `_cat/indices` answers the header row even on an EMPTY
 //! node, a `_bulk` shipment indexes docs (created/201, errors:false),
-//! a `create` action on an EXISTING id is a per-item 409
-//! version_conflict that flips errors:true, `_bulk` deletes settle
+//! a `create` action on an EXISTING id is a per-item
+//! version_conflict (envelope status 400 here -- real ES says 409;
+//! error.type carries the verdict) that flips errors:true, deletes settle
 //! hit (`deleted`) vs miss (404 `not_found`, still errors:false), and
 //! after `_refresh` the cat row reports the live docs.count. One REAL
 //! node, ES front.

@@ -308,7 +308,8 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   `ali_ce`<`alice`/`DON%24A`<`DON24C`、LIKE `DON\%%` 3 行 vs `DON%` 4 行、
   `ali\_%` 排除 alice、空窗 SUM NULL）、
   `index_lifecycle_cat_bulk`（空节点 `_cat/indices` 仅表头、`_bulk` index 201
-  created、create 撞现存 item 400 + `version_conflict_engine_exception` 翻
+  created、create 撞现存 item 400（真 ES 409，已知偏差）+
+  `version_conflict_engine_exception` 翻
   errors:true、delete 命中 deleted/未命中 404 不翻、refresh 后 docs.count 1）、
   `consumer_fleet_metadata`（XADD `*2` 种子 + Produce v3 base=1、Metadata v1
   Some(1)/None、ListOffsets v5 latest=2/earliest=0、JoinGroup 79→gen1 自任
