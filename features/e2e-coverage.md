@@ -13,7 +13,7 @@ Commit: b7378c0
 | in-proc wire | `resp::serve` 临时监听（`resp_e2e`/`gaps_e2e`/`bits_e2e`/`server_surface_e2e`/`routing_newcmds_e2e`） | 真实编解码 + 原始 TcpStream |
 | in-proc raft | `raft_cluster_e2e`/`raft_transport`/`ha_failover`/`sql_oracle_cluster_e2e` | 进程内 openraft 节点 |
 | 进程级 e2e | `tests/common/mod.rs`（`CARGO_BIN_EXE_rdb` + 临时 yaml + 临时端口） | 最接近真实部署 |
-| 进程级多存储场景 | `tests/scenario_common/`（多前端单节点 `front_world` + 3 节点集群） | 真实业务场景横切多存储面 |
+| 进程级多存储场景 | `tests/scenario/`（target `scenario`）+ `tests/scenario_common/`（多前端单节点 `front_world` + 3 节点集群） | 真实业务场景横切多存储面 |
 | 前端专用 mini-harness | `kafka_front_common/`、`es_common/`、`s3/`、`rocksmq_http_e2e` | 真实二进制 + 手搓协议客户端 |
 | shell 场景 | `scrtips/e2e_scenarios/scenario_*.sh`（run_all.sh glob，当前 9 个） | redis-cli/iredis/redis-py/mysql/confluent-kafka 等真实客户端 |
 
@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10，`tests/scenario_*_e2e.rs` 110 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10，`tests/scenario/scenario_*_e2e.rs` 110 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、

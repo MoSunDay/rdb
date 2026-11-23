@@ -12,9 +12,9 @@ e2e 测试按**功能分组**组织：每个功能组目录是**单个测试 cra
 - `common/` —— 全组共享 harness：spawn 真实 `rdb` 二进制、写临时 yaml、
   RESP2/MySQL 客户端、集群生命周期驱动。`mod.rs` 已达 800 行上限，
   **冻结不再增改**；领域子模块 `lite.rs` / `mq.rs` / `mysql.rs`。
-- `es_common/`、`kafka_front_common/`、`backup_surface_common/` —— 组共享
-  件，原地不动，由对应组 crate 的 `main.rs` 经 `#[path]` 引入，组内文件以
-  `use crate::es_common;` 等方式消费。
+- `es_common/`、`kafka_front_common/`、`backup_surface_common/`、
+  `scenario_common/` —— 组共享件，原地不动，由对应组 crate 的 `main.rs`
+  经 `#[path]` 引入，组内文件以 `use crate::es_common;` 等方式消费。
 
 ### 功能组（每个 = 单个测试 crate，`<组>/main.rs` 为聚合根）
 
@@ -30,6 +30,7 @@ e2e 测试按**功能分组**组织：每个功能组目录是**单个测试 cra
 | `search/` | `search` | 3 | FT.* 全文检索 | — |
 | `cluster/` | `cluster` | 14 | 控制面 / HA / 进程生命周期 / 迁移 | `ha_failover`、`raft_cluster_e2e` |
 | `s3/` | `s3` | — | S3 前端 e2e（用例在 `main.rs`，`client.rs`/`fixture.rs` 为支撑模块） | — |
+| `scenario/` | `scenario` | 110 | 多存储真实业务场景（KV/SQL/ES/Kafka/RocksMQ/S3 横切） | — |
 
 例外文件物理上仍放组目录，但在 `Cargo.toml` 以 `[[test]] name/path` 声明为
 独立 target（原因见约定 3），**不**挂在组 `main.rs` 的 mod 列表里。
@@ -51,13 +52,18 @@ e2e 测试按**功能分组**组织：每个功能组目录是**单个测试 cra
    子进程读数且语义安全的 env（如 `RDB_SQL_GC_PERIOD_MS`）可并入组 crate。
 4. **单文件 <400 行**：超出按命令族/主题拆分新文件。
 5. **纯函数式风格**：不引入 class/OOP，helper 一律自由函数组合。
+6. **`scenario` 组用例串行**：每个用例体首行必须
+   `let _serial = scenario_common::serial_guard().await;`——该组
+   单 crate 内用例共用一把进程级互斥锁，不持锁起节点会撞下面
+   「运行方式」所述的 free-port TOCTOU（`resp ... not accepting
+   within 30s`、空回复）。
 
 ## 运行方式
 
 ```sh
 cargo test --test kv              # 单个功能组
 cargo test --test sql -- sql_e2e  # 组内按 mod 前缀过滤
-cargo test --workspace            # 全量（10 个组 crate + 3 个独立 target）
+cargo test --workspace            # 全量（11 个组 crate + 3 个独立 target）
 cargo test --test ha_failover     # 独立 target 照常
 ```
 
@@ -66,6 +72,12 @@ e2e 每用例拉起真实多监听 rdb 节点（一个 free-:0 探测派生 ~10 
 同进程并行度直接决定 free-port TOCTOU 撞车率（EADDRINUSE 重试耗尽、或
 per-test 目录名撞端口引发同进程 RocksDB LOCK 冲突）。封顶对齐 CI runner
 核数，勿在本机调高后跑全量。
+
+`scenario` 组在此之上再自封一层：110 个用例各自拉起多前端节点
+（RESP+MySQL+ES+Kafka+RocksMQ+S3 任意子集），端口面最宽，仅靠 4 线程
+封顶仍会撞 TOCTOU，故组内以 `scenario_common::serial_guard()` 串行化
+用例体；实测串行反而更快（203s vs 4 并发 348s，EADDRINUSE 重试归零），
+`--test-threads` 取值不再影响该组结果。
 
 注意：组内用例名带 mod 路径前缀（如 `sql_e2e::xxx`），`-- --exact` 过滤时
 需带前缀。

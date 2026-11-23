@@ -1,27 +1,30 @@
-//! Multi-store scenario fixture for the `scenario_*_e2e.rs` binaries:
-//! one REAL rdb binary with ANY subset of the fronts enabled (MySQL,
-//! ES HTTP, Kafka, RocksMQ HTTP, S3, SQL 2PC rpc) alongside RESP, the
-//! readiness poll, and thin assertion shims. Mounted as its own
-//! directory module (`mod scenario_common;`) next to `mod common;` --
-//! the frozen `tests/common/mod.rs` is reused AS IS and stays untouched
-//! (same pattern as `es_common/` and `kafka_front_common/`).
+//! Multi-store scenario fixture for the `scenario` group crate's
+//! `scenario_*_e2e.rs` modules: one REAL rdb binary with ANY subset of
+//! the fronts enabled (MySQL, ES HTTP, Kafka, RocksMQ HTTP, S3, SQL 2PC
+//! rpc) alongside RESP, the readiness poll, and thin assertion shims.
+//! Mounted once by `tests/scenario/main.rs` via
+//! `#[path = "../scenario_common/mod.rs"]`; the frozen
+//! `tests/common/mod.rs` is reused AS IS and stays untouched (same
+//! pattern as `es_common/` and `kafka_front_common/`).
 //!
 //! Front yaml keys mirror the per-front fixtures: `mysql_bind` +
 //! `mysql_user`/`mysql_password` (= common::mysql::PASS), `sql_rpc_bind`
 //! (spawn_node_sql), `es_bind`/`es_token` (spawn_node_es),
 //! `kafka_bind` (kafka_front_common), `rocksmq_bind` (common::mq),
-//! `s3_bind`/`s3_store_path`/`s3_bucket`/`s3_token` (s3_e2e::fixture).
+//! `s3_bind`/`s3_store_path`/`s3_bucket`/`s3_token` (s3::fixture).
 
-#![allow(dead_code)] // each mounting binary uses a different subset
+#![allow(dead_code)] // each scenario module uses a different subset
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::{Mutex, MutexGuard};
 
-use crate::common::lite::cmd_full_reply;
+use crate::common::lite::cmd_full_reply_wait;
 use crate::common::{
     cmd_one_shot, spawn_node_yaml, wait_mysql_ready, wait_resp_ready, ProcNode, TOKEN,
 };
@@ -42,6 +45,21 @@ pub struct FrontSpec {
 /// Bearer token the S3 front checks (the e2e fixture convention; NOT a
 /// real secret).
 pub mod codec;
+
+/// Serialize the scenario suites inside the one group crate. Each test
+/// spawns a multi-front REAL node and probes free ports; at
+/// RUST_TEST_THREADS=4 the probes race (`resp ... not accepting within
+/// 30s`, empty replies), while a serial run is both green and faster
+/// (203s vs 348s) because the respawn retries vanish.
+fn serial_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Hold for the whole test body, before any node spawn.
+pub async fn serial_guard() -> MutexGuard<'static, ()> {
+    serial_lock().lock().await
+}
 pub mod kafka; // hand-framed Produce v3 (its own file: keep mod.rs under 400 lines)
 
 pub const S3_TOKEN: &str = "s3-e2e-fake-token-0123456789abcdef0123456789abcdef";
@@ -147,7 +165,11 @@ pub async fn wait_fronts(front: &mut FrontNode, mysql: bool, es: bool, s3: bool)
             if status == 200 {
                 break;
             }
-            assert!(Instant::now() < deadline, "es front never up; {}", front.node.ctx());
+            assert!(
+                Instant::now() < deadline,
+                "es front never up; {}",
+                front.node.ctx()
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -163,7 +185,11 @@ pub async fn wait_fronts(front: &mut FrontNode, mysql: bool, es: bool, s3: bool)
             if TcpStream::connect(&addr).await.is_ok() {
                 break;
             }
-            assert!(Instant::now() < deadline, "{what} front never up; {}", front.node.ctx());
+            assert!(
+                Instant::now() < deadline,
+                "{what} front never up; {}",
+                front.node.ctx()
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -173,7 +199,11 @@ pub async fn wait_fronts(front: &mut FrontNode, mysql: bool, es: bool, s3: bool)
             if TcpStream::connect(&front.s3).await.is_ok() {
                 break;
             }
-            assert!(Instant::now() < deadline, "s3 front never up; {}", front.node.ctx());
+            assert!(
+                Instant::now() < deadline,
+                "s3 front never up; {}",
+                front.node.ctx()
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -183,13 +213,7 @@ pub async fn wait_fronts(front: &mut FrontNode, mysql: bool, es: bool, s3: bool)
 /// `(front, resp addr)`. The FrontNode must stay bound (`_front`).
 pub async fn front_world(tag: &str, spec: &FrontSpec) -> (FrontNode, String) {
     let mut front = spawn_front_node(&world_dir(tag), 0, true, None, spec);
-    wait_fronts(
-        &mut front,
-        spec.mysql,
-        spec.es,
-        spec.s3,
-    )
-    .await;
+    wait_fronts(&mut front, spec.mysql, spec.es, spec.s3).await;
     let resp = front.node.resp.clone();
     (front, resp)
 }
@@ -207,8 +231,11 @@ pub async fn rt(addr: &str, args: &[&[u8]]) -> String {
 }
 
 /// Full-drain reply as text (arrays-of-arrays need the quiet-gap reader).
+/// Patient first byte: a just-booted multi-front node can need >250ms
+/// before its first reply lands, which the plain 250ms quiet-gap form
+/// reads as an empty reply (`no bulk #0 in []`).
 pub async fn rf(addr: &str, args: &[&[u8]]) -> String {
-    crate::common::lite::text(&cmd_full_reply(addr, TOKEN, args, 250).await)
+    crate::common::lite::text(&cmd_full_reply_wait(addr, TOKEN, args, 250, 10_000).await)
 }
 
 /// Assert a `+OK` simple-string reply.
@@ -240,7 +267,8 @@ pub fn bulk_at(reply: &[u8], n: usize) -> String {
             let len: usize = len.parse().unwrap_or(0);
             let body = it.next().unwrap_or("");
             if items == n {
-                return String::from_utf8_lossy(&body.as_bytes()[..len.min(body.len())]).into_owned();
+                return String::from_utf8_lossy(&body.as_bytes()[..len.min(body.len())])
+                    .into_owned();
             }
             items += 1;
         }
@@ -287,9 +315,14 @@ pub fn stream_ids(full: &str) -> Vec<String> {
         if let Some(len) = toks[i].strip_prefix('$') {
             let body = toks[i + 1];
             if let Ok(n) = len.parse::<usize>() {
-                if n == body.len() && body.split_once('-').is_some_and(|(a, b)| {
-                    !a.is_empty() && !b.is_empty() && a.bytes().all(|c| c.is_ascii_digit()) && b.bytes().all(|c| c.is_ascii_digit())
-                }) {
+                if n == body.len()
+                    && body.split_once('-').is_some_and(|(a, b)| {
+                        !a.is_empty()
+                            && !b.is_empty()
+                            && a.bytes().all(|c| c.is_ascii_digit())
+                            && b.bytes().all(|c| c.is_ascii_digit())
+                    })
+                {
                     ids.push(body.to_string());
                 }
             }
@@ -323,8 +356,15 @@ pub async fn http(addr: &str, method: &str, path: &str, body: Option<&str>) -> (
         _ => return (0, String::new()),
     }
     let raw = String::from_utf8_lossy(&buf).into_owned();
-    let status = raw.split(' ').nth(1).and_then(|t| t.parse().ok()).unwrap_or(0);
-    (status, raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+    let status = raw
+        .split(' ')
+        .nth(1)
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
+    (
+        status,
+        raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string(),
+    )
 }
 
 /// RocksMQ HTTP POST (produce/consume/ack target with query string).

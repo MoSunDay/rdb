@@ -39,7 +39,9 @@ pub async fn kafka_produce_v3(
     req.extend_from_slice(b"e2e"); // client_id
     req.extend_from_slice(&body);
     let mut sock = TcpStream::connect(addr).await.expect("connect kafka front");
-    sock.write_all(&(req.len() as u32).to_be_bytes()).await.expect("frame len");
+    sock.write_all(&(req.len() as u32).to_be_bytes())
+        .await
+        .expect("frame len");
     sock.write_all(&req).await.expect("write produce v3");
     let mut lb = [0u8; 4];
     sock.read_exact(&mut lb).await.expect("read resp len");

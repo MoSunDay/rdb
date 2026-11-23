@@ -98,27 +98,69 @@ pub fn frame(args: &[&[u8]]) -> Vec<u8> {
 /// Like `cmd_one_shot` but drains the whole reply (arrays-of-arrays are not
 /// resolvable line-by-line): reads until the socket falls quiet for `quiet_ms`.
 pub async fn cmd_full_reply(addr: &str, token: &str, args: &[&[u8]], quiet_ms: u64) -> Vec<u8> {
+    cmd_full_reply_wait(addr, token, args, quiet_ms, quiet_ms).await
+}
+
+/// [`cmd_full_reply`] whose FIRST byte waits up to `first_ms` and only the
+/// gaps between chunks use `quiet_ms`. The plain form doubles as a "did it
+/// answer at all" probe (lite tests assert emptiness for blocking reads),
+/// but a just-booted node racing a cold RocksDB can miss a 250ms first byte
+/// and read as `[]` (`no bulk #0 in []`); callers that always expect a real
+/// reply pass a patient `first_ms`.
+pub async fn cmd_full_reply_wait(
+    addr: &str,
+    token: &str,
+    args: &[&[u8]],
+    quiet_ms: u64,
+    first_ms: u64,
+) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut sock = match tokio::net::TcpStream::connect(addr).await {
         Ok(s) => s,
         Err(e) => return format!("<CONN-ERR {e}>").into_bytes(),
     };
-    let mut buf = Vec::new();
     let auth = frame(&[b"AUTH", token.as_bytes()]);
     let cmd = frame(args);
     if sock.write_all(&auth).await.is_err() || sock.write_all(&cmd).await.is_err() {
         return b"<WRITE-ERR>".to_vec();
     }
-    let mut chunk = [0u8; 4096];
+    // Read the AUTH line to completion BEFORE the quiet-gap drain: with both
+    // frames pipelined, +OK lands as its own chunk and the `quiet_ms` gap
+    // would fire right after it, truncating the command's still-in-flight
+    // reply to "" (seen as `no bulk #0 in []` under load).
+    let mut buf = Vec::new();
+    let mut one = [0u8; 1];
     loop {
         match tokio::time::timeout(
-            std::time::Duration::from_millis(quiet_ms),
+            std::time::Duration::from_millis(first_ms),
+            sock.read(&mut one),
+        )
+        .await
+        {
+            Ok(Ok(1)) => {
+                buf.push(one[0]);
+                if buf.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            _ => return buf, // no AUTH line: hand back whatever arrived
+        }
+    }
+    let mut chunk = [0u8; 4096];
+    let mut first = true;
+    loop {
+        let wait_ms = if first { first_ms } else { quiet_ms };
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(wait_ms),
             sock.read(&mut chunk),
         )
         .await
         {
             Ok(Ok(0)) => break,
-            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&chunk[..n]);
+                first = false;
+            }
             Ok(Err(_)) => break,
             Err(_) => break, // fell quiet: reply complete
         }
