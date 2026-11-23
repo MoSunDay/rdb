@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9，`tests/scenario_*_e2e.rs` 100 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10，`tests/scenario_*_e2e.rs` 110 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -284,6 +284,44 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   0 号库；ES knn 分数上界 1、_doc 排序抑制 _score；SASL 失败消息无 token 片段、
   未认证数据命令静默丢弃；NOT IN NULL 列表零行、INTERSECT ALL/EXCEPT ALL 乘数语义、
   标量子查询空→NULL；ODKU affected 1/2/0 与 REPLACE=删除数+1。
+  批次 10（2026-11-22，编号 #101–#110 再扩 10 例，changelog
+  `changelog/2026-11-22/multistore-scenarios-batch10.md`）：
+  `factory_reset_flushdb`（FLUSHDB 五家族 + stream 根整体擦除：DBSIZE 0/每族读空/
+  RANDOMKEY nil、组记忆随擦除回收——重建流 XINFO GROUPS 裸 `*0`、junk 参数
+  `-ERR syntax error` 不触发、`ASYNC`/`SYNC` 直通）、
+  `sales_report_cte`（CTE 别名自连接、带别名表的链式引用、体内子查询、CTE ∘
+  UNION ALL 保重 vs UNION 去重、`WITH RECURSIVE` 1235 点名 recursive）、
+  `invoice_formatting_funcs`（字符串族 + 控制四件 + CAST 在列数据上 crib：LPAD `003`、
+  NULLIF 精确匹配→NULL、DECIMAL(6,2) 保 `1250.00`、CONCAT_WS 跳过 NULL 而
+  COALESCE 版留占位、CONCAT NULL 传播）、
+  `shift_schedule_datetime`（DATE_ADD DAY/MONTH 钳闰年 02-29/HOUR 升格 DATETIME/
+  MINUTE、DATEDIFF 正反 `1`/`-1`、DATE_FORMAT 列上 `%H:%i:%s` + `%W`/`%M`/`%j`
+  定值 crib）、
+  `leaderboard_trim_dml_limit`（UPDATE/DELETE `ORDER BY … LIMIT` 字面拼写：前二
+  +100、先筛后切、尾二出队、`LIMIT 0` 零 affected）、
+  `schema_audit_show`（SHOW TABLES/DATABASES、DESCRIBE 6 列 PRI/MUL/UNI、SHOW INDEX
+  三行 Non_unique 0/1/0、EXPLAIN SeqScan vs IndexScan `-> 2 pks`、SHOW CREATE 渲染
+  DROP→重建逐字节往返、ALTER RENAME TO 后旧名 1146）、
+  `draft_editor_rollback`（`START TRANSACTION` 作者私有舞台、ROLLBACK 全弃/COMMIT
+  全落、跨连接可重复读快照至自身 COMMIT、事务内 DDL 四形 1235 事务不废）、
+  `donation_audit_aggdistinct`（SUM 350 vs SUM(DISTINCT) 150、字符串 MIN/MAX 字节序
+  `ali_ce`<`alice`/`DON%24A`<`DON24C`、LIKE `DON\%%` 3 行 vs `DON%` 4 行、
+  `ali\_%` 排除 alice、空窗 SUM NULL）、
+  `index_lifecycle_cat_bulk`（空节点 `_cat/indices` 仅表头、`_bulk` index 201
+  created、create 撞现存 item 400 + `version_conflict_engine_exception` 翻
+  errors:true、delete 命中 deleted/未命中 404 不翻、refresh 后 docs.count 1）、
+  `consumer_fleet_metadata`（XADD `*2` 种子 + Produce v3 base=1、Metadata v1
+  Some(1)/None、ListOffsets v5 latest=2/earliest=0、JoinGroup 79→gen1 自任
+  leader、SyncGroup `[fleetp0]`、DescribeGroups Stable、OffsetCommit v2 /
+  OffsetFetch v0 回 2）。
+  批次 10 追加钉死：FLUSHDB 组记忆随擦除回收、junk 不触发、ASYNC/SYNC 直通；CTE
+  别名链/体内子查询/与 UNION [ALL] 复合、RECURSIVE 1235；CONCAT NULL 传播、
+  CONCAT_WS 跳过 NULL；DATE_ADD 月钳/HOUR 升格、DATEDIFF 日期部分；`ORDER BY …
+  LIMIT` 字面拼写 aff=n、LIMIT 0 零；DESCRIBE 恒 6 列、SHOW CREATE 可往返、EXPLAIN
+  `IndexScan <ix> -> <n> pks`；`START TRANSACTION`=BEGIN、快照至自身 COMMIT、事务内
+  DDL 1235；SUM(DISTINCT) 折叠、LIKE `\%`/`\_` 字面通配；`_bulk` create 冲突 item
+  400 + error.type、delete 未命中不翻 errors；Metadata None/ListOffsets epoch -1 哨兵/
+  JoinGroup 79 取 broker id。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
