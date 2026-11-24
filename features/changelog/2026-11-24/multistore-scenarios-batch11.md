@@ -100,6 +100,11 @@ Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），断言同一份数据在不�
   1243 反面偏差也通过，Ok 臂声称接受 NULL 行但 `cell_i64` 遇 NULL 即 panic）；#116 补
   20 次 `HGETALL` 读回与 FT 文档逐字段比对（原 HASH 面只写不读），`cmd_int` 改用
   `scenario_common::int_of`。
+- 推送前门禁复跑（修正后）：`cargo build --workspace` 与 `clippy -D warnings` 干净；
+  `cargo test --workspace --no-fail-fast` 2140 过 + 1 例负载 flake
+  `tests/sql/sql_join_cluster_e2e.rs` `cluster_joins_gather_both_sides`（node1 raft-http
+  join head timeout，18 个 target 并发时出现；单跑 3/3 绿、`--test sql` 整 target 139/139
+  绿；本批未动 `src/` 与 `tests/common/`，与 `sql_2pc` 的负载抖动同类）。
 - `cargo clippy --workspace --all-targets -- -D warnings` 零告警（修复 9 处：#129 同型
   cast、#127 文档 `>=` 转义、#120/#124 `query_drop(&format!(…))` 去借用）。
 - 20 个新文件 147–398 行（上限 400）；`tests/scenario_common/mod.rs` 414 行（迭代上限
