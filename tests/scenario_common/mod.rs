@@ -61,6 +61,8 @@ pub async fn serial_guard() -> MutexGuard<'static, ()> {
     serial_lock().lock().await
 }
 pub mod kafka; // hand-framed Produce v3 (its own file: keep mod.rs under 400 lines)
+pub mod perf; // batch 11 perf gates (perf[label] evidence lines)
+pub mod s3_extra; // batch 11 S3 header round trips (Range/HEAD)
 
 pub const S3_TOKEN: &str = "s3-e2e-fake-token-0123456789abcdef0123456789abcdef";
 

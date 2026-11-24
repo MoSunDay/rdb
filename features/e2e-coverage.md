@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10，`tests/scenario/scenario_*_e2e.rs` 110 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10 + 2026-11-24 批次 11，`tests/scenario/scenario_*_e2e.rs` 130 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -323,6 +323,58 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   DDL 1235；SUM(DISTINCT) 折叠、LIKE `\%`/`\_` 字面通配；`_bulk` create 冲突 item
   400 + error.type、delete 未命中不翻 errors；Metadata None/ListOffsets epoch -1 哨兵/
   JoinGroup 79 取 broker id。
+  批次 11（2026-11-24，编号 #111–#130 再扩 20 例，changelog
+  `changelog/2026-11-24/multistore-scenarios-batch11.md`；本批新增
+  `scenario_common::perf`（now/within/at_least/rate/scenario）与 `s3_extra`
+  （带请求头的 S3 往返），每例钉死性能预算并以 `perf[...]` 日志为证据）：
+  `video_streaming_range`（S3 3×4KiB 分片 + 20 次 Range GET 字节精确/Content-Range、
+  10 HEAD、3 LIST 折 CommonPrefix、416 InvalidRange；SQL 登记 = RESP HSET 缓存）、
+  `telecom_cdr_batch_spool`（/produce_batch 50 + /range 回放 + 消费 10/ack_batch +
+  XLEN 互查 + 700ms 延迟唤醒长轮询 + 空 park 满 wait_ms + SQL 台账）、
+  `event_platform_topic_admin`（CreateTopics 3→5、重复 36、DescribeConfigs 4 项、
+  DeleteTopics 后 Metadata 空、XINFO TOPICS events 5 个 p0..p4）、
+  `consumer_fleet_churn`（JoinGroup 79/gen0→gen1、SyncGroup/Heartbeat/OffsetCommit v2/
+  ListGroups Stable、已提交流 XTRIM 被守卫拒、组删后 MAXLEN 0 回 3、10 组 churn）、
+  `kafka_autocreate_registry`（Produce 打未知 auto126 自动建题、XLEN auto126/p0==2、
+  重复 CreateTopics 36、10 轮往返）、
+  `security_log_drill`（一次 _bulk 100 条、query_string/match_phrase/prefix/_source
+  includes+excludes、三方计数一致、HEAD→DELETE→HEAD 404）、
+  `product_search_ab`（FT.CREATE ON HASH/TAG 被拒 + 真实 FT.ADD JSON 面、命中 doc id
+  作 HASH 键 HGETALL 读回逐字段 = FT 文档、SORTBY/RETURN/RETURN 0/HIGHLIGHT/
+  WITHSCORES、ES term + SQL WHERE 同判）、
+  `bank_reconciliation_fullouter`（FULL OUTER JOIN 7 行、USING 双 id、反连接、
+  INTERSECT/EXCEPT、歧义 ORDER BY 1054、S3 报告往返、200 join+3 set op <2s（≥50 stmt/s））、
+  `visual_sql_ann`（VECTOR(4) 三度量 KNN、向量函数往返、vector index = SHOW INDEX
+  BTREE 行、ES knn 同 top-5）、
+  `iot_columnar_analytics`（1000 行 columnar 分块插入、跨 segment 聚合、append-only
+  1235、SHOW CREATE TABLE、TRUNCATE、S3 往返）、
+  `saas_dual_engine_turso`（rocks + turso 双引擎同节点、SHOW DATABASES 合并、
+  AUTO_INCREMENT/JOIN/UNION/CTE、T3 allowlist 6 形 1235、USE 未知库 1049）、
+  `order_history_prepared_pagination`（prepared LIMIT/OFFSET 两页、LIMIT 0、负 LIMIT 与
+  LIMIT ?,? 1064、20 次重执行、DEALLOCATE 后 stale handle 绝不答原页、ES from/size 互查）、
+  `hotel_row_lock_hold`（FOR UPDATE 锁持 1205、异行可锁、COMMIT 释放、FOR SHARE 共存、
+  NOWAIT/SKIP LOCKED 1235、10 轮 <2s）、
+  `regulatory_typed_report`（BIGINT/BOOLEAN/BLOB/DATE/DATETIME/DECIMAL 往返、DESCRIBE
+  类型名、宽松日期规范化、1292、BOOLEAN 比较 1235、会话面定形、ES 镜像）、
+  `telemetry_shard_topics_lite`（telemetry q0/q1/q2 = 5/3/2、XINFO TOPICS 字节序扁平对、
+  XINFO STREAM、组排空+XACK、XINFO LITE messages/acks 计数、SQL 分片登记）、
+  `data_lake_export_lifecycle`（自建 lake125 桶全生命周期：Create 200/409、25 对象、
+  ListObjectsV2 10/10/5 分页 + CommonPrefixes、非空删桶 409、25 删 204、删桶 204、
+  HEAD 404）、
+  `lite_gc_redelivery`（300ms 双 sweep：idle 重投 deliveries 1→≥2、MAXDELIVERY 2 +
+  DLQ 死信、XACK 清兄弟、空 PEL 消费者 GC、SQL 对账）、
+  `sql_dr_checkpoint`（20 SQL 行 + 10 RESP 键、等晚于写入的 checkpoint、SIGKILL +
+  擦 KV 保 raft/ + 拷回、重启后行值/HGETALL/meta.json 全在）、
+  `kafka_offset_epoch`（XADD 10 → ListOffsets v5 10/0、OffsetForLeaderEpoch v2
+  (0,-1,10)/(3,-1,-1)、OffsetCommit/Fetch v0 从 7 尾批、SQL 水位表）、
+  `cluster_migrate_list`（真两节点 + cluster init、100 键单槽、手开 IMPORTING 证
+  ASKING 一次性、migrate task +OK、migrate list JSON done/moved 100、属主切换、
+  leader MySQL 审计行）。
+  批次 11 追加钉死：S3 Range/HEAD/List 分页 + 416；Kafka topic admin 全生命周期 +
+  auto-create + 79/gen0；Lite 双 sweep 重投/死信/GC + XINFO LITE；SQL FULL OUTER/
+  USING/反连接/歧义列 1054 + vector index BTREE + columnar 1235 + prepared 翻页/
+  DEALLOCATE stale handle + 1205 行锁 + 类型化 DDL + 双引擎合并；FT 真实语法面 +
+  RETURN 0/HIGHLIGHT/WITHSCORES；migrate task/list JSON + ASKING 一次性。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
