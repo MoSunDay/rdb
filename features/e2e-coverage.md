@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10 + 2026-11-24 批次 11，`tests/scenario/scenario_*_e2e.rs` 130 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10 + 2026-11-24 批次 11 + 2026-11-25 批次 12，`tests/scenario/scenario_*_e2e.rs` 145 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -375,6 +375,49 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   USING/反连接/歧义列 1054 + vector index BTREE + columnar 1235 + prepared 翻页/
   DEALLOCATE stale handle + 1205 行锁 + 类型化 DDL + 双引擎合并；FT 真实语法面 +
   RETURN 0/HIGHLIGHT/WITHSCORES；migrate task/list JSON + ASKING 一次性。
+  批次 12（2026-11-25，编号 #131–#145 再扩 15 例，changelog
+  `changelog/2026-11-25/multistore-scenarios-batch12.md`；选题来自 130 例覆盖地图的
+  已实现未覆盖缺口审计，每例同样钉死性能预算）：
+  `ops_dashboard_cluster`（真两节点 `CLUSTER INFO/NODES/SLOTS/KEYSLOT` + `RAFT stats/
+  leader/nodes` 面板互查、epoch = term++commit_index、`-MOVED` 由 NODES/SLOTS 预测并
+  双向验证、`raft get sql_nodes` 四元登记、leader MySQL 快照行复制到 follower）、
+  `auction_ladder_zrange`（统一 ZRANGE 10 对组合与旧命令字节相等、11 条统一错误、
+  BYLEX REV 不交换边界、XADD 尾条 = ZREVRANGE 0 0、SQL ORDER BY LIMIT OFFSET 窗口）、
+  `coupon_exat_window`（SET EXAT/PXAT 未来/过去、KEEPTTL 与 EX 互斥、TTL/PTTL 换算、
+  SQL 账本 `expires_at` 集合 = RESP 存活集、XADD DELAY 提醒、三处 at_least）、
+  `ordered_ticket_queue`（XGROUP ORDERED INFLIGHT 配给、XINFO GROUPS/STREAM FULL 形状
+  与 COUNT 截断、DESTROY :1/:0 → NOGROUP、审计表 = PEL 行数）、
+  `profile_merge_vector_attrs`（JSON.FORGET 别名与静态路径门、VADD VALUES/FP16、VSIM
+  WITHATTRIBS 布局与 Rust 独立排名、FT.SEARCH FP16 = VSIM、FT.BUILD 质心、SQL 计数）、
+  `attendance_clock_funcs`（Hinnant 历元 oracle 对 NOW/CURDATE/CURTIME/YEAR../DATE_SUB/
+  UNIX_TIMESTAMP/FROM_UNIXTIME/DATE_FORMAT/DATEDIFF、TIMESTAMPDIFF 1054、RESP TTL 互查）、
+  `partner_export_funcs`（数值 24 格 + 字符串 28 格 + 位运算 u64 + 21 个 1235、
+  CSV → S3 PUT/GET/HEAD ETag = md5、SQL COUNT = RESP HLEN）、
+  `bi_session_handshake`（SET NAMES 静态回显、autocommit=0 1235、隔离级连字符回显、
+  @@version/autocommit/max_allowed_packet、USER()/CONNECTION_ID()、USE/DATABASE()
+  turso_ 前缀、RESP 哈希 = SQL）、
+  `warehouse_schema_migration`（RIGHT = 交换侧 LEFT、CROSS JOIN 笛卡尔、逗号 join
+  1235、RENAME 保 PK、DROP INDEX 让 EXPLAIN IndexScan → SeqScan、DROP DATABASE 1008/
+  USE 1049）、
+  `starrocks_vendor_contract`（DUPLICATE/PRIMARY KEY + DISTRIBUTED BY HASH 解析、7 条
+  1235、SHOW CREATE 往返、INSERT…SELECT 去重/append-only、ES 镜像命中 = SQL 计数）、
+  `log_index_rollover`（ES root/health/GET index/自动 id/doc GET-HEAD/GET 动词
+  _search|_count|_refresh/405/404 信封、SQL rollover_log SUM = _count/命中）、
+  `customer_upsert_bulk`（op_type=create 201/409、定域 _bulk index/update/delete 逐项
+  状态、minimum_should_match 数值/百分比 + 400、RESP 哈希 + SQL billing 三面一致）、
+  `fleet_coordinator_onboarding`（ApiVersions v0–v3/v4 35、Metadata v1、FindCoordinator
+  v0/v1 两类 key、Produce tombstone → 流 `__null__`、ListOffsets/Fetch、SQL alive 集合）、
+  `lake_listing_audit`（ListBuckets、v1 marker/NextMarker 三页、v2 start-after/
+  continuation-token、encoding-type=url、max-keys 0/-1/abc/5000、InvalidBucketName/
+  NoSuchBucket/NoSuchKey、SQL manifest = 列表并集）、
+  `observability_drill`（/metrics 直方图精确计 INCR、raft /get、/sql/ts 纯文本租约、
+  /sql/nodes、/join //depart 错 token 401 且登记不变、RocksMQ 404/405/400）。
+  批次 12 追加钉死：CLUSTER/RAFT 面板全集 + `-MOVED` 预测；统一 ZRANGE 矩阵；SET
+  EXAT/PXAT/KEEPTTL；XGROUP ORDERED INFLIGHT + XINFO STREAM FULL；JSON.FORGET/VSIM
+  WITHATTRIBS/FT FP16；SQL 时钟函数族 + 数值/字符串/位运算函数族；会话握手 1235/回显
+  矩阵；RIGHT/CROSS JOIN + RENAME/DROP INDEX/DROP DATABASE；StarRocks 方言子集；ES
+  REST 生命周期 + op_type/_bulk/msm；Kafka ApiVersions/FindCoordinator/tombstone；S3
+  ListBuckets/v1 marker；运维面 /metrics + raft HTTP + RocksMQ 错误合同。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
