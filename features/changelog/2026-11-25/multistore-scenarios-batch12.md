@@ -128,6 +128,10 @@ FindCoordinator/tombstone、S3 ListBuckets/v1 marker、运维面 `/metrics` 与 
   ≥600ms 实测 1.06s、活券未提前 ≥1.9s 实测 2.36s、毫秒券 ≥2.9s 实测 3.12s。整例最慢
   obs145 5.56s（另一轮 9.55s，5s gauge ticker 相位）、ops131 4.06s（两节点 + 注册表
   收敛），其余 ≤3.4s。
+- 推送前门禁：`cargo test --workspace --no-fail-fast` 全量 2156 例全绿（`RUST_TEST_THREADS=4`
+  并发负载下 scenario 145/145 218.49s、sql 139/139、lib 1432、其余 target 全绿），本轮
+  未出现既有负载 flake（`sql_2pc_e2e::dead_participant_aborts_and_restart_recovers`、
+  `sql_join_cluster_e2e::cluster_joins_gather_both_sides` 均过）。
 - `cargo clippy --workspace --all-targets -- -D warnings` 零告警（修复 5 处：#136
   `useless_format`、#138 `map_clone`/`iter_cloned_collect` → `CARDS.to_vec()`、#145
   `cloned_ref_to_slice_refs`、#134 `needless_borrow`、#140 `useless_vec`）。
