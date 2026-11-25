@@ -118,9 +118,9 @@ FindCoordinator/tombstone、S3 ListBuckets/v1 marker、运维面 `/metrics` 与 
 
 ## 回归与卫生
 
-- `cargo test --test scenario -- --nocapture` 串行全量 145/145 两轮绿（221.87s /
-  218.92s，批次 11 基线 190.6–199.1s + 本批 15 例合计 ~24.7s）。首轮 #131 因
-  INFO/stats 快照时序失败一次，修正后单跑 3/3 + 全量绿。15 例热块实测/预算：
+- `cargo test --test scenario -- --nocapture` 串行全量两轮：首轮 144/145（221.87s，
+  唯一失败 #131 因 INFO/stats 快照时序），修正后 145/145 绿（218.92s；批次 11 基线
+  190.6–199.1s + 本批 15 例合计 ~24.7s），#131 单跑另 3/3 绿。15 例热块实测/预算：
   clock136 854ms/3s、zr132 699ms/3s、attrs135 413ms/2s、sess138 384ms/2s、srs140 338ms/2s、
   obs145 控制面 262ms/2s、mig139 259ms/2s、ops131 171ms/2s、ord134 161ms/2s、fmt137 139ms/2s、
   coord143 42ms/2s、obs145 抓取 35ms/2s、exat133 35ms/2s、upsert142 36ms/2s、roll141 30ms/2s、
