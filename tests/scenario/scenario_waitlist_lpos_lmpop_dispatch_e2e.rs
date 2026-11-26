@@ -165,7 +165,7 @@ async fn waitlist_dispatches_through_rocksmq() {
     assert_eq!(cells(&drain(&a, &["LPOS", &w1, "anka", "COUNT", "0"]).await), ["0", "3"], "COUNT 0 = every match");
     assert_eq!(cells(&drain(&a, &["LPOS", &w1, "anka", "COUNT", "1"]).await), ["0"], "COUNT caps the array");
     assert_eq!(cells(&drain(&a, &["LPOS", &w1, "anka", "RANK", "2", "COUNT", "5"]).await), ["3"], "RANK skips, COUNT caps");
-    assert_eq!(cells(&drain(&a, &["LPOS", &w1, "zoe", "COUNT", "5"]).await), Vec::<String>::new(), "no match with COUNT = empty array");
+    assert_eq!(drain(&a, &["LPOS", &w1, "zoe", "COUNT", "5"]).await, "*0\r\n", "no match with COUNT = an empty array, never nil");
     assert_eq!(cmd(&a, &["LPOS", &w1, "anka", "MAXLEN", "2"]).await, ":0");
     assert_eq!(cmd(&a, &["LPOS", &w1, "emil", "MAXLEN", "2"]).await, "$-1", "MAXLEN bounds the scan to the head");
     assert_eq!(cmd(&a, &["LPOS", &w1, "emil", "MAXLEN", "3", "RANK", "-1"]).await, ":5", "a tail-bounded scan still reports head-based positions");

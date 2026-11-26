@@ -66,14 +66,38 @@ async fn xadd(a: &str, sev: &str, text: &str) -> String {
 
 /// Park one blocking read on its OWN connection (the spawned task owns
 /// the socket); the full reply text rides the oneshot once answered.
-fn spawn_block(addr: &str, args: &[&[u8]]) -> oneshot::Receiver<String> {
+/// Arrival handshake: the AUTH `+OK` is awaited BEFORE the command goes
+/// out, so once this returns the server holds a live authenticated
+/// session and the caller's settle sleep only has to cover the dispatch
+/// of the blocking read itself (never the connect/AUTH round trip).
+async fn spawn_block(addr: &str, args: &[&[u8]]) -> oneshot::Receiver<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = TcpStream::connect(addr).await.expect("block connect");
+    let auth = common::lite::frame(&[b"AUTH", common::TOKEN.as_bytes()]);
+    sock.write_all(&auth).await.expect("block auth write");
+    let mut ok = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut ok))
+        .await
+        .expect("auth answered within 10s")
+        .expect("auth read");
+    assert_eq!(&ok, b"+OK\r\n", "auth handshake");
+    sock.write_all(&common::lite::frame(args)).await.expect("block cmd write");
     let (tx, rx) = oneshot::channel();
-    let addr = addr.to_string();
-    let args: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
     tokio::spawn(async move {
-        let argv: Vec<&[u8]> = args.iter().map(|v| v.as_slice()).collect();
-        let raw = common::lite::cmd_full_reply_wait(&addr, common::TOKEN, &argv, 20, 10_000).await;
-        let _ = tx.send(common::lite::text(&raw));
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut first = true;
+        loop {
+            let wait = if first { 10_000 } else { 20 };
+            match tokio::time::timeout(Duration::from_millis(wait), sock.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    first = false;
+                }
+            }
+        }
+        let _ = tx.send(common::lite::text(&buf));
     });
     rx
 }
@@ -175,26 +199,21 @@ async fn tail_wakes_one_reader_and_times_out_cleanly() {
     // b) An idle tail: `$` is the last id, nothing follows, so the
     //    reader parks the whole BLOCK budget and answers the nil array.
     let t = scenario_common::perf::now();
-    let idle = answered(spawn_block(
-        &a,
-        &[b"XREAD", b"BLOCK", b"1500", b"STREAMS", STREAM.as_bytes(), b"$"],
-    ))
-    .await;
+    let idle = answered(spawn_block(&a, &[b"XREAD", b"BLOCK", b"1500", b"STREAMS", STREAM.as_bytes(), b"$"]).await)
+        .await;
     assert_eq!(idle, "*-1\r\n", "idle tail times out to nil");
     scenario_common::perf::at_least("tail146/idle-park", t, Duration::from_millis(1400));
 
     // c) A reader parked BEFORE a new XADD wakes with exactly that
-    //    entry (the stream name leads the single observation).
+    //    entry (the stream name leads the single observation). The
+    //    handshake proves the session is live; the settle sleep covers
+    //    the dispatch, so `$` is resolved before the XADD below.
     let t = scenario_common::perf::now();
-    let reader = spawn_block(
-        &a,
-        &[b"XREAD", b"BLOCK", b"3000", b"STREAMS", STREAM.as_bytes(), b"$"],
-    );
+    let reader = spawn_block(&a, &[b"XREAD", b"BLOCK", b"3000", b"STREAMS", STREAM.as_bytes(), b"$"]).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let id4 = xadd(&a, "critical", "page-db-replica-lag").await;
     let woke = answered(reader).await;
     scenario_common::perf::within("tail146/parked-xadd-wake", t, Duration::from_secs(2));
-    scenario_common::perf::at_least("tail146/wake-after-xadd", t, Duration::from_millis(200));
     assert_eq!(stream_ids(&woke), vec![id4.clone()], "exactly the new entry: {woke}");
     assert!(
         woke.contains("page-db-replica-lag") && !woke.contains("deploy-done"),
@@ -211,11 +230,13 @@ async fn tail_wakes_one_reader_and_times_out_cleanly() {
     let c1 = spawn_block(
         &a,
         &[b"XREADGROUP", b"GROUP", GROUP, b"c1", b"COUNT", b"1", b"BLOCK", b"800", b"STREAMS", STREAM.as_bytes(), b">"],
-    );
+    )
+    .await;
     let c2 = spawn_block(
         &a,
         &[b"XREADGROUP", b"GROUP", GROUP, b"c2", b"COUNT", b"1", b"BLOCK", b"800", b"STREAMS", STREAM.as_bytes(), b">"],
-    );
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let id5 = xadd(&a, "warning", "kafka-lag-high").await;
     let (r1, r2) = (answered(c1).await, answered(c2).await);
@@ -296,11 +317,8 @@ async fn tail_wakes_one_reader_and_times_out_cleanly() {
 
     // g) A consumed tail does not re-deliver: `$` again answers nil.
     let t = scenario_common::perf::now();
-    let again = answered(spawn_block(
-        &a,
-        &[b"XREAD", b"BLOCK", b"100", b"STREAMS", STREAM.as_bytes(), b"$"],
-    ))
-    .await;
+    let again = answered(spawn_block(&a, &[b"XREAD", b"BLOCK", b"100", b"STREAMS", STREAM.as_bytes(), b"$"]).await)
+        .await;
     assert_eq!(again, "*-1\r\n", "consumed tail stays nil");
     scenario_common::perf::within("tail146/consumed-tail-reread", t, Duration::from_secs(2));
     scenario_common::perf::scenario("tail146", t0);

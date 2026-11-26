@@ -209,6 +209,7 @@ async fn long_poll_fetch_parks_until_produce() {
     }
     // e) Produce acks=0: NO reply frame, yet the record lands and the
     //    same socket keeps answering later requests.
+    let t_fire = scenario_common::perf::now();
     let mut fire = TcpStream::connect(&front.kafka).await.expect("connect kafka front");
     fire.write_all(&produce_frame(corr, 0, &[rec(b"dev-9", b"temp=23")])).await.expect("write acks=0 produce");
     corr += 1;
@@ -227,6 +228,9 @@ async fn long_poll_fetch_parks_until_produce() {
         assert!(Instant::now() < deadline, "acks=0 record never landed (len {off})");
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
+    // The 500ms silence is a fixed cost of this window; the landing
+    // itself is one ListOffsets round trip.
+    scenario_common::perf::within("kpoll157/acks0-silence+landing", t_fire, Duration::from_secs(2));
     // f) The RESP side appends the 4th reading: two fields map
     //    positionally to (key, value) on Fetch (fetch_records.rs:158-165).
     let reply = drain(&a, &[b"XADD", TOPIC.as_bytes(), b"*", b"temp", b"cellar-24", b"site", b"rack-3"]).await;
@@ -266,7 +270,7 @@ async fn long_poll_fetch_parks_until_produce() {
     }
     assert_eq!(ints(&mut c, "SELECT COUNT(*) FROM telemetry_lag").await, vec![xlen], "COUNT(*) == XLEN");
     assert_eq!(ints(&mut c, "SELECT MAX(hwm) FROM telemetry_lag").await, vec![hwm], "every row under the live hwm");
-    assert_eq!(ints(&mut c, "SELECT SUM(lag) FROM telemetry_lag").await, vec![lag_sum], "the lag ledger sums to 0+1+2+3");
+    assert_eq!(ints(&mut c, "SELECT SUM(lag) FROM telemetry_lag").await, vec![lag_sum], "the lag ledger sums to hwm + (hwm-1) + (hwm-2) + (hwm-3)");
     assert_eq!(ints(&mut c, "SELECT COUNT(*) FROM telemetry_lag WHERE source = 'poll' AND log_offset < 2").await, vec![2], "the two polled readings");
     scenario_common::perf::scenario(TAG, t0);
 }

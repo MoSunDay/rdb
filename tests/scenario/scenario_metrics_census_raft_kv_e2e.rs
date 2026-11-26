@@ -178,7 +178,7 @@ fn record<'a>(key: &'a [u8], value: &'a [u8]) -> rdb::kafka::record::BatchRecord
 
 /// One round trip on a fresh AUTH'd session (MULTI/EXEC state is per
 /// connection): AUTH and every command of `cmds` are written back to
-/// back, the replies drain until a 60ms quiet gap (the first byte may
+/// back, the replies drain until a 150ms quiet gap (the first byte may
 /// lag 3s on a loaded box; EXEC's nested array arrives in pieces).
 async fn session(addr: &str, cmds: &[&[&[u8]]]) -> Vec<u8> {
     let mut sock = TcpStream::connect(addr).await.expect("connect");
@@ -194,7 +194,7 @@ async fn session(addr: &str, cmds: &[&[&[u8]]]) -> Vec<u8> {
         let wait = if buf.is_empty() {
             deadline.saturating_duration_since(Instant::now())
         } else {
-            Duration::from_millis(60)
+            Duration::from_millis(150)
         };
         if wait.is_zero() {
             break;

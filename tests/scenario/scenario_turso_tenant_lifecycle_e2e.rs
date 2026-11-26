@@ -37,6 +37,7 @@ const ER_NO_SUCH_TABLE: u16 = 1146;
 const ER_BAD_DB: u16 = 1049;
 const ER_DB_CREATE_EXISTS: u16 = 1007;
 const ER_DB_DROP_EXISTS: u16 = 1008;
+#[cfg(unix)]
 const ER_OPTION_PREVENTS: u16 = 1290;
 
 /// The server error of `sql` with its errno asserted; returns the message.
@@ -242,27 +243,28 @@ async fn turso_tenant_lifecycle_and_errors() {
     assert!(file_gone, "library file must be unlinked by DROP DATABASE");
 
     // f) 1290 is the read-only library path: a 0444 library file in the
-    //    root is listable/usable, but every write answers the errno.
-    let ro = turso_dir.join("turso_ro155.db");
-    std::fs::write(&ro, []).expect("seed read-only library");
-    let mut perms = std::fs::metadata(&ro).expect("ro metadata").permissions();
+    //    root is listable/usable, but every write answers the errno
+    //    (unix-only: the detection reads the permission bits).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let ro = turso_dir.join("turso_ro155.db");
+        std::fs::write(&ro, []).expect("seed read-only library");
+        let mut perms = std::fs::metadata(&ro).expect("ro metadata").permissions();
         perms.set_mode(0o444);
+        std::fs::set_permissions(&ro, perms).expect("strip write bits");
+        c.query_drop("USE turso_ro155").await.expect("use read-only library");
+        let ro_err = expect_error(&mut c, "CREATE TABLE t (id INT PRIMARY KEY)", ER_OPTION_PREVENTS).await;
+        c.query_drop("USE rdb").await.expect("leave read-only library");
+        let _ = std::fs::remove_file(&ro);
+        assert!(ro_err.contains("read-only: turso_ro155.db"), "{ro_err}");
     }
-    std::fs::set_permissions(&ro, perms).expect("strip write bits");
-    c.query_drop("USE turso_ro155").await.expect("use read-only library");
-    let ro_err = expect_error(
-        &mut c,
-        "CREATE TABLE t (id INT PRIMARY KEY)",
-        ER_OPTION_PREVENTS,
-    )
-    .await;
-    c.query_drop("USE rdb").await.expect("leave read-only library");
-    let _ = std::fs::remove_file(&ro);
-    assert!(ro_err.contains("read-only: turso_ro155.db"), "{ro_err}");
     let e = server_error(&mut c, "DROP DATABASE rdb").await;
     assert_eq!(e.code, ER_NOT_SUPPORTED, "{e:?}");
+    // The library root sits outside the self-cleaning scenario world, so
+    // the test removes it itself once the node is down.
+    drop(front);
+    drop(c);
+    let _ = std::fs::remove_dir_all(&turso_dir);
     scenario_common::perf::scenario(TAG, t0);
 }

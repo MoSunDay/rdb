@@ -118,8 +118,9 @@ JSON.SET NX/XX 与 TTL 保持、DDL 幂等脚本、AUTO_INCREMENT 预留批次�
   triage147 清扫 183–193ms/2s、fuse150 融合 182–187ms/2s、jobs148 检索 186–213ms/2s、
   triage147 认领 164–170ms/2s、dry149 ASK 探针 135–138ms/2s、kadmin156 梯 35–40ms/2s、
   mig153 两跑 28–42ms/2s、s3hard158 探针 13–14ms/2s、flag152 写入 13–23ms/2s、
-  eserr159 DSL 2–3ms/2s；#146/#157/#160 的 `at_least`：停住 ≥1.4s/≥200ms、≥900ms、
-  ≥30s/≥28s（实测 1.4s/0.2s、1.01–1.02s、30.003s/29.49s）。整例最慢 census160 35.5–35.8s
+  eserr159 DSL 2–3ms/2s；#146/#157/#160 的 `at_least`：停住 ≥1.4s、≥900ms、
+  ≥30s/≥28s（实测 1.54s、1.02s、30.003s/29.49s；#146 原有的 ≥200ms 项为同义反复，收尾时删除）。
+  整例最慢 census160 35.5–35.8s
   （故意 30s join 探针）、dry149 7.49–7.67s（两节点 + 3s topology ticker ×2）、kpoll157
   2.26–2.70s，其余 ≤3.4s。
 - 推送前门禁：`cargo test --workspace --no-fail-fast` 全量 2171 例全绿 = 基线 2156 +
@@ -134,3 +135,15 @@ JSON.SET NX/XX 与 TTL 保持、DDL 幂等脚本、AUTO_INCREMENT 预留批次�
 - 附带发现（既有、未改）：MySQL 前端每个结果集语句固定 ~42ms（`SELECT 1` 也如此，OK 包
   语句亚毫秒），`src/sql/front/serve.rs:74` 的 socket 未 `set_nodelay`，疑似 Nagle ×
   delayed-ACK；与批次 12 记录的 ~30–42ms/SELECT 一致。
+- 评审后收尾加固（评审结论"有条件上线"；只动批次内 5 个文件，不改 `src/`/公共夹具）：
+  #146 `spawn_block` 改为到达握手——先等 AUTH `+OK` 再写阻塞读，200ms 让渡只覆盖 XREAD
+  派发而不再覆盖连接/AUTH 往返（`$` 在 XADD 前定型），并删除同义反复的
+  `at_least(200ms)`（空闲停住 ≥1.4s 的那项保留）；#160 `session()` 静默间隙 60ms→150ms
+  （文件已顶 400 行，行数不变）；#155 0444 只读块整体 `#[cfg(unix)]`（检测按权限位，
+  非 unix 下原本会假失败）+ 用例末尾 `drop(front)` 后删除库根目录（不在自清理 world 内，
+  此前每跑残留一个 `/tmp/rdb-scenario-turso155-db-<pid>`）；#151 LPOS COUNT 无匹配改断言
+  线上形态 `*0
+`（原 `cells()==[]` 对 nil 同样成立）；#157 修正 SUM(lag) 断言文案
+  （和为 hwm..hwm-3 而非 0+1+2+3），并把 acks=0 的"500ms 静默 + 落地"从 3s 长窗口拆出
+  独立 `within` 2s（实测 503ms）。复验：5 例各 3 轮 15/15、scenario 160/160（275.97s）、
+  clippy 零告警。
