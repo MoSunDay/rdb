@@ -146,4 +146,5 @@ JSON.SET NX/XX 与 TTL 保持、DDL 幂等脚本、AUTO_INCREMENT 预留批次�
 `（原 `cells()==[]` 对 nil 同样成立）；#157 修正 SUM(lag) 断言文案
   （和为 hwm..hwm-3 而非 0+1+2+3），并把 acks=0 的"500ms 静默 + 落地"从 3s 长窗口拆出
   独立 `within` 2s（实测 503ms）。复验：5 例各 3 轮 15/15、scenario 160/160（275.97s）、
-  clippy 零告警。
+  clippy 零告警；收尾提交（`5c202f3`）上再跑全量 `cargo test --workspace --no-fail-fast`
+  （`RUST_TEST_THREADS=4`）2171/2171 绿（scenario 160/160 274.10s、sql 139、lib 1432）。
