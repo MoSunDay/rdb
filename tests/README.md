@@ -30,7 +30,7 @@ e2e 测试按**功能分组**组织：每个功能组目录是**单个测试 cra
 | `search/` | `search` | 3 | FT.* 全文检索 | — |
 | `cluster/` | `cluster` | 14 | 控制面 / HA / 进程生命周期 / 迁移 | `ha_failover`、`raft_cluster_e2e` |
 | `s3/` | `s3` | — | S3 前端 e2e（用例在 `main.rs`，`client.rs`/`fixture.rs` 为支撑模块） | — |
-| `scenario/` | `scenario` | 160 | 多存储真实业务场景（KV/SQL/ES/Kafka/RocksMQ/S3 横切） | — |
+| `scenario/` | `scenario` | 175 | 多存储真实业务场景（KV/SQL/ES/Kafka/RocksMQ/S3 横切） | — |
 
 例外文件物理上仍放组目录，但在 `Cargo.toml` 以 `[[test]] name/path` 声明为
 独立 target（原因见约定 3），**不**挂在组 `main.rs` 的 mod 列表里。
@@ -73,7 +73,7 @@ e2e 每用例拉起真实多监听 rdb 节点（一个 free-:0 探测派生 ~10 
 per-test 目录名撞端口引发同进程 RocksDB LOCK 冲突）。封顶对齐 CI runner
 核数，勿在本机调高后跑全量。
 
-`scenario` 组在此之上再自封一层：160 个用例各自拉起多前端节点
+`scenario` 组在此之上再自封一层：175 个用例各自拉起多前端节点
 （RESP+MySQL+ES+Kafka+RocksMQ+S3 任意子集），端口面最宽，仅靠 4 线程
 封顶仍会撞 TOCTOU，故组内以 `scenario_common::serial_guard()` 串行化
 用例体；实测串行反而更快（203s vs 4 并发 348s，EADDRINUSE 重试归零），

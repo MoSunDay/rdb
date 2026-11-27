@@ -41,7 +41,7 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
 - **S3 checkpoint**：retention 剪裁（盘上 = 协议面 = 保留数）+ meta.json 文件清单与 S3 GET 字节一致性。
 - **Kafka 边角**：`kafka_group_e2e` 补 LeaveGroup 未知成员/group（均 25）、DescribeGroups 未知
   group（group 级 NONE + state Dead，非 25）。
-- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10 + 2026-11-24 批次 11 + 2026-11-25 批次 12 + 2026-11-26 批次 13，`tests/scenario/scenario_*_e2e.rs` 160 例 + `tests/scenario_common/` 公共夹具）**：
+- **多存储真实场景套件（2026-11-19 首批 10 例 + 2026-11-20 批次 2/3/4 + 2026-11-21 批次 5/6/7 + 2026-11-22 批次 8/9/10 + 2026-11-24 批次 11 + 2026-11-25 批次 12 + 2026-11-26 批次 13 + 2026-11-27 批次 14，`tests/scenario/scenario_*_e2e.rs` 175 例 + `tests/scenario_common/` 公共夹具）**：
   业务故事横切多个存储面（KV 家族/JSON/Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），
   断言的是「同一份数据在不同面之间的可见性与一致性」而非单命令：
   `order_pipeline`（购物车 Hash→订单 SQL UNIQUE→ZSET 榜单→stream 事件→XACK）、
@@ -455,6 +455,42 @@ CI 入口：push 跑 `cargo test --workspace --no-fail-fast`（含全部 Rust e2
   面；SETSLOT MIGRATING ASK；ZUNIONSTORE/ZINTERSTORE；LPOS/LMPOP + RocksMQ；JSON NX/XX；
   DDL 幂等；AUTO_INCREMENT 预留；turso 生命周期；Kafka admin 梯；长轮询 Fetch；S3 硬化；
   ES 合同；指标普查。
+  批次 14（2026-11-27，编号 #161–#175 再扩 15 例，changelog
+  `changelog/2026-11-27/multistore-scenarios-batch14.md`；选题来自第二轮已实现未覆盖缺口
+  审计，每例钉死性能预算）：
+  `search_bm25_doclen`（BM25 长度/词频/AND/并集/NUMERIC range/K1-B 调参、LIMIT vs SORTBY
+  计数、FT.INFO、MySQL 对账）、
+  `watch_json_crossfront`（WATCH JSON + HINCRBY 跨连接竞争、FT 跟已提交事务、CROSSSLOT
+  整体中止、Kafka ListOffsets == XLEN）、
+  `rename_typed_families`（RENAME 搬 hash/zset/set/list/JSON/vectorset/FT 索引 + TTL、
+  RENAMENX、MySQL 计划表）、
+  `lite_dlq_contract`（DLQ 选项矩阵、XCLAIM 抬 delivery、超限转移四件套、XAUTOCLAIM
+  第三段、`op="dlq"` 指标）、
+  `rocksmq_http_contract`（RocksMQ 路由梯/produce/consume/pending/ack/range + 裸通道 ==
+  Kafka topic == RESP 流跨协议身份、MySQL 审计）、
+  `lite_fanin_group_retire`（多流 XREADGROUP 扇入、Kafka 账本守卫、DELCONSUMER/DESTROY/
+  NOGROUP/账本折叠、MySQL 对账）、
+  `kafka_session_expiry_rebalance`（session 超时驱逐 → 27 → 新 generation）、
+  `kafka_leader_assignment`（leader 逐成员 SyncGroup 分配往返 + 22/23/24/25 梯）、
+  `kafka_fenced_commit`（陈旧/离开成员提交围栏、跨 rebalance 检查点存活）、
+  `sql_pk_lookup_plan`（EXPLAIN PkLookup/IndexScan/SeqScan/Filter/Order/Limit、
+  `Direct execution`、SHOW INDEX 6 列、RESP ZSET 驱动 IN）、
+  `sql_conjunct_join_null`（INNER/LEFT/RIGHT 的 NULL 语义、合取换序、NULL 排序、
+  `NOT IN (.., NULL)`、`<=>`、turso 逐行相等）、
+  `sql_multirow_insert`（affected/LAST_INSERT_ID/64 预留/1062 烧号/1136/1048/1292、
+  RESP ZSET 拒单）、
+  `s3_expect_continue_incomplete`（100-continue 先于 auth、零长无 100、IncompleteBody
+  半关、坏 Content-Length、ETag md5/sidecar 退化、list XML 转义、RESP hash + MySQL
+  目录）、
+  `es_health_init_census`（两节点 YELLOW/1 → GREEN/2、带边界布点、routing_exception、
+  `_cat/indices` 本地普查 uuid/docs.count、`?v` 忽略）、
+  `redirect_metrics_backup`（`ack="true"` 仅 MOVED/ASK、`type="backup"` 共用 collector、
+  备份口 READONLY 门与 INIT 后全键 -MOVED、MIGRATING 缺键 -ASK、`raft_stats` Leader
+  唯一）。
+  批次 14 追加钉死：FT BM25 面；WATCH 跨前端；RENAME 类型族；Lite DLQ 合同；RocksMQ
+  路由梯 + 跨协议身份；多流扇入/组退役；Kafka session expiry/leader assignment/围栏
+  提交；SQL 计划面/SHOW INDEX；双引擎 join + NULL；多行 INSERT；S3 原始传输；ES 两节点
+  普查；重定向记账 + 备份口。
 - **MQ 引擎批次（2026-10-06 Batch 1，首次入台账）**：
   - `lite_dlq_e2e`（7）：MAXDELIVERY 超限单 WAL 批原子转移三件套（PEL 删行+水位推进+
     DLQ 入队）、重复 claim 不双转、ORDERED 仅 PEL 头、显式 DLQ 名/语法门（DLQ 须随
