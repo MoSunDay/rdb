@@ -69,14 +69,14 @@ MOVED/ASK 重定向记账与备份监听）。每例仍是一个真实业务故�
   数，`src/search/ft_search.rs:181`），全量计数只在 SORTBY 下出现（`ft_search.rs:232-259`）；
   NUMERIC range 节点记常数 1.0 而非 BM25（`eval_tree.rs:198-208`）。
 - #162（缺陷疑似）：对 lite 流键 WATCH 永不触发——router 用全名哈希
-  （`src/command/mod.rs:455`），lite 存在父名的槽前缀下（`src/lite/append.rs:56`）；
+  （`src/command/mod.rs:449-450`），lite 存在父名的槽前缀下（`src/lite/append.rs:56`）；
   该腿移除，不断言。
 - #163（缺陷疑似）：普通流名对 RENAME 不可见（`-ERR no such key`，XLEN 1 / EXISTS 0
   同样成立），RENAME 不带 delivered 水位（`src/lite/offset.rs:57`），旧 (stream, group)
   的 offset 缓存无驱逐（`offset.rs:57-115`、`keys_core.rs:342`：`XREADGROUP <old> >`
   得 `*-1` 而非 NOGROUP，`XACK <old>` :1 复活组）；流相关腿移除，其余类型族照常钉死。
 - #164：committed-id 是连续 ACKED 前缀（id1 pending 时 `0-0`，转移后变 id1；
-  `offset.rs:217-254`）；last-delivered-id 是持久化投递水位（`read.rs:420`），由下一次
+  `offset.rs:164-207`，`resolve` 同规则 `:192-198`）；last-delivered-id 是持久化投递水位（`read.rs:420`），由下一次
   committed 推进落盘。
 - #165/#166：`/produce` 回 TEXT（体 = id，`api.rs:176`）；`/range` 参数名 `begin`/`end`
   （`range.rs:35`）；`/ack` 不查 pending/归属（`api.rs:184-216`）；lite 组的 OffsetFetch
@@ -104,7 +104,7 @@ MOVED/ASK 重定向记账与备份监听）。每例仍是一个真实业务故�
   routing）；`?v` 从不读取；`cat_indices` 只扫本地存储（`misc.rs:76-102`）；ES `slot_check`
   无 hash tag（`write.rs:76-102`）。
 - #175：备份口共享拓扑但不共享 RESP bind，INIT 后对每个键读都 -MOVED 到带主，包括
-  node0 自有槽（`main.rs:491-497`、`router.rs:30-48`）；MIGRATING 源对已有键本地服务、
+  node0 自有槽（`main.rs:493` 换 bind、`:506` 克隆拓扑；`router.rs:30-48`）；MIGRATING 源对已有键本地服务、
   仅缺键 -ASK（`command/mod.rs:366-371`）；`ack="true"` 仅见于 MOVED/ASK（`mod.rs:468-472`）。
 
 ## 回归与卫生
@@ -118,7 +118,7 @@ MOVED/ASK 重定向记账与备份监听）。每例仍是一个真实业务故�
   `kexpiry/rejoin-dance` ~54ms（另 `at_least kexpiry/eviction-honors-session` ≥1s，
   实测 ~1.9s 真实 session 等待）、`kassign/sync-handoff` ~303ms（`at_least
   kassign/follower-parked` ~250ms）、`kfence/fence-ladder` ~30ms、
-  `pkplan/explain-ladder` 0.97s（≤3s，~20 个结果集语句 × 42ms）、
+  `pkplan/explain-ladder` 0.97s（≤3s，~20 个结果集语句 × 42ms）、`pkplan/after-ix-id` 0.17s、
   `conjnull/join-null` 0.55s + `conjnull/turso-join-null` 0.57s、
   `multirow/error-ladder` 0.13s、`s3cont/incomplete-body` <2ms +
   `s3cont/put-get-etag` 19–46ms、`eshealth/census` 5–8ms、
@@ -136,3 +136,6 @@ MOVED/ASK 重定向记账与备份监听）。每例仍是一个真实业务故�
   全量中的 `scenario_sqlrpc_twopc_e2e::settlement_spans_shards_over_sql_rpc_and_vetoes_dupes`：
   多节点 join `head timeout`），三例单独复跑各 2–5 轮全过，第二轮全量 2186/2186；与批次 13
   记录的 `sql_2pc_e2e`/`sql_join_cluster_e2e` flake 同类，均为既有、未改。
+- 评审收尾（只改注释/文档，不动断言）：修正 changelog 三处 src 行号引用（#162 `mod.rs:449-450`、
+  #164 `offset.rs:164-207`、#175 `main.rs:493,506`）与 #163 文件头同步，性能表补
+  `pkplan/after-ix-id`；增量构建复验通过。

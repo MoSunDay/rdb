@@ -6,7 +6,7 @@
 //! names; old names are gone, a TTL travels (index) or is replaced (string <-> hash),
 //! RENAMENX refuses an occupied code.
 //! Deviation: the stream names are slot-aligned with their parents by construction
-//! (the router hashes the FULL name, src/command/mod.rs:455; lite stores under the
+//! (the router hashes the FULL name, src/command/mod.rs:449-450; lite stores under the
 //! PARENT's slot, src/lite/append.rs:56) -- an ordinary stream name is invisible to
 //! RENAME; the delivered watermark is not carried (src/lite/offset.rs:57); legs dropped.
 //! RESP RENAME/RENAMENX/TYPE/TTL/PEXPIRE/PERSIST + HASH/ZSET/SET/LIST/JSON/VECTORSET/STREAM + FT + MySQL. One REAL node, fronts mysql (RESP always).
