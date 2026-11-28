@@ -18,7 +18,6 @@ use md5::{Digest, Md5};
 use scenario_common::{
     front_world, http, ok, r, rb, rt, spawn_front_node, wait_fronts, world_dir, FrontSpec,
 };
-use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 const TAG: &str = "rmetrics175";
@@ -76,9 +75,9 @@ fn node_id(addr: &str) -> String {
     format!("{d}{}", &d[24..])
 }
 
+/// One reserved loopback port (process-wide reservation lives in `common`).
 fn free_port() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().expect("local_addr").to_string()
+    common::free_addr()
 }
 
 /// First `{rm175t<i>}` tag whose slot satisfies `pred`.
