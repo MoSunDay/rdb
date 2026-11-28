@@ -30,8 +30,12 @@ pub fn render_expr(e: &Expr) -> SqlResult<String> {
         },
         Expr::Neg(inner) => Ok(format!("(-{})", render_expr(inner)?)),
         Expr::Not(inner) => Ok(format!("(NOT {})", render_expr(inner)?)),
+        // `IS [NOT] NULL` is a postfix predicate: the parentheses wrap
+        // the WHOLE test (`x IS NULL`), not the operand -- the earlier
+        // `(x IS) NULL` spelling was SQLite `near ")": syntax error`
+        // (MySQL face 1064); the regression tests pin the shape.
         Expr::IsNull { expr, negated } => Ok(format!(
-            "({} IS{}) NULL",
+            "({} IS{} NULL)",
             render_expr(expr)?,
             if *negated { " NOT" } else { "" }
         )),
@@ -176,5 +180,108 @@ pub fn render_value(v: &Value) -> String {
         // column's NUMERIC affinity keeps blobs blobs (text spellings
         // would stay TEXT and break length()/4 and blob read-back).
         Value::Vector(v) => super::vector::blob_literal(v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `expr IS NULL` / `expr IS NOT NULL` rendered to SQLite text.
+    fn is_null(expr: Expr, negated: bool) -> SqlResult<String> {
+        render_expr(&Expr::IsNull {
+            expr: Box::new(expr),
+            negated,
+        })
+    }
+
+    fn bare(name: &str) -> Expr {
+        Expr::Col {
+            table: None,
+            name: name.to_string(),
+        }
+    }
+
+    fn qualified(table: &str, name: &str) -> Expr {
+        Expr::Col {
+            table: Some(table.to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    fn add(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Add,
+            right: Box::new(right),
+        }
+    }
+
+    #[test]
+    fn is_null_bare_column() {
+        assert_eq!(is_null(bare("name"), false).unwrap(), "(\"name\" IS NULL)");
+        assert_eq!(
+            is_null(bare("name"), true).unwrap(),
+            "(\"name\" IS NOT NULL)"
+        );
+        // Identifiers keep the shared quoting (embedded quotes doubled).
+        assert_eq!(
+            is_null(bare("a\"b"), false).unwrap(),
+            "(\"a\"\"b\" IS NULL)"
+        );
+    }
+
+    #[test]
+    fn is_null_qualified_column() {
+        assert_eq!(
+            is_null(qualified("c", "city_id"), false).unwrap(),
+            "(\"c\".\"city_id\" IS NULL)"
+        );
+        assert_eq!(
+            is_null(qualified("customers", "city_id"), true).unwrap(),
+            "(\"customers\".\"city_id\" IS NOT NULL)"
+        );
+    }
+
+    #[test]
+    fn is_null_nested_expression() {
+        // Negation inside the predicate.
+        assert_eq!(
+            is_null(Expr::Neg(Box::new(bare("w"))), false).unwrap(),
+            "((-\"w\") IS NULL)"
+        );
+        // A binary tree (fully parenthesized) inside the predicate.
+        assert_eq!(
+            is_null(add(Expr::Lit(Value::Int(1)), qualified("t", "x")), false).unwrap(),
+            "((1 + \"t\".\"x\") IS NULL)"
+        );
+        assert_eq!(
+            is_null(add(bare("a"), add(bare("b"), bare("c"))), true).unwrap(),
+            "((\"a\" + (\"b\" + \"c\")) IS NOT NULL)"
+        );
+    }
+
+    /// The defect this module pins (batch 14 R2): the old spelling put
+    /// the closing parenthesis after IS / IS NOT (`(x IS) NULL`), which
+    /// SQLite rejects with `near ")": syntax error`.
+    #[test]
+    fn is_null_never_renders_the_misplaced_paren() {
+        let subjects = [
+            bare("name"),
+            qualified("t", "name"),
+            Expr::Neg(Box::new(bare("w"))),
+            add(Expr::Lit(Value::Int(1)), bare("x")),
+        ];
+        for negated in [false, true] {
+            for e in &subjects {
+                let sql = is_null(e.clone(), negated).unwrap();
+                assert!(!sql.contains("IS) NULL"), "{sql}");
+                assert!(!sql.contains("IS NOT) NULL"), "{sql}");
+                assert!(
+                    sql.ends_with(if negated { "IS NOT NULL)" } else { "IS NULL)" }),
+                    "{sql}"
+                );
+            }
+        }
     }
 }

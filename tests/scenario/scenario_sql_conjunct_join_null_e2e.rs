@@ -6,10 +6,11 @@
 //! / LAST descending (host deviation vs MySQL: select.rs cmp_null_first;
 //! turso = SQLite NULLs-smallest, the same); `NOT IN (1, NULL)` is EMPTY,
 //! `IN (1, NULL)` keeps the city-1 rows; LEFT JOIN + COUNT(c.id) GROUP BY
-//! counts 0 for the unmatched city. `<=>` is host-only by design.
+//! counts 0 for the unmatched city. `IS NULL` / `IS NOT NULL` run on BOTH
+//! engines (the turso renderer used to spell `x IS NULL` as `(x IS) NULL`
+//! -> 1064; fixed by the batch-14 R2 closure, translate/expr.rs). `<=>`
+//! is host-only by design: turso still rejects it with 1235.
 //! One REAL node, MySQL front (host engine + turso engine).
-//! Deviation: `IS NULL`/`IS NOT NULL` run on the HOST only -- the turso
-//! renderer spells `x IS NULL` as `(x IS) NULL` (translate/expr.rs) -> 1064.
 
 use std::time::Duration;
 
@@ -201,16 +202,32 @@ async fn census_reads(c: &mut mysql_async::Conn) {
     assert_eq!(grid(&rows(c, agg).await), census(), "LEFT JOIN census");
 }
 
-/// Host-only NULL predicates: `IS NULL` as the residual after an IN
-/// list, the `IS NOT NULL` count, and the NULL-safe `<=>` (which
-/// counts the NULL-key rows the way `IS NULL` does).
+/// NULL predicates, engine-agnostic since the turso renderer fix
+/// (batch-14 R2: `(x IS) NULL` -> 1064): `IS NULL` as the residual
+/// after an IN list, the `IS NULL` / `IS NOT NULL` id sets, and the
+/// `IS NOT NULL` count. Host and turso answer the SAME rows.
 async fn null_predicates(c: &mut mysql_async::Conn) {
     let nulls: Vec<i64> = (1..=3i64).filter(|i| CUSTOMERS[*i as usize - 1].2.is_none()).collect();
     let residual = ints(c, "SELECT id FROM customers WHERE id IN (1, 2, 3) AND city_id IS NULL ORDER BY id").await;
     assert_eq!(residual, nulls, "IN + IS NULL residual");
-    let keyed = CUSTOMERS.iter().filter(|c| c.2.is_some()).count();
-    let null_keys = CUSTOMERS.len() - keyed;
-    assert_eq!(ints(c, "SELECT COUNT(*) FROM customers WHERE city_id IS NOT NULL").await, vec![keyed as i64]);
+    let uncited: Vec<i64> = CUSTOMERS.iter().filter(|c| c.2.is_none()).map(|c| c.0).collect();
+    let cited: Vec<i64> = CUSTOMERS.iter().filter(|c| c.2.is_some()).map(|c| c.0).collect();
+    assert_eq!(ints(c, "SELECT id FROM customers WHERE city_id IS NULL ORDER BY id").await, uncited, "IS NULL ids");
+    assert_eq!(
+        ints(c, "SELECT id FROM customers WHERE city_id IS NOT NULL ORDER BY id").await,
+        cited,
+        "IS NOT NULL ids"
+    );
+    assert_eq!(ints(c, "SELECT COUNT(*) FROM customers WHERE city_id IS NOT NULL").await, vec![cited.len() as i64]);
+    // Three-valued logic: `= NULL` is never TRUE on either engine.
+    assert!(ints(c, "SELECT id FROM customers WHERE city_id = NULL").await.is_empty(), "= NULL is empty");
+}
+
+/// Host-only: the NULL-safe `<=>` counts the NULL-key rows the way
+/// `IS NULL` does (turso rejects the operator with 1235 -- see the
+/// library leg and turso_crud_e2e's matrix).
+async fn null_safe_equal(c: &mut mysql_async::Conn) {
+    let null_keys = CUSTOMERS.iter().filter(|c| c.2.is_none()).count();
     assert_eq!(ints(c, "SELECT COUNT(*) FROM customers WHERE city_id <=> NULL").await, vec![null_keys as i64]);
 }
 
@@ -239,12 +256,14 @@ async fn sql_conjunct_join_null() {
     let t = scenario_common::perf::now();
     census_reads(&mut c).await;
     scenario_common::perf::within("conjnull/join-null", t, Duration::from_secs(2));
-    // c) The host-only NULL predicates: `IS NULL` residual, `IS NOT
-    //    NULL`, `<=>`.
+    // c) The NULL predicates (engine-agnostic, see d) plus the
+    //    host-only NULL-safe `<=>`.
     null_predicates(&mut c).await;
+    null_safe_equal(&mut c).await;
 
     // d) The SAME census in the turso library: identical expectations
-    //    for every engine-agnostic read above.
+    //    for every engine-agnostic read above, NULL predicates
+    //    included. Only `<=>` stays host-only (1235 here).
     common::mysql::ddl(&mut c, "CREATE DATABASE turso_census").await;
     c.query_drop("USE turso_census").await.expect("use turso_census");
     common::mysql::ddl(&mut c, "CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(32), city_id INT)").await;
@@ -253,6 +272,9 @@ async fn sql_conjunct_join_null() {
     let t = scenario_common::perf::now();
     census_reads(&mut c).await;
     scenario_common::perf::within("conjnull/turso-join-null", t, Duration::from_secs(2));
+    null_predicates(&mut c).await;
+    let e = common::mysql::server_error(&mut c, "SELECT COUNT(*) FROM customers WHERE city_id <=> NULL").await;
+    assert_eq!(e.code, common::mysql::ER_NOT_SUPPORTED_YET, "turso `<=>`: {e:?}");
     c.query_drop("USE rdb").await.expect("back to the host");
     assert_eq!(ints(&mut c, "SELECT COUNT(*) FROM customers").await, vec![6], "host census intact after the detour");
 

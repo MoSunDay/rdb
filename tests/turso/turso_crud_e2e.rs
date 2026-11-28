@@ -4,8 +4,9 @@
 //! INSERT with engine-side id allocation and LAST_INSERT_ID, the
 //! SELECT trunk (WHERE / ORDER BY / LIMIT incl. the MySQL
 //! offset,limit swap / GROUP BY aggregates), UPDATE and DELETE with
-//! affected-rows checks, TRUNCATE/DROP, and the 1235 rejection shape
-//! for everything outside the allowlist.
+//! affected-rows checks, the NULL predicates (`IS [NOT] NULL`, and
+//! `= NULL` under three-valued logic), TRUNCATE/DROP, and the 1235
+//! rejection shape for everything outside the allowlist.
 
 use crate::common;
 
@@ -254,6 +255,66 @@ async fn turso_crud_end_to_end() {
         .expect("create vec");
     let desc = rows(&mut c, "DESCRIBE vec").await;
     assert_eq!(desc[1][1], s("vector(3)"), "{desc:?}");
+
+    // (i) NULL predicates (batch-14 R2: the renderer used to spell
+    // `x IS NULL` as `(x IS) NULL` -- 1064 on every IS NULL read, so
+    // the leg was absent here). Three-valued logic: `= NULL` / `!= NULL`
+    // are never TRUE, `IS [NOT] NULL` is the two-valued test; 0 is a
+    // value, not NULL.
+    c.query_drop("CREATE TABLE nul (id INT PRIMARY KEY, v INT)")
+        .await
+        .expect("create nul");
+    c.query_drop("INSERT INTO nul VALUES (1, 10), (2, NULL), (3, 30), (4, NULL), (5, 0)")
+        .await
+        .expect("seed nul");
+    assert_eq!(
+        common::mysql::ints(&mut c, "SELECT id FROM nul WHERE v IS NULL ORDER BY id").await,
+        vec![2, 4],
+        "IS NULL"
+    );
+    assert_eq!(
+        common::mysql::ints(&mut c, "SELECT id FROM nul WHERE v IS NOT NULL ORDER BY id").await,
+        vec![1, 3, 5],
+        "IS NOT NULL"
+    );
+    for sql in [
+        "SELECT id FROM nul WHERE v = NULL",
+        "SELECT id FROM nul WHERE v != NULL",
+        "SELECT id FROM nul WHERE v = NULL AND v = 10",
+    ] {
+        assert!(
+            rows(&mut c, sql).await.is_empty(),
+            "{sql}: = NULL is never TRUE (NULL AND TRUE is NULL)"
+        );
+    }
+    // The other half of the three-valued truth table: NULL OR TRUE is
+    // TRUE, so the comparison to NULL merely drops out of the OR.
+    assert_eq!(
+        common::mysql::ints(&mut c, "SELECT id FROM nul WHERE v = NULL OR v = 10").await,
+        vec![1],
+        "NULL OR TRUE is TRUE"
+    );
+    // Composed with the rest of the trunk: the AND residual, an
+    // expression operand (NULL propagates), and COUNT skipping NULLs.
+    assert_eq!(
+        common::mysql::ints(
+            &mut c,
+            "SELECT id FROM nul WHERE id > 1 AND v IS NULL ORDER BY id"
+        )
+        .await,
+        vec![2, 4],
+        "AND + IS NULL"
+    );
+    assert_eq!(
+        common::mysql::ints(&mut c, "SELECT id FROM nul WHERE v + 1 IS NULL ORDER BY id").await,
+        vec![2, 4],
+        "expression operand"
+    );
+    assert_eq!(
+        rows(&mut c, "SELECT COUNT(*), COUNT(v) FROM nul").await,
+        vec![vec![s("5"), s("3")]]
+    );
+    c.query_drop("DROP TABLE nul").await.expect("drop nul");
 
     node.kill_now();
 }
