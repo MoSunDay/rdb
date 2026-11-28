@@ -1,8 +1,8 @@
-//! RocksMQ-style HTTP API, process-level e2e: one REAL rdb binary with
-//! `rocksmq_bind` set, driven over raw TCP HTTP/1.1 (hand-rolled
-//! requests, like every other front's e2e) plus the RESP port for the
-//! interop proofs (XADD/XACK/XPENDING/XRANGE on the same streams).
+//! RocksMQ-style HTTP API, process-level e2e: one REAL rdb binary with `rocksmq_bind` set,
+//! driven over raw TCP HTTP/1.1 (hand-rolled requests, like every other front's e2e) plus the
+//! RESP port for the interop proofs (XADD/XACK/XPENDING/XRANGE on the same streams).
 
+use crate::common;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -40,13 +40,7 @@ fn free_addr() -> String {
 
 fn spawn_rocksmq_node(dir: &str) -> Node {
     std::fs::create_dir_all(dir).expect("create node dir");
-    let (resp, raft, raft_http, monitor, http) = (
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-    );
+    let [resp, raft, raft_http, monitor, http] = [(); 5].map(|_| free_addr());
     let config_path = PathBuf::from(dir).join("conf.yaml");
     let yaml = format!(
         "bind: \"{resp}\"\nstore_path: \"{dir}\"\nraft_bind_address: \"{raft}\"\n\
@@ -104,8 +98,7 @@ async fn post(addr: &str, target: &str, body: &str) -> (u16, String) {
         "POST {target} HTTP/1.1\r\nHost: e2e\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
-    let (status, head, out_body) = round_trip(&mut sock, &req).await;
-    let _ = head;
+    let (status, _, out_body) = round_trip(&mut sock, &req).await;
     (status, out_body)
 }
 
@@ -147,28 +140,15 @@ async fn round_trip(sock: &mut TcpStream, req: &str) -> (u16, String, String) {
     (status, head, body)
 }
 
-/// AUTH + one RESP command on a fresh connection; returns the command
-/// reply (AUTH's +OK stripped).
-async fn resp_cmd(addr: &str, args: &[&[u8]]) -> Vec<u8> {
-    let mut sock = TcpStream::connect(addr).await.expect("connect resp");
-    let mut buf = b"*2\r\n$4\r\nAUTH\r\n".to_vec();
-    buf.extend_from_slice(format!("${}\r\n{}\r\n", TOKEN.len(), TOKEN).as_bytes());
-    buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
-    for a in args {
-        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
-        buf.extend_from_slice(a);
-        buf.extend_from_slice(b"\r\n");
-    }
-    sock.write_all(&buf).await.expect("write resp cmds");
-    let mut out = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match tokio::time::timeout(Duration::from_millis(300), sock.read(&mut chunk)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => out.extend_from_slice(&chunk[..n]),
-        }
-    }
-    out.split_at(5).1.to_vec() // drop "+OK\r\n"
+/// AUTH'd RESP command; its line/bulk reply (CRLF stripped) via the shared reader (10s per reply).
+async fn resp_line(addr: &str, args: &[&[u8]]) -> Vec<u8> {
+    common::cmd_one_shot(addr, TOKEN, args).await
+}
+
+/// The same for an ARRAY reply (XRANGE, XPENDING summary): the line reader stops at the `*N`
+/// header, so arrays take the shared quiet-gap reader (patient 10s first byte, 100ms tail gap).
+async fn resp_array(addr: &str, args: &[&[u8]]) -> Vec<u8> {
+    common::lite::cmd_full_reply_wait(addr, TOKEN, args, 100, 10_000).await
 }
 
 fn msgs_of(body: &str) -> Vec<(String, String)> {
@@ -246,10 +226,9 @@ async fn produce_group_consume_ack_flow() {
     )
     .await;
     assert_eq!((s, b.as_str()), (200, "ok"), "re-ack is idempotent");
-    let resp = resp_cmd(&node.resp, &[b"XACK", b"ch1/q0", b"g1", ids[1].as_bytes()]).await;
-    assert_eq!(resp, b":1\r\n".to_vec(), "RESP XACK of the second id");
-    // The third delivery is still pending; ack it over HTTP, then the
-    // whole PEL must be empty (XPENDING summary total = 0).
+    let resp = resp_line(&node.resp, &[b"XACK", b"ch1/q0", b"g1", ids[1].as_bytes()]).await;
+    assert_eq!(resp, b":1".to_vec(), "RESP XACK of the second id");
+    // The third delivery is still pending; ack it over HTTP, then the whole PEL must be empty.
     let (s, b) = post(
         &node.http,
         &format!("/ack?channel=ch1&group=g1&id={}", ids[2]),
@@ -257,7 +236,7 @@ async fn produce_group_consume_ack_flow() {
     )
     .await;
     assert_eq!((s, b.as_str()), (200, "ok"), "ack of the last delivery");
-    let pend = resp_cmd(&node.resp, &[b"XPENDING", b"ch1/q0", b"g1"]).await;
+    let pend = resp_array(&node.resp, &[b"XPENDING", b"ch1/q0", b"g1"]).await;
     assert!(
         pend.windows(4).any(|w| w == b"*3\r\n") && pend.windows(4).any(|w| w == b":0\r\n"),
         "PEL must be empty: {:?}",
@@ -277,9 +256,8 @@ async fn interop_resp_xadd_and_back() {
     let resp_addr = node.resp.clone();
     wait_accepting(&mut node, &resp_addr, "resp").await;
 
-    // RESP XADD lands in ch2/q0; a NEW HTTP group consume sees it
-    // (auto-created group starts at the stream head).
-    let resp = resp_cmd(&node.resp, &[b"XADD", b"ch2/q0", b"*", b"v", b"world"]).await;
+    // RESP XADD lands in ch2/q0; a NEW HTTP group consume sees it (new groups start at head).
+    let resp = resp_line(&node.resp, &[b"XADD", b"ch2/q0", b"*", b"v", b"world"]).await;
     assert!(
         resp.starts_with(b"$"),
         "xadd id: {:?}",
@@ -291,11 +269,10 @@ async fn interop_resp_xadd_and_back() {
     assert_eq!(got.len(), 1, "{b}");
     assert_eq!(got[0].1, "d29ybGQ=", "base64(world): {b}");
 
-    // HTTP produce lands in the SAME stream (XRANGE sees both entries
-    // with the 'v' field) -- the shared 1-pair rule with the Kafka front.
+    // HTTP produce lands in the SAME stream (XRANGE sees both entries, 'v'-paired as in Kafka).
     let (s, _) = post(&node.http, "/produce?channel=ch2", "http-msg").await;
     assert_eq!(s, 200);
-    let range = resp_cmd(&node.resp, &[b"XRANGE", b"ch2/q0", b"-", b"+"]).await;
+    let range = resp_array(&node.resp, &[b"XRANGE", b"ch2/q0", b"-", b"+"]).await;
     let text = String::from_utf8_lossy(&range).to_string();
     assert!(text.contains("*2\r\n"), "two entries: {text}");
     assert!(
@@ -366,9 +343,8 @@ async fn no_group_pull_and_error_paths() {
     .await;
     assert_eq!(s, 405, "{head}");
     assert!(head.to_ascii_lowercase().contains("allow: post"), "{head}");
-    // 413: the server answers and closes WITHOUT draining an oversized
-    // body (the standard posture), so the client write may hit EPIPE --
-    // tolerate it and just read whatever reply arrives.
+    // 413: the server answers and closes WITHOUT draining an oversized body (the standard
+    // posture), so the client write may hit EPIPE -- tolerate it and just read whatever arrives.
     let big = "x".repeat((4 << 20) + 1);
     let mut sock = TcpStream::connect(&node.http).await.expect("connect");
     let req = format!(
