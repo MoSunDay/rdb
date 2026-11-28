@@ -36,6 +36,9 @@ impl Session {
 }
 
 /// Frame `args`, write once, drain the reply until a 120ms quiet gap.
+/// The FIRST byte waits up to 10s (only the gaps between chunks follow the
+/// 120ms rule): under load the reply trails the write by more than one
+/// quiet gap and the drain handed back "" (batch-14 gate).
 async fn cmd_raw(sock: &mut TcpStream, args: &[&[u8]]) -> Vec<u8> {
     let mut frame = format!("*{}\r\n", args.len()).into_bytes();
     for a in args {
@@ -47,11 +50,15 @@ async fn cmd_raw(sock: &mut TcpStream, args: &[&[u8]]) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        match tokio::time::timeout(Duration::from_millis(120), sock.read(&mut chunk)).await {
+        let wait = if buf.is_empty() {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_millis(120)
+        };
+        match tokio::time::timeout(wait, sock.read(&mut chunk)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-            Ok(Err(_)) => break,
-            Err(_) => break, // fell quiet: reply complete
+            Ok(Err(_)) | Err(_) => break, // fell quiet: reply complete
         }
     }
     buf
