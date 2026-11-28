@@ -6,15 +6,16 @@
 //! The FT index only follows a committed transaction; a read keeps the watch, the own write
 //! outside MULTI (or DISCARD) clears it; queue-time CROSSSLOT aborts wholesale; both fronts
 //! read the SAME audit log (Kafka ListOffsets latest == RESP XLEN, the produced k/v in XRANGE).
-//! Deviation: WATCH on the stream key itself is NOT exercised -- probed, it never fires (the
-//! watch hashes under the full name's slot prefix, lite under the parent's, src/lite/append.rs:56).
+//! WATCH on the stream's plain NAME (`parent/child`, no hash tag: the routed slot of the full
+//! name is not the PARENT slot the X-* verbs store under, the watch covers both windows) fires
+//! too: EXISTS = 1 / TYPE = stream from a routed connection, a rival XADD aborts the EXEC.
 //! RESP MULTI/WATCH/EXEC + JSON + FT.ADD/FT.SEARCH + Kafka (Produce v3, ListOffsets v5). One REAL node, fronts kafka (RESP always).
 use crate::common;
 use crate::kafka_front_common::topics::list_offsets_v5;
 use crate::scenario_common;
 use rdb::kafka::record::BatchRecord;
 use scenario_common::kafka::kafka_produce_v3;
-use scenario_common::{bulk_at, front_world, int_of, json_of, ok, r, rb, stream_ids, FrontSpec};
+use scenario_common::{bulk_at, front_world, int_of, json_of, ok, r, rb, rt, stream_ids, FrontSpec};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -278,5 +279,27 @@ async fn watch_json_crossfront() {
     let x = say(&mut ed, &[&["MULTI"], &["JSON.SET", "{x162}other", "$", &d1], &["XADD", "{y162}stream", "1-1", "f", "v"], &["EXEC"]]).await;
     assert_eq!(x, vec!["+OK", "+QUEUED", CROSSSLOT, ABORT], "crossslot: {x:?}");
     assert_eq!(int_of(&r(&a, &[b"EXISTS", b"{x162}other"]).await), 0, "nothing was written");
+
+    // h) WATCH on the audit stream's plain NAME: the key-space commands
+    //    see the stream from a routed connection (it lives under the
+    //    PARENT's slot, not under the routed slot of the full name), and a
+    //    rival XADD to the stream breaks the watch like any other write:
+    //    the queued publish is dropped, neither face moved (control first:
+    //    the same watch stays clean when no rival writes).
+    assert_ne!(slot_of(STREAM), slot_of("w162audit"), "the full name and its parent hash apart by construction");
+    let seen = (int_of(&r(&a, &[b"EXISTS", STREAM.as_bytes()]).await), rt(&a, &[b"TYPE", STREAM.as_bytes()]).await);
+    assert_eq!(seen, (1, "+stream".to_string()), "EXISTS/TYPE see the stream");
+    let depth = int_of(&r(&a, &[b"XLEN", STREAM.as_bytes()]).await);
+    let t8c = say(&mut ed, &[&["WATCH", STREAM], &["MULTI"], &["HINCRBY", BOARD, "publishes", "1"], &["EXEC"]]).await;
+    assert_eq!(t8c, vec!["+OK", "+OK", "+QUEUED", "*1\r\n:4"], "no rival write: the stream watch stays clean: {t8c:?}");
+    let t8 = say(&mut ed, &[&["WATCH", STREAM], &["MULTI"], &["JSON.SET", STORY, "$", draft(7).as_str()], &["HINCRBY", BOARD, "publishes", "1"]]).await;
+    assert_eq!(t8, vec!["+OK", "+OK", "+QUEUED", "+QUEUED"], "stream watch + queue: {t8:?}");
+    let rival_x = rb(&resp, &[b"XADD", STREAM.as_bytes(), b"*", b"event", b"rival", b"rev", b"7"]).await;
+    assert_eq!(int_of(&r(&a, &[b"XLEN", STREAM.as_bytes()]).await), depth + 1, "the rival's XADD landed: {rival_x}");
+    let t8x = say(&mut ed, &[&["EXEC"]]).await;
+    assert_eq!(t8x, vec!["*-1"], "the rival XADD broke the watch on the stream name: {t8x:?}");
+    let after8 = stored(&a).await;
+    assert_eq!((after8["title"].as_str(), after8["rev"].as_i64()), (Some("harbor bridge reopens r6"), Some(6)), "the aborted draft NOT applied");
+    assert_eq!(rb(&a, &[b"HGET", BOARD.as_bytes(), b"publishes"]).await, "4", "only the control's publish was counted");
     scenario_common::perf::scenario("watchjson", t0);
 }

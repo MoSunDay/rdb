@@ -118,6 +118,25 @@ pub fn stream_prefix(stream: &[u8]) -> Option<Vec<u8>> {
     Some(hash::slot_with_prefix(parent).1)
 }
 
+/// Physical slot prefix a key-space command (EXISTS/TYPE/DEL/EXPIRE/
+/// RENAME/WATCH) must address for `name` when it is a valid lite stream
+/// name (`parse_topic_name` says Stream AND [`stream_prefix`] has a
+/// slot, the same rule every lite path applies): the PARENT's slot, where
+/// the node-local X-* verbs store the stream under its FULL name as the
+/// user key. `None` = ordinary key, addressed by the routed slot of the
+/// whole name. (Batch-14 closure, form A: the command layer resolves,
+/// the storage layout is unchanged.) The `contains` pre-check keeps
+/// slash-free keys allocation-free.
+pub fn stream_key_target(name: &[u8]) -> Option<Vec<u8>> {
+    if !name.contains(&b'/') {
+        return None;
+    }
+    match super::parse_topic_name(name) {
+        Ok(super::TopicName::Stream(_, _)) => stream_prefix(name),
+        _ => None,
+    }
+}
+
 // ---- key constructors ----------------------------------------------------
 
 pub fn meta_key(prefix: &[u8], stream: &[u8]) -> Vec<u8> {

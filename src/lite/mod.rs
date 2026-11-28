@@ -176,6 +176,21 @@ impl Runtime {
             .push((prefix.to_vec(), stream.to_vec()));
     }
 
+    /// `old` was RENAMEd to `new` (same parent; family, group records and
+    /// PEL moved under the stream flush latch, `keys_core::rename_stream`):
+    /// re-key the cached group states to the new name instead of dropping
+    /// them, so unflushed ack deltas survive; the ordered-group lease
+    /// owners of both names reset (read-through on the next delivery).
+    /// Not queued for the reaper: the move left nothing behind at `old`
+    /// and the flush latch ordered every in-flight round before (its
+    /// records travelled) or after (its snapshot no longer holds `old`)
+    /// the move.
+    pub fn stream_renamed(&self, old: &[u8], new: &[u8]) {
+        offset::rename_stream(&self.offsets, old, new);
+        ordered::drop_stream(&self.owners, old);
+        ordered::drop_stream(&self.owners, new);
+    }
+
     /// Sweeps queued and awaiting the next [`drain_reaps`] (tests).
     pub fn pending_reaps(&self) -> usize {
         self.reaps

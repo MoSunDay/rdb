@@ -369,6 +369,28 @@ pub fn remove_stream(cache: &OffsetCache, stream: &[u8]) {
     write.dirty.retain(|(s, _)| s != stream);
 }
 
+/// RENAME of a stream (batch-14 closure): re-key every cached group of
+/// `old` to `new` and mark it dirty, so the next flush round lands the
+/// unflushed ack deltas under the name the family/group records now
+/// carry -- dropping them (the reap path) would lose up to one flush
+/// period of watermarks. Groups cached for `new` are overwritten like
+/// the records they mirrored (RENAME replaces the destination).
+pub fn rename_stream(cache: &OffsetCache, old: &[u8], new: &[u8]) {
+    let mut write = cache.inner.write().unwrap();
+    let moved: DirtySnapshot = write
+        .map
+        .iter()
+        .filter(|((s, _), _)| s == old)
+        .map(|((_, g), st)| ((new.to_vec(), g.clone()), st.clone()))
+        .collect();
+    write.map.retain(|(s, _), _| s != old && s != new);
+    write.dirty.retain(|(s, _)| s != old && s != new);
+    for (key, state) in moved {
+        write.dirty.insert(key.clone());
+        write.map.insert(key, state);
+    }
+}
+
 /// Snapshot + clear the dirty set (batch construction happens off-lock).
 /// Snapshot of dirty group states drained for one flush round:
 /// `((stream, group), state)`.
@@ -459,6 +481,37 @@ mod tests {
             maxdelivery: 0,
             dlq: Vec::new(),
         }
+    }
+
+    #[test]
+    fn rename_stream_rekeys_and_remarks_dirty() {
+        let c = new_cache();
+        insert_new(&c, b"t/q0", b"g", st(10));
+        insert_new(&c, b"t/q0", b"h", st(11));
+        // Destination already cached (its records are overwritten by
+        // RENAME): that state must not survive under the moved stream.
+        insert_new(&c, b"t/q9", b"g", st(99));
+        insert_new(&c, b"other/q0", b"g", st(5));
+        assert_eq!(dirty_len(&c), 0);
+        rename_stream(&c, b"t/q0", b"t/q9");
+        assert_eq!(peek_cached(&c, b"t/q0", b"g"), None);
+        assert_eq!(peek_cached(&c, b"t/q0", b"h"), None);
+        assert_eq!(peek_cached(&c, b"t/q9", b"g").unwrap().committed.ms, 10);
+        assert_eq!(peek_cached(&c, b"t/q9", b"h").unwrap().committed.ms, 11);
+        assert_eq!(peek_cached(&c, b"other/q0", b"g").unwrap().committed.ms, 5);
+        let mut keys = dirty_keys(&c);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                (b"t/q9".to_vec(), b"g".to_vec()),
+                (b"t/q9".to_vec(), b"h".to_vec())
+            ]
+        );
+        // The next flush round lands them under the NEW name only.
+        let flushed = flush_dirty(&c);
+        assert!(flushed.iter().all(|((s, _), _)| s == b"t/q9"));
+        assert_eq!(flushed.len(), 2);
     }
 
     #[test]

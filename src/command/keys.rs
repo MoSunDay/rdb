@@ -316,26 +316,34 @@ pub async fn randomkey(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// Shared RENAME/RENAMENX body.
+/// Shared RENAME/RENAMENX body. The window rule is `setops::rename_slot`:
+/// two lite stream names of one parent move under the PARENT slot (form A,
+/// batch-14 closure), two ordinary keys under the routed slot as before.
 async fn rename_common(ctx: &mut Ctx<'_>, cmd: &str, nx: bool) {
     if ctx.args.len() != 2 {
         arity(ctx.out, cmd);
         return;
     }
-    if !ds::setops::require_same_slot(ctx.out, &ctx.args) {
-        return;
-    }
-    let now = ds::expire::now_ms();
-    match keys_core::rename_key(
-        ctx.shared,
-        &ctx.prefix_key,
-        &ctx.args[0],
-        &ctx.args[1],
-        nx,
-        now,
-    )
-    .await
-    {
+    let (src, dst) = (&ctx.args[0], &ctx.args[1]);
+    let outcome = match ds::setops::rename_slot(src, dst) {
+        ds::setops::RenameSlot::CrossSlot => {
+            append_error(ctx.out, ds::setops::CROSSSLOT_ERROR);
+            return;
+        }
+        ds::setops::RenameSlot::Mixed => {
+            append_error(ctx.out, ds::setops::RENAME_MIXED_ERROR);
+            return;
+        }
+        ds::setops::RenameSlot::Ordinary => {
+            keys_core::rename_key(ctx.shared, &ctx.prefix_key, src, dst, nx, ds::expire::now_ms())
+                .await
+        }
+        ds::setops::RenameSlot::Stream(prefix) => {
+            keys_core::rename_stream(ctx.shared, &prefix, src, dst, nx, ds::expire::now_ms())
+                .await
+        }
+    };
+    match outcome {
         Ok(RenameOutcome::Moved) => {
             if nx {
                 append_int(ctx.out, 1);
@@ -359,3 +367,5 @@ pub async fn renamenx(ctx: &mut Ctx<'_>) {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_stream;

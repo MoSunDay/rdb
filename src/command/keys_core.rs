@@ -9,6 +9,7 @@
 //! read-modify-write sequences serialize. Two-key operations (RENAME)
 //! lock both latch keys in byte order to avoid ABBA deadlock.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use rocksdb::WriteBatch;
@@ -106,9 +107,77 @@ pub fn resolve_arc(store: &Arc<Store>, prefix: &[u8], key: &[u8], now: u64) -> K
 /// `purge(prefix, family, key, now)` decides how a due record's delete is committed.
 pub type PurgeFn<'a> = &'a dyn Fn(&[u8], codec::CodecFamily, &[u8], u64) -> bool;
 
+/// [`resolve_arc`] for the write paths (DEL/EXPIRE/PERSIST): the prefix
+/// the state was found under travels with it, so the write addresses the
+/// SAME window it resolved -- a lite stream name lives under its PARENT
+/// slot, not under the routed slot the handler was dispatched with.
+pub fn resolve_located<'a>(
+    shared: &Shared,
+    prefix: &'a [u8],
+    key: &[u8],
+    now: u64,
+) -> (Cow<'a, [u8]>, KeyState) {
+    resolve_located_with(&shared.store, prefix, key, now, &|p, family, k, n| {
+        expire::purge_if_expired_arc(&shared.store, p, family, k, n)
+    })
+}
+
+/// Latch every window `key` can resolve to -- the routed slot and, for a
+/// lite stream name, its parent slot -- byte-sorted (deadlock rule); the
+/// returned guards are held by the caller across its write, which is
+/// what makes DEL/EXPIRE/PERSIST read-modify-write sequences atomic over
+/// both windows.
+pub async fn lock_key_latches(shared: &Shared, prefix: &[u8], key: &[u8]) -> Vec<latch::KeyGuard> {
+    let mut keys = vec![latch_key(prefix, key)];
+    if let Some(stream) = crate::lite::model::stream_key_target(key) {
+        keys.push(latch_key(&stream, key));
+        keys.sort();
+    }
+    let mut guards = Vec::with_capacity(keys.len());
+    for k in &keys {
+        guards.push(latch::lock(&shared.latch, k).await);
+    }
+    guards
+}
+
 /// Core of [`resolve`]/[`resolve_arc`]; [`PurgeFn`] decides how a due
-/// record's delete is committed.
+/// record's delete is committed. A valid lite stream name
+/// (`parent/child`) is looked up under its PARENT slot
+/// (`lite::model::stream_key_target`: the node-local X-* verbs' window,
+/// batch-14 closure form A) AFTER the routed slot, so a plain key that
+/// merely looks like `parent/child` keeps resolving where it was written.
 fn resolve_with(
+    store: &Store,
+    prefix: &[u8],
+    key: &[u8],
+    now: u64,
+    purge: PurgeFn<'_>,
+) -> KeyState {
+    resolve_located_with(store, prefix, key, now, purge).1
+}
+
+fn resolve_located_with<'a>(
+    store: &Store,
+    prefix: &'a [u8],
+    key: &[u8],
+    now: u64,
+    purge: PurgeFn<'_>,
+) -> (Cow<'a, [u8]>, KeyState) {
+    let state = resolve_at(store, prefix, key, now, purge);
+    if state.is_present() {
+        return (Cow::Borrowed(prefix), state);
+    }
+    match crate::lite::model::stream_key_target(key) {
+        Some(stream) => {
+            let state = resolve_at(store, &stream, key, now, purge);
+            (Cow::Owned(stream), state)
+        }
+        None => (Cow::Borrowed(prefix), state),
+    }
+}
+
+/// One window: both storage shapes under `prefix`, lazily purging.
+fn resolve_at(
     store: &Store,
     prefix: &[u8],
     key: &[u8],
@@ -164,26 +233,29 @@ pub async fn delete_records(
     key: &[u8],
     now: u64,
 ) -> Result<bool, String> {
-    match resolve_arc(&shared.store, prefix, key, now) {
+    // The matched window (routed slot, or the PARENT slot of a lite
+    // stream name) is the one deleted AND latched.
+    let (prefix, state) = resolve_located(shared, prefix, key, now);
+    match state {
         KeyState::Missing => Ok(false),
         KeyState::RawString { .. } => {
             // Fast path: one bare record, atomic single delete — but
             // still latched, or a concurrent EXPIRE (raw -> enveloped
             // RMW) could leave the migrated record behind after a
             // reported delete.
-            let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
+            let _guard = latch::lock(&shared.latch, &latch_key(&prefix, key)).await;
             store::del_async(Arc::clone(&shared.store), prefix.to_vec(), key.to_vec()).await
         }
         KeyState::Enveloped {
             kind, expire_ms, ..
         } => {
             let family = codec::family_of(kind).unwrap_or(codec::STRING_FAMILY);
-            let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
+            let _guard = latch::lock(&shared.latch, &latch_key(&prefix, key)).await;
             let mut batch = WriteBatch::default();
             expire::family_delete_entries(
                 &mut batch,
                 Some(&shared.store),
-                prefix,
+                &prefix,
                 family,
                 key,
                 expire_ms,
@@ -191,14 +263,17 @@ pub async fn delete_records(
             ops::batch_write_async(Arc::clone(&shared.store), batch)
                 .await
                 .map(|_| {
-                    // Designed protection (today unreachable for streams:
-                    // lite records live under the PARENT-derived slot
-                    // prefix, DEL derives it from the full key name): a
-                    // deleted stream family must not leave dirty cached
+                    // A deleted stream family must not leave dirty cached
                     // group offsets behind, or the 200ms flusher writes
-                    // orphan group records onto the deleted family.
+                    // orphan group records onto the deleted family. The
+                    // cached states drop now and the deferred sweep
+                    // range-deletes the group window under the flush
+                    // latch (`lite::reap_stream`), closing the race with
+                    // a round already past validation. Reachable since the
+                    // batch-14 closure: a lite stream name resolves under
+                    // its PARENT slot, exactly the prefix the sweep needs.
                     if family == codec::STREAM_FAMILY {
-                        shared.lite.stream_reaped(prefix, key);
+                        shared.lite.stream_reaped(&prefix, key);
                     }
                     true
                 })
@@ -217,8 +292,8 @@ pub async fn apply_ttl(
     flag: TtlFlag,
     now: u64,
 ) -> Result<bool, String> {
-    let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
-    let state = resolve_arc(&shared.store, prefix, key, now);
+    let _guards = lock_key_latches(shared, prefix, key).await;
+    let (prefix, state) = resolve_located(shared, prefix, key, now);
     if !state.is_present() {
         return Ok(false);
     }
@@ -229,21 +304,21 @@ pub async fn apply_ttl(
     let mut batch = WriteBatch::default();
     let mut stream_deleted = false;
     if new_ms <= now {
-        delete_batch(&mut batch, Some(&shared.store), prefix, key, &state);
+        delete_batch(&mut batch, Some(&shared.store), &prefix, key, &state);
         stream_deleted = matches!(&state, KeyState::Enveloped { kind, .. }
             if codec::family_of(*kind) == Some(codec::STREAM_FAMILY));
     } else {
         match state {
             KeyState::RawString { value } => {
-                let root = codec::data_key(prefix, codec::KIND_STRING_TTL, key);
+                let root = codec::data_key(&prefix, codec::KIND_STRING_TTL, key);
                 batch.put(&root, codec::encode_envelope(new_ms, &value));
-                batch.delete(codec::string_key(prefix, key));
-                expire::set_ttl_entries(&mut batch, prefix, root, 0, new_ms);
+                batch.delete(codec::string_key(&prefix, key));
+                expire::set_ttl_entries(&mut batch, &prefix, root, 0, new_ms);
             }
             KeyState::Enveloped { kind, payload, .. } => {
-                let root = codec::data_key(prefix, kind, key);
+                let root = codec::data_key(&prefix, kind, key);
                 batch.put(&root, codec::encode_envelope(new_ms, &payload));
-                expire::set_ttl_entries(&mut batch, prefix, root, old, new_ms);
+                expire::set_ttl_entries(&mut batch, &prefix, root, old, new_ms);
             }
             KeyState::Missing => unreachable!("checked above"),
         }
@@ -251,10 +326,10 @@ pub async fn apply_ttl(
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
         .map(|_| {
-            // See delete_records: same designed protection for the
-            // past-deadline EXPIRE delete path.
+            // See delete_records: same protection for the past-deadline
+            // EXPIRE delete path.
             if stream_deleted {
-                shared.lite.stream_reaped(prefix, key);
+                shared.lite.stream_reaped(&prefix, key);
             }
             true
         })
@@ -268,8 +343,8 @@ pub async fn persist_key(
     key: &[u8],
     now: u64,
 ) -> Result<bool, String> {
-    let _guard = latch::lock(&shared.latch, &latch_key(prefix, key)).await;
-    let state = resolve_arc(&shared.store, prefix, key, now);
+    let _guards = lock_key_latches(shared, prefix, key).await;
+    let (prefix, state) = resolve_located(shared, prefix, key, now);
     match state {
         KeyState::Missing | KeyState::RawString { .. } => Ok(false),
         KeyState::Enveloped { expire_ms: 0, .. } => Ok(false),
@@ -279,14 +354,14 @@ pub async fn persist_key(
             payload,
         } => {
             let mut batch = WriteBatch::default();
-            let root = codec::data_key(prefix, kind, key);
+            let root = codec::data_key(&prefix, kind, key);
             if kind == codec::KIND_STRING_TTL {
-                batch.put(codec::string_key(prefix, key), payload);
+                batch.put(codec::string_key(&prefix, key), payload);
                 batch.delete(&root);
             } else {
                 batch.put(&root, codec::encode_envelope(0, &payload));
             }
-            expire::set_ttl_entries(&mut batch, prefix, root, expire_ms, 0);
+            expire::set_ttl_entries(&mut batch, &prefix, root, expire_ms, 0);
             ops::batch_write_async(Arc::clone(&shared.store), batch)
                 .await
                 .map(|_| true)
@@ -347,6 +422,37 @@ pub async fn rename_key(
     nx: bool,
     now: u64,
 ) -> Result<RenameOutcome, String> {
+    rename_under(shared, prefix, src, dst, nx, now, false).await
+}
+
+/// RENAME of one lite stream onto another of the SAME parent (`prefix`
+/// is that parent slot, see `setops::rename_slot`). The move is
+/// [`rename_key`]'s; on top of it both names' stream flush latches
+/// (`lite::stream_latch_key`, the X-* meta latch) are held across the
+/// move, so every offset flush round is ordered either before it (its
+/// group records travel with the family) or after it (its snapshot no
+/// longer holds the old name); once committed, the cached group states
+/// are re-keyed to the new name (`Runtime::stream_renamed`).
+pub async fn rename_stream(
+    shared: &Shared,
+    prefix: &[u8],
+    src: &[u8],
+    dst: &[u8],
+    nx: bool,
+    now: u64,
+) -> Result<RenameOutcome, String> {
+    rename_under(shared, prefix, src, dst, nx, now, true).await
+}
+
+async fn rename_under(
+    shared: &Shared,
+    prefix: &[u8],
+    src: &[u8],
+    dst: &[u8],
+    nx: bool,
+    now: u64,
+    stream: bool,
+) -> Result<RenameOutcome, String> {
     if src == dst {
         // Same key: a plain existence check (the two latch locks would
         // otherwise self-deadlock on one latch cell).
@@ -369,6 +475,20 @@ pub async fn rename_key(
     };
     let _ga = latch::lock(&shared.latch, &ka).await;
     let _gb = latch::lock(&shared.latch, &kb).await;
+    // Stream rename: the two flush windows too, byte-sorted (user-key
+    // latches first, flush latches second -- the X-* verbs and the flush
+    // rounds take flush latches only, so no cycle).
+    let mut flush = Vec::new();
+    if stream {
+        let mut keys = vec![
+            crate::lite::stream_latch_key(src),
+            crate::lite::stream_latch_key(dst),
+        ];
+        keys.sort();
+        for k in &keys {
+            flush.push(latch::lock(&shared.latch, k).await);
+        }
+    }
     let src_state = resolve_arc(&shared.store, prefix, src, now);
     if !src_state.is_present() {
         return Ok(RenameOutcome::SrcMissing);
@@ -401,7 +521,12 @@ pub async fn rename_key(
     }
     ops::batch_write_async(Arc::clone(&shared.store), batch)
         .await
-        .map(|_| RenameOutcome::Moved)
+        .map(|_| {
+            if stream {
+                shared.lite.stream_renamed(src, dst);
+            }
+            RenameOutcome::Moved
+        })
 }
 
 /// Copy every record of `src`'s family to `dst` (rewriting the user key

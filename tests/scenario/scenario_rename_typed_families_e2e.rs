@@ -4,11 +4,11 @@
 //! plan `catalog_moves` read in `old_name` order; the inventory register `shelf_items`
 //! (JOIN + SUM over the moved kinds) must agree with the RESP cardinalities at the new
 //! names; old names are gone, a TTL travels (index) or is replaced (string <-> hash),
-//! RENAMENX refuses an occupied code.
-//! Deviation: the stream names are slot-aligned with their parents by construction
-//! (the router hashes the FULL name, src/command/mod.rs:449-450; lite stores under the
-//! PARENT's slot, src/lite/append.rs:56) -- an ordinary stream name is invisible to
-//! RENAME; the delivered watermark is not carried (src/lite/offset.rs:57); legs dropped.
+//! RENAMENX refuses an occupied code. A second stream leg renames a PLAIN name
+//! (`orders/q0 -> orders/q9`: the full names hash apart from each other and from
+//! their parent, both live under the PARENT's slot) -- entries and the group record
+//! travel, XLEN is conserved, EXISTS/TYPE see the stream at the new name only,
+//! RENAMENX onto it answers 0.
 //! RESP RENAME/RENAMENX/TYPE/TTL/PEXPIRE/PERSIST + HASH/ZSET/SET/LIST/JSON/VECTORSET/STREAM + FT + MySQL. One REAL node, fronts mysql (RESP always).
 use crate::common;
 use crate::scenario_common;
@@ -20,8 +20,8 @@ use std::time::Duration;
 /// Hash tag of every shelf key: RENAME needs both names in one slot.
 const T: &str = "{r163}";
 /// The lending-desk stream and its new name: both parents AND both full names
-/// share this slot, so the router's prefix of a full name IS the lite layer's
-/// parent prefix (the only shape under which a stream can be renamed at all).
+/// share this slot (the slot-aligned shape of the plan row; a PLAIN name whose
+/// full name hashes apart from its parent is renamed in leg g).
 const STREAM_OLD: &str = "desk61/q5484";
 const STREAM_NEW: &str = "archive1189/q16945";
 const SLOT: u16 = 6208;
@@ -353,5 +353,33 @@ async fn rename_typed_families() {
     assert_eq!((text(&a, &["RENAME", &new_list, &new_list]).await, text(&a, &["RENAME", "{r163}nope", "{r163}nope"]).await), ("+OK".into(), NO_KEY.into()), "same key");
     assert_ne!(slot("{a163}k"), slot("{b163}k"), "distinct slots by construction");
     assert_eq!(text(&a, &["RENAME", "{a163}k", "{b163}k"]).await, CROSSSLOT, "cross-slot");
+
+    // g) A PLAIN stream name: `orders/q0 -> orders/q9` hash apart from each
+    //    other AND from their parent, yet both live under the PARENT's slot,
+    //    so RENAME moves the whole family there -- entries (XLEN/XRANGE
+    //    conserved), the group record -- and EXISTS/TYPE resolve the new
+    //    name while the old one is gone; RENAMENX onto it answers 0.
+    let (plain_old, plain_new, plain_src) = ("orders/q0", "orders/q9", "orders/q1");
+    let parent_slot = slot("orders");
+    assert!([slot(plain_old), slot(plain_new), slot(plain_src)].iter().all(|s| *s != parent_slot) && slot(plain_old) != slot(plain_new), "plain names hash apart from the parent by construction");
+    let entries = ["5-1", "event", "hold", "copy", "A7", "6-1", "event", "renew", "copy", "A7"];
+    for (id, event) in [("5-1", "hold"), ("6-1", "renew")] {
+        let got = rb(&a, &[b"XADD", plain_old.as_bytes(), id.as_bytes(), b"event", event.as_bytes(), b"copy", b"A7"]).await;
+        assert_eq!(got, id, "xadd {id}");
+    }
+    ok(&r(&a, &[b"XGROUP", b"CREATE", plain_old.as_bytes(), b"g0", b"0-0"]).await, "xgroup create");
+    assert_eq!(bulks(&drain(&a, &["XRANGE", plain_old, "-", "+"]).await), entries, "entries before the move");
+    assert_eq!((count(&a, "XLEN", plain_old).await, count(&a, "EXISTS", plain_old).await, ty(&a, plain_old).await), (2, 1, "stream".into()), "the plain stream is visible before the move");
+    assert_eq!(text(&a, &["RENAME", plain_old, plain_new]).await, "+OK", "plain stream rename");
+    assert_eq!(bulks(&drain(&a, &["XRANGE", plain_new, "-", "+"]).await), entries, "entries after the move");
+    assert_eq!((count(&a, "XLEN", plain_new).await, count(&a, "EXISTS", plain_old).await, count(&a, "EXISTS", plain_new).await, ty(&a, plain_new).await), (2, 0, 1, "stream".into()), "XLEN conserved, old name gone, new name present");
+    assert_eq!(text(&a, &["XINFO", "STREAM", plain_old]).await, NO_KEY, "XINFO STREAM at the old name");
+    let plain_groups = drain(&a, &["XINFO", "GROUPS", plain_new]).await;
+    assert!(plain_groups.starts_with("*1\r\n*13\r\n$2\r\ng0\r\n"), "g0 travelled with the family: {plain_groups}");
+    assert_eq!(text(&a, &["XINFO", "GROUPS", plain_old]).await, "*0", "no group left at the old name");
+    assert_eq!(rb(&a, &[b"XADD", plain_src.as_bytes(), b"7-1", b"event", b"reserve"]).await, "7-1", "xadd the second plain stream");
+    assert_eq!(int_of(&r(&a, &[b"RENAMENX", plain_src.as_bytes(), plain_new.as_bytes()]).await), 0, "occupied stream destination");
+    assert_eq!((count(&a, "XLEN", plain_src).await, count(&a, "XLEN", plain_new).await), (1, 2), "nothing moved");
+    assert_eq!(text(&a, &["RENAME", plain_old, plain_new]).await, NO_KEY, "the old name is gone for RENAME too");
     scenario_common::perf::scenario("rentyped", t0);
 }

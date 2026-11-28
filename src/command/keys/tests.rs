@@ -7,7 +7,7 @@ use crate::state::{testutil, Shared};
 
 const PREFIX: &[u8] = b"70/";
 
-fn shared_for(bind: &str) -> (std::sync::MutexGuard<'static, ()>, Shared) {
+pub(super) fn shared_for(bind: &str) -> (std::sync::MutexGuard<'static, ()>, Shared) {
     let guard = crate::command::string::TEST_STORE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -625,8 +625,8 @@ fn scan_type_filter_and_syntax_errors() {
 #[test]
 fn rename_stream_moves_offset_ledger() {
     // Lite streams live under the PARENT-derived slot prefix with the
-    // full `parent/child` name as the user key; RENAME's dispatch-level
-    // slot routing is a separate concern (e2e), so the storage-level
+    // full `parent/child` name as the user key; the handler-level
+    // routing into that window is `tests_stream.rs`, so the storage-level
     // move is driven directly with the stream's real prefix.
     let (_g, s) = shared_for("127.0.0.1:40234");
     let prefix = crate::hash::slot_with_prefix(b"t").1;
@@ -665,7 +665,7 @@ fn rename_stream_moves_offset_ledger() {
     let moved = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("test runtime")
-        .block_on(keys_core::rename_key(&s, &prefix, src, dst, false, 0));
+        .block_on(keys_core::rename_stream(&s, &prefix, src, dst, false, 0));
     assert_eq!(moved, Ok(RenameOutcome::Moved));
 
     // The ledger row travelled with the stream family, value intact.

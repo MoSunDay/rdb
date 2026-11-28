@@ -22,15 +22,63 @@ use crate::store::Store;
 /// Error text for keys hashing to different slots (Redis cluster wording).
 pub const CROSSSLOT_ERROR: &str = "ERR CROSSSLOT Keys in request don't hash to the same slot";
 
+/// Error text for RENAME between a lite stream name and an ordinary key:
+/// the two live in different physical windows (parent slot vs. routed
+/// slot), so no single-window move can carry one onto the other.
+pub const RENAME_MIXED_ERROR: &str =
+    "ERR RENAME source and destination must both be lite stream names or both be ordinary keys";
+
 /// Do all keys hash to the same cluster slot? Slot is computed from the
 /// hash tag exactly like routing (`hash::hash_tag` + CRC16).
 pub fn same_slot(keys: &[Vec<u8>]) -> bool {
-    let mut slots = keys
-        .iter()
-        .map(|k| crate::hash::slot_with_prefix(crate::hash::hash_tag(k)).0);
+    let mut slots = keys.iter().map(|k| slot_of(k));
     match slots.next() {
         None => true, // no keys: vacuously same
         Some(first) => slots.all(|s| s == first),
+    }
+}
+
+/// Routing slot of one ordinary key (hash tag + CRC16).
+fn slot_of(key: &[u8]) -> u16 {
+    crate::hash::slot_with_prefix(crate::hash::hash_tag(key)).0
+}
+
+/// RENAME/RENAMENX window rule (batch-14 closure, form A): both operands
+/// must address ONE physical window. A valid lite stream name addresses
+/// its PARENT slot (`lite::model::stream_key_target`), so `parent/a ->
+/// parent/b` is a same-window move although the full names hash apart,
+/// `p1/a -> p2/b` is CROSSSLOT, and a stream name next to an ordinary
+/// key never shares a window.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenameSlot {
+    /// Both ordinary keys of one hash-tag slot (the routed prefix).
+    Ordinary,
+    /// Both streams of one parent: the shared parent slot prefix.
+    Stream(Vec<u8>),
+    CrossSlot,
+    Mixed,
+}
+
+pub fn rename_slot(src: &[u8], dst: &[u8]) -> RenameSlot {
+    match (
+        crate::lite::model::stream_key_target(src),
+        crate::lite::model::stream_key_target(dst),
+    ) {
+        (Some(a), Some(b)) => {
+            if a == b {
+                RenameSlot::Stream(a)
+            } else {
+                RenameSlot::CrossSlot
+            }
+        }
+        (None, None) => {
+            if slot_of(src) == slot_of(dst) {
+                RenameSlot::Ordinary
+            } else {
+                RenameSlot::CrossSlot
+            }
+        }
+        _ => RenameSlot::Mixed,
     }
 }
 
@@ -165,6 +213,20 @@ mod tests {
 
     fn hs(members: &[&[u8]]) -> HashSet<Vec<u8>> {
         members.iter().map(|m| m.to_vec()).collect()
+    }
+
+    #[test]
+    fn rename_slot_windows() {
+        // Two streams of one parent share the PARENT slot window even
+        // though the full names hash apart (batch-14 closure, form A).
+        let parent = crate::lite::model::stream_key_target(b"orders/q0").unwrap();
+        assert_eq!(rename_slot(b"orders/q0", b"orders/q9"), RenameSlot::Stream(parent));
+        assert_eq!(rename_slot(b"p1/q0", b"p2/q0"), RenameSlot::CrossSlot);
+        assert_eq!(rename_slot(b"p1/q0", b"plain"), RenameSlot::Mixed);
+        assert_eq!(rename_slot(b"plain", b"p1/q0"), RenameSlot::Mixed);
+        // Ordinary keys: the routed hash-tag slot decides, as before.
+        assert_eq!(rename_slot(b"{x}a", b"{x}b"), RenameSlot::Ordinary);
+        assert_eq!(rename_slot(b"aa", b"bb"), RenameSlot::CrossSlot);
     }
 
     #[test]
