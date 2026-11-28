@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{free_addr, write_config, ProcNode};
+use super::{free_ports, write_config, ProcNode};
 
 pub(super) fn spawn_child(
     config_path: &Path,
@@ -144,7 +144,7 @@ pub fn spawn_node_yaml(
     let mut addr_in_use = 0usize;
     let mut join_failed = 0usize;
     loop {
-        let (resp, raft, http, monitor) = (free_addr(), free_addr(), free_addr(), free_addr());
+        let [resp, raft, http, monitor] = free_ports();
         let config_path = node_dir.join("conf.yaml");
         write_config(
             &config_path,

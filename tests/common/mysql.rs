@@ -359,13 +359,7 @@ pub fn spawn_node_mysql_yaml(
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
     for _ in 0..super::SPAWN_ATTEMPTS {
-        let (resp, raft, http, monitor, mysql) = (
-            super::free_addr(),
-            super::free_addr(),
-            super::free_addr(),
-            super::free_addr(),
-            super::free_addr(),
-        );
+        let [resp, raft, http, monitor, mysql] = super::free_ports();
         let config_path = node_dir.join("conf.yaml");
         super::write_config(
             &config_path,

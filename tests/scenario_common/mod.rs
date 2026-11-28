@@ -15,7 +15,6 @@
 
 #![allow(dead_code)] // each scenario module uses a different subset
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -76,11 +75,6 @@ pub struct FrontNode {
     pub s3: String,
 }
 
-fn free_addr() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().expect("local_addr").to_string()
-}
-
 /// Per-test self-cleaning world root (unique per tag; a leftover from a
 /// crashed run of the same pid is removed first).
 pub fn world_dir(tag: &str) -> PathBuf {
@@ -102,14 +96,7 @@ pub fn spawn_front_node(
 ) -> FrontNode {
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
-    let (mysql, sql_rpc, es, kafka, rocksmq, s3) = (
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-    );
+    let [mysql, sql_rpc, es, kafka, rocksmq, s3] = crate::common::free_ports();
     let mut extra = String::new();
     if spec.mysql {
         extra.push_str(&format!(

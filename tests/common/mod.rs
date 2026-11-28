@@ -51,6 +51,24 @@ fn free_addr() -> String {
     listener.local_addr().expect("local_addr").to_string()
 }
 
+/// `N` pairwise-distinct free ports for ONE node (each from [`free_addr`]).
+/// Consecutive :0 probes CAN hand back the same ephemeral port once the
+/// probe listener is dropped: seen as `raft=http=127.0.0.1:38475` in
+/// `process_cluster_e2e::failed_first_join_is_retried_on_restart`, whose
+/// same-config respawn then died on its own `listen` with EADDRINUSE
+/// (batch-14 gate, 3 concurrent `--test cluster` runs). Duplicates are
+/// redrawn; a collision with OTHER processes stays the accepted risk above.
+pub fn free_ports<const N: usize>() -> [String; N] {
+    let mut ports: Vec<String> = Vec::with_capacity(N);
+    while ports.len() < N {
+        let addr = free_addr();
+        if !ports.contains(&addr) {
+            ports.push(addr);
+        }
+    }
+    ports.try_into().expect("N ports collected above")
+}
+
 /// One spawned rdb process plus everything needed to talk to or restart it.
 pub struct ProcNode {
     /// Per-node data dir (config, rocksdb store and raft log live below it).
@@ -166,13 +184,7 @@ pub fn spawn_node_mysql(
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
     for _ in 0..SPAWN_ATTEMPTS {
-        let (resp, raft, http, monitor, mysql) = (
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-        );
+        let [resp, raft, http, monitor, mysql] = free_ports();
         let config_path = node_dir.join("conf.yaml");
         write_config(
             &config_path,
@@ -214,14 +226,7 @@ pub fn spawn_node_sql(dir: &Path, id: usize, bootstrap: bool, join_http: Option<
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
     for _ in 0..SPAWN_ATTEMPTS {
-        let (resp, raft, http, monitor, mysql, sql_rpc) = (
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-        );
+        let [resp, raft, http, monitor, mysql, sql_rpc] = free_ports();
         let config_path = node_dir.join("conf.yaml");
         write_config(
             &config_path,
@@ -271,13 +276,7 @@ pub fn spawn_node_es(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
     for _ in 0..SPAWN_ATTEMPTS {
-        let (resp, raft, http, monitor, es) = (
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-        );
+        let [resp, raft, http, monitor, es] = free_ports();
         let config_path = node_dir.join("conf.yaml");
         write_config(
             &config_path,
@@ -333,13 +332,7 @@ pub fn spawn_node_backup(
     let node_dir = dir.join(format!("node{id}"));
     std::fs::create_dir_all(&node_dir).expect("create node dir");
     for _ in 0..SPAWN_ATTEMPTS {
-        let (resp, raft, http, monitor, backup) = (
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-            free_addr(),
-        );
+        let [resp, raft, http, monitor, backup] = free_ports();
         let config_path = node_dir.join("conf.yaml");
         write_config(
             &config_path,

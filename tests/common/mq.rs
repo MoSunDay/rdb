@@ -8,7 +8,6 @@
 //! fixture; the existing per-file fixtures are deliberately NOT
 //! touched -- this module is the factored home for new files.
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -45,13 +44,7 @@ impl Drop for MqNode {
 /// `rocksmq_token: "..."` / `rocksmq_max_connections: 1`).
 pub fn spawn_mq_node(dir: &str, extra: &str) -> MqNode {
     std::fs::create_dir_all(dir).expect("create node dir");
-    let (resp, raft, raft_http, monitor, http) = (
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-        free_addr(),
-    );
+    let [resp, raft, raft_http, monitor, http] = super::free_ports();
     let yaml = format!(
         "bind: \"{resp}\"\nstore_path: \"{dir}\"\nraft_bind_address: \"{raft}\"\n\
          raft_http_bind_address: \"{raft_http}\"\nmonitor_addr: \"{monitor}\"\n\
@@ -102,11 +95,6 @@ pub async fn node_up(tag: &str, extra: &str) -> MqNode {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-fn free_addr() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().expect("local_addr").to_string()
 }
 
 pub fn dir_for(tag: &str) -> String {
