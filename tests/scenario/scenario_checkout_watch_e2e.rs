@@ -37,6 +37,9 @@ impl Session {
 }
 
 /// Frame `args`, write once, drain the reply until a 120ms quiet gap.
+/// Patient FIRST byte (10s, like `scenario_common::rf`): under load a node
+/// can take >120ms to answer an EXEC, which the plain quiet-gap form reads
+/// as an empty reply (`exec replies: ""`, batch-14 gate, scenario 302s).
 async fn cmd_raw(sock: &mut TcpStream, args: &[&[u8]]) -> Vec<u8> {
     let mut frame = format!("*{}\r\n", args.len()).into_bytes();
     for a in args {
@@ -48,7 +51,12 @@ async fn cmd_raw(sock: &mut TcpStream, args: &[&[u8]]) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        match tokio::time::timeout(Duration::from_millis(120), sock.read(&mut chunk)).await {
+        let wait = if buf.is_empty() {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_millis(120)
+        };
+        match tokio::time::timeout(wait, sock.read(&mut chunk)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
             Ok(Err(_)) | Err(_) => break,
