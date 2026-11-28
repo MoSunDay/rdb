@@ -1,6 +1,8 @@
 //! S3 front, process-level e2e tests.
 
 mod client;
+#[path = "../common/mod.rs"]
+mod common;
 mod fixture;
 
 use client::{

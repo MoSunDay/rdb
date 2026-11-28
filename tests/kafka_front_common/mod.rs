@@ -12,7 +12,6 @@
 pub mod groups;
 pub mod topics;
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -68,9 +67,9 @@ impl Drop for KafkaNode {
     }
 }
 
+/// One reserved loopback port (process-wide reservation lives in `common`).
 pub fn free_addr() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().expect("local_addr").to_string()
+    crate::common::free_addr()
 }
 
 pub fn spawn_kafka_node(dir: &Path) -> KafkaNode {

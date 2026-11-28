@@ -7,7 +7,6 @@
 //! one full response); the delay sweep is armed via
 //! `lite.delay_sweep_ms` in the node yaml.
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -46,15 +45,7 @@ impl Drop for Node {
 /// Spawn one node; `mq_token` empty = gate off (the default posture).
 fn spawn_node(dir: &str, mq_token: &str) -> Node {
     std::fs::create_dir_all(dir).expect("create node dir");
-    let a: Vec<String> = (0..5)
-        .map(|_| {
-            TcpListener::bind("127.0.0.1:0")
-                .expect("bind ephemeral")
-                .local_addr()
-                .expect("local_addr")
-                .to_string()
-        })
-        .collect();
+    let a: [String; 5] = crate::common::free_ports();
     let gate = (mq_token.is_empty())
         .then(String::new)
         .unwrap_or_else(|| format!("rocksmq_token: \"{mq_token}\"\n"));

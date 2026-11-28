@@ -3,7 +3,6 @@
 //! RESP port for the interop proofs (XADD/XACK/XPENDING/XRANGE on the same streams).
 
 use crate::common;
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -33,14 +32,9 @@ impl Drop for Node {
     }
 }
 
-fn free_addr() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().expect("local_addr").to_string()
-}
-
 fn spawn_rocksmq_node(dir: &str) -> Node {
     std::fs::create_dir_all(dir).expect("create node dir");
-    let [resp, raft, raft_http, monitor, http] = [(); 5].map(|_| free_addr());
+    let [resp, raft, raft_http, monitor, http] = common::free_ports();
     let config_path = PathBuf::from(dir).join("conf.yaml");
     let yaml = format!(
         "bind: \"{resp}\"\nstore_path: \"{dir}\"\nraft_bind_address: \"{raft}\"\n\

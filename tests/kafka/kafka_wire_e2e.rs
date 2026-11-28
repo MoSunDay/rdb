@@ -339,8 +339,8 @@ async fn advertised_overrides_beat_wildcard_bind() {
     let dir = std::env::temp_dir().join(format!("rdb-kafka-adv-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let bind = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("0.0.0.0:{}", probe.local_addr().unwrap().port())
+        let addr = crate::common::free_addr();
+        format!("0.0.0.0:{}", addr.rsplit(':').next().expect("host:port"))
     };
     let (_node, connect) = spawn_until_ready(
         &dir,

@@ -1,7 +1,6 @@
 //! Per-test process fixture: spawns the REAL rdb binary with `s3_bind`
 //! enabled and waits for its listeners.
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -27,9 +26,9 @@ impl Drop for Node {
     }
 }
 
+/// One reserved loopback port (process-wide reservation lives in `common`).
 pub(super) fn free_addr() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    l.local_addr().expect("local_addr").to_string()
+    crate::common::free_addr()
 }
 
 pub(super) fn spawn_once(dir: &str, s3_token: &str) -> Node {

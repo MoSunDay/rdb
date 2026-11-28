@@ -73,8 +73,10 @@ pub fn reserve_port(port: u16) -> bool {
 
 /// Reserve one free loopback port: bind :0, read the port, drop the
 /// listener; redraw while the port was already handed out (see
-/// [`handed_out`]). Assertions print stderr.
-fn free_addr() -> String {
+/// [`handed_out`]). Also the primitive behind the front-specific fixtures
+/// (`kafka_front_common`, s3, rocksmq) that used to carry private probe
+/// copies outside the reservation.
+pub fn free_addr() -> String {
     loop {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
         let addr = listener.local_addr().expect("local_addr");
