@@ -88,10 +88,12 @@ async fn config_key_lifecycle_ttl_types_rename_scan_and_lazy_expiry() {
     assert_eq!(int(&r(&a, &[b"ZADD", b"kt:zset", b"1", b"m"]).await), 1);
     // A stream key is a FULL topic name (parent/child; hash tags are
     // rejected and a bare name round-robins onto an implicit child
-    // queue). QUIRK pinned: the stream meta lives under the PARENT
-    // topic's slot, so TYPE (routed by the key's own slot) answers
-    // none -- while SCAN, whose classifier reads the physical record,
-    // still lists the stream key.
+    // queue). The stream meta lives under the PARENT topic's slot,
+    // not the key's own slot: keyspace verbs resolve stream names
+    // through the parent slot (batch-14 R1, 2026-11-28 -- until then
+    // TYPE answered none, pinned here as a quirk), so TYPE sees the
+    // stream just like SCAN, whose classifier reads the physical
+    // record.
     assert!(
         r(&a, &[b"XADD", b"ktstream/q0", b"*", b"f", b"v"])
             .await
@@ -125,8 +127,8 @@ async fn config_key_lifecycle_ttl_types_rename_scan_and_lazy_expiry() {
     );
     assert_eq!(
         word(&r(&a, &[b"TYPE", b"ktstream/q0"]).await),
-        "none",
-        "stream TYPE quirk"
+        "stream",
+        "TYPE resolves a stream name through the parent slot (batch-14 R1)"
     );
 
     // c) RENAME moves value AND ttl together on a same-slot pair; the
@@ -169,7 +171,7 @@ async fn config_key_lifecycle_ttl_types_rename_scan_and_lazy_expiry() {
     }
 
     // e) TYPE filter: only the zset key answers under MATCH kt:*; a
-    //    stream-type scan sees the stream key TYPE itself cannot.
+    //    stream-type scan sees the same stream key TYPE now answers.
     let (zsets, _) = scan_all(&a, "kt:*", "10", &[b"TYPE", b"zset"]).await;
     assert_eq!(
         zsets,
