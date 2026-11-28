@@ -113,7 +113,7 @@ async fn kill9_leader_new_leader_elects_and_old_leader_catches_up() {
         .await,
         b"+OK",
         "raft set k2 on the new leader\n{}",
-        nodes[new_leader].ctx()
+        all_ctx(&nodes)
     );
 
     // Restart the old leader: same config path + data dir, NO bootstrap,

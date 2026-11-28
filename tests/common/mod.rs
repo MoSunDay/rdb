@@ -7,10 +7,12 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,28 +46,54 @@ pub fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Reserve one free loopback port: bind :0, read the port, drop the
-/// listener. Reuse races are an accepted risk; assertions print stderr.
-fn free_addr() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    listener.local_addr().expect("local_addr").to_string()
+/// Ports ever handed out by THIS test process: a port is never handed out
+/// twice. The kernel hands a released port out again at ~1/|ephemeral range|
+/// per probe, and a workspace run draws thousands -- a sibling test's probe
+/// landing on the port of a node that is between `kill_now()` and its
+/// same-config `respawn()` (raft identity = address, so the port must come
+/// back) made that respawn die on `listen 127.0.0.1:43787 failed: Address
+/// already in use` (batch-14 gate); the same race hits the first bind of a
+/// node whose probe->bind window lost the port. Cross-process reuse
+/// (concurrent runs, foreign processes) stays the accepted risk.
+fn handed_out() -> &'static Mutex<HashSet<u16>> {
+    static HANDED_OUT: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    HANDED_OUT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// `N` pairwise-distinct free ports for ONE node (each from [`free_addr`]).
-/// Consecutive :0 probes CAN hand back the same ephemeral port once the
-/// probe listener is dropped: seen as `raft=http=127.0.0.1:38475` in
-/// `process_cluster_e2e::failed_first_join_is_retried_on_restart`, whose
-/// same-config respawn then died on its own `listen` with EADDRINUSE
-/// (batch-14 gate, 3 concurrent `--test cluster` runs). Duplicates are
-/// redrawn; a collision with OTHER processes stays the accepted risk above.
-pub fn free_ports<const N: usize>() -> [String; N] {
-    let mut ports: Vec<String> = Vec::with_capacity(N);
-    while ports.len() < N {
-        let addr = free_addr();
-        if !ports.contains(&addr) {
-            ports.push(addr);
+/// Enter `port` into the process-wide reservation ([`handed_out`]):
+/// false when the port was handed out before (the caller redraws). For
+/// fixtures that derive a block of ports from one base (`rdb standalone`
+/// binds base+0..base+10) instead of drawing each port.
+pub fn reserve_port(port: u16) -> bool {
+    handed_out()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(port)
+}
+
+/// Reserve one free loopback port: bind :0, read the port, drop the
+/// listener; redraw while the port was already handed out (see
+/// [`handed_out`]). Assertions print stderr.
+fn free_addr() -> String {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        if reserve_port(addr.port()) {
+            return addr.to_string();
         }
     }
+}
+
+/// `N` pairwise-distinct free ports for ONE node. Before the process-wide
+/// reservation, consecutive :0 probes DID hand back the same ephemeral port
+/// once the probe listener was dropped: seen as `raft=http=127.0.0.1:38475`
+/// in `process_cluster_e2e::failed_first_join_is_retried_on_restart`, whose
+/// same-config respawn then died on its own `listen` with EADDRINUSE
+/// (batch-14 gate, 3 concurrent `--test cluster` runs).
+pub fn free_ports<const N: usize>() -> [String; N] {
+    let mut ports: Vec<String> = Vec::with_capacity(N);
+    ports.extend((0..N).map(|_| free_addr()));
     ports.try_into().expect("N ports collected above")
 }
 

@@ -111,19 +111,30 @@ fn spawn_standalone(dir: &Path, host: &str, port: u16, turso_dir: Option<&Path>)
 }
 
 /// A base port with the whole +0..+10 derivation window free (held
-/// simultaneously while probing, then released for the child).
+/// simultaneously while probing, then released for the child) and never
+/// handed out before in this process: the block enters the process-wide
+/// reservation like every `free_addr` port, so a sibling node's probe can
+/// no longer be handed a port the standalone child is about to bind
+/// (`listen 127.0.0.1:38985 failed`, batch-14 gate).
 fn free_port_block() -> u16 {
     for _ in 0..16 {
         let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
-        let held: Vec<_> = (0u16..=10)
-            .filter_map(|o| {
-                port.checked_add(o)
-                    .and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok())
-            })
+        let block: Vec<u16> = (0u16..=10).filter_map(|o| port.checked_add(o)).collect();
+        let held: Vec<_> = block
+            .iter()
+            .filter_map(|p| TcpListener::bind(("127.0.0.1", *p)).ok())
             .collect();
-        if held.len() == 11 {
+        if held.len() != 11 || block.len() != 11 {
+            continue;
+        }
+        drop(held);
+        let mut fresh = true;
+        for p in &block {
+            fresh &= common::reserve_port(*p);
+        }
+        if fresh {
             return port;
         }
     }

@@ -320,7 +320,7 @@ async fn failed_first_join_is_retried_on_restart() {
     assert_eq!(
         status.code(),
         Some(1),
-        "failed join is fatal (Go parity)\n{}",
+        "failed join is fatal (Go parity); status: {status}\n{}",
         joiner.ctx()
     );
     let raft_dir = joiner.dir.join(&joiner.resp).join("raft");
