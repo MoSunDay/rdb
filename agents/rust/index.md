@@ -27,7 +27,7 @@ Commit: b7378c0
 - `resp/`：RESP 层。
   - `codec.rs`：RESP2 解析/写出，与 redcon fork 字节对齐（测试内联于 `codec_tests.rs`）；
   - `conn.rs`：连接状态机——AUTH 门（仅 `raft_token` 可通过）、白名单跳过路由、slot 路由与 MOVED、`catch_unwind` 兜底、延迟埋点；
-  - `mod.rs`：bind/accept，一连接一 task。
+  - `mod.rs`：bind/accept，一连接一 task，accepted socket 设 `TCP_NODELAY`（2026-11-28 起，`sql/front/serve.rs` 同策略——MySQL 结果集多包写出，Nagle + 延迟 ACK 曾使每次往返 ~40ms）。
 - `command/`：命令注册表 `lookup` 与处理器。
   - `string.rs`：GET/SET/DEL/MGET/MSET/PING/QUIT/CONFIG（PING 带参回显）+ 共享助手（`old_string_value`/`write_string_record` 等）；
   - `string_incr.rs`：INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT（共享核、TTL 保持、i64 溢出、f64 最短回程格式）；
@@ -42,7 +42,7 @@ Commit: b7378c0
     + `migrate task <slot> <src> <dst>` 编排（SETSLOT MIGRATING/IMPORTING/NODE/STABLE +
     GETKEYSINSLOT 排空，任务 JSON 经 raft 键 `migrate_task` 复制）；线格式 `ds/dump.rs`（流载荷折 0x20 账本 + 0x1D 暂存行，RESTORE 改名时延迟行重定根到目标流名、源侧删除同折——2026-10-08 起），
     出站客户端 `resp/client.rs`。
-  - `keys*.rs`：TYPE/EXISTS/DEL/UNLINK/EXPIRE 族（NX/XX/GT/LT）/TTL/PTTL/PERSIST/SCAN/KEYS/RANDOMKEY/RENAME(NX)（流 rename 增搬 kind-0x20 组账本行，旧名 OffsetCommit 回 UNKNOWN_TOPIC_OR_PARTITION；核心状态 `keys_core.rs`，游标类 `keys_scan.rs`）；
+  - `keys*.rs`：TYPE/EXISTS/DEL/UNLINK/EXPIRE 族（NX/XX/GT/LT）/TTL/PTTL/PERSIST/SCAN/KEYS/RANDOMKEY/RENAME(NX)（流 rename 增搬 kind-0x20 组账本行，旧名 OffsetCommit 回 UNKNOWN_TOPIC_OR_PARTITION；核心状态 `keys_core.rs`，游标类 `keys_scan.rs`）；流名键空间命令（EXISTS/TYPE/DEL/EXPIRE/PERSIST/RENAME/WATCH）经 `lite::model::stream_key_target` 按父槽解析（先路由槽、后父槽，两窗口同上闩；RENAME 两流同父槽走 `keys_core::rename_stream`，一流一普通键拒绝），单测 `keys/tests_stream.rs`（2026-11-28 起）；**已知局限**：cluster 下 X 族节点本地，流名键空间命令仅在持有该流的节点生效；RENAME 不迁移消费组水位/PEL（新名 read-through 为空）；
   - `json_*.rs`：JSON 全命令（RedisJSON v1 legacy 路径：`$`/`.f`/`['f']`/`[i]`，无通配符）——`json_path.rs` 路径解析与 Value 导航（get/set/remove，字段自动建、数组 len 处追加）、`json_cmd.rs` SET(NX/XX)/GET/DEL/FORGET/TYPE/MGET、`json_str.rs` STRAPPEND/STRLEN/NUMINCRBY、`json_arr.rs` ARRAPPEND/ARRPOP/ARRINDEX/ARRINSERT/ARRLEN/ARRTRIM、`json_obj.rs` OBJKEYS/OBJLEN；多路径 GET 返回扁平数组（偏差见 COMPAT.md）。
   - `vectorset_*.rs`：VectorSet 全命令——`vectorset_cmd.rs` VADD（FP16 blob/VALUES 文本，重加保属性回 0）/VREM/VCARD/VDIM、`vectorset_attr.rs` VSETATTR/VGETATTR、`vectorset_sim.rs` VSIM（暴力 cosine，score=(cos+1)/2，COUNT/WITHSCORES/WITHATTRIBS）；偏差见 COMPAT.md（无 HNSW/EF/FILTER）。
   - `search/`（`src/search/`，Rust 独有）：FT.* 搜索引擎——`ft_cmd.rs` CREATE/ADD/DEL/DROP/INFO/BUILD、`ft_search.rs` 查询执行（BM25 文本 + KNN 探测重排）；`tokenize.rs` jieba+bigram 混合分词（索引/查询同源）、`bm25.rs` 打分与 TopK、`index_codec.rs` 记录编解码、`ft_index.rs` 增删批构建、`ann.rs` k-means/分区/KNN、`vecmath.rs`/`quant.rs` SQ8 标定与向量数学（VSIM 复用）；偏差与命令面见 COMPAT.md「Full-text + vector search」。

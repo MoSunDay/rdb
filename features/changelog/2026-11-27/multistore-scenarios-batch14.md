@@ -70,7 +70,7 @@ MOVED/ASK 重定向记账与备份监听）。每例仍是一个真实业务故�
   NUMERIC range 节点记常数 1.0 而非 BM25（`eval_tree.rs:198-208`）。
 - #162（缺陷疑似）：对 lite 流键 WATCH 永不触发——router 用全名哈希
   （`src/command/mod.rs:449-450`），lite 存在父名的槽前缀下（`src/lite/append.rs:56`）；
-  该腿移除，不断言。
+  该腿移除，不断言；已修：`batch14-defect-closure.md` 缺陷 1（`d0f5992`）。
 - #163（缺陷疑似）：普通流名对 RENAME 不可见（`-ERR no such key`，XLEN 1 / EXISTS 0
   同样成立），RENAME 不带 delivered 水位（`src/lite/offset.rs:57`），旧 (stream, group)
   的 offset 缓存无驱逐（`offset.rs:57-115`、`keys_core.rs:342`：`XREADGROUP <old> >`
@@ -94,6 +94,7 @@ MOVED/ASK 重定向记账与备份监听）。每例仍是一个真实业务故�
 - #171（缺陷疑似）：turso 渲染器把 `x IS NULL` 写成 `(x IS) NULL` → 1064
   （`src/sql/turso/translate/expr.rs:33-36`），`IS NULL`/`IS NOT NULL`/`<=>` 改为 host
   专用块，turso 跑其余全部读取并逐行相等。host NULL 排序与 MySQL 相反（`select.rs:671`）。
+  IS NULL 腿已修回：`batch14-defect-closure.md` 缺陷 2（`24d801b`）。
 - #172：自增计数器每条自增语句预留 64（65 → 129 → 257，`sequence.rs:37,84-89`），UNIQUE
   命中整句回滚但预留已烧（下一条 257 = 193 + 64）；pk 重复静默覆盖（`write.rs:165-195`）。
 - #173：`x-amz-meta-*` 从不存储/回显（`router.rs:283-285`）；checkpoint 发布者持续向桶
@@ -125,7 +126,7 @@ MOVED/ASK 重定向记账与备份监听）。每例仍是一个真实业务故�
   `redirmetrics/redirect-accounting` 4–8ms；整例 0.3s–5.3s（两节点各 3.6s/5.1s，后者含
   5s raft tick 等待）。
 - 既有、未改：MySQL 前端每个结果集语句固定 ~42ms（`src/sql/front/serve.rs:66` 的
-  监听 socket 未 `set_nodelay`），与批次 12/13 记录一致。
+  监听 socket 未 `set_nodelay`），与批次 12/13 记录一致。已修：`batch14-defect-closure.md` 缺陷 5（`8d4c0c7`）。
 - 门禁：15 例串行各 3 轮全绿（写者）+ 编排者串行 1 轮；scenario 175/175（291.69s，
   `RUST_TEST_THREADS=4`）；`cargo clippy --test scenario -- -D warnings` 零告警；全量
   `cargo test --workspace --no-fail-fast`（`RUST_TEST_THREADS=4`）2186/2186 绿（scenario
@@ -135,7 +136,8 @@ MOVED/ASK 重定向记账与备份监听）。每例仍是一个真实业务故�
   `sql_2pc_e2e::follower_coordinated_update_delete_reaches_all_slot_owners` 与一次 scenario
   全量中的 `scenario_sqlrpc_twopc_e2e::settlement_spans_shards_over_sql_rpc_and_vetoes_dupes`：
   多节点 join `head timeout`），三例单独复跑各 2–5 轮全过，第二轮全量 2186/2186；与批次 13
-  记录的 `sql_2pc_e2e`/`sql_join_cluster_e2e` flake 同类，均为既有、未改。
+  记录的 `sql_2pc_e2e`/`sql_join_cluster_e2e` flake 同类，均为既有、未改。两处已由
+  `batch14-defect-closure.md` 缺陷 3/4 闭环。
 - 评审收尾（只改注释/文档，不动断言）：修正 changelog 三处 src 行号引用（#162 `mod.rs:449-450`、
   #164 `offset.rs:164-207`、#175 `main.rs:493,506`）与 #163 文件头同步，性能表补
   `pkplan/after-ix-id`；增量构建复验通过。

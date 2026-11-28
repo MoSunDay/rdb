@@ -567,3 +567,8 @@ never used one; (z1)/(z2) keep the suffix inside the turso block's letter space)
   the dependency is `default-features = false` (turso's default `mimalloc`
   declares a process-wide `#[global_allocator]`, `fts` is unneeded) so the
   embedded engine can never swap rdb's allocator; the feature rides `full` only.
+- Fixed rendering note (2026-11-28, `24d801b`): `IS NULL` / `IS NOT NULL` used to render
+  `(x IS) NULL` and fail 1064 on turso (batch-14 #171; see
+  `features/changelog/2026-11-27/batch14-defect-closure.md`). Both now render
+  `({expr} IS NULL)` / `({expr} IS NOT NULL)` and are e2e'd on both engines with
+  identical assertions; `<=>` keeps the uniform 1235 on turso.

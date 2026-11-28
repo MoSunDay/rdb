@@ -1,6 +1,7 @@
 # 2026-11-27 lite-stream-keyspace-closure：批次 14 五项缺陷闭环计划
 
-> 状态：proposed
+> 状态：landed（2026-11-28 WP1–WP5 全量落地，含可选 WP5；本地提交 d0f5992 / 24d801b / edb3a5d / fd6bd2a / 8d4c0c7 + 门禁 follow-up c78feea / b37de48 / 314c407 / dcde3a7 /
+7b4ea50 / 4fc6c38 / a1a7bdd / c89d4f0 / 9957e8d，未推送）
 > 日期：2026-11-27
 > 输入：`features/changelog/2026-11-27/multistore-scenarios-batch14.md`（§真实行为偏差；flake 记录 :132-138）
 > 关联：`plans/2026-10-06-mysql-hardening/05-h4-test-hygiene.md`（H4-3 join head timeout，WP4 落地后回写）；
@@ -86,6 +87,8 @@ RENAME **不迁移**消费组水位/PEL（新名 read-through 为空）。
 - turso `InList` 空列表无守卫（`expr.rs:38-54`）→ 登记。
 - 流 RENAME 水位/PEL 不迁移 → 台账已知局限（除非 1.5 发现 reaper 可顺带覆盖）。
 - R4 src 侧重试/超时调整；R5 未确认前不做。
+- 服务端 join 毒化 leader（门禁中发现，§6 登记）：`/join` 在 leader 侧卡满 30s 后 leader 留下把死/慢 peer 算进 quorum
+  的未提交成员日志；本计划只登记 + 候选修复，不动 `src/rcache`。
 
 ## 5. 提交与收尾
 本地提交序列（不推送）：① `fix(lite): resolve stream names by parent slot in keyspace commands; evict offset cache on rename/del`
@@ -95,3 +98,22 @@ RENAME **不迁移**消费组水位/PEL（新名 read-through 为空）。
 文档：新建 `features/changelog/2026-11-27/batch14-defect-closure.md`（`## 缺陷 N：` 格式 ×5，含 sha）；
 `COMPAT.sql.md` turso 段注记 IS NULL 已修（若台账惯例要求）；`agents/rust/index.md` 加两条已知局限；
 `05-h4-test-hygiene.md` H4-3 回写"由 closure WP4 落地"；本计划状态 → landed，`plans/index.md` 同步。
+
+## 6. 落地结果（2026-11-28）
+
+| WP | 提交 | 结论 |
+| --- | --- | --- |
+| WP1 R1 | `d0f5992` | 形态 A 落地：`stream_key_target` + `resolve_located` 双窗口 + `rename_slot` 四分类 + `Runtime::stream_renamed`；1.5 结论 `family_delete_entries` 已覆盖，`stream_reaped` 改传父前缀即可；e2e #162/#163 回填 |
+| WP2 R2 | `24d801b` | `({} IS{} NULL)` + 4 渲染单测 + turso e2e 空值块；#171 turso 腿恢复，`<=>` 仍 1235 |
+| WP3 R3 | `edb3a5d` | `resp_cmd` 删除，改 `cmd_one_shot` / `cmd_full_reply_wait`，423→399 行 |
+| WP4 R4 | `fd6bd2a` | 新 `tests/common/spawn.rs`（200 行），`mod.rs` 800→703；join 失败重生 3 次、300ms 退避；src 超时不动 |
+| WP5 R5 | `8d4c0c7` | **确认**：`SELECT 1` 环回 avg 41.05ms（300/300 >5ms）→ 0.09–0.37ms；20 行结果集 42.4ms → 1.2–1.6ms；RESP 本就无停顿。两监听 accept 后 `set_nodelay` |
+| 门禁 follow-up | `c78feea` `b37de48` `314c407` `dcde3a7` `7b4ea50` `4fc6c38` `a1a7bdd` `c89d4f0` `9957e8d` | ① `scenario_key_lifecycle_e2e` TYPE 断言改 `stream`（曾把 R1 钉成 quirk）；② lite dlq 首字节改耐心读；③ WP5 去停顿后暴露的夹具时序：`common::mysql::seed_insert`（1213 ts-authority 预热重试）+ `sql_upsert_cluster_e2e::wait_all_nodes`（读点追平轮询）；④ `common::free_ports::<N>()` 同节点端口互异（`free_addr()` 连续两次可发回同一端口，`raft=http=…:38475`）；⑤ scenario 三处负载时序窗（checkout WATCH / cashier 首字节 10s、consumer-GC 预算 10s）；⑥ 进程级端口预留：本机 bind(0) 实测只发 32769–46883 的奇数口（≈7058 个，范围的 1/4），`free_addr()` 发过的口不再发、standalone 派生块与各私有探测（kafka_front/s3/rocksmq/kafka 0.0.0.0/redirect-metrics）接入同一集合——es 38215 / respawn 43787 / standalone 38985 三类首 bind 撞口 |
+
+摘要：`features/changelog/2026-11-27/batch14-defect-closure.md`（门禁数字见其 §门禁）。
+登记（未做）：**服务端 join 毒化 leader**（`/join` 卡满 30s 后 leader 留下把死/慢 peer 算进 quorum 的未提交
+成员日志 → 后续 `/join` 一律 InProgress、客户端写全部 `apply timeout`；openraft `add_learner(blocking=true)`
+按 lag 阈值判"追上"；WP4 重生救不了，候选修复见 changelog 登记 1 / H4-3）；rocksmq http 私有夹具 EADDRINUSE 偶发；
+`spawn_node_sql/_mysql/_es/_backup` 不在 join 重生内；端口预留只覆盖进程内（跨进程撞口、五项单次观测——含 kafka 目标既有负载时序类——见 changelog 登记 10）；
+多键 EXISTS/DEL 对流名仍按全名哈希（CROSSSLOT）；turso `InList` 空列表守卫；
+EXEC 对排队 XADD 的闩锁键不一致；流 RENAME 不迁移水位/PEL。

@@ -104,7 +104,8 @@ Vector/FT/lite-MQ/SQL/RocksMQ-HTTP/ES/Kafka/S3），断言同一份数据在不�
   `cargo test --workspace --no-fail-fast` 2140 过 + 1 例负载 flake
   `tests/sql/sql_join_cluster_e2e.rs` `cluster_joins_gather_both_sides`（node1 raft-http
   join head timeout，18 个 target 并发时出现；单跑 3/3 绿、`--test sql` 整 target 139/139
-  绿；本批未动 `src/` 与 `tests/common/`，与 `sql_2pc` 的负载抖动同类）。
+  绿；本批未动 `src/` 与 `tests/common/`，与 `sql_2pc` 的负载抖动同类）。（harness 侧重生已由
+  batch-14 closure WP4 落地：`2026-11-27/batch14-defect-closure.md` 缺陷 4。）
 - `cargo clippy --workspace --all-targets -- -D warnings` 零告警（修复 9 处：#129 同型
   cast、#127 文档 `>=` 转义、#120/#124 `query_drop(&format!(…))` 去借用）。
 - 20 个新文件 147–398 行（上限 400）；`tests/scenario_common/mod.rs` 414 行（迭代上限

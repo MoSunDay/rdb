@@ -59,7 +59,7 @@ Commit: b0d81c9
 | `2026-11-09-turso-engine/` | landed | 2 | 第二嵌入式引擎 tursodatabase/turso（pin =0.9.0-pre.2）：T0 研究（00-research 嵌入 API 调查 + 00-rdb-context 落点地图）→ T1 `turso_` 前缀库级路由 → T2 目录/库文件 → T3 CRUD 翻译与双引擎 parity → T4 向量面（精确 KNN）→ T5 事务/预编译 → T6 对照矩阵与台账收尾 |
 | `2026-11-09-wukong-ft/` | landed | 5 | 位置化 posting（kind 0x1A v2）+ 双前端查询树（QueryNode/eval_tree，FT.SEARCH 与 ES query_string 同一 AST）+ ES DSL 追平（match_phrase/prefix/msm/term 对象/数值 sort doc-values）+ 停用词/BM25 k1/b 旋钮 + `@num:[min max]` 数值区间 + SORTBY/RETURN + 互操作矩阵（_bulk/混写/TTL 双端视图）+ P3 出池 HIGHLIGHT；Batch 1 = WP1+WP2+WP5、Batch 2 = WP3+WP4+WP6 摘要见 features/changelog/2026-11-09/wukong-ft-batch{1,2}.md |
 | `2026-11-10-turso-acceptance/` | landed | 1 | 四项验收收口：standalone `--turso-db-dir` 一体化（opt-in）、stock sqlite3 CLI 双向互操作 e2e + 台账 (z3)（写者独占 WAL，退出后可读）、turso 向量可用口径=精确 KNN（ANN non-goal）、CI 三段门 + 文档四方同步 |
-| `2026-11-27-lite-stream-keyspace-closure/` | proposed | 1 | 批次 14 五项缺陷闭环：lite 流名 WATCH/RENAME/EXISTS 父槽解析 + offset 缓存驱逐（形态 A）、turso IS NULL 渲染、RocksMQ http e2e 夹具加固、harness join 超时重生、（可选）MySQL/RESP 监听 nodelay |
+| `2026-11-27-lite-stream-keyspace-closure/` | landed | 1 | 批次 14 五项缺陷闭环（R1–R5 全落地）：lite 流名 WATCH/RENAME/EXISTS 父槽解析 + offset 缓存驱逐（形态 A）、turso IS NULL 渲染、RocksMQ http e2e 夹具加固、harness join 超时重生、MySQL/RESP 监听 TCP_NODELAY（实测 SELECT 1 环回 41ms→0.1ms）；摘要见 features/changelog/2026-11-27/batch14-defect-closure.md |
 
 `2026-10-06-mq-gap/` 背景：以常用 MQ 功能清单为尺，对 Lite（RESP 动词面）、
 Kafka（wire 面）、HTTP（rocksmq 面）三面做只读差距复核，产出分级处置矩阵；
