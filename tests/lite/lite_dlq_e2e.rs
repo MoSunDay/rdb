@@ -11,7 +11,7 @@
 
 use crate::common;
 
-use common::lite::{boot, cmd_full_reply, pel_rows, text};
+use common::lite::{boot, cmd_full_reply_wait, pel_rows, text};
 use common::{cmd_one_shot, wait_resp_ready, ProcNode, TOKEN};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,8 +21,13 @@ async fn t(a: &str, args: &[&[u8]]) -> String {
     text(&cmd_one_shot(a, TOKEN, args).await)
 }
 
+// Patient first byte (10s): an XCLAIM transfer persists synchronously, so
+// under load its reply can trail the AUTH `+OK` by more than the 200ms
+// quiet gap -- the plain `cmd_full_reply` then truncated it to "" (seen
+// as "claim 1-1 must transfer, not deliver: left \"\"" in full-workspace
+// gate runs). Only the gaps between chunks keep the 200ms quiet rule.
 async fn full(a: &str, args: &[&[u8]]) -> String {
-    text(&cmd_full_reply(a, TOKEN, args, 200).await)
+    text(&cmd_full_reply_wait(a, TOKEN, args, 200, 10_000).await)
 }
 
 /// XGROUP CREATE <s> <g> 0-0 MKSTREAM <extra..>; asserts +OK.
@@ -84,7 +89,8 @@ async fn xrange_has(a: &str, s: &[u8], needles: &[&str]) {
 /// (id, consumer, deliveries) of `XPENDING <s> <g> - + 10` range rows
 /// (the >5 filter drops a `*4\r\n` reply-header artifact at 4 rows).
 async fn pending(a: &str, s: &[u8], g: &[u8]) -> Vec<(String, String, u64)> {
-    let reply = cmd_full_reply(a, TOKEN, &[b"xpending", s, g, b"-", b"+", b"10"], 200).await;
+    let reply =
+        cmd_full_reply_wait(a, TOKEN, &[b"xpending", s, g, b"-", b"+", b"10"], 200, 10_000).await;
     pel_rows(&reply)
         .into_iter()
         .filter(|r| r.len() > 5)
