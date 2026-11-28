@@ -40,13 +40,17 @@ pub fn effective_user(mysql_user: &str) -> String {
 }
 
 /// Accept loop: one task per connection. Accept errors are skipped with a
-/// 10ms backoff (same policy as `resp::serve`).
+/// 10ms backoff (same policy as `resp::serve`). Accepted sockets get
+/// `TCP_NODELAY`: every result-set packet is its own `write_all`, so with
+/// Nagle on, packet #2 waits for the client's delayed ACK of packet #1
+/// (~40ms per result set on loopback, measured in batch-14 R5).
 pub async fn serve(listener: TcpListener, shared: Arc<Shared>) -> ! {
     let user = effective_user(&shared.conf.mysql_user);
     let password = shared.conf.mysql_password.clone();
     loop {
         match listener.accept().await {
             Ok((sock, _peer)) => {
+                sock.set_nodelay(true).ok();
                 let shared = shared.clone();
                 let user = user.clone();
                 let password = password.clone();

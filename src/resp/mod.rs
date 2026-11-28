@@ -32,10 +32,14 @@ pub fn bind(addr: &str) -> Result<tokio::net::TcpListener, String> {
 /// Accept loop (Go redcon `ListenAndServe`): one task per connection.
 /// Accept errors are skipped, matching redcon's silent retry, but with a
 /// 10ms backoff so an EMFILE-style error storm cannot busy-spin the loop.
+/// Accepted sockets get `TCP_NODELAY` like Redis (`acceptCommonHandler`)
+/// and `sql::dist`; replies here are already one write per batch, so this
+/// is parity with the other listeners, not a measured win (batch-14 R5).
 pub async fn serve(listener: tokio::net::TcpListener, shared: Arc<state::Shared>) -> ! {
     loop {
         match listener.accept().await {
             Ok((sock, _peer)) => {
+                sock.set_nodelay(true).ok();
                 let shared = shared.clone();
                 tokio::spawn(conn::handle_conn(sock, shared));
             }
