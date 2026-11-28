@@ -2,14 +2,15 @@
 //! binary (cargo's `CARGO_BIN_EXE_rdb`) against REAL yaml configs written
 //! into a per-test tempdir, talk RESP2 over raw TcpStreams, and drive the
 //! cluster lifecycle (bootstrap -> join -> leader -> init). This is a
-//! module (`mod common;`), not a test binary of its own.
+//! module (`mod common;`), not a test binary of its own. The process
+//! launch and respawn loop lives in the child module `spawn`.
 
 #![allow(dead_code)]
 
 use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,6 +23,13 @@ use mysql_async::prelude::Queryable;
 pub mod lite;
 pub mod mq;
 pub mod mysql;
+/// Process launch + the respawn rules (EADDRINUSE, fatal `/join`);
+/// its public API is re-exported below, so call sites keep reading
+/// `common::spawn_node(..)`. The private launch helpers stay visible
+/// to the child modules only (`super::spawn_child` in `mysql.rs`).
+pub mod spawn;
+use spawn::{early_exit_kind, spawn_child, SPAWN_ATTEMPTS};
+pub use spawn::{spawn_node, spawn_node_yaml};
 
 pub const TOKEN: &str = "e2e-fake-token-0123456789abcdef0123456789abcdef";
 
@@ -145,111 +153,6 @@ fn write_config(
         node_dir.display()
     );
     std::fs::write(path, yaml).expect("write conf.yaml");
-}
-
-fn spawn_child(
-    config_path: &Path,
-    bootstrap: bool,
-    join_http: Option<&str>,
-    stderr_path: &Path,
-    append: bool,
-) -> Child {
-    let stderr = if append {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stderr_path)
-            .expect("open stderr log")
-    } else {
-        std::fs::File::create(stderr_path).expect("create stderr log")
-    };
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rdb"));
-    cmd.arg("-config").arg(config_path);
-    // Start from a clean env regardless of what the test runner carries.
-    cmd.env_remove("RAFT_BOOTSTRAP")
-        .env_remove("RAFT_JOIN_ADDR")
-        .env_remove("RDB_BEACON")
-        .env_remove("RDB_DEBUG_REPL")
-        .env_remove("RUST_LOG");
-    if bootstrap {
-        cmd.env("RAFT_BOOTSTRAP", "true"); // exactly "true" enables it
-    }
-    if let Some(join) = join_http {
-        cmd.env("RAFT_JOIN_ADDR", join);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr));
-    cmd.spawn().expect("spawn rdb binary")
-}
-
-/// Launch attempts per node: free-:0 port probes race with sibling tests
-/// binding them first (the child needs ~0.5s to reach its binds), so a
-/// node that dies instantly on EADDRINUSE is respawned on fresh ports.
-const SPAWN_ATTEMPTS: usize = 4;
-
-/// None while the child is alive and startup proceeds; Some(true) when it
-/// died of a port collision (respawn on fresh ports); Some(false) for any
-/// other early exit (intentional in some failover tests -- surface it).
-fn early_exit_kind(child: &mut std::process::Child, stderr_path: &std::path::Path) -> Option<bool> {
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    if matches!(child.try_wait(), Ok(None)) {
-        return None;
-    }
-    let tail = std::fs::read_to_string(stderr_path).unwrap_or_default();
-    Some(tail.contains("Address already in use"))
-}
-
-/// Spawn node `id` below the per-test `dir`: node dir + conf.yaml + 4 fresh
-/// ports, child launched per `bootstrap`/`join_http`.
-pub fn spawn_node(dir: &Path, id: usize, bootstrap: bool, join_http: Option<&str>) -> ProcNode {
-    spawn_node_yaml(dir, id, bootstrap, join_http, "")
-}
-
-/// [`spawn_node`] with extra top-level yaml lines appended to the node's
-/// conf.yaml (e.g. a `lite:` section arming the idle redelivery sweep);
-/// ports, respawn retries and the stderr log are identical.
-pub fn spawn_node_yaml(
-    dir: &Path,
-    id: usize,
-    bootstrap: bool,
-    join_http: Option<&str>,
-    extra_yaml: &str,
-) -> ProcNode {
-    let node_dir = dir.join(format!("node{id}"));
-    std::fs::create_dir_all(&node_dir).expect("create node dir");
-    for _ in 0..SPAWN_ATTEMPTS {
-        let (resp, raft, http, monitor) = (free_addr(), free_addr(), free_addr(), free_addr());
-        let config_path = node_dir.join("conf.yaml");
-        write_config(
-            &config_path,
-            &node_dir,
-            &resp,
-            &raft,
-            &http,
-            &monitor,
-            "",
-            extra_yaml,
-        );
-        let stderr_path = node_dir.join("stderr.log");
-        let mut child = spawn_child(&config_path, bootstrap, join_http, &stderr_path, false);
-        if !matches!(early_exit_kind(&mut child, &stderr_path), Some(true)) {
-            return ProcNode {
-                dir: node_dir,
-                config_path,
-                stderr_path,
-                child,
-                resp,
-                raft,
-                http,
-                monitor,
-                mysql: String::new(),
-                sql_rpc: String::new(),
-                es: String::new(),
-            };
-        }
-    }
-    panic!("rdb kept dying at startup; see stderr.log in {node_dir:?}");
 }
 
 /// Spawn a node with the SQL (MySQL-protocol) plane enabled on a fresh
