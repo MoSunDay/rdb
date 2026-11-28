@@ -40,6 +40,11 @@ pub const ER_DB_CREATE_EXISTS: u16 = 1007;
 /// MySQL 1008 (ER_DB_DROP_EXISTS): DROP DATABASE of a missing name.
 pub const ER_DB_DROP_EXISTS: u16 = 1008;
 
+/// MySQL 1213 (ER_LOCK_DEADLOCK): the code the server stamps on every
+/// retryable serialization failure (`conflict:` vetoes, unreachable
+/// participants, an unreachable ts authority).
+pub const ER_LOCK_DEADLOCK: u16 = 1213;
+
 /// MySQL 1290 (ER_OPTION_PREVENTS_STATEMENT): writes against storage
 /// opened read-only (turso permission-decided read-only libraries).
 pub const ER_OPTION_PREVENTS_STATEMENT: u16 = 1290;
@@ -106,6 +111,31 @@ pub async fn ddl(conn: &mut mysql_async::Conn, sql: &str) {
 /// AUTO_INCREMENT suite, which retries counter-bumping INSERTs too).
 pub async fn run(conn: &mut mysql_async::Conn, sql: &str) {
     leader_retry(conn, sql, "run").await
+}
+
+/// Seed INSERT of a cluster fixture, on any node. A node's first
+/// distributed commit can race its first ts lease (the refiller
+/// re-leases every 200ms): the pre-commit reserve then fails fast with
+/// 1213 "ts authority unreachable" BEFORE anything is written, so only
+/// that label is retried -- a `conflict:` 1213 on a seed of fresh ids
+/// has no rival writer and stays a failure. Same 15s deadline as the
+/// leader retry.
+pub async fn seed_insert(conn: &mut mysql_async::Conn, sql: &str, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match conn.query_drop(sql).await {
+            Ok(()) => return,
+            Err(mysql_async::Error::Server(e))
+                if e.code == ER_LOCK_DEADLOCK
+                    && e.message.contains("ts authority unreachable")
+                    && std::time::Instant::now() < deadline =>
+            {
+                eprintln!("seed_insert: {what} hit 1213 ts authority, retrying: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("{what}: {e}"),
+        }
+    }
 }
 
 /// Rows as raw wire cells (the text protocol hands non-NULL scalars

@@ -10,6 +10,7 @@ use crate::common;
 
 use std::time::{Duration, Instant};
 
+use common::mysql::seed_insert;
 use common::{start_sql_cluster, wait_leader, ProcNode};
 use mysql_async::prelude::*;
 use mysql_async::{OptsBuilder, Value as MVal};
@@ -125,18 +126,21 @@ async fn union_and_cte_gather_cluster_wide() {
         let rows: Vec<String> = (0..5)
             .map(|j| format!("({}, 'c{}')", lo + j, lo + j))
             .collect();
-        conn.query_drop(format!("INSERT INTO cs (id, v) VALUES {}", rows.join(", ")))
-            .await
-            .expect("columnar seed");
+        seed_insert(
+            conn,
+            &format!("INSERT INTO cs (id, v) VALUES {}", rows.join(", ")),
+            "columnar seed",
+        )
+        .await;
     }
     // Row store: ONE insert of 5 ids anywhere (2PC scatters them to
     // their slot-band owners).
-    conns[0]
-        .query_drop(
-            "INSERT INTO rs (id, w) VALUES (100,'x'),(101,'y'),(102,'z'),(103,'p'),(104,'q')",
-        )
-        .await
-        .expect("row seed");
+    seed_insert(
+        &mut conns[0],
+        "INSERT INTO rs (id, w) VALUES (100,'x'),(101,'y'),(102,'z'),(103,'p'),(104,'q')",
+        "row seed",
+    )
+    .await;
 
     // Read-point convergence: lift every oracle view above all
     // columnar commits (4200 rows > one 4096-row ts block per node).
@@ -153,9 +157,12 @@ async fn union_and_cte_gather_cluster_wide() {
         let rows: Vec<String> = (0..4200)
             .map(|j| format!("({})", base + j as i64))
             .collect();
-        conn.query_drop(format!("INSERT INTO adv (k) VALUES {}", rows.join(", ")))
-            .await
-            .expect("ts-advancer insert");
+        seed_insert(
+            conn,
+            &format!("INSERT INTO adv (k) VALUES {}", rows.join(", ")),
+            "ts-advancer insert",
+        )
+        .await;
     }
 
     // UNION distinct over columnar + row operands: 20 ids, identical

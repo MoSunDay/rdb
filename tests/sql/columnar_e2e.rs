@@ -10,7 +10,9 @@
 
 use crate::common;
 
-use common::mysql::{connect_root, ddl, wait_table, ER_NOT_SUPPORTED_YET, ER_NO_SUCH_TABLE};
+use common::mysql::{
+    connect_root, ddl, seed_insert, wait_table, ER_NOT_SUPPORTED_YET, ER_NO_SUCH_TABLE,
+};
 use common::{spawn_node_mysql, start_sql_cluster, wait_leader, wait_mysql_ready, wait_resp_ready};
 use mysql_async::prelude::*;
 use mysql_async::Value as MVal;
@@ -232,9 +234,12 @@ async fn cluster_columnar_segments_spread_and_gather() {
         let rows: Vec<String> = (0..4200)
             .map(|j| format!("({})", base + j as i64))
             .collect();
-        conn.query_drop(format!("INSERT INTO adv (k) VALUES {}", rows.join(", ")))
-            .await
-            .expect("ts-advancer insert");
+        seed_insert(
+            conn,
+            &format!("INSERT INTO adv (k) VALUES {}", rows.join(", ")),
+            "ts-advancer insert",
+        )
+        .await;
     }
 
     // ---- reads from EVERY node fan out and return the union ----

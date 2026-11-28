@@ -12,6 +12,7 @@ use crate::common;
 
 use std::time::{Duration, Instant};
 
+use common::mysql::seed_insert;
 use common::{start_sql_cluster, wait_leader, ProcNode};
 use mysql_async::prelude::*;
 use mysql_async::{OptsBuilder, Value as MVal};
@@ -109,6 +110,38 @@ async fn server_error(conn: &mut mysql_async::Conn, sql: &str) -> mysql_async::S
     }
 }
 
+/// Poll `sql` on EVERY node until the first row's text cells equal
+/// `want` everywhere. A node that was neither coordinator nor
+/// participant of a commit reads at its own snapshot read point
+/// (COMPAT.md, columnar "Reads"), which catches up with the covering
+/// ts cursor entry: one refill tick + raft apply, longer under load.
+async fn wait_all_nodes(conns: &mut [mysql_async::Conn], sql: &str, want: &[String]) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut lagging = Vec::new();
+        for (i, c) in conns.iter_mut().enumerate() {
+            let rs: Vec<mysql_async::Row> = c.query(sql).await.expect(sql);
+            let cells: Vec<String> = (0..rs[0].len())
+                .map(|k| match rs[0].get::<MVal, _>(k) {
+                    Some(MVal::Bytes(b)) => String::from_utf8(b).unwrap(),
+                    v => panic!("node {i}: non-bytes cell {v:?}"),
+                })
+                .collect();
+            if cells != want {
+                lagging.push(format!("node {i}: {cells:?}"));
+            }
+        }
+        if lagging.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "read points never converged for {sql}: {lagging:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn cluster_rejects_conflict_paths_but_plain_writes_work() {
     let dir = std::env::temp_dir().join(format!("rdb-sql-upsert-cluster-{}", std::process::id()));
@@ -166,31 +199,20 @@ async fn cluster_rejects_conflict_paths_but_plain_writes_work() {
 
     // ---- the plain paths keep working: a band-spanning INSERT into
     // cs, then a plain INSERT..SELECT ci <- cs through 2PC ----
-    conns[0]
-        .query_drop(batch_sql(1))
-        .await
-        .expect("spanning insert into cs");
-    conns[1]
-        .query_drop("INSERT INTO ci (id, name) SELECT id, name FROM cs")
-        .await
-        .expect("plain INSERT..SELECT across cluster tables");
+    seed_insert(&mut conns[0], &batch_sql(1), "spanning insert into cs").await;
+    seed_insert(
+        &mut conns[1],
+        "INSERT INTO ci (id, name) SELECT id, name FROM cs",
+        "plain INSERT..SELECT across cluster tables",
+    )
+    .await;
     assert_eq!(conns[1].affected_rows() as i64, BATCH);
-    for (i, c) in conns.iter_mut().enumerate() {
-        let rs: Vec<mysql_async::Row> = c
-            .query("SELECT COUNT(*), MIN(id), MAX(id) FROM ci")
-            .await
-            .expect("gathered count");
-        let (n, lo, hi): (i64, i64, i64) = (
-            rs[0].get(0).unwrap(),
-            rs[0].get(1).unwrap(),
-            rs[0].get(2).unwrap(),
-        );
-        assert_eq!(
-            (n, lo, hi),
-            (BATCH, 1, BATCH),
-            "node {i} gathered read after INSERT..SELECT"
-        );
-    }
+    wait_all_nodes(
+        &mut conns,
+        "SELECT COUNT(*), MIN(id), MAX(id) FROM ci",
+        &[BATCH.to_string(), 1.to_string(), BATCH.to_string()],
+    )
+    .await;
 
     // ---- unique index still vets across bands: a duplicate name is
     // 1062 and leaves the original rows intact everywhere ----
@@ -207,22 +229,20 @@ async fn cluster_rejects_conflict_paths_but_plain_writes_work() {
     assert_eq!(rs[0].get::<i64, _>(0).unwrap(), 5);
 
     // ---- plain-INSERT pk upsert (the intentional deviation) still
-    // rides 2PC: same pk rewrites through, gathered read sees it ----
-    conns[0]
-        .query_drop("INSERT INTO ci (id, name) VALUES (5, 'renamed')")
-        .await
-        .expect("pk upsert through 2PC");
-    for (i, c) in conns.iter_mut().enumerate() {
-        let rs: Vec<mysql_async::Row> = c
-            .query("SELECT name FROM ci WHERE id = 5")
-            .await
-            .expect("gathered read of the upserted pk");
-        let name = match rs[0].get::<MVal, _>(0) {
-            Some(MVal::Bytes(b)) => String::from_utf8(b).unwrap(),
-            v => panic!("node {i}: non-bytes cell {v:?}"),
-        };
-        assert_eq!(name, "renamed", "node {i}");
-    }
+    // rides 2PC: same pk rewrites through, and every node's gathered
+    // read sees it once its read point has passed the commit ----
+    seed_insert(
+        &mut conns[0],
+        "INSERT INTO ci (id, name) VALUES (5, 'renamed')",
+        "pk upsert through 2PC",
+    )
+    .await;
+    wait_all_nodes(
+        &mut conns,
+        "SELECT name FROM ci WHERE id = 5",
+        &["renamed".to_string()],
+    )
+    .await;
     for mut n in nodes {
         n.kill_now();
     }

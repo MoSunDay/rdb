@@ -13,6 +13,7 @@ use crate::common;
 
 use std::time::{Duration, Instant};
 
+use common::mysql::seed_insert;
 use common::{start_sql_cluster, wait_leader, ProcNode};
 use mysql_async::prelude::*;
 use mysql_async::{OptsBuilder, Value as MVal};
@@ -134,17 +135,22 @@ async fn cluster_joins_gather_both_sides() {
         let rows: Vec<String> = (0..5)
             .map(|j| format!("({}, 'c{}')", lo + j, lo + j))
             .collect();
-        conn.query_drop(format!("INSERT INTO cj (id, v) VALUES {}", rows.join(", ")))
-            .await
-            .expect("per-node columnar insert");
+        seed_insert(
+            conn,
+            &format!("INSERT INTO cj (id, v) VALUES {}", rows.join(", ")),
+            "per-node columnar insert",
+        )
+        .await;
     }
     // ---- row-store band spread: 300 fixed ids in ONE insert on node0
     // (2PC distributes them to their slot-band owners).
     let rows: Vec<String> = (1..=300).map(|k| format!("({k}, 'w{k}')")).collect();
-    conns[0]
-        .query_drop(format!("INSERT INTO rj (id, w) VALUES {}", rows.join(", ")))
-        .await
-        .expect("row-store spread insert");
+    seed_insert(
+        &mut conns[0],
+        &format!("INSERT INTO rj (id, w) VALUES {}", rows.join(", ")),
+        "row-store spread insert",
+    )
+    .await;
     // ids 1..=15 into rj as the join partner set: reuse of the same
     // table keeps the partner rows inside the 300 (ids 1..=15 exist).
 
@@ -165,9 +171,12 @@ async fn cluster_joins_gather_both_sides() {
         let rows: Vec<String> = (0..4200)
             .map(|j| format!("({})", base + j as i64))
             .collect();
-        conn.query_drop(format!("INSERT INTO adv (k) VALUES {}", rows.join(", ")))
-            .await
-            .expect("ts-advancer insert");
+        seed_insert(
+            conn,
+            &format!("INSERT INTO adv (k) VALUES {}", rows.join(", ")),
+            "ts-advancer insert",
+        )
+        .await;
     }
 
     let expect_ids: Vec<String> = (1..=15).map(|i| i.to_string()).collect();
